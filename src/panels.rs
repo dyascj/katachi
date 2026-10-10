@@ -2215,25 +2215,78 @@ impl App {
     }
 
     fn export_props(&mut self, ui: &mut Ui) {
-        heading(ui, "Export");
+        use crate::doc::{ExportFormat, ExportSetting};
+        let roots = self.sel_roots();
+        let single = (roots.len() == 1).then(|| roots[0]);
         ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("export-scale")
-                .width(60.0)
-                .selected_text(format!("{}x", num(self.export_scale)))
-                .show_ui(ui, |ui| {
-                    for s in [0.5, 1.0, 2.0, 3.0, 4.0] {
-                        ui.selectable_value(&mut self.export_scale, s, format!("{}x", num(s)));
+            ui.label(RichText::new("Export").strong());
+            if let Some(id) = single {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, Icon::Plus, false, 22.0, "Add export setting").clicked() {
+                        self.checkpoint();
+                        let n = self.doc.node_mut(id);
+                        // Figma adds the next common scale.
+                        let next = match n.exports.last().map(|e| e.scale) {
+                            None => 1.0,
+                            Some(s) if s < 2.0 => 2.0,
+                            Some(s) => s + 1.0,
+                        };
+                        n.exports.push(ExportSetting { scale: next, ..Default::default() });
                     }
                 });
-            egui::ComboBox::from_id_salt("export-format")
-                .width(60.0)
-                .selected_text(if self.export_svg { "SVG" } else { "PNG" })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.export_svg, false, "PNG");
-                    ui.selectable_value(&mut self.export_svg, true, "SVG");
-                });
+            }
         });
-        let label = match self.sel_roots().as_slice() {
+        let fmt_combo = |ui: &mut Ui, id: egui::Id, f: &mut ExportFormat| {
+            let mut changed = false;
+            egui::ComboBox::from_id_salt(id).width(56.0).selected_text(f.ext().to_uppercase()).show_ui(ui, |ui| {
+                for k in [ExportFormat::Png, ExportFormat::Jpg, ExportFormat::Svg, ExportFormat::Pdf] {
+                    changed |= ui.selectable_value(f, k, k.ext().to_uppercase()).changed();
+                }
+            });
+            changed
+        };
+        let scale_combo = |ui: &mut Ui, id: egui::Id, s: &mut f32| {
+            let mut changed = false;
+            egui::ComboBox::from_id_salt(id).width(48.0).selected_text(format!("{}x", num(*s))).show_ui(ui, |ui| {
+                for v in [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0] {
+                    changed |= ui.selectable_value(s, v, format!("{}x", num(v))).changed();
+                }
+            });
+            changed
+        };
+        let presets = single.map(|id| self.doc.node(id).exports.clone()).unwrap_or_default();
+        if presets.is_empty() {
+            ui.horizontal(|ui| {
+                scale_combo(ui, ui.id().with("export-scale"), &mut self.export_scale);
+                let mut f = if self.export_svg { ExportFormat::Svg } else { ExportFormat::Png };
+                if fmt_combo(ui, ui.id().with("export-format"), &mut f) {
+                    self.export_svg = f == ExportFormat::Svg;
+                }
+            });
+        } else if let Some(id) = single {
+            let mut list = presets.clone();
+            let mut remove = None;
+            for (i, p) in list.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    scale_combo(ui, ui.id().with(("ex-scale", id, i)), &mut p.scale);
+                    ui.add(egui::TextEdit::singleline(&mut p.suffix).hint_text("Suffix").desired_width(60.0));
+                    fmt_combo(ui, ui.id().with(("ex-fmt", id, i)), &mut p.format);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icon_button(ui, Icon::Minus, false, 20.0, "Remove").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                });
+            }
+            if let Some(i) = remove {
+                list.remove(i);
+            }
+            if list != presets {
+                self.begin_edit();
+                self.doc.node_mut(id).exports = list;
+            }
+        }
+        let label = match roots.as_slice() {
             [] => format!("Export {}", self.doc.pages[self.page].name),
             [one] => format!("Export {}", self.doc.node(*one).name),
             many => format!("Export {} layers", many.len()),

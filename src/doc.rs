@@ -379,6 +379,43 @@ impl BlendMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ExportFormat {
+    #[default]
+    Png,
+    Jpg,
+    Svg,
+    Pdf,
+}
+
+impl ExportFormat {
+    pub fn ext(self) -> &'static str {
+        match self {
+            ExportFormat::Png => "png",
+            ExportFormat::Jpg => "jpg",
+            ExportFormat::Svg => "svg",
+            ExportFormat::Pdf => "pdf",
+        }
+    }
+    pub fn raster(self) -> bool {
+        matches!(self, ExportFormat::Png | ExportFormat::Jpg)
+    }
+}
+
+/// One export preset on a layer, like Figma's Export rows.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExportSetting {
+    pub scale: f32,
+    pub format: ExportFormat,
+    pub suffix: String,
+}
+
+impl Default for ExportSetting {
+    fn default() -> Self {
+        Self { scale: 1.0, format: ExportFormat::Png, suffix: String::new() }
+    }
+}
+
 /// What sits at the ends of an open path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Marker {
@@ -631,6 +668,7 @@ pub struct Node {
     pub bool_op: BoolOp,
     /// Clips the layers above it in the same parent.
     pub is_mask: bool,
+    pub exports: Vec<ExportSetting>,
     pub blend: BlendMode,
     /// Prototype interactions.
     pub reactions: Vec<Reaction>,
@@ -706,6 +744,7 @@ impl Default for Node {
             absolute: false,
             bool_op: BoolOp::Union,
             is_mask: false,
+            exports: vec![],
             blend: BlendMode::Normal,
             reactions: vec![],
             fill_style: None,

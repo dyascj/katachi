@@ -581,6 +581,40 @@ pub fn to_png(doc: &Document, ids: &[NodeId], scale: f32) -> Result<Vec<u8>, Str
     svg_to_png(doc, &to_svg(doc, ids), scale)
 }
 
+/// Encode export SVG in a format: SVG as-is, PNG/JPG rasterized at `scale`, PDF as vectors.
+pub fn encode(doc: &Document, svg: &str, format: crate::doc::ExportFormat, scale: f32) -> Result<Vec<u8>, String> {
+    use crate::doc::ExportFormat;
+    match format {
+        ExportFormat::Svg => Ok(svg.as_bytes().to_vec()),
+        ExportFormat::Png => svg_to_png(doc, svg, scale),
+        ExportFormat::Jpg => {
+            // JPEG has no alpha: flatten onto white.
+            let png = svg_to_png(doc, svg, scale)?;
+            let img = image::load_from_memory(&png).map_err(|e| e.to_string())?.to_rgba8();
+            let mut rgb = image::RgbImage::new(img.width(), img.height());
+            for (x, y, p) in img.enumerate_pixels() {
+                let a = p.0[3] as u32;
+                let c = |v: u8| ((v as u32 * a + 255 * (255 - a)) / 255) as u8;
+                rgb.put_pixel(x, y, image::Rgb([c(p.0[0]), c(p.0[1]), c(p.0[2])]));
+            }
+            let mut out = std::io::Cursor::new(vec![]);
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 92).encode_image(&rgb).map_err(|e| e.to_string())?;
+            Ok(out.into_inner())
+        }
+        ExportFormat::Pdf => {
+            let mut opt = svg2pdf::usvg::Options::default();
+            if doc.nodes.values().any(|n| n.kind == Kind::Text && n.font_family != "Inter") {
+                opt.fontdb_mut().load_system_fonts();
+            }
+            for f in FONTS {
+                opt.fontdb_mut().load_font_data(f.to_vec());
+            }
+            let tree = svg2pdf::usvg::Tree::from_str(svg, &opt).map_err(|e| e.to_string())?;
+            svg2pdf::to_pdf(&tree, Default::default(), Default::default()).map_err(|e| e.to_string())
+        }
+    }
+}
+
 pub fn svg_to_png(doc: &Document, svg: &str, scale: f32) -> Result<Vec<u8>, String> {
     let mut opt = resvg::usvg::Options::default();
     // System fonts only when a layer uses one; Inter is always bundled.
@@ -704,6 +738,21 @@ mod tests {
         let img = image::load_from_memory(&png).unwrap().to_rgba8();
         assert!(img.get_pixel(20, 20).0[3] > 200, "center kept");
         assert!(img.get_pixel(2, 2).0[3] < 30, "corner masked away");
+    }
+
+    #[test]
+    fn jpg_and_pdf_encode() {
+        use crate::doc::ExportFormat;
+        let mut d = Document::default();
+        let mut t = Node::new(Kind::Text, Rect::from_min_size(pos2(0., 0.), vec2(60., 20.)));
+        t.text = "PDF".into();
+        let a = d.insert(0, None, None, t);
+        d.insert(0, None, None, Node::new(Kind::Ellipse, Rect::from_min_size(pos2(0., 30.), vec2(40., 40.))));
+        let svg = to_svg(&d, &[a]);
+        let jpg = encode(&d, &svg, ExportFormat::Jpg, 2.0).unwrap();
+        assert_eq!(&jpg[..2], &[0xFF, 0xD8], "JPEG magic");
+        let pdf = encode(&d, &svg, ExportFormat::Pdf, 1.0).unwrap();
+        assert!(pdf.starts_with(b"%PDF"), "PDF magic");
     }
 
     #[test]

@@ -902,35 +902,65 @@ impl App {
         }
     }
 
+    /// Export the selection (or page) with each layer's presets, or the panel's default.
     pub fn export(&mut self) {
+        use crate::doc::{ExportFormat, ExportSetting};
         let ids = if self.sel.is_empty() { self.doc.pages[self.page].children.clone() } else { self.sel_roots() };
         if ids.is_empty() {
             return;
         }
-        let name = if ids.len() == 1 { self.doc.node(ids[0]).name.clone() } else { "Export".into() };
-        let ext = if self.export_svg { "svg" } else { "png" };
-        let suffix = if self.export_scale != 1.0 && !self.export_svg { format!("@{}x", self.export_scale) } else { String::new() };
-        let Some(path) = rfd::FileDialog::new().add_filter(ext.to_uppercase(), &[ext]).set_file_name(format!("{name}{suffix}.{ext}")).save_file()
-        else {
-            return;
-        };
-        // A slice exports whatever lies inside it.
-        let svg = match ids.as_slice() {
-            [one] if self.doc.node(*one).kind == Kind::Slice => {
-                let n = self.doc.node(*one);
-                crate::export::region_svg(&self.doc, self.page, n.aabb(), n.id)
-            }
-            _ => crate::export::to_svg(&self.doc, &ids),
-        };
-        let data = if self.export_svg {
-            Ok(svg.into_bytes())
+        let fallback = ExportSetting { scale: self.export_scale, format: if self.export_svg { ExportFormat::Svg } else { ExportFormat::Png }, suffix: String::new() };
+        // Each job: (ids to render, base name, preset).
+        let mut jobs: Vec<(Vec<NodeId>, String, ExportSetting)> = vec![];
+        if self.sel.is_empty() {
+            jobs.push((ids.clone(), self.doc.pages[self.page].name.clone(), fallback.clone()));
         } else {
-            crate::export::svg_to_png(&self.doc, &svg, self.export_scale)
-        };
-        match data.and_then(|d| std::fs::write(&path, d).map_err(|e| e.to_string())) {
-            Ok(()) => self.toast(format!("Exported {}", path.file_name().unwrap_or_default().to_string_lossy())),
-            Err(e) => self.toast(format!("Export failed: {e}")),
+            for &id in &ids {
+                let n = self.doc.node(id);
+                let presets = if n.exports.is_empty() { vec![fallback.clone()] } else { n.exports.clone() };
+                for p in presets {
+                    jobs.push((vec![id], n.name.clone(), p));
+                }
+            }
         }
+        let file_name = |name: &str, p: &ExportSetting| {
+            let scale = if p.format.raster() && p.scale != 1.0 { format!("@{}x", crate::canvas::num(p.scale)) } else { String::new() };
+            format!("{}{}{}.{}", name.replace('/', "-"), p.suffix, scale, p.format.ext())
+        };
+        // One file: ask where. Several: ask for a folder.
+        let targets: Vec<std::path::PathBuf> = if jobs.len() == 1 {
+            let (_, name, p) = &jobs[0];
+            let ext = p.format.ext();
+            match rfd::FileDialog::new().add_filter(ext.to_uppercase(), &[ext]).set_file_name(file_name(name, p)).save_file() {
+                Some(path) => vec![path],
+                None => return,
+            }
+        } else {
+            match rfd::FileDialog::new().pick_folder() {
+                Some(dir) => jobs.iter().map(|(_, name, p)| dir.join(file_name(name, p))).collect(),
+                None => return,
+            }
+        };
+        let mut done = 0;
+        for ((ids, _, p), path) in jobs.iter().zip(&targets) {
+            // A slice exports whatever lies inside it.
+            let svg = match ids.as_slice() {
+                [one] if self.doc.node(*one).kind == Kind::Slice => {
+                    let n = self.doc.node(*one);
+                    crate::export::region_svg(&self.doc, self.page, n.aabb(), n.id)
+                }
+                _ => crate::export::to_svg(&self.doc, ids),
+            };
+            match crate::export::encode(&self.doc, &svg, p.format, p.scale).and_then(|d| std::fs::write(path, d).map_err(|e| e.to_string())) {
+                Ok(()) => done += 1,
+                Err(e) => return self.toast(format!("Export failed: {e}")),
+            }
+        }
+        self.toast(if done == 1 {
+            format!("Exported {}", targets[0].file_name().unwrap_or_default().to_string_lossy())
+        } else {
+            format!("Exported {done} files")
+        });
     }
 
     pub fn request_new(&mut self) {
