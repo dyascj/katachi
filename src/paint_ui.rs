@@ -201,21 +201,18 @@ fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEve
                 ev = Some(PaintEvent::Changed);
             }
             paint.stops.sort_by(|a, b| a.0.total_cmp(&b.0));
-            if let Some((_, c)) = paint.stops.get_mut(sel) {
-                if rgb_picker(ui, c) {
+            if let Some((_, c)) = paint.stops.get_mut(sel)
+                && rgb_picker(ui, c) {
                     ev = Some(PaintEvent::Changed);
                 }
-            }
             ui.data_mut(|d| d.insert_temp(selected_id, sel));
         }
         PaintKind::Image => {
-            if ui.button("Choose image…").clicked() {
-                if let Some(path) = rfd::FileDialog::new().add_filter("Image", &["png", "jpg", "jpeg"]).pick_file() {
-                    if let Ok(bytes) = std::fs::read(path) {
+            if ui.button("Choose image…").clicked()
+                && let Some(path) = rfd::FileDialog::new().add_filter("Image", &["png", "jpg", "jpeg"]).pick_file()
+                    && let Ok(bytes) = std::fs::read(path) {
                         ev = Some(PaintEvent::Image(bytes));
                     }
-                }
-            }
             if paint.image.is_empty() {
                 ui.label("No image selected");
             }

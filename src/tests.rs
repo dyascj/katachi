@@ -403,9 +403,17 @@ fn shots() {
     tile.radius = 12.0;
     let t = st.doc.insert(0, None, None, tile);
     st.sel = vec![card];
-    let _ = t;
     h.run_steps(3);
     save(&mut h, "5-paints");
+    // Auto layout panel: wrap the tile and two copies in a horizontal stack.
+    let st = h.state_mut();
+    st.sel = vec![t];
+    st.duplicate_selection();
+    st.nudge(vec2(180., 0.));
+    st.sel = vec![t, st.sel[0]];
+    st.add_auto_layout();
+    h.run_steps(3);
+    save(&mut h, "6-auto-layout");
 }
 
 #[test]
@@ -446,4 +454,36 @@ fn dropping_an_image_file_creates_an_image_layer() {
     assert_eq!(n.fills[0].kind, crate::doc::PaintKind::Image);
     assert_eq!(h.state().doc.images.len(), 1);
     assert_eq!(n.name, "leaf.png");
+}
+
+#[test]
+fn shift_a_wraps_in_auto_layout_and_drag_reorders() {
+    use crate::doc::LayoutMode;
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (40.0, 40.0));
+    let b = draw(&mut h, Key::R, (60.0, 0.0), (100.0, 40.0));
+    let c = draw(&mut h, Key::R, (120.0, 0.0), (160.0, 40.0));
+    h.state_mut().sel = vec![a, b, c];
+    key(&mut h, Modifiers::SHIFT, Key::A);
+    let f = h.state().sel[0];
+    let fr = h.state().doc.node(f).clone();
+    assert_eq!(fr.layout.mode, LayoutMode::Horizontal);
+    assert_eq!(fr.children, vec![a, b, c]);
+    assert_eq!(fr.rect, r(0., 0., 140., 40.), "hugs: 3x40 + 2x10 gap");
+    // Drag `a` past `c`: it moves to the end and the others slide left.
+    let (from, to) = (s(&h, 20., 20.), s(&h, 135., 20.));
+    let p = s(&h, -300., 300.);
+    click(&mut h, p, Modifiers::NONE);
+    click(&mut h, from, Modifiers::NONE);
+    assert_eq!(h.state().sel, vec![a], "children of a top-level frame are directly selectable");
+    drag(&mut h, from, to, Modifiers::NONE);
+    let fr = h.state().doc.node(f).clone();
+    assert_eq!(fr.children, vec![b, c, a]);
+    assert_eq!(rect(&h, b).min.x, 0.0);
+    assert_eq!(rect(&h, a).min.x, 100.0);
+    // Remove auto layout keeps positions.
+    h.state_mut().sel = vec![f];
+    key(&mut h, Modifiers::SHIFT | Modifiers::ALT, Key::A);
+    assert_eq!(h.state().doc.node(f).layout.mode, LayoutMode::None);
+    assert_eq!(rect(&h, a).min.x, 100.0);
 }

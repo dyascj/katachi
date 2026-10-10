@@ -1,6 +1,6 @@
 //! App state, document actions, undo, clipboard, files, and keyboard shortcuts.
 
-use crate::doc::{Document, Kind, Node, NodeId, Order};
+use crate::doc::{AutoLayout, Document, Kind, LayoutMode, Node, NodeId, Order, Sizing};
 use crate::render::View;
 use egui::{Event, Key, Modifiers, Pos2, Rect, Vec2, vec2};
 use std::path::PathBuf;
@@ -235,7 +235,7 @@ impl App {
         for id in std::mem::take(&mut self.sel) {
             self.doc.remove(id);
         }
-        self.doc.fit_groups();
+        self.doc.reflow();
     }
 
     /// Top-most selected roots only (drop nodes whose ancestor is also selected).
@@ -261,6 +261,57 @@ impl App {
                 *n = Node { id: n.id, parent: n.parent, children: n.children.clone(), name, ..Node::new(Kind::Frame, r) };
             }
             self.sel = vec![g];
+        }
+    }
+
+    /// Shift+A: turn selected frames into auto layout, or wrap other selections in a new one.
+    pub fn add_auto_layout(&mut self) {
+        let roots = self.sel_roots();
+        if roots.is_empty() {
+            return;
+        }
+        let frames_only = roots.iter().all(|&id| {
+            let n = self.doc.node(id);
+            n.kind == Kind::Frame && n.layout.mode == LayoutMode::None
+        });
+        if !frames_only {
+            self.group_selection(true);
+        } else {
+            self.checkpoint();
+        }
+        for id in self.sel.clone() {
+            // Guess direction from how the children are spread out, like Figma.
+            let kids = self.doc.node(id).children.clone();
+            let b = self.doc.bounds(&kids);
+            let spread_x = kids.windows(2).map(|w| (self.doc.node(w[1]).rect.center().x - self.doc.node(w[0]).rect.center().x).abs()).sum::<f32>();
+            let spread_y = kids.windows(2).map(|w| (self.doc.node(w[1]).rect.center().y - self.doc.node(w[0]).rect.center().y).abs()).sum::<f32>();
+            let horizontal = spread_x >= spread_y;
+            // Keep the visual order: sort children along the chosen axis.
+            let mut sorted = kids.clone();
+            sorted.sort_by(|a, b| {
+                let (ra, rb) = (self.doc.node(*a).rect.center(), self.doc.node(*b).rect.center());
+                if horizontal { ra.x.total_cmp(&rb.x) } else { ra.y.total_cmp(&rb.y) }
+            });
+            let fr = self.doc.node(id).rect;
+            let pad = if b.is_finite() { (b.min.x - fr.min.x).max(0.0).round() } else { 0.0 };
+            let n = self.doc.node_mut(id);
+            n.children = sorted;
+            n.layout = AutoLayout { mode: if horizontal { LayoutMode::Horizontal } else { LayoutMode::Vertical }, gap: 10.0, padding: [pad; 4], ..Default::default() };
+            n.sizing = [Sizing::Hug, Sizing::Hug];
+        }
+        self.doc.reflow();
+    }
+
+    pub fn remove_auto_layout(&mut self) {
+        let frames: Vec<NodeId> = self.sel.iter().copied().filter(|&id| self.doc.node(id).layout.mode != LayoutMode::None).collect();
+        if frames.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for id in frames {
+            let n = self.doc.node_mut(id);
+            n.layout.mode = LayoutMode::None;
+            n.sizing = [Sizing::Fixed; 2];
         }
     }
 
@@ -305,7 +356,7 @@ impl App {
         for id in self.sel_roots() {
             self.doc.translate(id, d);
         }
-        self.doc.fit_groups();
+        self.doc.reflow();
     }
 
     pub fn toggle_visible(&mut self) {
@@ -356,7 +407,7 @@ impl App {
             };
             self.doc.translate(id, vec2(d.x.round(), d.y.round()));
         }
-        self.doc.fit_groups();
+        self.doc.reflow();
     }
 
     // ---------- clipboard ----------
@@ -412,7 +463,7 @@ impl App {
             && self.doc.nodes.get(&id).is_some_and(|n| n.text.trim().is_empty()) {
                 self.doc.remove(id);
                 self.sel.retain(|s| *s != id);
-                self.doc.fit_groups();
+                self.doc.reflow();
             }
     }
 
@@ -589,6 +640,8 @@ impl App {
             (true, true, false, Key::G) => self.ungroup_selection(),
             (true, true, false, Key::H) => self.toggle_visible(),
             (true, true, false, Key::L) => self.toggle_locked(),
+            (false, true, false, Key::A) => self.add_auto_layout(),
+            (false, true, true, Key::A) => self.remove_auto_layout(),
             (true, false, false, Key::CloseBracket) => self.reorder_selection(Order::Forward),
             (true, false, false, Key::OpenBracket) => self.reorder_selection(Order::Backward),
             (true, false, true, Key::CloseBracket) => self.reorder_selection(Order::Front),

@@ -1,7 +1,7 @@
 //! Infinite canvas: navigation, tools, selection, snapping, and on-canvas overlays.
 
 use crate::app::{App, Drag, Grip, Press, Tool};
-use crate::doc::{Kind, Node, NodeId, Order, PathPoint, rotate};
+use crate::doc::{Kind, LayoutMode, Node, NodeId, Order, PathPoint, Sizing, rotate};
 use crate::render::{self, View};
 use egui::{
     Color32, CornerRadius, CursorIcon, FontId, Key, Painter, PointerButton, Pos2, Rect, Sense, Stroke, StrokeKind,
@@ -178,7 +178,7 @@ impl App {
             }
         }
         if changed {
-            self.doc.fit_groups();
+            self.doc.reflow();
         }
     }
 
@@ -366,6 +366,19 @@ impl App {
             Drag::Move { base, start, .. } => {
                 self.doc = base.clone();
                 let roots = self.sel_roots();
+                if let Some(p) = self.reorder_parent(&roots, w) {
+                    // Live reorder inside auto layout: siblings slide, the dragged layer follows the cursor.
+                    let id = roots[0];
+                    let from = self.doc.node(id).aabb().min;
+                    let i = self.al_index(p, id, w);
+                    self.doc.reparent(id, self.page, Some(p), Some(i));
+                    self.doc.reflow();
+                    let now = self.doc.node(id).aabb().min;
+                    self.doc.translate(id, from + (w - *start) - now);
+                    self.guides.clear();
+                    self.drag = Some(drag);
+                    return;
+                }
                 let b = self.doc.bounds(&roots);
                 let mut d = w - *start;
                 if mods.shift {
@@ -377,7 +390,7 @@ impl App {
                 for id in roots {
                     self.doc.translate(id, d);
                 }
-                self.doc.fit_groups();
+                self.doc.reflow();
             }
             Drag::Rotate { base, center, start_angle, start_rot, deg } => {
                 self.doc = base.clone();
@@ -440,7 +453,7 @@ impl App {
                 if rot != 0.0 {
                     // Keep the fixed side planted: move the new center back into world space.
                     let c = rotate(nb.center(), b.center(), rot);
-                    self.doc.set_rect(roots[0], Rect::from_center_size(c, nb.size()));
+                    self.doc.set_rect_with(roots[0], Rect::from_center_size(c, nb.size()), !mods.command);
                     self.drag = Some(drag);
                     return;
                 }
@@ -449,9 +462,17 @@ impl App {
                 let map = |p: Pos2| pos2(nb.min.x + (p.x - b.min.x) * sx, nb.min.y + (p.y - b.min.y) * sy);
                 for id in roots {
                     let r = self.doc.node(id).rect;
-                    self.doc.set_rect(id, Rect::from_two_pos(map(r.min), map(r.max)));
+                    // Dragging a size by hand pins it, as in Figma.
+                    let n = self.doc.node_mut(id);
+                    if hx != 0 {
+                        n.sizing[0] = Sizing::Fixed;
+                    }
+                    if hy != 0 {
+                        n.sizing[1] = Sizing::Fixed;
+                    }
+                    self.doc.set_rect_with(id, Rect::from_two_pos(map(r.min), map(r.max)), !mods.command);
                 }
-                self.doc.fit_groups();
+                self.doc.reflow();
             }
             Drag::Create { base, start, id } => {
                 self.doc = base.clone();
@@ -506,17 +527,22 @@ impl App {
             Some(Drag::Move { .. }) => {
                 // Dropping onto a frame nests the layer in it; dragging out un-nests it.
                 let roots = self.sel_roots();
-                for id in roots {
-                    let parent = self.doc.node(id).parent;
-                    if parent.is_some_and(|p| self.doc.node(p).kind == Kind::Group) {
-                        continue;
-                    }
-                    let target = self.frame_at(w, &[id]);
-                    if target != parent {
-                        self.doc.reparent(id, self.page, target, None);
+                if self.reorder_parent(&roots, w).is_none() {
+                    for id in roots {
+                        let parent = self.doc.node(id).parent;
+                        if parent.is_some_and(|p| self.doc.node(p).kind == Kind::Group) {
+                            continue;
+                        }
+                        let target = self.frame_at(w, &[id]);
+                        if target != parent {
+                            let index = target
+                                .filter(|t| self.doc.node(*t).layout.mode != LayoutMode::None)
+                                .map(|t| self.al_index(t, id, w));
+                            self.doc.reparent(id, self.page, target, index);
+                        }
                     }
                 }
-                self.doc.fit_groups();
+                self.doc.reflow();
             }
             Some(Drag::Create { id, .. }) => {
                 let n = self.doc.node(id).clone();
@@ -618,6 +644,35 @@ impl App {
                     self.focus_text = true;
                 }
             }
+    }
+
+    /// The auto-layout frame a single dragged layer is being reordered within, if any.
+    fn reorder_parent(&self, roots: &[NodeId], w: Pos2) -> Option<NodeId> {
+        let [id] = roots else { return None };
+        let n = self.doc.node(*id);
+        let p = self.doc.node(n.parent?);
+        let inside = p.rect.contains(p.to_local(w));
+        (p.layout.mode != LayoutMode::None && !n.absolute && inside).then_some(p.id)
+    }
+
+    /// Child-list index for dropping `id` into auto-layout frame `p` at pointer `w`.
+    fn al_index(&self, p: NodeId, id: NodeId, w: Pos2) -> usize {
+        let pn = self.doc.node(p);
+        let h = pn.layout.mode == LayoutMode::Horizontal;
+        let mut index = 0;
+        let others = pn.children.iter().filter(|c| **c != id);
+        for (i, c) in others.enumerate() {
+            let k = self.doc.node(*c);
+            if !k.visible || k.absolute {
+                continue;
+            }
+            let center = k.aabb().center();
+            let before = if h { center.x < w.x } else { center.y < w.y };
+            if before {
+                index = i + 1;
+            }
+        }
+        index
     }
 
     fn marquee_hits(&self, r: Rect) -> Vec<NodeId> {

@@ -2,7 +2,7 @@
 
 use crate::app::{Align, App, Tool};
 use crate::canvas::{BLUE, num};
-use crate::doc::{Kind, NodeId, Page, Paint, Rgba, SHAPE_GRAY, Shadow, StrokeAlign};
+use crate::doc::{AutoLayout, AxisAlign, Constraint, Kind, LayoutMode, NodeId, Page, Paint, Rgba, SHAPE_GRAY, Shadow, Sizing, StrokeAlign};
 use crate::paint_ui::{PaintEvent, hex_field, paint_row, shadow_row};
 use egui::{
     Color32, CornerRadius, DragValue, FontId, Painter, Pos2, Rect, Response, RichText, Sense, Shape, Stroke, StrokeKind,
@@ -27,6 +27,15 @@ pub enum Icon {
     Minus,
     Chevron(bool),
     Menu,
+    ArrowDown,
+    ArrowRight,
+    Opacity,
+    Radius,
+    PadH,
+    PadV,
+    GapH,
+    GapV,
+    Rotate,
 }
 
 const SUBTLE: Color32 = Color32::from_rgb(0xF5, 0xF5, 0xF5);
@@ -149,6 +158,57 @@ pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
             p.line_segment([at(-5., 0.), at(5., 0.)], s);
             p.line_segment([at(0., -5.), at(0., 5.)], s);
         }
+        Icon::ArrowDown | Icon::ArrowRight => {
+            let (a, b, l, r) = if icon == Icon::ArrowDown {
+                (at(0., -6.), at(0., 6.), at(-4., 2.), at(4., 2.))
+            } else {
+                (at(-6., 0.), at(6., 0.), at(2., -4.), at(2., 4.))
+            };
+            p.line_segment([a, b], s);
+            p.line_segment([l, b], s);
+            p.line_segment([r, b], s);
+        }
+        Icon::Opacity => {
+            p.circle_stroke(c, 5.0, s);
+            let half: Vec<Pos2> = (0..=12).map(|i| {
+                let t = std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * i as f32 / 12.0;
+                at(5.0 * t.cos(), 5.0 * t.sin())
+            }).collect();
+            p.add(Shape::convex_polygon(half, color, Stroke::NONE));
+        }
+        Icon::Radius => {
+            let pts: Vec<Pos2> = (0..=8).map(|i| {
+                let t = std::f32::consts::PI + std::f32::consts::FRAC_PI_2 * i as f32 / 8.0;
+                at(1.0 + 5.0 * t.cos(), 1.0 + 5.0 * t.sin())
+            }).collect();
+            p.line_segment([at(-4., 6.), at(-4., 1.)], s);
+            p.line_segment([at(1., -4.), at(6., -4.)], s);
+            p.add(Shape::line(pts, s));
+        }
+        Icon::PadH | Icon::PadV => {
+            let h = icon == Icon::PadH;
+            let f = |x: f32, y: f32| if h { at(x, y) } else { at(y, x) };
+            p.line_segment([f(-6., -5.), f(-6., 5.)], s);
+            p.line_segment([f(6., -5.), f(6., 5.)], s);
+            p.rect_stroke(Rect::from_two_pos(f(-3., -3.), f(3., 3.)), 1.0, s, StrokeKind::Middle);
+        }
+        Icon::GapH | Icon::GapV => {
+            let h = icon == Icon::GapH;
+            let f = |x: f32, y: f32| if h { at(x, y) } else { at(y, x) };
+            p.line_segment([f(-5., -5.), f(-5., 5.)], s);
+            p.line_segment([f(5., -5.), f(5., 5.)], s);
+            p.line_segment([f(-2., 0.), f(2., 0.)], s);
+        }
+        Icon::Rotate => {
+            let pts: Vec<Pos2> = (0..=16).map(|i| {
+                let t = -0.6 + 5.0 * i as f32 / 16.0;
+                at(5.0 * t.cos(), 5.0 * t.sin())
+            }).collect();
+            let end = *pts.last().unwrap();
+            p.add(Shape::line(pts, s));
+            p.line_segment([end, end + vec2(3.0, 0.5)], s);
+            p.line_segment([end, end + vec2(0.5, 3.0)], s);
+        }
         Icon::Menu => {
             for y in [-4., 0., 4.] {
                 p.line_segment([at(-6., y), at(6., y)], s);
@@ -186,6 +246,111 @@ fn kind_icon(k: Kind) -> Icon {
         Kind::Ellipse => Icon::Ellipse,
         Kind::Vector => Icon::Pen,
         Kind::Text => Icon::Text,
+    }
+}
+
+/// Half the panel's content width, independent of what a row has already used.
+fn half(ui: &Ui) -> f32 {
+    (ui.max_rect().width() - 8.0) / 2.0
+}
+
+/// Figma-style number box with a label (or `@icon` name) inside on the left.
+fn num_field(ui: &mut Ui, v: &mut f32, label: &str, min: f32, width: f32) -> bool {
+    let icon = match label {
+        "@opacity" => Some(Icon::Opacity),
+        "@radius" => Some(Icon::Radius),
+        "@padh" => Some(Icon::PadH),
+        "@padv" => Some(Icon::PadV),
+        "@gaph" => Some(Icon::GapH),
+        "@gapv" => Some(Icon::GapV),
+        "@rotate" => Some(Icon::Rotate),
+        _ => None,
+    };
+    let prefix = match (icon, label.is_empty()) {
+        (Some(_), _) => "     ".to_string(),
+        (None, true) => String::new(),
+        (None, false) => format!("{label}  "),
+    };
+    let unit = match label {
+        "@opacity" => "%",
+        "@rotate" => "°",
+        _ => "",
+    };
+    let mut tmp = if v.is_nan() { 0.0 } else { *v };
+    let mixed = v.is_nan();
+    let resp = ui.add_sized(
+        [width.max(30.0), 22.0],
+        DragValue::new(&mut tmp).prefix(prefix).speed(1.0).range(min..=1e6).custom_formatter(move |x, _| {
+            if mixed {
+                "Mixed".into()
+            } else {
+                format!("{}{}", num(x as f32), unit)
+            }
+        }),
+    );
+    if let Some(i) = icon {
+        let r = Rect::from_center_size(pos2(resp.rect.min.x + 13.0, resp.rect.center().y), vec2(14.0, 14.0));
+        paint_icon(ui.painter(), r, i, Color32::from_gray(0x80));
+    }
+    if resp.changed() {
+        *v = tmp;
+    }
+    resp.changed()
+}
+
+/// Compact chevron button opening a Fixed / Hug / Fill menu.
+fn sizing_menu(ui: &mut Ui, id: egui::Id, mode: &mut Sizing, can_hug: bool, can_fill: bool) -> bool {
+    let resp = icon_button(ui, Icon::Chevron(true), false, 18.0, "Resizing");
+    let mut changed = false;
+    egui::Popup::menu(&resp).id(id).show(|ui| {
+        for (m, ok, label) in [(Sizing::Fixed, true, "Fixed"), (Sizing::Hug, can_hug, "Hug contents"), (Sizing::Fill, can_fill, "Fill container")] {
+            if ok && ui.selectable_label(*mode == m, label).clicked() && *mode != m {
+                *mode = m;
+                changed = true;
+            }
+        }
+    });
+    changed
+}
+
+/// 3x3 alignment picker for auto layout (rows = vertical, columns = horizontal position).
+fn align_grid(ui: &mut Ui, l: &mut AutoLayout) {
+    let (rect, resp) = ui.allocate_exact_size(vec2(64.0, 64.0), Sense::click());
+    let p = ui.painter();
+    p.rect_filled(rect, 4.0, SUBTLE);
+    let h = l.mode == LayoutMode::Horizontal;
+    let idx = |a: AxisAlign| match a {
+        AxisAlign::Min => 0,
+        AxisAlign::Center => 1,
+        AxisAlign::Max => 2,
+    };
+    let (col, row) = if h { (idx(l.main), idx(l.cross)) } else { (idx(l.cross), idx(l.main)) };
+    let cell = |c: usize, r: usize| pos2(rect.min.x + 12.0 + c as f32 * 20.0, rect.min.y + 12.0 + r as f32 * 20.0);
+    for r in 0..3 {
+        for c in 0..3 {
+            let at = cell(c, r);
+            if (c, r) == (col, row) {
+                // Bars show the children's arrangement.
+                let (bw, bh) = if h { (3.0, 10.0) } else { (10.0, 3.0) };
+                for k in [-1.0, 0.0, 1.0] {
+                    let off = if h { vec2(k * 4.5, 0.0) } else { vec2(0.0, k * 4.5) };
+                    let len = if k == 0.0 { 1.0 } else { 0.7 };
+                    p.rect_filled(Rect::from_center_size(at + off, vec2(bw * if h { 1.0 } else { len }, bh * if h { len } else { 1.0 })), 1.0, BLUE);
+                }
+            } else {
+                p.circle_filled(at, 1.5, Color32::from_gray(0xB3));
+            }
+        }
+    }
+    if let Some(pos) = resp.interact_pointer_pos().filter(|_| resp.clicked()) {
+        let c = (((pos.x - rect.min.x) / 21.4) as usize).min(2);
+        let r = (((pos.y - rect.min.y) / 21.4) as usize).min(2);
+        let to = |i: usize| [AxisAlign::Min, AxisAlign::Center, AxisAlign::Max][i];
+        if h {
+            (l.main, l.cross) = (to(c), to(r));
+        } else {
+            (l.main, l.cross) = (to(r), to(c));
+        }
     }
 }
 
@@ -489,7 +654,7 @@ impl App {
                     // The list is drawn top-first, so "above" means a higher z index.
                     self.doc.reparent(dragged, self.page, parent, Some(if zone == 0 { i + 1 } else { i }));
                 }
-                self.doc.fit_groups();
+                self.doc.reflow();
                 self.sel = vec![dragged];
             }
         }
@@ -525,6 +690,7 @@ impl App {
             });
             ui.separator();
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.set_max_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 6.0;
                 if self.sel.is_empty() {
                     self.page_props(ui);
@@ -555,153 +721,19 @@ impl App {
     fn selection_props(&mut self, ui: &mut Ui) {
         let roots = self.sel_roots();
         let first = self.sel[0];
-        // Alignment
-        ui.horizontal(|ui| {
-            for a in [Align::Left, Align::HCenter, Align::Right, Align::Top, Align::VCenter, Align::Bottom] {
-                if icon_button(ui, Icon::Align(a), false, 26.0, &format!("Align {a:?}")).clicked() {
-                    self.align(a);
-                }
-            }
-        });
-        ui.separator();
-
-        // Position & size, relative to the nearest frame like Figma.
-        let b = self.doc.bounds(&roots);
-        let origin = self
-            .doc
-            .ancestors(first)
-            .into_iter()
-            .find(|a| self.doc.node(*a).kind == Kind::Frame)
-            .map(|f| self.doc.node(f).rect.min.to_vec2())
-            .unwrap_or_default();
-        // A lone rotated layer reports its own size and its rotated top-left corner, like Figma.
-        let single = (roots.len() == 1).then(|| self.doc.node(first).clone()).filter(|n| n.rotation != 0.0);
-        let (anchor, size) = match &single {
-            Some(n) => (n.corners()[0], n.rect.size()),
-            None => (b.min, b.size()),
-        };
-        let (mut x, mut y, mut w, mut h) = (anchor.x - origin.x, anchor.y - origin.y, size.x, size.y);
-        let half = (ui.available_width() - 8.0) / 2.0;
-        let field = |ui: &mut Ui, v: &mut f32, prefix: &str, min: f32| {
-            ui.add_sized([half, 22.0], DragValue::new(v).prefix(prefix).speed(1.0).range(min..=1e6).custom_formatter(|v, _| num(v as f32)))
-                .changed()
-        };
-        let (mut moved, mut sized) = (false, false);
-        ui.horizontal(|ui| {
-            moved |= field(ui, &mut x, "X  ", -1e6);
-            moved |= field(ui, &mut y, "Y  ", -1e6);
-        });
-        ui.horizontal(|ui| {
-            sized |= field(ui, &mut w, "W  ", 0.01);
-            sized |= field(ui, &mut h, "H  ", 0.01);
-        });
-        if moved {
-            self.begin_edit();
-            let d = vec2(x + origin.x, y + origin.y) - anchor.to_vec2();
-            for &id in &roots {
-                self.doc.translate(id, d);
-            }
-            self.doc.fit_groups();
-        }
-        if let (true, Some(n)) = (sized, &single) {
-            // Grow from the rotated top-left corner.
-            self.begin_edit();
-            let local = Rect::from_min_size(n.rect.min, vec2(w, h));
-            let c = crate::doc::rotate(local.center(), n.rect.center(), n.rotation);
-            self.doc.set_rect(n.id, Rect::from_center_size(c, local.size()));
-            self.doc.fit_groups();
-        } else if sized && (b.width() > 0.0 || b.height() > 0.0) {
-            self.begin_edit();
-            let nb = Rect::from_min_size(b.min, vec2(w, h));
-            let sx = if b.width() > 0.0 { w / b.width() } else { 1.0 };
-            let sy = if b.height() > 0.0 { h / b.height() } else { 1.0 };
-            let map = |p: Pos2| pos2(nb.min.x + (p.x - b.min.x) * sx, nb.min.y + (p.y - b.min.y) * sy);
-            for &id in &roots {
-                let r = self.doc.node(id).rect;
-                self.doc.set_rect(id, Rect::from_two_pos(map(r.min), map(r.max)));
-            }
-            self.doc.fit_groups();
-        }
-        // Rotation: a lone layer turns around its center, several turn around their shared center.
-        let mut rot = if roots.len() == 1 { self.doc.node(first).rotation } else { 0.0 };
-        let old = rot;
-        ui.horizontal(|ui| {
-            ui.label("Rotation");
-            if ui.add(DragValue::new(&mut rot).speed(0.5).suffix("°").custom_formatter(|v, _| num(v as f32))).changed() {
-                self.begin_edit();
-                let c = self.doc.bounds(&roots).center();
-                for &id in &roots {
-                    let pivot = if roots.len() == 1 { self.doc.node(id).rect.center() } else { c };
-                    self.doc.rotate(id, rot - old, pivot);
-                }
-            }
-        });
         let n = self.doc.node(first).clone();
-        if matches!(n.kind, Kind::Rectangle | Kind::Frame) {
-            let mut r = n.radius;
-            ui.horizontal(|ui| {
-                ui.label("Radius");
-                if ui.add(DragValue::new(&mut r).range(0.0..=1e5).speed(0.5).custom_formatter(|v, _| num(v as f32))).changed() {
-                    self.begin_edit();
-                    for &id in &self.sel {
-                        if matches!(self.doc.node(id).kind, Kind::Rectangle | Kind::Frame) {
-                            self.doc.node_mut(id).radius = r;
-                        }
-                    }
-                }
-            });
-        }
-        if n.kind == Kind::Frame {
-            let mut clip = n.clip;
-            if ui.checkbox(&mut clip, "Clip content").changed() {
-                self.checkpoint();
-                for &id in &self.sel {
-                    if self.doc.node(id).kind == Kind::Frame {
-                        self.doc.node_mut(id).clip = clip;
-                    }
-                }
-            }
+        self.position_section(ui, &roots);
+        ui.separator();
+        self.layout_section(ui, &roots);
+        if let [one] = roots[..] {
+            self.constraints_section(ui, one);
         }
         ui.separator();
-
-        heading(ui, "Layer");
-        let mut op = (n.opacity * 100.0).round();
-        ui.horizontal(|ui| {
-            ui.label("Opacity");
-            if ui.add(DragValue::new(&mut op).range(0.0..=100.0).suffix("%").speed(0.5)).changed() {
-                self.begin_edit();
-                for &id in &self.sel {
-                    self.doc.node_mut(id).opacity = op / 100.0;
-                }
-            }
-        });
-
+        self.appearance_section(ui, &n);
         if self.sel.iter().all(|&id| self.doc.node(id).kind == Kind::Text) {
             ui.separator();
-            heading(ui, "Text");
-            let (mut size, mut weight) = (n.font_size, n.font_weight);
-            let mut changed = false;
-            ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("weight")
-                    .width(110.0)
-                    .selected_text(weight_name(weight))
-                    .show_ui(ui, |ui| {
-                        for w in [400, 500, 600, 700] {
-                            changed |= ui.selectable_value(&mut weight, w, weight_name(w)).changed();
-                        }
-                    });
-                changed |= ui.add(DragValue::new(&mut size).range(1.0..=1000.0).speed(0.25).custom_formatter(|v, _| num(v as f32))).changed();
-            });
-            if changed {
-                self.begin_edit();
-                for &id in &self.sel {
-                    let t = self.doc.node_mut(id);
-                    t.font_size = size;
-                    t.font_weight = weight;
-                }
-            }
+            self.typography_section(ui, &n);
         }
-
         if n.kind != Kind::Group {
             ui.separator();
             self.paints_section(ui, false);
@@ -710,6 +742,292 @@ impl App {
         }
         ui.separator();
         self.effects_section(ui);
+    }
+
+    /// Origin that X/Y are reported against: the nearest frame, like Figma.
+    fn frame_origin(&self, id: NodeId) -> egui::Vec2 {
+        self.doc
+            .ancestors(id)
+            .into_iter()
+            .find(|a| self.doc.node(*a).kind == Kind::Frame)
+            .map(|f| self.doc.node(f).rect.min.to_vec2())
+            .unwrap_or_default()
+    }
+
+    fn position_section(&mut self, ui: &mut Ui, roots: &[NodeId]) {
+        heading(ui, "Position");
+        ui.horizontal(|ui| {
+            for a in [Align::Left, Align::HCenter, Align::Right, Align::Top, Align::VCenter, Align::Bottom] {
+                if icon_button(ui, Icon::Align(a), false, 26.0, &format!("Align {a:?}")).clicked() {
+                    self.align(a);
+                }
+            }
+        });
+        let first = roots[0];
+        let b = self.doc.bounds(roots);
+        let origin = self.frame_origin(first);
+        // A lone rotated layer reports its rotated top-left corner, like Figma.
+        let single = (roots.len() == 1).then(|| self.doc.node(first).clone()).filter(|n| n.rotation != 0.0);
+        let anchor = single.as_ref().map_or(b.min, |n| n.corners()[0]);
+        let (mut x, mut y) = (anchor.x - origin.x, anchor.y - origin.y);
+        let mut moved = false;
+        ui.horizontal(|ui| {
+            moved |= num_field(ui, &mut x, "X", -1e6, half(ui));
+            moved |= num_field(ui, &mut y, "Y", -1e6, half(ui));
+        });
+        if moved {
+            self.begin_edit();
+            let d = vec2(x + origin.x, y + origin.y) - anchor.to_vec2();
+            for &id in roots {
+                self.doc.translate(id, d);
+            }
+            self.doc.reflow();
+        }
+        // Rotation: a lone layer turns around its center, several turn around their shared center.
+        let mut rot = if roots.len() == 1 { self.doc.node(first).rotation } else { 0.0 };
+        let old = rot;
+        ui.horizontal(|ui| {
+            if num_field(ui, &mut rot, "@rotate", -1e6, half(ui)) {
+                self.begin_edit();
+                let c = self.doc.bounds(roots).center();
+                for &id in roots {
+                    let pivot = if roots.len() == 1 { self.doc.node(id).rect.center() } else { c };
+                    self.doc.rotate(id, rot - old, pivot);
+                }
+            }
+        });
+    }
+
+    fn layout_section(&mut self, ui: &mut Ui, roots: &[NodeId]) {
+        let first = roots[0];
+        let n = self.doc.node(first).clone();
+        let is_frame = roots.len() == 1 && n.kind == Kind::Frame;
+        let al = is_frame && n.layout.mode != LayoutMode::None;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(if is_frame { "Auto layout" } else { "Layout" }).strong());
+            if is_frame {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (icon, tip) = if al { (Icon::Minus, "Remove auto layout (⌥⇧A)") } else { (Icon::Plus, "Add auto layout (⇧A)") };
+                    if icon_button(ui, icon, false, 22.0, tip).clicked() {
+                        if al { self.remove_auto_layout() } else { self.add_auto_layout() }
+                    }
+                });
+            }
+        });
+        if al {
+            self.auto_layout_controls(ui, first);
+        }
+
+        // Size, with Figma's Fixed / Hug / Fill modes where they apply.
+        let b = self.doc.bounds(roots);
+        let single = (roots.len() == 1).then(|| self.doc.node(first).clone()).filter(|n| n.rotation != 0.0);
+        let size = single.as_ref().map_or(b.size(), |n| n.rect.size());
+        let (mut w, mut h) = (size.x, size.y);
+        let parent_al = n.parent.is_some_and(|p| self.doc.node(p).layout.mode != LayoutMode::None) && !n.absolute;
+        let can_hug = n.layout.mode != LayoutMode::None;
+        let mut sizing = n.sizing;
+        let mut sized = false;
+        let mut sizing_changed = false;
+        ui.horizontal(|ui| {
+            let menus = roots.len() == 1 && (can_hug || parent_al);
+            let wide = if menus { half(ui) - 22.0 } else { half(ui) };
+            for (axis, v, label) in [(0usize, &mut w, "W"), (1, &mut h, "H")] {
+                let shown = match (menus, sizing[axis]) {
+                    (true, Sizing::Hug) => "W Hug",
+                    (true, Sizing::Fill) => "W Fill",
+                    _ => label,
+                };
+                let shown = if axis == 1 { shown.replacen('W', "H", 1) } else { shown.to_string() };
+                sized |= num_field(ui, v, &shown, 0.01, wide);
+                if menus {
+                    sizing_changed |= sizing_menu(ui, ui.id().with(("sizing", axis)), &mut sizing[axis], can_hug, parent_al);
+                }
+            }
+        });
+        if sizing_changed {
+            self.checkpoint();
+            self.doc.node_mut(first).sizing = sizing;
+            self.doc.reflow();
+        }
+        if sized {
+            self.begin_edit();
+            for &id in roots {
+                let s = &mut self.doc.node_mut(id).sizing;
+                if (w - size.x).abs() > 1e-4 {
+                    s[0] = Sizing::Fixed;
+                }
+                if (h - size.y).abs() > 1e-4 {
+                    s[1] = Sizing::Fixed;
+                }
+            }
+            if let Some(n) = &single {
+                // Grow from the rotated top-left corner.
+                let local = Rect::from_min_size(n.rect.min, vec2(w, h));
+                let c = crate::doc::rotate(local.center(), n.rect.center(), n.rotation);
+                self.doc.set_rect(n.id, Rect::from_center_size(c, local.size()));
+            } else if b.width() > 0.0 || b.height() > 0.0 {
+                let nb = Rect::from_min_size(b.min, vec2(w, h));
+                let sx = if b.width() > 0.0 { w / b.width() } else { 1.0 };
+                let sy = if b.height() > 0.0 { h / b.height() } else { 1.0 };
+                let map = |p: Pos2| pos2(nb.min.x + (p.x - b.min.x) * sx, nb.min.y + (p.y - b.min.y) * sy);
+                for &id in roots {
+                    let r = self.doc.node(id).rect;
+                    self.doc.set_rect(id, Rect::from_two_pos(map(r.min), map(r.max)));
+                }
+            }
+            self.doc.reflow();
+        }
+        if parent_al || n.absolute {
+            let mut abs = n.absolute;
+            if ui.checkbox(&mut abs, "Ignore auto layout").changed() {
+                self.checkpoint();
+                self.doc.node_mut(first).absolute = abs;
+                self.doc.reflow();
+            }
+        }
+        if n.kind == Kind::Frame {
+            let mut clip = n.clip;
+            if ui.checkbox(&mut clip, "Clip content").changed() {
+                self.checkpoint();
+                for &id in &self.sel.clone() {
+                    if self.doc.node(id).kind == Kind::Frame {
+                        self.doc.node_mut(id).clip = clip;
+                    }
+                }
+            }
+        }
+    }
+
+    fn auto_layout_controls(&mut self, ui: &mut Ui, f: NodeId) {
+        let mut l = self.doc.node(f).layout;
+        let before = l;
+        ui.horizontal(|ui| {
+            for (m, icon, tip) in [(LayoutMode::Vertical, Icon::ArrowDown, "Vertical layout"), (LayoutMode::Horizontal, Icon::ArrowRight, "Horizontal layout")] {
+                if icon_button(ui, icon, l.mode == m, 26.0, tip).clicked() {
+                    l.mode = m;
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            align_grid(ui, &mut l);
+            ui.vertical(|ui| {
+                ui.add_enabled_ui(!l.space_between, |ui| {
+                    num_field(ui, &mut l.gap, if l.mode == LayoutMode::Horizontal { "@gaph" } else { "@gapv" }, 0.0, (ui.available_width()).min(110.0));
+                });
+                ui.checkbox(&mut l.space_between, "Auto gap");
+            });
+        });
+        let [t, r, b, lft] = &mut l.padding;
+        let mut ph = if (*lft - *r).abs() < 1e-4 { *lft } else { f32::NAN };
+        let mut pv = if (*t - *b).abs() < 1e-4 { *t } else { f32::NAN };
+        let split_id = ui.id().with(("pad-split", f));
+        let mut split = ui.data(|d| d.get_temp::<bool>(split_id)).unwrap_or(ph.is_nan() || pv.is_nan());
+        ui.horizontal(|ui| {
+            if split {
+                for (v, label) in [(&mut *lft, "L"), (&mut *t, "T"), (&mut *r, "R"), (&mut *b, "B")] {
+                    num_field(ui, v, label, 0.0, (ui.available_width() - 30.0) / 4.0 - 4.0);
+                }
+            } else {
+                if num_field(ui, &mut ph, "@padh", 0.0, half(ui) - 16.0) {
+                    (*lft, *r) = (ph, ph);
+                }
+                if num_field(ui, &mut pv, "@padv", 0.0, half(ui) - 16.0) {
+                    (*t, *b) = (pv, pv);
+                }
+            }
+            if icon_button(ui, Icon::Frame, split, 22.0, "Individual padding").clicked() {
+                split = !split;
+            }
+        });
+        ui.data_mut(|d| d.insert_temp(split_id, split));
+        if l != before {
+            self.begin_edit();
+            self.doc.node_mut(f).layout = l;
+            self.doc.reflow();
+        }
+    }
+
+    fn constraints_section(&mut self, ui: &mut Ui, id: NodeId) {
+        let n = self.doc.node(id).clone();
+        let Some(p) = n.parent else { return };
+        let pn = self.doc.node(p);
+        if pn.kind != Kind::Frame || (pn.layout.mode != LayoutMode::None && !n.absolute) {
+            return;
+        }
+        ui.separator();
+        heading(ui, "Constraints");
+        let mut c = n.constraints;
+        let names = |axis: usize, k: Constraint| match (axis, k) {
+            (0, Constraint::Min) => "Left",
+            (0, Constraint::Max) => "Right",
+            (0, Constraint::Stretch) => "Left & right",
+            (1, Constraint::Min) => "Top",
+            (1, Constraint::Max) => "Bottom",
+            (1, Constraint::Stretch) => "Top & bottom",
+            (_, Constraint::Center) => "Center",
+            (_, Constraint::Scale) => "Scale",
+            _ => "",
+        };
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            for axis in 0..2 {
+                egui::ComboBox::from_id_salt(("constraint", axis)).width(half(ui) - 12.0).selected_text(names(axis, c[axis])).show_ui(ui, |ui| {
+                    for k in [Constraint::Min, Constraint::Max, Constraint::Stretch, Constraint::Center, Constraint::Scale] {
+                        changed |= ui.selectable_value(&mut c[axis], k, names(axis, k)).changed();
+                    }
+                });
+            }
+        });
+        if changed {
+            self.checkpoint();
+            self.doc.node_mut(id).constraints = c;
+        }
+    }
+
+    fn appearance_section(&mut self, ui: &mut Ui, n: &crate::doc::Node) {
+        heading(ui, "Appearance");
+        let mut op = (n.opacity * 100.0).round();
+        let mut r = n.radius;
+        let has_radius = matches!(n.kind, Kind::Rectangle | Kind::Frame);
+        ui.horizontal(|ui| {
+            if num_field(ui, &mut op, "@opacity", 0.0, half(ui)) {
+                self.begin_edit();
+                for &id in &self.sel {
+                    self.doc.node_mut(id).opacity = op.min(100.0) / 100.0;
+                }
+            }
+            if has_radius && num_field(ui, &mut r, "@radius", 0.0, half(ui)) {
+                self.begin_edit();
+                for &id in &self.sel {
+                    if matches!(self.doc.node(id).kind, Kind::Rectangle | Kind::Frame) {
+                        self.doc.node_mut(id).radius = r;
+                    }
+                }
+            }
+        });
+    }
+
+    fn typography_section(&mut self, ui: &mut Ui, n: &crate::doc::Node) {
+        heading(ui, "Typography");
+        ui.add_enabled(false, egui::Button::new("Inter").min_size(vec2(ui.available_width(), 22.0)));
+        let (mut size, mut weight) = (n.font_size, n.font_weight);
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("weight").width(half(ui) - 12.0).selected_text(weight_name(weight)).show_ui(ui, |ui| {
+                for w in [400, 500, 600, 700] {
+                    changed |= ui.selectable_value(&mut weight, w, weight_name(w)).changed();
+                }
+            });
+            changed |= num_field(ui, &mut size, "", 1.0, half(ui));
+        });
+        if changed {
+            self.begin_edit();
+            for &id in &self.sel {
+                let t = self.doc.node_mut(id);
+                t.font_size = size;
+                t.font_weight = weight;
+            }
+        }
     }
 
     fn paints_section(&mut self, ui: &mut Ui, stroke: bool) {

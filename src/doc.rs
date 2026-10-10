@@ -32,6 +32,57 @@ impl Kind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum LayoutMode {
+    #[default]
+    None,
+    Horizontal,
+    Vertical,
+}
+
+/// How a layer sizes itself along one axis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Sizing {
+    #[default]
+    Fixed,
+    /// Shrink-wrap content (auto-layout frames).
+    Hug,
+    /// Stretch to the auto-layout parent.
+    Fill,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AxisAlign {
+    #[default]
+    Min,
+    Center,
+    Max,
+}
+
+/// Figma constraint for one axis: Left/Top, Right/Bottom, Left & right, Center, Scale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Constraint {
+    #[default]
+    Min,
+    Max,
+    Stretch,
+    Center,
+    Scale,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoLayout {
+    pub mode: LayoutMode,
+    pub gap: f32,
+    /// "Auto" spacing: children spread to fill the main axis.
+    pub space_between: bool,
+    /// Top, right, bottom, left.
+    pub padding: [f32; 4],
+    pub main: AxisAlign,
+    pub cross: AxisAlign,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StrokeAlign {
     Inside,
@@ -204,6 +255,12 @@ pub struct Node {
     pub radius: f32,
     pub clip: bool,
     pub shadows: Vec<Shadow>,
+    pub layout: AutoLayout,
+    /// Horizontal, vertical.
+    pub sizing: [Sizing; 2],
+    pub constraints: [Constraint; 2],
+    /// Ignores the parent's auto layout.
+    pub absolute: bool,
     pub points: Vec<PathPoint>,
     pub closed: bool,
     pub text: String,
@@ -232,6 +289,10 @@ impl Default for Node {
             radius: 0.0,
             clip: false,
             shadows: vec![],
+            layout: AutoLayout::default(),
+            sizing: [Sizing::Fixed; 2],
+            constraints: [Constraint::Min; 2],
+            absolute: false,
             points: vec![],
             closed: false,
             text: String::new(),
@@ -517,11 +578,16 @@ impl Document {
                 node.rotation = normalize_deg(node.rotation + deg);
             }
         }
-        self.fit_groups();
+        self.reflow();
     }
 
-    /// Resize a node. Groups and vectors scale their contents; frames keep children in place.
+    /// Resize a node. Groups and vectors scale their contents; frame children follow their constraints.
     pub fn set_rect(&mut self, id: NodeId, r: Rect) {
+        self.set_rect_with(id, r, true);
+    }
+
+    /// `constraints: false` resizes a frame without moving its children (Cmd-drag in Figma).
+    pub fn set_rect_with(&mut self, id: NodeId, r: Rect, constraints: bool) {
         let old = self.nodes[&id].rect;
         let sx = if old.width() > 0.0 { r.width() / old.width() } else { 1.0 };
         let sy = if old.height() > 0.0 { r.height() / old.height() } else { 1.0 };
@@ -533,16 +599,147 @@ impl Document {
             pt.h_in = vec2(pt.h_in.x * sx, pt.h_in.y * sy);
             pt.h_out = vec2(pt.h_out.x * sx, pt.h_out.y * sy);
         }
-        if node.kind == Kind::Group {
-            for c in node.children.clone() {
+        let (kind, mode) = (node.kind, node.layout.mode);
+        let kids = node.children.clone();
+        if kind == Kind::Group {
+            for c in kids {
                 let cr = self.nodes[&c].rect;
                 self.set_rect(c, Rect::from_two_pos(map(cr.min), map(cr.max)));
+            }
+        } else if kind == Kind::Frame && mode == LayoutMode::None && constraints {
+            for c in kids {
+                let (cr, [ch, cv]) = (self.nodes[&c].rect, self.nodes[&c].constraints);
+                let axis = |k: Constraint, lo: f32, hi: f32, olo: f32, ohi: f32, nlo: f32, nhi: f32| -> (f32, f32) {
+                    match k {
+                        Constraint::Min => (lo + nlo - olo, hi + nlo - olo),
+                        Constraint::Max => (lo + nhi - ohi, hi + nhi - ohi),
+                        Constraint::Stretch => (lo + nlo - olo, hi + nhi - ohi),
+                        Constraint::Center => {
+                            let d = (nlo + nhi - olo - ohi) / 2.0;
+                            (lo + d, hi + d)
+                        }
+                        Constraint::Scale => {
+                            let s = if ohi > olo { (nhi - nlo) / (ohi - olo) } else { 1.0 };
+                            (nlo + (lo - olo) * s, nlo + (hi - olo) * s)
+                        }
+                    }
+                };
+                let (x0, x1) = axis(ch, cr.min.x, cr.max.x, old.min.x, old.max.x, r.min.x, r.max.x);
+                let (y0, y1) = axis(cv, cr.min.y, cr.max.y, old.min.y, old.max.y, r.min.y, r.max.y);
+                let nr = Rect::from_min_max(pos2(x0, y0), pos2(x1.max(x0), y1.max(y0)));
+                if (nr.size() - cr.size()).length() < 1e-4 {
+                    self.translate(c, nr.min - cr.min);
+                } else {
+                    self.set_rect(c, nr);
+                }
             }
         }
     }
 
+    /// Re-derive everything computed from children: group bounds and auto layout.
+    pub fn reflow(&mut self) {
+        self.fit_groups_only();
+        let mut frames: Vec<(usize, NodeId)> = self
+            .nodes
+            .values()
+            .filter(|n| n.kind == Kind::Frame && n.layout.mode != LayoutMode::None)
+            .map(|n| (self.ancestors(n.id).len(), n.id))
+            .collect();
+        if frames.is_empty() {
+            return;
+        }
+        // Deepest first so hugging frames know their content, then top-down so Fill sizes flow into children.
+        frames.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for &(_, f) in &frames {
+            self.layout_frame(f);
+        }
+        self.fit_groups_only();
+        for &(_, f) in frames.iter().rev() {
+            self.layout_frame(f);
+        }
+        self.fit_groups_only();
+    }
+
+    fn layout_frame(&mut self, f: NodeId) {
+        let n = self.nodes[&f].clone();
+        let l = n.layout;
+        let h = l.mode == LayoutMode::Horizontal;
+        let (ma, ca) = if h { (0, 1) } else { (1, 0) };
+        let main = |v: Vec2| if h { v.x } else { v.y };
+        let cross = |v: Vec2| if h { v.y } else { v.x };
+        let along = |m: f32, c: f32| if h { vec2(m, c) } else { vec2(c, m) };
+        let [pt, pr, pb, pl] = l.padding;
+        let (p0, p1, q0, q1) = if h { (pl, pr, pt, pb) } else { (pt, pb, pl, pr) };
+        let kids: Vec<NodeId> = n
+            .children
+            .iter()
+            .copied()
+            .filter(|c| self.nodes[c].visible && !self.nodes[c].absolute)
+            .collect();
+        // Text is always auto-width, so it can only hug.
+        let fills = |k: &Node, axis: usize| k.sizing[axis] == Sizing::Fill && k.kind != Kind::Text;
+        let count = kids.len() as f32;
+        let gaps = l.gap * (count - 1.0).max(0.0);
+        let fixed_main: f32 = kids.iter().map(|c| &self.nodes[c]).filter(|k| !fills(k, ma)).map(|k| main(k.aabb().size())).sum();
+        let n_fill = kids.iter().filter(|c| fills(&self.nodes[c], ma)).count() as f32;
+
+        let mut size = n.rect.size();
+        if n.sizing[ma] == Sizing::Hug {
+            let fill_now: f32 = kids.iter().map(|c| &self.nodes[c]).filter(|k| fills(k, ma)).map(|k| main(k.aabb().size())).sum();
+            let m = p0 + p1 + fixed_main + fill_now + if l.space_between { 0.0 } else { gaps };
+            size = along(m, cross(size));
+        }
+        if n.sizing[ca] == Sizing::Hug {
+            let c = kids.iter().map(|c| &self.nodes[c]).filter(|k| !fills(k, ca)).map(|k| cross(k.aabb().size())).fold(0.0, f32::max);
+            size = along(main(size), q0 + q1 + c);
+        }
+        if size != n.rect.size() {
+            self.node_mut(f).rect = Rect::from_min_size(n.rect.min, size);
+        }
+        let inner_main = (main(size) - p0 - p1).max(0.0);
+        let inner_cross = (cross(size) - q0 - q1).max(0.0);
+        let free = inner_main - fixed_main - gaps;
+        let fill_main = if n_fill > 0.0 { (free / n_fill).max(0.0) } else { 0.0 };
+        let gap = if l.space_between && n_fill == 0.0 && count > 1.0 { (inner_main - fixed_main) / (count - 1.0) } else { l.gap };
+        let lead = if n_fill > 0.0 || l.space_between {
+            0.0
+        } else {
+            match l.main {
+                AxisAlign::Min => 0.0,
+                AxisAlign::Center => free / 2.0,
+                AxisAlign::Max => free,
+            }
+        };
+        let origin = n.rect.min;
+        let mut cursor = main(origin.to_vec2()) + p0 + lead;
+        for c in kids {
+            let k = self.nodes[&c].clone();
+            let mut ks = k.aabb().size();
+            if fills(&k, ma) {
+                ks = along(fill_main, cross(ks));
+            }
+            if fills(&k, ca) {
+                ks = along(main(ks), inner_cross);
+            }
+            if (ks - k.aabb().size()).length() > 1e-4 && k.rotation == 0.0 {
+                self.set_rect(c, Rect::from_min_size(k.rect.min, ks));
+            }
+            let off = match l.cross {
+                AxisAlign::Min => 0.0,
+                AxisAlign::Center => (inner_cross - cross(ks)) / 2.0,
+                AxisAlign::Max => inner_cross - cross(ks),
+            };
+            let target = along(cursor, cross(origin.to_vec2()) + q0 + off).to_pos2();
+            let cur = self.nodes[&c].aabb().min;
+            if cur != target {
+                self.translate(c, target - cur);
+            }
+            cursor += main(ks) + gap;
+        }
+    }
+
     /// Groups always hug their children; empty groups disappear.
-    pub fn fit_groups(&mut self) {
+    fn fit_groups_only(&mut self) {
         let mut groups: Vec<(usize, NodeId)> = self
             .nodes
             .values()
@@ -588,7 +785,7 @@ impl Document {
         for id in ids {
             self.reparent(id, page, Some(g), None);
         }
-        self.fit_groups();
+        self.reflow();
         Some(g)
     }
 
@@ -602,7 +799,7 @@ impl Document {
             self.reparent(*c, page, parent, Some(index + 1 + i));
         }
         self.remove(id);
-        self.fit_groups();
+        self.reflow();
         kids
     }
 
@@ -828,7 +1025,7 @@ mod tests {
         let a = d.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 0., 10., 10.)));
         let g = d.group(&[a]).unwrap();
         d.remove(a);
-        d.fit_groups();
+        d.reflow();
         assert!(!d.nodes.contains_key(&g));
         assert!(d.pages[0].children.is_empty());
     }
@@ -916,6 +1113,87 @@ mod tests {
         assert!(json.contains("AQID+g=="), "{json}");
         let back: Document = serde_json::from_str(&json).unwrap();
         assert_eq!(back.images["abc"].as_slice(), &[1, 2, 3, 250]);
+    }
+
+    fn al_frame(d: &mut Document, mode: LayoutMode) -> NodeId {
+        let mut f = Node::new(Kind::Frame, r(0., 0., 300., 100.));
+        f.layout = AutoLayout { mode, gap: 10., padding: [5., 5., 5., 5.], ..Default::default() };
+        d.insert(0, None, None, f)
+    }
+
+    #[test]
+    fn auto_layout_stacks_hugs_and_fills() {
+        let mut d = Document::default();
+        let f = al_frame(&mut d, LayoutMode::Horizontal);
+        let a = d.insert(0, Some(f), None, Node::new(Kind::Rectangle, r(100., 100., 20., 30.)));
+        let b = d.insert(0, Some(f), None, Node::new(Kind::Rectangle, r(0., 0., 40., 10.)));
+        d.reflow();
+        assert_eq!(d.node(a).rect, r(5., 5., 20., 30.));
+        assert_eq!(d.node(b).rect, r(35., 5., 40., 10.));
+        // Hug both axes.
+        d.node_mut(f).sizing = [Sizing::Hug, Sizing::Hug];
+        d.reflow();
+        assert_eq!(d.node(f).rect, r(0., 0., 80., 40.));
+        // Fill: b takes the rest of a fixed 300 wide frame; cross fill stretches.
+        d.node_mut(f).sizing = [Sizing::Fixed, Sizing::Fixed];
+        d.node_mut(f).rect = r(0., 0., 300., 100.);
+        d.node_mut(b).sizing = [Sizing::Fill, Sizing::Fill];
+        d.reflow();
+        assert_eq!(d.node(b).rect, r(35., 5., 260., 90.));
+        // Centered, vertical, space-between.
+        d.node_mut(b).sizing = [Sizing::Fixed, Sizing::Fixed];
+        d.node_mut(b).rect = r(0., 0., 40., 10.);
+        d.node_mut(f).layout.mode = LayoutMode::Vertical;
+        d.node_mut(f).layout.space_between = true;
+        d.node_mut(f).layout.cross = AxisAlign::Center;
+        d.reflow();
+        assert_eq!(d.node(a).rect.min, pos2(140., 5.));
+        assert_eq!(d.node(b).rect.max.y, 95.);
+        // Absolute children are left alone; hidden ones don't take space.
+        d.node_mut(a).absolute = true;
+        d.node_mut(a).rect = r(200., 50., 20., 30.);
+        d.reflow();
+        assert_eq!(d.node(a).rect, r(200., 50., 20., 30.));
+    }
+
+    #[test]
+    fn nested_auto_layout_hug_propagates() {
+        let mut d = Document::default();
+        let outer = al_frame(&mut d, LayoutMode::Vertical);
+        d.node_mut(outer).sizing = [Sizing::Hug, Sizing::Hug];
+        let inner = d.insert(0, Some(outer), None, {
+            let mut f = Node::new(Kind::Frame, r(0., 0., 10., 10.));
+            f.layout = AutoLayout { mode: LayoutMode::Horizontal, gap: 4., ..Default::default() };
+            f.sizing = [Sizing::Hug, Sizing::Hug];
+            f
+        });
+        d.insert(0, Some(inner), None, Node::new(Kind::Rectangle, r(0., 0., 30., 30.)));
+        d.insert(0, Some(inner), None, Node::new(Kind::Rectangle, r(0., 0., 30., 20.)));
+        d.reflow();
+        assert_eq!(d.node(inner).rect, r(5., 5., 64., 30.));
+        assert_eq!(d.node(outer).rect, r(0., 0., 74., 40.));
+    }
+
+    #[test]
+    fn constraints_follow_frame_resize() {
+        let mut d = Document::default();
+        let f = d.insert(0, None, None, Node::new(Kind::Frame, r(0., 0., 100., 100.)));
+        let mk = |d: &mut Document, h: Constraint, v: Constraint| {
+            let mut n = Node::new(Kind::Rectangle, r(10., 10., 20., 20.));
+            n.constraints = [h, v];
+            d.insert(0, Some(f), None, n)
+        };
+        let left = mk(&mut d, Constraint::Min, Constraint::Min);
+        let right = mk(&mut d, Constraint::Max, Constraint::Max);
+        let both = mk(&mut d, Constraint::Stretch, Constraint::Center);
+        let scale = mk(&mut d, Constraint::Scale, Constraint::Scale);
+        d.set_rect(f, r(-50., 0., 200., 200.));
+        assert_eq!(d.node(left).rect, r(-40., 10., 20., 20.), "left edge moved, child follows it");
+        assert_eq!(d.node(right).rect, r(60., 110., 20., 20.));
+        assert_eq!(d.node(both).rect, r(-40., 60., 120., 20.));
+        assert_eq!(d.node(scale).rect, r(-30., 20., 40., 40.));
+        d.set_rect_with(f, r(0., 0., 100., 100.), false);
+        assert_eq!(d.node(left).rect, r(-40., 10., 20., 20.), "Cmd-resize ignores constraints");
     }
 
     #[test]
