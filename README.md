@@ -82,8 +82,8 @@ GitHub Actions. Building from source needs Rust 1.92 or newer.
 - Export presets per layer to PNG, JPG, SVG, and PDF
 
 **Plugins**
-- Run Figma plugins headlessly: Main menu > Plugins > Development > Import plugin from manifest. Plugins use the core of Figma's plugin API (`figma.currentPage`, selection, `findAll`, `create*`, fills, text, `notify`, async) and each run is one undo step
-- Plugins > Development > Run script for quick one-off scripts; see `examples/plugins/tidy-names`
+- Run Figma plugins: Main menu > Plugins > Development > Import plugin from manifest. Plugins use the core of Figma's plugin API (`figma.currentPage`, selection, `findAll`, `create*`, fills, text, `notify`, `clientStorage`, `figma.on("selectionchange")`, async), and plugin UIs (`figma.showUI`) open in a panel with Figma's `postMessage` messaging (macOS and Windows). Each change a plugin makes is one undo step
+- Plugins > Development > Run script for quick one-off scripts; see `examples/plugins/tidy-names` and `examples/plugins/shape-maker`
 
 | Auto layout | Components and variants |
 | --- | --- |
@@ -123,7 +123,7 @@ GitHub Actions. Building from source needs Rust 1.92 or newer.
 
 ## Roadmap
 
-- Plugin UIs (`figma.showUI`) and the rest of the plugin API
+- The rest of the plugin API (styles, components, variables, and more node types)
 
 ## Development
 

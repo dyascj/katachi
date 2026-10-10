@@ -659,8 +659,8 @@ impl App {
         ui.menu_button("Plugins", |ui| {
             for p in crate::plugins::installed() {
                 if ui.button(&p.name).clicked() {
-                    match crate::plugins::main_code(&p) {
-                        Ok(code) => self.run_plugin(&p.name, &code),
+                    match crate::plugins::load(&p) {
+                        Ok((code, html, id)) => self.run_plugin(&p.name, Some(&id), &code, html.as_deref()),
                         Err(e) => self.toast(format!("{}: {e}", p.name)),
                     }
                     ui.close();

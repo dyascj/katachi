@@ -1,0 +1,22 @@
+<style>
+  body { font: 12px Inter, system-ui, sans-serif; margin: 16px; color: #1e1e1e; }
+  label { display: block; margin-bottom: 8px; }
+  input, select { width: 100%; box-sizing: border-box; padding: 6px; margin-top: 4px; border: 1px solid #e5e5e5; border-radius: 6px; }
+  button { padding: 8px 12px; border-radius: 6px; border: 0; background: #0d99ff; color: white; font-weight: 600; }
+  #sel { color: #888; margin-top: 10px; }
+</style>
+<label>Shape <select id="shape"><option value="rectangle">Rectangle</option><option value="ellipse">Ellipse</option></select></label>
+<label>Count <input id="count" type="number" value="3" min="1" max="50"></label>
+<button id="create">Create</button>
+<div id="sel"></div>
+<script>
+  document.getElementById("create").onclick = () => {
+    const count = parseInt(document.getElementById("count").value, 10);
+    const shape = document.getElementById("shape").value;
+    parent.postMessage({ pluginMessage: { type: "create", count, shape } }, "*");
+  };
+  onmessage = (e) => {
+    const msg = e.data.pluginMessage;
+    if (msg.type === "selection") document.getElementById("sel").textContent = msg.count + " layers selected";
+  };
+</script>

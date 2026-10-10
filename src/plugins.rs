@@ -1,5 +1,6 @@
 //! Plugins: run JavaScript written against Figma's plugin API (a core subset) with QuickJS.
-//! The plugin works on a JS copy of the current page; its changes come back as one batch.
+//! A plugin session keeps its JS state alive; each event (start, a UI message, a selection change)
+//! runs against a fresh JS copy of the current page, and the changes come back as one batch.
 
 use crate::doc::{Document, Kind, Node, NodeId, Paint, PaintKind, Rgba};
 use egui::{Rect, pos2, vec2};
@@ -9,7 +10,17 @@ use std::collections::HashMap;
 /// `figma` global and node prototype, implemented over plain objects.
 const PRELUDE: &str = r#"
 const __nodes = new Map();
-let __removed = [], __notes = [], __closed = false, __newId = 0, __errors = [];
+let __removed = [], __notes = [], __closed = false, __newId = 0, __errors = [], __outbox = [], __ui = null, __storage = {};
+const __handlers = {}, __uiHandlers = [];
+function __reset() { __removed = []; __notes = []; __errors = []; __outbox = []; }
+function __safe(f) { try { Promise.resolve(f()).catch(e => __errors.push(String(e) + (e && e.stack ? '\n' + e.stack : ''))); } catch (e) { __errors.push(String(e) + (e && e.stack ? '\n' + e.stack : '')); } }
+function __deliver(json) {
+  const msg = JSON.parse(json);
+  if (typeof figma.ui.onmessage === "function") __safe(() => figma.ui.onmessage(msg, { origin: "null" }));
+  for (const h of __uiHandlers) __safe(() => h(msg, { origin: "null" }));
+}
+function __emit(type, arg) { for (const h of __handlers[type] || []) __safe(() => h(arg)); }
+function __listens(type) { return (__handlers[type] || []).length > 0; }
 function __link(n) {
   Object.setPrototypeOf(n, __NodeProto);
   __nodes.set(n.id, n);
@@ -73,9 +84,24 @@ const figma = {
   apiVersion: "1.0.0", editorType: "figma", mixed: Symbol("mixed"),
   notify(m) { __notes.push(String(m)); return { cancel() {} }; },
   closePlugin(m) { if (m) __notes.push(String(m)); __closed = true; },
-  showUI() { __notes.push("Plugin UIs aren't supported yet; running headless."); },
-  ui: { postMessage() {}, onmessage: null, on() {}, resize() {}, close() {} },
-  on() {}, once() {}, off() {},
+  showUI(html, opts) {
+    opts = opts || {};
+    __ui = { html: String(html), width: opts.width || 300, height: opts.height || 200, visible: opts.visible !== false, title: opts.title || null };
+  },
+  ui: {
+    postMessage(m) { __outbox.push(JSON.stringify(m === undefined ? null : m)); },
+    onmessage: undefined,
+    on(type, cb) { if (type === "message") __uiHandlers.push(cb); },
+    once(type, cb) { this.on(type, cb); },
+    off(type, cb) { const i = __uiHandlers.indexOf(cb); if (i >= 0) __uiHandlers.splice(i, 1); },
+    resize(w, h) { if (__ui) { __ui.width = w; __ui.height = h; } },
+    show() { if (__ui) __ui.visible = true; },
+    hide() { if (__ui) __ui.visible = false; },
+    close() { __ui = null; },
+  },
+  on(type, cb) { (__handlers[type] = __handlers[type] || []).push(cb); },
+  once(type, cb) { this.on(type, cb); },
+  off(type, cb) { const l = __handlers[type] || []; const i = l.indexOf(cb); if (i >= 0) l.splice(i, 1); },
   loadFontAsync() { return Promise.resolve(); },
   listAvailableFontsAsync() { return Promise.resolve([]); },
   getNodeById(id) { return __nodes.get(id) || null; },
@@ -99,10 +125,16 @@ const figma = {
     return g;
   },
   viewport: { center: { x: 0, y: 0 }, zoom: 1, scrollAndZoomIntoView() {} },
-  clientStorage: { getAsync() { return Promise.resolve(undefined); }, setAsync() { return Promise.resolve(); } },
+  clientStorage: {
+    getAsync(k) { return Promise.resolve(__storage[k]); },
+    setAsync(k, v) { __storage[k] = v; return Promise.resolve(); },
+    deleteAsync(k) { delete __storage[k]; return Promise.resolve(); },
+    keysAsync() { return Promise.resolve(Object.keys(__storage)); },
+  },
   util: { rgb(c) { return c; }, solidPaint(c) { return { type: "SOLID", color: c, opacity: 1, visible: true }; } },
 };
 function __load(page) {
+  __nodes.clear();
   const link = (raw, parent) => {
     const n = __link(raw);
     n.parent = parent;
@@ -128,7 +160,8 @@ function __collect() {
   };
   walk(figma.currentPage, null);
   return JSON.stringify({ nodes: out, top: figma.currentPage.children.map(c => c.id), removed: __removed, notes: __notes,
-    selection: figma.currentPage.selection.map(n => n.id), closed: __closed, errors: __errors });
+    selection: figma.currentPage.selection.map(n => n.id), closed: __closed, errors: __errors, outbox: __outbox, ui: __ui,
+    storage: JSON.stringify(__storage) });
 }
 "#;
 
@@ -233,44 +266,126 @@ fn snapshot(doc: &Document, page: usize, sel: &[NodeId]) -> Value {
 pub struct Outcome {
     pub notes: Vec<String>,
     pub selection: Vec<NodeId>,
+    /// Messages for the plugin's UI (JSON).
+    pub outbox: Vec<String>,
+    /// The UI the plugin wants shown, if any.
+    pub ui: Option<UiRequest>,
+    pub closed: bool,
 }
 
-/// Run plugin code against the page and apply what it changed.
-pub fn run(doc: &mut Document, page: usize, sel: &[NodeId], code: &str) -> Result<Outcome, String> {
-    let rt = rquickjs::Runtime::new().map_err(|e| e.to_string())?;
-    rt.set_memory_limit(512 << 20);
-    let ctx = rquickjs::Context::full(&rt).map_err(|e| e.to_string())?;
-    let snap = snapshot(doc, page, sel).to_string();
-    let result: String = ctx.with(|ctx| -> Result<(), String> {
-        let fmt = |e: rquickjs::Error, ctx: &rquickjs::Ctx| match e {
-            rquickjs::Error::Exception => format!("{:?}", ctx.catch()),
-            e => e.to_string(),
-        };
-        ctx.eval::<(), _>(PRELUDE).map_err(|e| fmt(e, &ctx))?;
-        ctx.eval::<(), _>(format!("__load({snap});")).map_err(|e| fmt(e, &ctx))?;
-        // Plugins are often async; errors surface as notes.
-        let wrapped = format!("(async () => {{\n{code}\n}})().catch(e => __errors.push(String(e) + (e && e.stack ? '\\n' + e.stack : '')));");
-        ctx.eval::<(), _>(wrapped).map_err(|e| fmt(e, &ctx))?;
-        Ok(())
-    }).and_then(|_| {
+#[derive(Clone, Debug, PartialEq)]
+pub struct UiRequest {
+    pub html: String,
+    pub width: f32,
+    pub height: f32,
+    pub visible: bool,
+}
+
+/// A running plugin: its JS runtime stays alive between events.
+pub struct Session {
+    rt: rquickjs::Runtime,
+    ctx: rquickjs::Context,
+    pub name: String,
+    storage: Option<(std::path::PathBuf, String)>,
+}
+
+impl Session {
+    /// Start a plugin: define `figma` (and `__html__`), then run its main code.
+    /// `id` names its clientStorage file; `html` is the manifest's UI file.
+    pub fn start(doc: &mut Document, page: usize, sel: &[NodeId], name: &str, id: Option<&str>, code: &str, html: Option<&str>) -> Result<(Session, Outcome), String> {
+        let rt = rquickjs::Runtime::new().map_err(|e| e.to_string())?;
+        rt.set_memory_limit(512 << 20);
+        let ctx = rquickjs::Context::full(&rt).map_err(|e| e.to_string())?;
+        let storage = id.map(|id| {
+            let safe: String = id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+            let path = crate::files::data_dir().join("plugin-storage").join(format!("{safe}.json"));
+            let saved = std::fs::read_to_string(&path).unwrap_or_else(|_| "{}".into());
+            (path, saved)
+        });
+        let mut s = Session { rt, ctx, name: name.to_string(), storage };
+        let init = format!(
+            "globalThis.__html__ = {}; __storage = {};",
+            serde_json::to_string(html.unwrap_or("")).unwrap_or_default(),
+            s.storage.as_ref().map_or("{}".to_string(), |(_, j)| if serde_json::from_str::<Value>(j).is_ok() { j.clone() } else { "{}".into() })
+        );
+        s.eval(PRELUDE)?;
+        s.eval(&init)?;
+        // Plugins are often async; errors are collected rather than thrown.
+        let out = s.step(doc, page, sel, &format!("__safe(async () => {{\n{code}\n}});"))?;
+        Ok((s, out))
+    }
+
+    /// Deliver a message from the plugin's UI (`parent.postMessage({ pluginMessage })`).
+    pub fn message(&mut self, doc: &mut Document, page: usize, sel: &[NodeId], json: &str) -> Result<Outcome, String> {
+        let arg = serde_json::to_string(json).unwrap_or_default();
+        self.step(doc, page, sel, &format!("__deliver({arg});"))
+    }
+
+    /// Tell the plugin something happened (`figma.on(type, ...)`), if it's listening.
+    pub fn emit(&mut self, doc: &mut Document, page: usize, sel: &[NodeId], event: &str) -> Result<Option<Outcome>, String> {
+        let ev = serde_json::to_string(event).unwrap_or_default();
+        if !self.ctx.with(|ctx| ctx.eval::<bool, _>(format!("__listens({ev})")).unwrap_or(false)) {
+            return Ok(None);
+        }
+        self.step(doc, page, sel, &format!("__emit({ev});")).map(Some)
+    }
+
+    fn eval(&self, js: &str) -> Result<(), String> {
+        self.ctx.with(|ctx| match ctx.eval::<(), _>(js) {
+            Ok(()) => Ok(()),
+            Err(rquickjs::Error::Exception) => Err(format!("{:?}", ctx.catch())),
+            Err(e) => Err(e.to_string()),
+        })
+    }
+
+    /// Load the page into JS, run `js`, settle promises, and apply the changes.
+    fn step(&mut self, doc: &mut Document, page: usize, sel: &[NodeId], js: &str) -> Result<Outcome, String> {
+        let snap = snapshot(doc, page, sel).to_string();
+        self.eval(&format!("__reset(); __load({snap});"))?;
+        self.eval(js)?;
         for _ in 0..100_000 {
-            match rt.execute_pending_job() {
+            match self.rt.execute_pending_job() {
                 Ok(true) => continue,
                 Ok(false) => break,
                 Err(e) => return Err(format!("{e:?}")),
             }
         }
-        ctx.with(|ctx| ctx.eval::<String, _>("__collect()").map_err(|e| e.to_string()))
-    })?;
-    let out: Value = serde_json::from_str(&result).map_err(|e| e.to_string())?;
-    if let Some(errs) = out["errors"].as_array().filter(|e| !e.is_empty()) {
-        return Err(errs.iter().filter_map(|e| e.as_str()).collect::<Vec<_>>().join("\n"));
+        let result: String = self.ctx.with(|ctx| ctx.eval::<String, _>("__collect()").map_err(|e| e.to_string()))?;
+        let out: Value = serde_json::from_str(&result).map_err(|e| e.to_string())?;
+        if let Some(errs) = out["errors"].as_array().filter(|e| !e.is_empty()) {
+            return Err(errs.iter().filter_map(|e| e.as_str()).collect::<Vec<_>>().join("\n"));
+        }
+        if let (Some((path, saved)), Some(now)) = (&mut self.storage, out["storage"].as_str())
+            && now != saved
+        {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = crate::files::write_atomic(path, now.as_bytes());
+            *saved = now.to_string();
+        }
+        let ids = apply(doc, page, &out);
+        let strings = |k: &str| out[k].as_array().map(|a| a.iter().filter_map(|n| n.as_str().map(String::from)).collect()).unwrap_or_default();
+        let ui = out["ui"].as_object().map(|u| UiRequest {
+            html: u.get("html").and_then(|h| h.as_str()).unwrap_or("").to_string(),
+            width: u.get("width").and_then(|w| w.as_f64()).unwrap_or(300.0) as f32,
+            height: u.get("height").and_then(|h| h.as_f64()).unwrap_or(200.0) as f32,
+            visible: u.get("visible").and_then(|v| v.as_bool()).unwrap_or(true),
+        });
+        Ok(Outcome {
+            notes: strings("notes"),
+            selection: out["selection"].as_array().into_iter().flatten().filter_map(|v| ids.get(v.as_str()?).copied()).collect(),
+            outbox: strings("outbox"),
+            ui,
+            closed: out["closed"].as_bool().unwrap_or(false),
+        })
     }
-    let ids = apply(doc, page, &out);
-    Ok(Outcome {
-        notes: out["notes"].as_array().map(|a| a.iter().filter_map(|n| n.as_str().map(String::from)).collect()).unwrap_or_default(),
-        selection: out["selection"].as_array().into_iter().flatten().filter_map(|v| ids.get(v.as_str()?).copied()).collect(),
-    })
+}
+
+/// Run plugin code once, headless, and apply what it changed.
+#[cfg(test)]
+pub fn run(doc: &mut Document, page: usize, sel: &[NodeId], code: &str) -> Result<Outcome, String> {
+    Session::start(doc, page, sel, "Script", None, code, None).map(|(_, out)| out)
 }
 
 fn apply(doc: &mut Document, page: usize, out: &Value) -> HashMap<String, NodeId> {
@@ -401,10 +516,15 @@ pub fn install(manifest: &std::path::Path) -> Result<Installed, String> {
     Ok(p)
 }
 
-pub fn main_code(p: &Installed) -> Result<String, String> {
+/// A plugin's code, its UI's HTML (manifest `ui`), and its id.
+pub fn load(p: &Installed) -> Result<(String, Option<String>, String), String> {
     let m: Value = serde_json::from_str(&std::fs::read_to_string(&p.manifest).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     let main = m["main"].as_str().ok_or("manifest has no main")?;
-    std::fs::read_to_string(p.manifest.with_file_name(main)).map_err(|e| e.to_string())
+    let code = std::fs::read_to_string(p.manifest.with_file_name(main)).map_err(|e| e.to_string())?;
+    // `ui` is a file, or (for multiple UIs) a map of names to files; the first one is `__html__`.
+    let ui = m["ui"].as_str().or_else(|| m["ui"].as_object().and_then(|o| o.values().next()).and_then(|v| v.as_str()));
+    let html = ui.and_then(|f| std::fs::read_to_string(p.manifest.with_file_name(f)).ok());
+    Ok((code, html, m["id"].as_str().unwrap_or(&p.name).to_string()))
 }
 
 #[cfg(test)]
@@ -444,7 +564,39 @@ mod tests {
         assert_eq!(r.rect, Rect::from_min_size(pos2(150., 160.), vec2(30., 40.)));
         assert!(d.nodes.values().any(|n| n.kind == Kind::Text && n.text == "Made by a plugin"));
         // Errors come back as messages, not crashes.
+        let err0 = run(&mut d, 0, &[], "figma.notify(undefinedThing.x)").err().unwrap();
+        assert!(err0.contains("undefinedThing"), "{err0}");
         let err = run(&mut d, 0, &[], "throw new Error('nope')").err().unwrap();
         assert!(err.contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn ui_plugins_keep_running_and_talk_both_ways() {
+        let mut d = Document::default();
+        let code = r#"
+            figma.showUI(__html__, { width: 240, height: 120 });
+            figma.ui.postMessage({ type: "hello", layers: figma.currentPage.children.length });
+            figma.ui.onmessage = async (msg) => {
+                if (msg.type === "create") {
+                    for (let i = 0; i < msg.count; i++) { const r = figma.createRectangle(); r.x = i * 150; }
+                    figma.ui.postMessage({ type: "made", count: msg.count });
+                }
+                if (msg.type === "done") figma.closePlugin("Bye");
+            };
+            figma.on("selectionchange", () => figma.ui.postMessage({ type: "sel", n: figma.currentPage.selection.length }));
+        "#;
+        let (mut s, out) = Session::start(&mut d, 0, &[], "Shapes", None, code, Some("<p>UI</p>")).unwrap();
+        let ui = out.ui.unwrap();
+        assert_eq!((ui.html.as_str(), ui.width, ui.height), ("<p>UI</p>", 240.0, 120.0));
+        assert_eq!(out.outbox, vec![r#"{"type":"hello","layers":0}"#.to_string()]);
+        let out = s.message(&mut d, 0, &[], r#"{"type":"create","count":3}"#).unwrap();
+        assert_eq!(d.nodes.len(), 3, "the handler ran against the live document");
+        assert_eq!(out.outbox, vec![r#"{"type":"made","count":3}"#.to_string()]);
+        let first = *d.pages[0].children.first().unwrap();
+        let out = s.emit(&mut d, 0, &[first], "selectionchange").unwrap().unwrap();
+        assert_eq!(out.outbox, vec![r#"{"type":"sel","n":1}"#.to_string()]);
+        assert!(s.emit(&mut d, 0, &[], "currentpagechange").unwrap().is_none(), "not listening");
+        let out = s.message(&mut d, 0, &[], r#"{"type":"done"}"#).unwrap();
+        assert!(out.closed && out.notes == vec!["Bye".to_string()]);
     }
 }

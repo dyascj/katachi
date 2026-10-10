@@ -92,6 +92,20 @@ pub enum After {
     Open,
 }
 
+/// A plugin with a UI, running until it closes.
+pub struct PluginRun {
+    pub session: crate::plugins::Session,
+    pub ui: crate::plugins::UiRequest,
+    view: Option<crate::plugin_view::PluginView>,
+    /// Messages from the UI, filled by the webview.
+    inbox: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Messages for the UI, held until it has loaded.
+    outbox: Vec<String>,
+    ready: bool,
+    pos: Option<Pos2>,
+    last_sel: Vec<NodeId>,
+}
+
 const CLIP_TAG: &str = "katachi/nodes:";
 
 pub struct App {
@@ -135,6 +149,10 @@ pub struct App {
     pub outline_mode: bool,
     pub show_grids: bool,
     pub show_history: bool,
+    /// The plugin that's running with a UI, if any.
+    pub plugin: Option<PluginRun>,
+    /// `KATACHI_PLUGIN=path/manifest.json`: run a plugin at startup (development).
+    debug_plugin: Option<PathBuf>,
     /// The last layers copied here, for Paste to replace.
     pub clip_frag: Option<Vec<Node>>,
     /// Find and replace (Cmd F): (open, query, replacement, focus the field next frame).
@@ -227,6 +245,8 @@ impl App {
             show_history: false,
             find: (false, String::new(), String::new(), false),
             clip_frag: None,
+            plugin: None,
+            debug_plugin: std::env::var_os("KATACHI_PLUGIN").map(PathBuf::from),
             show_console: false,
             console_code: "for (const n of figma.currentPage.selection) {\n  n.rotation += 15;\n}\nfigma.notify(`Rotated ${figma.currentPage.selection.length} layers`);\n".into(),
             show_variables: false,
@@ -1277,24 +1297,146 @@ impl App {
     }
 
     /// Run plugin code on the current page as one undoable step.
-    pub fn run_plugin(&mut self, name: &str, code: &str) {
+    /// Run plugin code on the current page as one undoable step; plugins that show a UI keep running.
+    pub fn run_plugin(&mut self, name: &str, id: Option<&str>, code: &str, html: Option<&str>) {
+        self.plugin = None;
         let before = self.doc.clone();
-        match crate::plugins::run(&mut self.doc, self.page, &self.sel, code) {
+        let sel = self.sel.clone();
+        let mut session = None;
+        let res = crate::plugins::Session::start(&mut self.doc, self.page, &sel, name, id, code, html).map(|(s, out)| {
+            session = Some(s);
+            out
+        });
+        let Some(out) = self.plugin_apply(name, before, res) else { return };
+        match (session, out.ui) {
+            (Some(session), Some(ui)) if !out.closed => {
+                self.plugin = Some(PluginRun { session, ui, view: None, inbox: Default::default(), outbox: out.outbox, ready: false, pos: None, last_sel: self.sel.clone() });
+            }
+            _ if out.notes.is_empty() => self.toast(format!("Ran {name}")),
+            _ => {}
+        }
+    }
+
+    /// Keep a plugin step's changes as one undo step, or roll them back on error.
+    fn plugin_apply(&mut self, name: &str, before: Document, res: Result<crate::plugins::Outcome, String>) -> Option<crate::plugins::Outcome> {
+        match res {
             Ok(out) => {
                 if self.doc.nodes != before.nodes || self.doc.pages != before.pages {
                     let after = std::mem::replace(&mut self.doc, before);
                     self.checkpoint();
                     self.doc = after;
                 }
-                self.sel = out.selection;
-                self.toast(out.notes.last().cloned().unwrap_or_else(|| format!("Ran {name}")));
+                self.sel = out.selection.clone();
+                if let Some(n) = out.notes.last() {
+                    self.toast(n.clone());
+                }
+                if std::env::var_os("KATACHI_PLUGIN").is_some() {
+                    for n in &out.notes {
+                        eprintln!("{name}: {n}");
+                    }
+                }
+                Some(out)
             }
             Err(e) => {
                 self.doc = before;
                 self.toast(format!("{name} failed: {}", e.lines().next().unwrap_or_default()));
                 eprintln!("{name}: {e}");
+                None
             }
         }
+    }
+
+    /// A running plugin with a UI: pass messages both ways, report selection changes, draw its panel.
+    fn plugin_frame(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if let Some(manifest) = self.debug_plugin.take() {
+            let p = crate::plugins::Installed { name: "Plugin".into(), manifest };
+            match crate::plugins::load(&p) {
+                Ok((code, html, id)) => self.run_plugin(&id, Some(&id), &code, html.as_deref()),
+                Err(e) => self.toast(e),
+            }
+        }
+        let Some(mut run) = self.plugin.take() else { return };
+        let name = run.session.name.clone();
+        let mut outs = vec![];
+        let inbox: Vec<String> = std::mem::take(&mut *run.inbox.lock().unwrap());
+        for m in inbox {
+            if m == crate::plugin_view::READY {
+                run.ready = true;
+                continue;
+            }
+            let (before, sel) = (self.doc.clone(), self.sel.clone());
+            let res = run.session.message(&mut self.doc, self.page, &sel, &m);
+            outs.extend(self.plugin_apply(&name, before, res));
+        }
+        if self.sel != run.last_sel {
+            let (before, sel) = (self.doc.clone(), self.sel.clone());
+            match run.session.emit(&mut self.doc, self.page, &sel, "selectionchange") {
+                Ok(None) => {}
+                res => outs.extend(self.plugin_apply(&name, before, res.map(|o| o.unwrap()))),
+            }
+            run.last_sel = self.sel.clone();
+        }
+        for o in outs {
+            run.outbox.extend(o.outbox);
+            match o.ui {
+                Some(ui) if !o.closed => run.ui = ui,
+                _ => return,
+            }
+        }
+        // The panel: a title bar drawn by egui, the plugin's HTML in a native webview below it.
+        let size = vec2(run.ui.width, run.ui.height);
+        let canvas = self.canvas_rect.unwrap_or(ctx.content_rect());
+        let pos = *run.pos.get_or_insert(egui::pos2(canvas.max.x - size.x - 16.0, canvas.min.y + 16.0));
+        let title = 30.0;
+        let (mut close, mut drag) = (false, Vec2::ZERO);
+        if run.ui.visible {
+            egui::Area::new(egui::Id::new("plugin-panel")).fixed_pos(pos).order(egui::Order::Foreground).show(ctx, |ui| {
+                egui::Frame::window(ui.style()).inner_margin(0).show(ui, |ui| {
+                    let (bar, resp) = ui.allocate_exact_size(vec2(size.x, title), egui::Sense::drag());
+                    ui.painter().text(bar.left_center() + vec2(12.0, 0.0), egui::Align2::LEFT_CENTER, &name, egui::FontId::proportional(13.0), ui.visuals().strong_text_color());
+                    let x = Rect::from_center_size(bar.right_center() - vec2(16.0, 0.0), vec2(20.0, 20.0));
+                    let xr = ui.interact(x, ui.id().with("plugin-close"), egui::Sense::click());
+                    let c = if xr.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
+                    let s = egui::Stroke::new(1.5, c);
+                    let r = x.shrink(5.0);
+                    ui.painter().line_segment([r.left_top(), r.right_bottom()], s);
+                    ui.painter().line_segment([r.right_top(), r.left_bottom()], s);
+                    close = xr.clicked();
+                    drag = resp.drag_delta();
+                    ui.allocate_exact_size(size, egui::Sense::hover());
+                });
+            });
+        }
+        if close {
+            let (before, sel) = (self.doc.clone(), self.sel.clone());
+            if let Ok(Some(o)) = run.session.emit(&mut self.doc, self.page, &sel, "close") {
+                self.plugin_apply(&name, before, Ok(o));
+            }
+            return;
+        }
+        run.pos = Some(pos + drag);
+        let body = Rect::from_min_size(run.pos.unwrap() + vec2(0.0, title), size);
+        match &run.view {
+            Some(v) => {
+                v.place(body, ctx.zoom_factor());
+                v.show(run.ui.visible);
+            }
+            None => match crate::plugin_view::PluginView::open(frame, ctx, &run.ui.html, body, run.inbox.clone()) {
+                Ok(v) => run.view = Some(v),
+                Err(e) => {
+                    self.toast(format!("{name}: {e}"));
+                    return;
+                }
+            },
+        }
+        if run.ready
+            && let Some(v) = &run.view
+        {
+            for m in run.outbox.drain(..) {
+                v.post(&m);
+            }
+        }
+        self.plugin = Some(run);
     }
 
     fn find_window(&mut self, ctx: &egui::Context) {
@@ -1380,7 +1522,7 @@ impl App {
         });
         if run {
             let code = self.console_code.clone();
-            self.run_plugin("Script", &code);
+            self.run_plugin("Script", None, &code, None);
         }
         self.show_console = open;
     }
@@ -1891,7 +2033,7 @@ impl App {
 fn void(_: bool) {}
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if self.presenting.is_some() {
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.presentation_ui(ui));
@@ -1914,6 +2056,7 @@ impl eframe::App for App {
         self.history_window(&ctx);
         self.console_window(&ctx);
         self.find_window(&ctx);
+        self.plugin_frame(&ctx, frame);
         self.variables_window(&ctx);
         self.autosave(ctx.input(|i| i.time));
         self.debug_screenshot(&ctx);
