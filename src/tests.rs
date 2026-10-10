@@ -546,6 +546,25 @@ fn shots() {
     st.present(0.0);
     h.run_steps(3);
     save(&mut h, "15-present");
+    // Styles: a linked color style on the hero, and the local styles list.
+    let st = h.state_mut();
+    st.presenting = None;
+    st.prototype_tab = false;
+    let find = |st: &App, name: &str| *st.doc.nodes.keys().find(|i| st.doc.node(**i).name == name).unwrap();
+    let (hero, title, card) = (find(st, "Hero"), find(st, "Title"), find(st, "Card"));
+    let brand = st.doc.add_style("Brand/Blue".into(), crate::doc::StyleValue::Paint(vec![crate::doc::Paint::solid(Rgba::rgb(13, 153, 255))]));
+    st.doc.add_style("Brand/Ink".into(), crate::doc::StyleValue::Paint(vec![crate::doc::Paint::solid(Rgba::rgb(30, 30, 30))]));
+    let h1 = st.doc.add_style("Heading/H1".into(), crate::doc::StyleValue::Text(crate::doc::TextStyle::of(st.doc.node(title))));
+    st.doc.add_style("Elevation/Card".into(), crate::doc::StyleValue::Effect(st.doc.node(card).shadows.clone()));
+    st.doc.node_mut(hero).fill_style = Some(brand);
+    st.doc.node_mut(title).text_style = Some(h1);
+    st.doc.reflow();
+    st.sel = vec![hero];
+    h.run_steps(3);
+    save(&mut h, "16-style-linked");
+    h.state_mut().sel.clear();
+    h.run_steps(3);
+    save(&mut h, "17-local-styles");
 }
 
 #[test]

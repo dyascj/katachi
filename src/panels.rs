@@ -47,6 +47,8 @@ pub enum Icon {
     Pencil,
     Scale,
     Play,
+    Styles,
+    Detach,
 }
 
 const SUBTLE: Color32 = Color32::from_rgb(0xF5, 0xF5, 0xF5);
@@ -285,6 +287,16 @@ pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
             p.line_segment([at(-1., 1.), at(6., -6.)], s);
             p.line_segment([at(6., -6.), at(2., -6.)], s);
             p.line_segment([at(6., -6.), at(6., -2.)], s);
+        }
+        Icon::Styles => {
+            for (dx, dy) in [(-3., -3.), (3., -3.), (-3., 3.), (3., 3.)] {
+                p.circle_filled(at(dx, dy), 1.8, color);
+            }
+        }
+        Icon::Detach => {
+            p.line_segment([at(-6., 2.), at(-2., -2.)], s);
+            p.line_segment([at(2., 2.), at(6., -2.)], s);
+            p.line_segment([at(-1., -5.), at(1., 5.)], Stroke::new(1.0, color.gamma_multiply(0.7)));
         }
         Icon::Play => {
             p.add(Shape::convex_polygon(vec![at(-3.5, -5.), at(5., 0.), at(-3.5, 5.)], color, Stroke::NONE));
@@ -1088,6 +1100,72 @@ impl App {
                 self.doc.pages[self.page].background = bg;
             }
         });
+        self.local_styles(ui);
+    }
+
+    /// With nothing selected, list the file's styles like Figma's "Local styles".
+    fn local_styles(&mut self, ui: &mut Ui) {
+        use crate::doc::StyleValue;
+        if self.doc.styles.is_empty() {
+            return;
+        }
+        ui.separator();
+        heading(ui, "Local styles");
+        let mut delete = None;
+        for (label, is) in [
+            ("Color styles", (|v: &StyleValue| matches!(v, StyleValue::Paint(_))) as fn(&StyleValue) -> bool),
+            ("Text styles", |v: &StyleValue| matches!(v, StyleValue::Text(_))),
+            ("Effect styles", |v: &StyleValue| matches!(v, StyleValue::Effect(_))),
+        ] {
+            let list: Vec<crate::doc::Style> = self.doc.styles.iter().filter(|s| is(&s.value)).cloned().collect();
+            if list.is_empty() {
+                continue;
+            }
+            ui.label(RichText::new(label).color(Color32::from_gray(0x80)).small());
+            for st in list {
+                ui.horizontal(|ui| {
+                    crate::paint_ui::style_preview(ui, &st.value);
+                    let mut name = st.name.clone();
+                    let r = ui.add(egui::TextEdit::singleline(&mut name).frame(egui::Frame::NONE).desired_width(130.0));
+                    if r.changed() {
+                        self.begin_edit();
+                        if let Some(x) = self.doc.styles.iter_mut().find(|x| x.id == st.id) {
+                            x.name = name;
+                        }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icon_button(ui, Icon::Minus, false, 22.0, "Delete style").clicked() {
+                            delete = Some(st.id);
+                        }
+                        if let StyleValue::Paint(ps) = &st.value {
+                            let edit = icon_button(ui, Icon::Styles, false, 22.0, "Edit style");
+                            egui::Popup::menu(&edit).id(ui.id().with(("local-style", st.id))).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                                ui.set_width(240.0);
+                                let mut ps = ps.clone();
+                                let mut edited = false;
+                                for (i, p) in ps.iter_mut().enumerate().rev() {
+                                    if !matches!(paint_row(ui, ui.id().with(("ls-paint", st.id, i)), p), PaintEvent::None) {
+                                        edited = true;
+                                    }
+                                }
+                                if edited {
+                                    self.begin_edit();
+                                    if let Some(x) = self.doc.styles.iter_mut().find(|x| x.id == st.id) {
+                                        x.value = StyleValue::Paint(ps);
+                                    }
+                                    self.doc.reflow();
+                                }
+                            });
+                        }
+                    });
+                });
+            }
+        }
+        if let Some(id) = delete {
+            self.checkpoint();
+            self.doc.styles.retain(|s| s.id != id);
+            self.doc.reflow();
+        }
     }
 
     fn selection_props(&mut self, ui: &mut Ui) {
@@ -1496,7 +1574,47 @@ impl App {
     fn typography_section(&mut self, ui: &mut Ui, n: &crate::doc::Node) {
         use crate::doc::{Decoration, LineHeight, TextAlign, TextCase, TextSizing, VAlign};
         use crate::text::{families, weight_name, weights_for};
-        heading(ui, "Typography");
+        let mut pick = None;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Typography").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                pick = crate::paint_ui::style_menu(ui, ui.id().with("text-styles"), &self.doc.styles, |v| matches!(v, crate::doc::StyleValue::Text(_)));
+            });
+        });
+        match pick {
+            Some(crate::paint_ui::StylePick::Apply(sid)) => {
+                self.checkpoint();
+                for &id in &self.sel.clone() {
+                    self.doc.node_mut(id).text_style = Some(sid);
+                }
+                self.doc.reflow();
+                return;
+            }
+            Some(crate::paint_ui::StylePick::Create(name)) => {
+                self.checkpoint();
+                let sid = self.doc.add_style(name, crate::doc::StyleValue::Text(crate::doc::TextStyle::of(n)));
+                for &id in &self.sel.clone() {
+                    self.doc.node_mut(id).text_style = Some(sid);
+                }
+                self.doc.reflow();
+                return;
+            }
+            None => {}
+        }
+        if let Some(style) = n.text_style.and_then(|sid| self.doc.style(sid)).cloned() {
+            ui.horizontal(|ui| {
+                crate::paint_ui::style_preview(ui, &style.value);
+                ui.label(&style.name);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, Icon::Detach, false, 22.0, "Detach style").clicked() {
+                        self.checkpoint();
+                        for &id in &self.sel.clone() {
+                            self.doc.node_mut(id).text_style = None;
+                        }
+                    }
+                });
+            });
+        }
         let mut t = n.clone();
         // Font family picker with search.
         let fam_id = ui.id().with("font-search");
@@ -1624,6 +1742,8 @@ impl App {
             self.begin_edit();
             for &id in &self.sel.clone() {
                 let d = self.doc.node_mut(id);
+                // Changing a styled value by hand detaches the style, like Figma.
+                d.text_style = None;
                 d.font_family = t.font_family.clone();
                 d.font_weight = t.font_weight;
                 d.font_size = t.font_size;
@@ -1639,11 +1759,75 @@ impl App {
     }
 
     fn paints_section(&mut self, ui: &mut Ui, stroke: bool) {
+        use crate::doc::StyleValue;
+        use crate::paint_ui::{StylePick, style_menu, style_preview};
         let first = self.sel[0];
         let n = self.doc.node(first).clone();
         let mut paints = if stroke { n.strokes.clone() } else { n.fills.clone() };
         let mut changed = false;
-        if section_title(ui, if stroke { "Stroke" } else { "Fill" }) {
+        let link = if stroke { n.stroke_style } else { n.fill_style };
+        let mut add = false;
+        let mut pick = None;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(if stroke { "Stroke" } else { "Fill" }).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                add = icon_button(ui, Icon::Plus, false, 22.0, "").clicked();
+                pick = style_menu(ui, ui.id().with(("paint-styles", stroke)), &self.doc.styles, |v| matches!(v, StyleValue::Paint(_)));
+            });
+        });
+        let set_link = |app: &mut App, v: Option<crate::doc::StyleId>| {
+            for &id in &app.sel.clone() {
+                let t = app.doc.node_mut(id);
+                if stroke { t.stroke_style = v } else { t.fill_style = v }
+            }
+            app.doc.reflow();
+        };
+        match pick {
+            Some(StylePick::Apply(sid)) => {
+                self.checkpoint();
+                set_link(self, Some(sid));
+            }
+            Some(StylePick::Create(name)) => {
+                self.checkpoint();
+                let sid = self.doc.add_style(name, StyleValue::Paint(paints.clone()));
+                set_link(self, Some(sid));
+            }
+            None => {}
+        }
+        // A linked style shows as one row; editing it edits the style for everyone.
+        if let Some(style) = link.and_then(|sid| self.doc.style(sid)).cloned() {
+            ui.horizontal(|ui| {
+                style_preview(ui, &style.value);
+                let open = ui.add(egui::Button::new(&style.name).frame(false));
+                egui::Popup::menu(&open).id(ui.id().with(("edit-style", style.id))).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                    ui.set_width(240.0);
+                    ui.label(RichText::new(format!("Edit {}", style.name)).strong());
+                    if let StyleValue::Paint(mut ps) = style.value.clone() {
+                        let mut edited = false;
+                        for (i, p) in ps.iter_mut().enumerate().rev() {
+                            if !matches!(paint_row(ui, ui.id().with(("style-paint", style.id, i)), p), PaintEvent::None) {
+                                edited = true;
+                            }
+                        }
+                        if edited {
+                            self.begin_edit();
+                            if let Some(st) = self.doc.styles.iter_mut().find(|s| s.id == style.id) {
+                                st.value = StyleValue::Paint(ps);
+                            }
+                            self.doc.reflow();
+                        }
+                    }
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, Icon::Detach, false, 22.0, "Detach style").clicked() {
+                        self.checkpoint();
+                        set_link(self, None);
+                    }
+                });
+            });
+            return;
+        }
+        if add {
             let c = match (stroke, n.kind) {
                 (true, _) | (false, Kind::Text) => Rgba::BLACK,
                 (false, Kind::Frame) => Rgba::WHITE,
@@ -1771,10 +1955,53 @@ impl App {
     }
 
     fn effects_section(&mut self, ui: &mut Ui) {
+        use crate::doc::StyleValue;
+        use crate::paint_ui::{StylePick, style_menu, style_preview};
         let first = self.sel[0];
         let mut shadows = self.doc.node(first).shadows.clone();
         let mut changed = false;
-        if section_title(ui, "Effects") {
+        let link = self.doc.node(first).effect_style;
+        let mut add = false;
+        let mut pick = None;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Effects").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                add = icon_button(ui, Icon::Plus, false, 22.0, "").clicked();
+                pick = style_menu(ui, ui.id().with("effect-styles"), &self.doc.styles, |v| matches!(v, StyleValue::Effect(_)));
+            });
+        });
+        let set_link = |app: &mut App, v: Option<crate::doc::StyleId>| {
+            for &id in &app.sel.clone() {
+                app.doc.node_mut(id).effect_style = v;
+            }
+            app.doc.reflow();
+        };
+        match pick {
+            Some(StylePick::Apply(sid)) => {
+                self.checkpoint();
+                set_link(self, Some(sid));
+            }
+            Some(StylePick::Create(name)) => {
+                self.checkpoint();
+                let sid = self.doc.add_style(name, StyleValue::Effect(shadows.clone()));
+                set_link(self, Some(sid));
+            }
+            None => {}
+        }
+        if let Some(style) = link.and_then(|sid| self.doc.style(sid)).cloned() {
+            ui.horizontal(|ui| {
+                style_preview(ui, &style.value);
+                ui.label(&style.name);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, Icon::Detach, false, 22.0, "Detach style").clicked() {
+                        self.checkpoint();
+                        set_link(self, None);
+                    }
+                });
+            });
+            return;
+        }
+        if add {
             shadows.push(Shadow::default());
             changed = true;
         }

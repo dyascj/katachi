@@ -231,6 +231,58 @@ pub struct Reaction {
     pub transition: Transition,
 }
 
+pub type StyleId = u64;
+
+/// Typography captured by a text style.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TextStyle {
+    pub font_family: String,
+    pub font_weight: u16,
+    pub font_size: f32,
+    pub line_height: LineHeight,
+    pub letter_spacing: f32,
+    pub decoration: Decoration,
+    pub text_case: TextCase,
+}
+
+impl TextStyle {
+    pub fn of(n: &Node) -> Self {
+        Self {
+            font_family: n.font_family.clone(),
+            font_weight: n.font_weight,
+            font_size: n.font_size,
+            line_height: n.line_height,
+            letter_spacing: n.letter_spacing,
+            decoration: n.decoration,
+            text_case: n.text_case,
+        }
+    }
+    pub fn apply(&self, n: &mut Node) {
+        n.font_family = self.font_family.clone();
+        n.font_weight = self.font_weight;
+        n.font_size = self.font_size;
+        n.line_height = self.line_height;
+        n.letter_spacing = self.letter_spacing;
+        n.decoration = self.decoration;
+        n.text_case = self.text_case;
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum StyleValue {
+    Paint(Vec<Paint>),
+    Text(TextStyle),
+    Effect(Vec<Shadow>),
+}
+
+/// A shared style that layers link to; editing it updates every user.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Style {
+    pub id: StyleId,
+    pub name: String,
+    pub value: StyleValue,
+}
+
 /// What sits at the ends of an open path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Marker {
@@ -483,6 +535,11 @@ pub struct Node {
     pub bool_op: BoolOp,
     /// Prototype interactions.
     pub reactions: Vec<Reaction>,
+    /// Linked shared styles.
+    pub fill_style: Option<StyleId>,
+    pub stroke_style: Option<StyleId>,
+    pub text_style: Option<StyleId>,
+    pub effect_style: Option<StyleId>,
     /// Instances: the main component they copy.
     pub component: Option<NodeId>,
     /// Inside an instance (and the instance itself): the component layer this mirrors.
@@ -544,6 +601,10 @@ impl Default for Node {
             absolute: false,
             bool_op: BoolOp::Union,
             reactions: vec![],
+            fill_style: None,
+            stroke_style: None,
+            text_style: None,
+            effect_style: None,
             component: None,
             source: None,
             synced: None,
@@ -712,6 +773,8 @@ pub struct Document {
     /// Embedded images: content hash -> encoded PNG/JPEG bytes (base64 in files).
     #[serde(default, with = "images_b64")]
     pub images: HashMap<String, std::sync::Arc<Vec<u8>>>,
+    #[serde(default)]
+    pub styles: Vec<Style>,
 }
 
 mod images_b64 {
@@ -749,6 +812,7 @@ impl Default for Document {
             nodes: HashMap::new(),
             next_id: 1,
             images: HashMap::new(),
+            styles: vec![],
         }
     }
 }
@@ -947,6 +1011,44 @@ impl Document {
         }
     }
 
+    pub fn style(&self, id: StyleId) -> Option<&Style> {
+        self.styles.iter().find(|s| s.id == id)
+    }
+
+    /// Create a style from a value and return its id.
+    pub fn add_style(&mut self, name: String, value: StyleValue) -> StyleId {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.styles.push(Style { id, name, value });
+        id
+    }
+
+    /// Push style values into every linked layer; links to deleted styles fall away.
+    pub fn apply_styles(&mut self) {
+        if self.styles.is_empty() && self.nodes.values().all(|n| n.fill_style.is_none() && n.stroke_style.is_none() && n.text_style.is_none() && n.effect_style.is_none()) {
+            return;
+        }
+        let styles: HashMap<StyleId, StyleValue> = self.styles.iter().map(|s| (s.id, s.value.clone())).collect();
+        for n in self.nodes.values_mut() {
+            for (link, stroke) in [(&mut n.fill_style, false), (&mut n.stroke_style, true)] {
+                match link.and_then(|id| styles.get(&id)) {
+                    Some(StyleValue::Paint(p)) => {
+                        if stroke { n.strokes = p.clone() } else { n.fills = p.clone() }
+                    }
+                    Some(_) | None => *link = None,
+                }
+            }
+            match n.text_style.and_then(|id| styles.get(&id)) {
+                Some(StyleValue::Text(t)) => t.apply(n),
+                _ => n.text_style = None,
+            }
+            match n.effect_style.and_then(|id| styles.get(&id)) {
+                Some(StyleValue::Effect(e)) => n.shadows = e.clone(),
+                _ => n.effect_style = None,
+            }
+        }
+    }
+
     /// Create an instance of `comp` with its top-left at `at`.
     pub fn instantiate(&mut self, comp: NodeId, page: usize, parent: Option<NodeId>, index: Option<usize>, at: Pos2) -> NodeId {
         let c = self.nodes[&comp].clone();
@@ -1075,6 +1177,7 @@ impl Document {
 
     /// Re-derive everything computed from children: group bounds and auto layout.
     pub fn reflow(&mut self) {
+        self.apply_styles();
         let instances: Vec<NodeId> = self.nodes.values().filter(|n| n.kind == Kind::Instance).map(|n| n.id).collect();
         // ponytail: syncs every instance on every edit; track dirty components when files get large
         for _ in 0..2 {
@@ -1470,7 +1573,8 @@ fn merge_from(e: &mut Node, src: &Node) {
     take!(
         name, visible, opacity, fills, strokes, stroke_width, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, constraints, absolute,
         paths, even_odd, text, font_size, font_weight, font_family, text_sizing, text_align, text_valign, line_height, letter_spacing,
-        decoration, text_case, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions
+        decoration, text_case, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, fill_style,
+        stroke_style, text_style, effect_style
     );
     e.synced = Some(Box::new(Node { children: vec![], synced: None, ..src.clone() }));
 }
@@ -1905,6 +2009,27 @@ mod tests {
         d.distribute(&[c, a, b], true);
         assert_eq!(d.node(b).rect.min.x, 45.0);
         assert_eq!(d.node(c).rect.min.x, 90.0);
+    }
+
+    #[test]
+    fn styles_propagate_and_detach() {
+        let mut d = Document::default();
+        let a = d.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 0., 10., 10.)));
+        let b = d.insert(0, None, None, Node::new(Kind::Ellipse, r(20., 0., 10., 10.)));
+        let red = d.add_style("Brand/Red".into(), StyleValue::Paint(vec![Paint::solid(Rgba::rgb(255, 0, 0))]));
+        d.node_mut(a).fill_style = Some(red);
+        d.node_mut(b).fill_style = Some(red);
+        d.reflow();
+        assert_eq!(d.node(b).fills[0].color, Rgba::rgb(255, 0, 0));
+        // Editing the style updates every user.
+        d.styles[0].value = StyleValue::Paint(vec![Paint::solid(Rgba::rgb(0, 0, 255))]);
+        d.reflow();
+        assert_eq!(d.node(a).fills[0].color, Rgba::rgb(0, 0, 255));
+        // Deleting it leaves the last value and drops the link.
+        d.styles.clear();
+        d.reflow();
+        assert_eq!(d.node(a).fill_style, None);
+        assert_eq!(d.node(a).fills[0].color, Rgba::rgb(0, 0, 255));
     }
 
     #[test]

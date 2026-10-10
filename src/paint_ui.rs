@@ -268,3 +268,65 @@ pub fn shadow_row(ui: &mut Ui, id: egui::Id, s: &mut Shadow) -> (bool, bool) {
     });
     (changed, remove)
 }
+
+pub enum StylePick {
+    Apply(crate::doc::StyleId),
+    Create(String),
+}
+
+/// Small preview of a style's value.
+pub fn style_preview(ui: &mut Ui, v: &crate::doc::StyleValue) {
+    use crate::doc::StyleValue;
+    match v {
+        StyleValue::Paint(p) => {
+            let first = p.last().cloned().unwrap_or_else(|| Paint::solid(Rgba::WHITE));
+            swatch(ui, &first);
+        }
+        StyleValue::Text(t) => {
+            ui.add_sized([20.0, 20.0], egui::Label::new(egui::RichText::new("Ag").size(11.0).strong())).on_hover_text(format!("{} {}", t.font_family, num(t.font_size)));
+        }
+        StyleValue::Effect(_) => {
+            let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+            ui.painter().rect_filled(r.shrink(3.0).translate(vec2(1.0, 2.0)), 3.0, Color32::from_black_alpha(60));
+            ui.painter().rect_filled(r.shrink(3.0), 3.0, Color32::WHITE);
+            ui.painter().rect_stroke(r.shrink(3.0), 3.0, Stroke::new(1.0, Color32::from_gray(0xCC)), StrokeKind::Inside);
+        }
+    }
+}
+
+/// Styles button with a popover: pick an existing style of this kind, or name and create one.
+pub fn style_menu(ui: &mut Ui, id: egui::Id, styles: &[crate::doc::Style], same_kind: impl Fn(&crate::doc::StyleValue) -> bool) -> Option<StylePick> {
+    let mut pick = None;
+    let btn = icon_button(ui, Icon::Styles, false, 22.0, "Styles");
+    Popup::menu(&btn).id(id).close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+        ui.set_width(220.0);
+        ui.label(egui::RichText::new("Local styles").strong());
+        let mut any = false;
+        for s in styles.iter().filter(|s| same_kind(&s.value)) {
+            any = true;
+            ui.horizontal(|ui| {
+                style_preview(ui, &s.value);
+                if ui.add(egui::Button::new(&s.name).frame(false)).clicked() {
+                    pick = Some(StylePick::Apply(s.id));
+                    ui.close();
+                }
+            });
+        }
+        if !any {
+            ui.label(egui::RichText::new("No styles yet").color(Color32::from_gray(0x99)));
+        }
+        ui.separator();
+        let name_id = id.with("new-name");
+        let mut name: String = ui.data(|d| d.get_temp(name_id)).unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut name).hint_text("New style name").desired_width(140.0));
+            if ui.add_enabled(!name.trim().is_empty(), egui::Button::new("Create")).clicked() {
+                pick = Some(StylePick::Create(name.trim().to_string()));
+                name.clear();
+                ui.close();
+            }
+        });
+        ui.data_mut(|d| d.insert_temp(name_id, name));
+    });
+    pick
+}
