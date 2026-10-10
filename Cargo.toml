@@ -9,6 +9,7 @@ description = "A Figma-style design tool written in Rust"
 base64 = "0.23.1"
 eframe = "0.35.0"
 egui = { version = "0.35.0", features = ["serde"] }
+i_overlay = "9.0.1"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 lyon = "1.0.19"
 resvg = "0.48.1"

@@ -437,6 +437,23 @@ fn shots() {
     st.sel = vec![title];
     h.run_steps(5);
     save(&mut h, "9-typography");
+    // Booleans and vector edit mode.
+    let st = h.state_mut();
+    let sq = st.doc.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 380., 120., 120.)));
+    let ci = st.doc.insert(0, None, None, Node::new(Kind::Ellipse, r(60., 320., 120., 120.)));
+    let star = st.doc.insert(0, None, None, Node::new(Kind::Ellipse, r(220., 360., 140., 140.)));
+    st.sel = vec![sq, ci];
+    st.boolean_selection(crate::doc::BoolOp::Subtract);
+    let b = st.sel[0];
+    st.doc.node_mut(b).fills = vec![crate::doc::Paint::solid(crate::doc::Rgba::rgb(13, 153, 255))];
+    st.sel = vec![star];
+    st.enter_vector_edit(star);
+    if let Some(ve) = st.vector_edit.as_mut() {
+        ve.selected = vec![(0, 1)];
+    }
+    st.zoom_to(&egui::Context::default(), None, false);
+    h.run_steps(4);
+    save(&mut h, "10-boolean-vector-edit");
 }
 
 #[test]
@@ -628,4 +645,32 @@ fn paste_svg_and_flatten() {
     let want = Rect::from_center_size(pos2(130., 20.), vec2(2. * hx, 2. * hy));
     assert!((n.rect.min - want.min).length() < 1.0 && (n.rect.max - want.max).length() < 1.0, "{:?} vs {want:?}", n.rect);
     assert!(!h.state().doc.nodes.contains_key(&e));
+}
+
+#[test]
+fn boolean_shortcuts_and_live_updates() {
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    let b = draw(&mut h, Key::O, (50.0, 50.0), (150.0, 150.0));
+    h.state_mut().sel = vec![a, b];
+    key(&mut h, Modifiers::SHIFT | Modifiers::ALT, Key::S);
+    let g = h.state().sel[0];
+    assert_eq!(h.state().doc.node(g).kind, Kind::Boolean);
+    assert_eq!(h.state().doc.node(g).bool_op, crate::doc::BoolOp::Subtract);
+    assert_eq!(rect(&h, g), r(0., 0., 100., 100.), "subtract result keeps the bottom square's bounds");
+    // The bitten corner is empty: clicks pass through.
+    let p = s(&h, -300., 300.);
+    click(&mut h, p, Modifiers::NONE);
+    let p = s(&h, 90., 90.);
+    click(&mut h, p, Modifiers::NONE);
+    assert!(h.state().sel.is_empty());
+    let p = s(&h, 20., 20.);
+    click(&mut h, p, Modifiers::NONE);
+    assert_eq!(h.state().sel, vec![g], "solid area selects the boolean");
+    // Moving an operand updates the result live.
+    h.state_mut().doc.translate(b, vec2(100., 100.));
+    h.state_mut().doc.reflow();
+    let p = s(&h, 90., 90.);
+    click(&mut h, p, Modifiers::NONE);
+    assert_eq!(h.state().sel, vec![g]);
 }

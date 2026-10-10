@@ -1,4 +1,5 @@
 mod app;
+mod boolean;
 mod canvas;
 mod doc;
 mod export;

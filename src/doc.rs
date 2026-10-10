@@ -13,6 +13,8 @@ pub enum Kind {
     Component,
     /// A live copy of a component.
     Instance,
+    /// A live boolean of its children.
+    Boolean,
     Group,
     Rectangle,
     Ellipse,
@@ -26,6 +28,7 @@ impl Kind {
             Kind::Frame => "Frame",
             Kind::Component => "Component",
             Kind::Instance => "Instance",
+            Kind::Boolean => "Boolean",
             Kind::Group => "Group",
             Kind::Rectangle => "Rectangle",
             Kind::Ellipse => "Ellipse",
@@ -34,12 +37,21 @@ impl Kind {
         }
     }
     pub fn is_container(self) -> bool {
-        self.is_frame() || self == Kind::Group
+        self.is_frame() || matches!(self, Kind::Group | Kind::Boolean)
     }
     /// Frames, components, and instances all behave as frames.
     pub fn is_frame(self) -> bool {
         matches!(self, Kind::Frame | Kind::Component | Kind::Instance)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum BoolOp {
+    #[default]
+    Union,
+    Subtract,
+    Intersect,
+    Exclude,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -329,6 +341,7 @@ pub struct Node {
     pub constraints: [Constraint; 2],
     /// Ignores the parent's auto layout.
     pub absolute: bool,
+    pub bool_op: BoolOp,
     /// Instances: the main component they copy.
     pub component: Option<NodeId>,
     /// Inside an instance (and the instance itself): the component layer this mirrors.
@@ -380,6 +393,7 @@ impl Default for Node {
             sizing: [Sizing::Fixed; 2],
             constraints: [Constraint::Min; 2],
             absolute: false,
+            bool_op: BoolOp::Union,
             component: None,
             source: None,
             synced: None,
@@ -419,6 +433,7 @@ impl Node {
                 n.stroke_align = StrokeAlign::Center;
             }
             Kind::Text => n.fills = vec![Paint::solid(Rgba::BLACK)],
+            Kind::Boolean => n.fills = vec![Paint::solid(SHAPE_GRAY)],
             Kind::Group => {}
         }
         n
@@ -712,7 +727,7 @@ impl Document {
         }
         let (kind, mode) = (node.kind, node.layout.mode);
         let kids = node.children.clone();
-        if kind == Kind::Group {
+        if matches!(kind, Kind::Group | Kind::Boolean) {
             for c in kids {
                 let cr = self.nodes[&c].rect;
                 self.set_rect(c, Rect::from_two_pos(map(cr.min), map(cr.max)));
@@ -993,7 +1008,7 @@ impl Document {
         let mut groups: Vec<(usize, NodeId)> = self
             .nodes
             .values()
-            .filter(|n| n.kind == Kind::Group)
+            .filter(|n| matches!(n.kind, Kind::Group | Kind::Boolean))
             .map(|n| (self.ancestors(n.id).len(), n.id))
             .collect();
         groups.sort_by(|a, b| b.0.cmp(&a.0)); // deepest first
@@ -1003,7 +1018,13 @@ impl Document {
                 self.remove(g);
                 continue;
             }
-            let r = kids.iter().fold(Rect::NOTHING, |r, c| r.union(self.nodes[c].aabb()));
+            let r = if self.nodes[&g].kind == Kind::Boolean {
+                let paths = crate::boolean::result(self, g);
+                let b = paths.iter().flat_map(|sp| sp.points.iter()).fold(Rect::NOTHING, |r, pt| r.union(Rect::from_min_size(pt.p, Vec2::ZERO)));
+                if b.is_finite() { b } else { kids.iter().fold(Rect::NOTHING, |r, c| r.union(self.nodes[c].aabb())) }
+            } else {
+                kids.iter().fold(Rect::NOTHING, |r, c| r.union(self.nodes[c].aabb()))
+            };
             self.node_mut(g).rect = r;
         }
     }
@@ -1035,6 +1056,23 @@ impl Document {
         for id in ids {
             self.reparent(id, page, Some(g), None);
         }
+        self.reflow();
+        Some(g)
+    }
+
+    /// Wrap layers in a live boolean group; it takes the bottom layer's paint, like Figma.
+    pub fn boolean(&mut self, ids: &[NodeId], op: BoolOp) -> Option<NodeId> {
+        let g = self.group(ids)?;
+        let bottom = self.nodes[&g].children[0];
+        let b = self.nodes[&bottom].clone();
+        let n = self.node_mut(g);
+        n.kind = Kind::Boolean;
+        n.bool_op = op;
+        n.name = format!("{op:?}");
+        n.fills = if b.fills.is_empty() { vec![Paint::solid(SHAPE_GRAY)] } else { b.fills };
+        n.strokes = b.strokes;
+        n.stroke_width = b.stroke_width;
+        n.expanded = false;
         self.reflow();
         Some(g)
     }
@@ -1126,6 +1164,13 @@ impl Document {
             if n.kind.is_frame() && n.clip && !n.rect.expand(tol).contains(n.to_local(p)) {
                 continue;
             }
+            if n.kind == Kind::Boolean {
+                // Only the result's area is clickable; it resolves to the operand underneath.
+                if !crate::boolean::contains(self, id, p) {
+                    continue;
+                }
+                return self.hit_in(&n.children, p, tol).or(Some(id));
+            }
             if let Some(h) = self.hit_in(&n.children, p, tol) {
                 return Some(h);
             }
@@ -1139,7 +1184,7 @@ impl Document {
     fn hit_self(&self, n: &Node, p: Pos2, tol: f32) -> bool {
         let p = n.to_local(p);
         match n.kind {
-            Kind::Group => false,
+            Kind::Group | Kind::Boolean => false,
             Kind::Frame | Kind::Component | Kind::Instance | Kind::Rectangle | Kind::Text => n.rect.expand(tol).contains(p),
             Kind::Ellipse => {
                 let c = n.rect.center();

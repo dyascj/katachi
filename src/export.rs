@@ -144,6 +144,30 @@ impl Svg<'_> {
         }
     }
 
+    /// Paint a standalone vector (no children), e.g. a boolean's result.
+    fn node_like(&mut self, v: &Node) {
+        let o = self.o;
+        let wrap = v.opacity < 1.0;
+        if wrap {
+            let _ = write!(self.out, r#"<g opacity="{:.3}">"#, v.opacity);
+        }
+        let shadow = self.open_shadows(v);
+        for f in v.fills.iter().filter(|f| f.visible) {
+            let a = self.paint("fill", f, v);
+            self.out.push_str(&shape(v, o, 0.0, &a));
+        }
+        for s in v.strokes.iter().filter(|s| s.visible) {
+            let attrs = format!(r#"fill="none" {} stroke-width="{}""#, self.paint("stroke", s, v), v.stroke_width);
+            self.out.push_str(&shape(v, o, 0.0, &attrs));
+        }
+        if shadow {
+            self.out.push_str("</g>");
+        }
+        if wrap {
+            self.out.push_str("</g>");
+        }
+    }
+
     /// Opens a drop-shadow filter group if the layer has shadows. Returns whether it did.
     fn open_shadows(&mut self, n: &Node) -> bool {
         let shadows: Vec<Shadow> = n.shadows.iter().filter(|s| s.visible).copied().collect();
@@ -187,6 +211,13 @@ impl Svg<'_> {
         let doc = self.doc;
         let n = doc.node(id);
         if !n.visible {
+            return;
+        }
+        if n.kind == Kind::Boolean {
+            // Export the computed result as one path; operands stay internal.
+            if let Some(v) = crate::boolean::as_vector(doc, id) {
+                self.node_like(&v);
+            }
             return;
         }
         let o = self.o;

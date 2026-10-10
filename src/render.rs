@@ -251,6 +251,14 @@ fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
     let screen = v.rect_to_screen(n.aabb());
     let a = alpha * n.opacity;
     let reach = n.stroke_width.max(n.shadows.iter().map(|s| s.blur + s.spread + s.offset.length()).fold(0.0, f32::max));
+    if n.kind == Kind::Boolean {
+        // Operands aren't drawn themselves; the result carries the paint.
+        if let Some(r) = crate::boolean::as_vector(sc.doc, id) {
+            draw_shadows(painter, &r, &v, alpha);
+            draw_content(painter, sc, &r, a);
+        }
+        return;
+    }
     if Some(id) != sc.hide && painter.clip_rect().intersects(screen.expand(reach * v.zoom + 2.0)) {
         draw_shadows(painter, n, &v, a);
         draw_content(painter, sc, n, a);

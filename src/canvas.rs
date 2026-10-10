@@ -1070,6 +1070,22 @@ impl App {
             self.group_selection(false);
             ui.close();
         }
+        let multi = self.sel_roots().len() > 1 || self.sel.iter().any(|&s| self.doc.node(s).kind == Kind::Boolean);
+        ui.add_enabled_ui(multi, |ui| {
+            ui.menu_button("Boolean", |ui| {
+                for (op, short) in [
+                    (crate::doc::BoolOp::Union, "⌥⇧U"),
+                    (crate::doc::BoolOp::Subtract, "⌥⇧S"),
+                    (crate::doc::BoolOp::Intersect, "⌥⇧I"),
+                    (crate::doc::BoolOp::Exclude, "⌥⇧E"),
+                ] {
+                    if ui.add(egui::Button::new(format!("{op:?} selection")).shortcut_text(short)).clicked() {
+                        self.boolean_selection(op);
+                        ui.close();
+                    }
+                }
+            });
+        });
         if item(ui, "Flatten", "⌘E", has) {
             self.flatten_selection();
             ui.close();

@@ -1,6 +1,6 @@
 //! App state, document actions, undo, clipboard, files, and keyboard shortcuts.
 
-use crate::doc::{AutoLayout, Document, Kind, LayoutMode, Node, NodeId, Order, Sizing};
+use crate::doc::{AutoLayout, BoolOp, Document, Kind, LayoutMode, Node, NodeId, Order, Sizing};
 use crate::render::View;
 use egui::{Event, Key, Modifiers, Pos2, Rect, Vec2, vec2};
 use std::path::PathBuf;
@@ -275,6 +275,30 @@ impl App {
                 *n = Node { id: n.id, parent: n.parent, children: n.children.clone(), name, ..Node::new(Kind::Frame, r) };
             }
             self.sel = vec![g];
+        }
+    }
+
+    /// Combine the selection into a live boolean, or change the op of a selected boolean.
+    pub fn boolean_selection(&mut self, op: BoolOp) {
+        let roots = self.sel_roots();
+        match roots.as_slice() {
+            [] => {}
+            [one] if self.doc.node(*one).kind == Kind::Boolean => {
+                self.checkpoint();
+                let n = self.doc.node_mut(*one);
+                n.bool_op = op;
+                if ["Union", "Subtract", "Intersect", "Exclude"].contains(&n.name.as_str()) {
+                    n.name = format!("{op:?}");
+                }
+                self.doc.reflow();
+            }
+            [_] => {}
+            many => {
+                self.checkpoint();
+                if let Some(b) = self.doc.boolean(many, op) {
+                    self.sel = vec![b];
+                }
+            }
         }
     }
 
@@ -847,6 +871,10 @@ impl App {
             (true, true, false, Key::G) => self.ungroup_selection(),
             (true, true, false, Key::H) => self.toggle_visible(),
             (true, true, false, Key::L) => self.toggle_locked(),
+            (false, true, true, Key::U) => self.boolean_selection(BoolOp::Union),
+            (false, true, true, Key::S) => self.boolean_selection(BoolOp::Subtract),
+            (false, true, true, Key::I) => self.boolean_selection(BoolOp::Intersect),
+            (false, true, true, Key::E) => self.boolean_selection(BoolOp::Exclude),
             (false, true, false, Key::A) => self.add_auto_layout(),
             (false, true, true, Key::A) => self.remove_auto_layout(),
             (true, false, false, Key::CloseBracket) => self.reorder_selection(Order::Forward),

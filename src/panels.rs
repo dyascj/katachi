@@ -38,6 +38,7 @@ pub enum Icon {
     Rotate,
     Component,
     Instance,
+    Boolean,
 }
 
 const SUBTLE: Color32 = Color32::from_rgb(0xF5, 0xF5, 0xF5);
@@ -226,6 +227,10 @@ pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
             let d = 5.5;
             p.add(Shape::closed_line(vec![at(0., -d), at(d, 0.), at(0., d), at(-d, 0.)], s));
         }
+        Icon::Boolean => {
+            p.rect_stroke(Rect::from_min_size(at(-6., -6.), vec2(8., 8.)), 1.0, s, StrokeKind::Middle);
+            p.rect_filled(Rect::from_min_size(at(-2., -2.), vec2(8., 8.)), 1.0, color);
+        }
         Icon::Menu => {
             for y in [-4., 0., 4.] {
                 p.line_segment([at(-6., y), at(6., y)], s);
@@ -260,6 +265,7 @@ fn kind_icon(k: Kind) -> Icon {
         Kind::Frame => Icon::Frame,
         Kind::Component => Icon::Component,
         Kind::Instance => Icon::Instance,
+        Kind::Boolean => Icon::Boolean,
         Kind::Group => Icon::Group,
         Kind::Rectangle => Icon::Rect,
         Kind::Ellipse => Icon::Ellipse,
@@ -806,6 +812,18 @@ impl App {
         let first = self.sel[0];
         let n = self.doc.node(first).clone();
         self.component_section(ui, first);
+        let is_bool = roots.len() == 1 && n.kind == Kind::Boolean;
+        if roots.len() > 1 || is_bool {
+            ui.horizontal(|ui| {
+                for op in [crate::doc::BoolOp::Union, crate::doc::BoolOp::Subtract, crate::doc::BoolOp::Intersect, crate::doc::BoolOp::Exclude] {
+                    let on = is_bool && n.bool_op == op;
+                    if ui.selectable_label(on, format!("{op:?}")).on_hover_text(format!("{op:?} selection")).clicked() {
+                        self.boolean_selection(op);
+                    }
+                }
+            });
+            ui.separator();
+        }
         self.position_section(ui, &roots);
         ui.separator();
         self.layout_section(ui, &roots);
