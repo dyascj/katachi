@@ -90,7 +90,7 @@ GitHub Actions. Building from source needs Rust 1.92 or newer.
 - Tools: `get_metadata` (XML outline), `get_screenshot`, `get_code` (CSS, SwiftUI, Compose), `get_variable_defs`, `get_components`, `get_selection`, `execute_code` (Figma plugin-API JavaScript, one undo step per call), `list_pages`, `set_page`, `select`, `import_svg`, `place_image`, `save`, `open_file`, `undo`
 
 **Plugins**
-- Run Figma plugins: Main menu > Plugins > Development > Import plugin from manifest. Plugins use the core of Figma's plugin API (`figma.currentPage`, selection, `findAll`, `create*`, fills, text, `notify`, `clientStorage`, `figma.on("selectionchange")`, async), and plugin UIs (`figma.showUI`) open in a panel with Figma's `postMessage` messaging (macOS and Windows). Each change a plugin makes is one undo step
+- Run Figma plugins: Main menu > Plugins > Development > Import plugin from manifest. Plugins use the core of Figma's plugin API (`figma.currentPage`, selection, `findAll`, `create*`, fills, text, `notify`, `clientStorage`, `figma.on("selectionchange")`, async), and plugin UIs (`figma.showUI`) open in a panel with Figma's `postMessage` messaging (on Linux they open in your browser, connected the same way). Each change a plugin makes is one undo step
 - Plugins > Development > Run script for quick one-off scripts; see `examples/plugins/tidy-names` and `examples/plugins/shape-maker`
 
 | Auto layout | Components and variants |

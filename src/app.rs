@@ -1444,7 +1444,9 @@ impl App {
             }
         }
         // The panel: a title bar drawn by egui, the plugin's HTML in a native webview below it.
-        let size = vec2(run.ui.width, run.ui.height);
+        // A UI in a browser tab gets just a title bar here.
+        let in_window = run.view.as_ref().is_none_or(|v| v.in_window());
+        let size = if in_window { vec2(run.ui.width, run.ui.height) } else { vec2(run.ui.width.max(260.0), 30.0) };
         let canvas = self.canvas_rect.unwrap_or(ctx.content_rect());
         let pos = *run.pos.get_or_insert(egui::pos2(canvas.max.x - size.x - 16.0, canvas.min.y + 16.0));
         let title = 30.0;
@@ -1463,7 +1465,18 @@ impl App {
                     ui.painter().line_segment([r.right_top(), r.left_bottom()], s);
                     close = xr.clicked();
                     drag = resp.drag_delta();
-                    ui.allocate_exact_size(size, egui::Sense::hover());
+                    if in_window {
+                        ui.allocate_exact_size(size, egui::Sense::hover());
+                    } else if let Some(url) = run.view.as_ref().and_then(|v| v.url()) {
+                        ui.horizontal(|ui| {
+                            ui.add_space(12.0);
+                            ui.label("The plugin's window is open in your browser.");
+                            if ui.link("Reopen").clicked() {
+                                crate::plugin_view::open_url(url);
+                            }
+                        });
+                        ui.add_space(8.0);
+                    }
                 });
             });
         }
