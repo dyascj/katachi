@@ -2,7 +2,8 @@
 
 use crate::app::{Align, App, Tool};
 use crate::canvas::{BLUE, num};
-use crate::doc::{Kind, NodeId, Page, Paint, SHAPE_GRAY, StrokeAlign};
+use crate::doc::{Kind, NodeId, Page, Paint, Rgba, SHAPE_GRAY, Shadow, StrokeAlign};
+use crate::paint_ui::{PaintEvent, hex_field, paint_row, shadow_row};
 use egui::{
     Color32, CornerRadius, DragValue, FontId, Painter, Pos2, Rect, Response, RichText, Sense, Shape, Stroke, StrokeKind,
     Ui, pos2, vec2,
@@ -203,66 +204,6 @@ fn heading(ui: &mut Ui, title: &str) {
     ui.add_space(4.0);
     ui.label(RichText::new(title).strong());
     ui.add_space(2.0);
-}
-
-fn parse_hex(s: &str) -> Option<Color32> {
-    let s = s.trim().trim_start_matches('#');
-    let s = match s.len() {
-        3 => s.chars().flat_map(|c| [c, c]).collect(),
-        6 => s.to_string(),
-        _ => return None,
-    };
-    let v = u32::from_str_radix(&s, 16).ok()?;
-    Some(Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8))
-}
-
-/// Hex text field that commits on Enter / focus loss.
-fn hex_field(ui: &mut Ui, id: egui::Id, color: &mut Color32) -> bool {
-    let [r, g, b, a] = color.to_srgba_unmultiplied();
-    let current = format!("{r:02X}{g:02X}{b:02X}");
-    let mut buf = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or(current);
-    let resp = ui.add(egui::TextEdit::singleline(&mut buf).id(id).desired_width(56.0).font(FontId::monospace(11.0)));
-    let mut changed = false;
-    if resp.lost_focus() {
-        if let Some(c) = parse_hex(&buf) {
-            *color = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a);
-            changed = true;
-        }
-        ui.data_mut(|d| d.remove::<String>(id));
-    } else if resp.has_focus() {
-        ui.data_mut(|d| d.insert_temp(id, buf));
-    } else {
-        ui.data_mut(|d| d.remove::<String>(id));
-    }
-    changed
-}
-
-/// One fill/stroke row. Returns (changed, remove).
-fn paint_row(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> (bool, bool) {
-    let mut changed = false;
-    let mut remove = false;
-    ui.horizontal(|ui| {
-        let mut c = paint.color;
-        if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::OnlyBlend).changed() {
-            paint.color = c;
-            changed = true;
-        }
-        changed |= hex_field(ui, id, &mut paint.color);
-        let [r, g, b, a] = paint.color.to_srgba_unmultiplied();
-        let mut pct = (a as f32 / 255.0 * 100.0).round();
-        if ui.add(DragValue::new(&mut pct).range(0.0..=100.0).suffix("%").speed(0.5)).changed() {
-            paint.color = Color32::from_rgba_unmultiplied(r, g, b, (pct / 100.0 * 255.0).round() as u8);
-            changed = true;
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            remove = icon_button(ui, Icon::Minus, false, 22.0, "Remove").clicked();
-            if icon_button(ui, Icon::Eye(paint.visible), false, 22.0, "Toggle visibility").clicked() {
-                paint.visible = !paint.visible;
-                changed = true;
-            }
-        });
-    });
-    (changed, remove)
 }
 
 impl App {
@@ -598,15 +539,15 @@ impl App {
 
     fn page_props(&mut self, ui: &mut Ui) {
         heading(ui, "Page");
-        let mut bg = Paint::solid(self.doc.pages[self.page].background);
+        let mut bg = self.doc.pages[self.page].background;
         ui.horizontal(|ui| {
-            let mut c = bg.color;
-            let mut changed = egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::Opaque).changed();
-            changed |= hex_field(ui, ui.id().with("page-bg"), &mut c);
+            let mut c = [bg.0[0], bg.0[1], bg.0[2]];
+            let mut changed = egui::color_picker::color_edit_button_srgb(ui, &mut c).changed();
+            bg = Rgba::rgb(c[0], c[1], c[2]);
+            changed |= hex_field(ui, ui.id().with("page-bg"), &mut bg, 56.0);
             if changed {
-                bg.color = c;
                 self.begin_edit();
-                self.doc.pages[self.page].background = bg.color;
+                self.doc.pages[self.page].background = bg;
             }
         });
     }
@@ -767,6 +708,8 @@ impl App {
             ui.separator();
             self.paints_section(ui, true);
         }
+        ui.separator();
+        self.effects_section(ui);
     }
 
     fn paints_section(&mut self, ui: &mut Ui, stroke: bool) {
@@ -776,8 +719,8 @@ impl App {
         let mut changed = false;
         if section_title(ui, if stroke { "Stroke" } else { "Fill" }) {
             let c = match (stroke, n.kind) {
-                (true, _) | (false, Kind::Text) => Color32::BLACK,
-                (false, Kind::Frame) => Color32::WHITE,
+                (true, _) | (false, Kind::Text) => Rgba::BLACK,
+                (false, Kind::Frame) => Rgba::WHITE,
                 _ => SHAPE_GRAY,
             };
             paints.push(Paint::solid(c));
@@ -787,10 +730,14 @@ impl App {
         // Topmost paint first, as in Figma.
         for i in (0..paints.len()).rev() {
             let id = ui.id().with((stroke, i, first));
-            let (c, r) = paint_row(ui, id, &mut paints[i]);
-            changed |= c;
-            if r {
-                remove = Some(i);
+            match paint_row(ui, id, &mut paints[i]) {
+                PaintEvent::None => {}
+                PaintEvent::Changed => changed = true,
+                PaintEvent::Remove => remove = Some(i),
+                PaintEvent::Image(bytes) => {
+                    paints[i].image = self.add_image(bytes);
+                    changed = true;
+                }
             }
         }
         if let Some(i) = remove {
@@ -831,6 +778,34 @@ impl App {
                 } else {
                     t.fills = paints.clone();
                 }
+            }
+        }
+    }
+
+    fn effects_section(&mut self, ui: &mut Ui) {
+        let first = self.sel[0];
+        let mut shadows = self.doc.node(first).shadows.clone();
+        let mut changed = false;
+        if section_title(ui, "Effects") {
+            shadows.push(Shadow::default());
+            changed = true;
+        }
+        let mut remove = None;
+        for i in (0..shadows.len()).rev() {
+            let (c, r) = shadow_row(ui, ui.id().with(("shadow", i, first)), &mut shadows[i]);
+            changed |= c;
+            if r {
+                remove = Some(i);
+            }
+        }
+        if let Some(i) = remove {
+            shadows.remove(i);
+            changed = true;
+        }
+        if changed {
+            self.begin_edit();
+            for &id in &self.sel.clone() {
+                self.doc.node_mut(id).shadows = shadows.clone();
             }
         }
     }

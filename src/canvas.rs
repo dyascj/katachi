@@ -19,7 +19,7 @@ pub fn num(v: f32) -> String {
 impl App {
     pub fn canvas_panel(&mut self, ui: &mut Ui) {
         let bg = self.doc.pages[self.page].background;
-        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(bg)).show(ui, |ui| self.canvas(ui));
+        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(bg.to32())).show(ui, |ui| self.canvas(ui));
     }
 
     fn canvas(&mut self, ui: &mut Ui) {
@@ -59,9 +59,12 @@ impl App {
             self.view.pan += scroll;
         }
 
-        render::draw_page(&painter, &self.doc, self.page, &self.view, self.editing_text);
+        let mut scene = render::Scene { doc: &self.doc, view: self.view, hide: self.editing_text, tex: &mut self.textures };
+        render::draw_page(&painter, &mut scene, self.page);
+        self.textures.end_frame();
         self.layout_frame_labels(&painter);
 
+        self.accept_drops(ui, hover_pos.filter(|p| rect.contains(*p)).unwrap_or(rect.center()));
         let ptr = resp.interact_pointer_pos().or(hover_pos);
         let world = ptr.map(|p| self.view.to_world(p));
         let panning = self.tool == Tool::Hand || (space && !typing) || mid || matches!(self.drag, Some(Drag::Pan));
@@ -119,6 +122,47 @@ impl App {
         self.set_cursor(ui, ptr, panning);
         self.toolbar(ui.ctx(), rect);
         self.draw_toast(&painter, rect);
+    }
+
+    /// Image files dropped on the canvas become image-filled rectangles at natural size.
+    fn accept_drops(&mut self, ui: &Ui, at: Pos2) {
+        let files = ui.input(|i| i.raw.dropped_files.clone());
+        let mut placed = vec![];
+        let mut offset = 0.0;
+        for f in files {
+            let bytes = match (&f.bytes, &f.path) {
+                (Some(b), _) => b.to_vec(),
+                (None, Some(p)) => match std::fs::read(p) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                },
+                _ => continue,
+            };
+            let Ok(img) = image::load_from_memory(&bytes) else {
+                self.toast(format!("Can't import {}", f.name));
+                continue;
+            };
+            if placed.is_empty() {
+                self.checkpoint();
+            }
+            let size = vec2(img.width() as f32, img.height() as f32);
+            let key = self.add_image(bytes);
+            let w = self.view.to_world(at) + vec2(offset, offset);
+            let mut n = Node::new(Kind::Rectangle, Rect::from_center_size(w.round(), size));
+            let mut p = crate::doc::Paint::solid(crate::doc::Rgba::WHITE);
+            p.convert(crate::doc::PaintKind::Image);
+            p.image = key;
+            n.fills = vec![p];
+            let stem = f.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned());
+            n.name = stem.unwrap_or_else(|| f.name.clone());
+            let parent = self.frame_at(w, &[]);
+            placed.push(self.doc.insert(self.page, parent, None, n));
+            offset += 20.0;
+        }
+        if !placed.is_empty() {
+            self.sel = placed;
+            self.tool = Tool::Move;
+        }
     }
 
     /// Auto-width text: the box always hugs its content.
@@ -793,7 +837,7 @@ impl App {
             return;
         };
         let font = FontId::new(n.font_size * self.view.zoom, render::font_family(n.font_weight));
-        let color = n.first_fill().unwrap_or(Color32::BLACK);
+        let color = n.first_fill().map_or(Color32::BLACK, |c| c.to32());
         let mut text = n.text.clone();
         let width = render::measure_text(painter, &n).x * self.view.zoom + n.font_size * self.view.zoom;
         let out = egui::Area::new(egui::Id::new("canvas-text-edit"))

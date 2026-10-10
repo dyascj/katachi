@@ -2,6 +2,7 @@ mod app;
 mod canvas;
 mod doc;
 mod export;
+mod paint_ui;
 mod panels;
 mod render;
 #[cfg(test)]

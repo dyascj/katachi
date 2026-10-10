@@ -375,6 +375,37 @@ fn shots() {
     h.state_mut().sel = vec![card];
     h.run_steps(3);
     save(&mut h, "4-rotated");
+    // Paints and effects: gradient hero, shadowed card, radial avatar, image tile.
+    use crate::doc::{Paint, PaintKind, Rgba, Shadow};
+    let st = h.state_mut();
+    st.undo();
+    let ids: Vec<NodeId> = st.doc.nodes.keys().copied().collect();
+    let find = |st: &App, name: &str| *ids.iter().find(|i| st.doc.node(**i).name == name).unwrap();
+    let (hero, card, avatar) = (find(st, "Hero"), find(st, "Card"), find(st, "Avatar"));
+    let mut g = Paint::solid(Rgba::rgb(13, 153, 255));
+    g.convert(PaintKind::Linear);
+    g.stops = vec![(0.0, Rgba::rgb(13, 153, 255)), (1.0, Rgba::rgb(151, 71, 255))];
+    g.from = pos2(0.0, 0.5);
+    g.to = pos2(1.0, 0.5);
+    st.doc.node_mut(hero).fills = vec![g];
+    st.doc.node_mut(card).shadows = vec![Shadow { blur: 24.0, offset: vec2(0., 12.), color: Rgba([0, 0, 0, 90]), ..Default::default() }];
+    let mut rg = Paint::solid(Rgba::rgb(255, 199, 0));
+    rg.convert(PaintKind::Radial);
+    st.doc.node_mut(avatar).fills = vec![rg];
+    let mut buf = std::io::Cursor::new(vec![]);
+    image::RgbaImage::from_fn(64, 64, |x, y| image::Rgba([(x * 4) as u8, (y * 4) as u8, 180, 255])).write_to(&mut buf, image::ImageFormat::Png).unwrap();
+    let key = st.add_image(buf.into_inner());
+    let mut ip = Paint::solid(Rgba::WHITE);
+    ip.convert(PaintKind::Image);
+    ip.image = key;
+    let mut tile = Node::new(Kind::Rectangle, r(0., 360., 160., 100.));
+    tile.fills = vec![ip];
+    tile.radius = 12.0;
+    let t = st.doc.insert(0, None, None, tile);
+    st.sel = vec![card];
+    let _ = t;
+    h.run_steps(3);
+    save(&mut h, "5-paints");
 }
 
 #[test]
@@ -394,4 +425,25 @@ fn rotate_by_corner_drag_and_resize_rotated() {
     let n = h.state().doc.node(id);
     assert_eq!(n.rect.size(), vec2(150., 100.), "{:?}", n.rect);
     assert_eq!(n.aabb(), r(0., -50., 100., 150.), "bottom edge stays planted");
+}
+
+#[test]
+fn dropping_an_image_file_creates_an_image_layer() {
+    let mut h = harness();
+    let mut buf = std::io::Cursor::new(vec![]);
+    image::RgbaImage::from_pixel(40, 30, image::Rgba([0, 200, 0, 255])).write_to(&mut buf, image::ImageFormat::Png).unwrap();
+    let p = s(&h, 0., 0.);
+    move_to(&mut h, p, Modifiers::NONE);
+    h.input_mut().dropped_files.push(egui::DroppedFile {
+        name: "leaf.png".into(),
+        bytes: Some(buf.into_inner().into()),
+        ..Default::default()
+    });
+    h.run_steps(2);
+    let id = h.state().sel[0];
+    let n = h.state().doc.node(id);
+    assert_eq!(n.rect, r(-20., -15., 40., 30.));
+    assert_eq!(n.fills[0].kind, crate::doc::PaintKind::Image);
+    assert_eq!(h.state().doc.images.len(), 1);
+    assert_eq!(n.name, "leaf.png");
 }

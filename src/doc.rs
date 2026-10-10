@@ -47,15 +47,139 @@ pub struct PathPoint {
     pub h_out: Vec2,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// Unmultiplied sRGBA. Unlike egui's premultiplied `Color32`, a 0% opacity color keeps its hue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Rgba(pub [u8; 4]);
+
+impl Rgba {
+    pub const BLACK: Rgba = Rgba([0, 0, 0, 255]);
+    pub const WHITE: Rgba = Rgba([255, 255, 255, 255]);
+
+    pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
+        Rgba([r, g, b, 255])
+    }
+    pub fn to32(self) -> Color32 {
+        let [r, g, b, a] = self.0;
+        Color32::from_rgba_unmultiplied(r, g, b, a)
+    }
+    pub fn a(self) -> u8 {
+        self.0[3]
+    }
+    pub fn with_alpha(self, a: u8) -> Self {
+        Rgba([self.0[0], self.0[1], self.0[2], a])
+    }
+    pub fn hex(self) -> String {
+        format!("{:02X}{:02X}{:02X}", self.0[0], self.0[1], self.0[2])
+    }
+    pub fn lerp(self, o: Rgba, t: f32) -> Rgba {
+        Rgba(std::array::from_fn(|i| (self.0[i] as f32 + (o.0[i] as f32 - self.0[i] as f32) * t).round() as u8))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PaintKind {
+    #[default]
+    Solid,
+    Linear,
+    Radial,
+    Image,
+}
+
+/// A fill or stroke paint. For gradients and images, `color`'s alpha is the paint opacity.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Paint {
-    pub color: Color32,
+    pub color: Rgba,
     pub visible: bool,
+    #[serde(default)]
+    pub kind: PaintKind,
+    /// Gradient stops: position in 0..=1 and color.
+    #[serde(default)]
+    pub stops: Vec<(f32, Rgba)>,
+    /// Gradient handles in the layer's unit square: linear start/end, or radial center/edge.
+    #[serde(default)]
+    pub from: Pos2,
+    #[serde(default)]
+    pub to: Pos2,
+    /// Key into `Document::images`.
+    #[serde(default)]
+    pub image: String,
 }
 
 impl Paint {
-    pub fn solid(color: Color32) -> Self {
-        Self { color, visible: true }
+    pub fn solid(color: Rgba) -> Self {
+        Self { color, visible: true, kind: PaintKind::Solid, stops: vec![], from: Pos2::ZERO, to: Pos2::ZERO, image: String::new() }
+    }
+
+    /// Switch kind, seeding Figma's defaults from the current color.
+    pub fn convert(&mut self, kind: PaintKind) {
+        if kind == self.kind {
+            return;
+        }
+        let a = self.color.a();
+        let base = if self.kind == PaintKind::Solid { self.color.with_alpha(255) } else { self.stops.first().map_or(Rgba::BLACK, |s| s.1) };
+        match kind {
+            PaintKind::Solid => self.color = base.with_alpha(a),
+            PaintKind::Linear | PaintKind::Radial => {
+                if self.stops.len() < 2 {
+                    self.stops = vec![(0.0, base), (1.0, base.with_alpha(0))];
+                }
+                (self.from, self.to) = if kind == PaintKind::Linear {
+                    (pos2(0.5, 0.0), pos2(0.5, 1.0))
+                } else {
+                    (pos2(0.5, 0.5), pos2(1.0, 0.5))
+                };
+                self.color = Rgba::WHITE.with_alpha(a);
+            }
+            PaintKind::Image => self.color = Rgba::WHITE.with_alpha(a),
+        }
+        self.kind = kind;
+    }
+
+    /// Paint opacity in 0..=1.
+    pub fn alpha(&self) -> f32 {
+        self.color.a() as f32 / 255.0
+    }
+
+    /// Gradient color at `t`, interpolated in unmultiplied sRGB like Figma.
+    pub fn sample(&self, t: f32) -> Rgba {
+        let stops = &self.stops;
+        let Some(first) = stops.first() else { return Rgba([0, 0, 0, 0]) };
+        if t <= first.0 {
+            return first.1;
+        }
+        for w in stops.windows(2) {
+            if t <= w[1].0 {
+                let span = (w[1].0 - w[0].0).max(1e-6);
+                return w[0].1.lerp(w[1].1, (t - w[0].0) / span);
+            }
+        }
+        stops.last().unwrap().1
+    }
+
+    /// Gradient parameter for a point in the layer's unit square.
+    pub fn gradient_t(&self, p: Pos2) -> f32 {
+        let d = self.to - self.from;
+        match self.kind {
+            PaintKind::Radial => (p - self.from).length() / d.length().max(1e-6),
+            _ => (p - self.from).dot(d) / d.length_sq().max(1e-6),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Shadow {
+    pub color: Rgba,
+    pub offset: Vec2,
+    pub blur: f32,
+    pub spread: f32,
+    pub visible: bool,
+}
+
+impl Default for Shadow {
+    /// Figma's default drop shadow.
+    fn default() -> Self {
+        Self { color: Rgba([0, 0, 0, 64]), offset: vec2(0.0, 4.0), blur: 4.0, spread: 0.0, visible: true }
     }
 }
 
@@ -79,6 +203,7 @@ pub struct Node {
     pub stroke_align: StrokeAlign,
     pub radius: f32,
     pub clip: bool,
+    pub shadows: Vec<Shadow>,
     pub points: Vec<PathPoint>,
     pub closed: bool,
     pub text: String,
@@ -106,6 +231,7 @@ impl Default for Node {
             stroke_align: StrokeAlign::Inside,
             radius: 0.0,
             clip: false,
+            shadows: vec![],
             points: vec![],
             closed: false,
             text: String::new(),
@@ -116,7 +242,7 @@ impl Default for Node {
     }
 }
 
-pub const SHAPE_GRAY: Color32 = Color32::from_rgb(0xD9, 0xD9, 0xD9);
+pub const SHAPE_GRAY: Rgba = Rgba::rgb(0xD9, 0xD9, 0xD9);
 
 impl Node {
     /// A node with Figma's defaults for its kind.
@@ -124,15 +250,15 @@ impl Node {
         let mut n = Node { kind, rect, ..Default::default() };
         match kind {
             Kind::Frame => {
-                n.fills = vec![Paint::solid(Color32::WHITE)];
+                n.fills = vec![Paint::solid(Rgba::WHITE)];
                 n.clip = true;
             }
             Kind::Rectangle | Kind::Ellipse => n.fills = vec![Paint::solid(SHAPE_GRAY)],
             Kind::Vector => {
-                n.strokes = vec![Paint::solid(Color32::BLACK)];
+                n.strokes = vec![Paint::solid(Rgba::BLACK)];
                 n.stroke_align = StrokeAlign::Center;
             }
-            Kind::Text => n.fills = vec![Paint::solid(Color32::BLACK)],
+            Kind::Text => n.fills = vec![Paint::solid(Rgba::BLACK)],
             Kind::Group => {}
         }
         n
@@ -192,8 +318,8 @@ impl Node {
         rotate(p, self.rect.center(), -self.rotation)
     }
 
-    pub fn first_fill(&self) -> Option<Color32> {
-        self.fills.iter().rev().find(|p| p.visible).map(|p| p.color)
+    pub fn first_fill(&self) -> Option<Rgba> {
+        self.fills.iter().rev().find(|p| p.visible && p.kind == PaintKind::Solid).map(|p| p.color)
     }
 }
 
@@ -201,16 +327,39 @@ impl Node {
 pub struct Page {
     pub name: String,
     pub children: Vec<NodeId>,
-    pub background: Color32,
+    pub background: Rgba,
 }
 
-pub const PAGE_BG: Color32 = Color32::from_rgb(0xF5, 0xF5, 0xF5);
+pub const PAGE_BG: Rgba = Rgba::rgb(0xF5, 0xF5, 0xF5);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Document {
     pub pages: Vec<Page>,
     pub nodes: HashMap<NodeId, Node>,
     pub next_id: NodeId,
+    /// Embedded images: content hash -> encoded PNG/JPEG bytes (base64 in files).
+    #[serde(default, with = "images_b64")]
+    pub images: HashMap<String, std::sync::Arc<Vec<u8>>>,
+}
+
+mod images_b64 {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    pub fn serialize<S: Serializer>(m: &HashMap<String, Arc<Vec<u8>>>, s: S) -> Result<S::Ok, S::Error> {
+        let enc: HashMap<&String, String> = m.iter().map(|(k, v)| (k, STANDARD.encode(v.as_slice()))).collect();
+        enc.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<HashMap<String, Arc<Vec<u8>>>, D::Error> {
+        let enc = HashMap::<String, String>::deserialize(d)?;
+        enc.into_iter()
+            .map(|(k, v)| STANDARD.decode(v).map(|b| (k, Arc::new(b))).map_err(serde::de::Error::custom))
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,6 +376,7 @@ impl Default for Document {
             pages: vec![Page { name: "Page 1".into(), children: vec![], background: PAGE_BG }],
             nodes: HashMap::new(),
             next_id: 1,
+            images: HashMap::new(),
         }
     }
 }
@@ -742,6 +892,30 @@ mod tests {
         assert_eq!(d.node(a).rotation, 180.0);
         assert_eq!(d.node(g).rotation, 0.0);
         assert!((d.node(g).rect.width() - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn gradients_sample_and_convert() {
+        let mut p = Paint::solid(Rgba::rgb(255, 0, 0));
+        p.convert(PaintKind::Linear);
+        assert_eq!(p.stops[0].1, Rgba::rgb(255, 0, 0));
+        assert_eq!(p.sample(0.5), Rgba([255, 0, 0, 128]), "fades without darkening");
+        assert_eq!(p.sample(1.0).a(), 0);
+        assert_eq!(p.gradient_t(pos2(0.3, 0.5)), 0.5, "top-to-bottom by default");
+        p.convert(PaintKind::Radial);
+        assert_eq!(p.gradient_t(pos2(0.5, 0.0)), 1.0);
+        p.convert(PaintKind::Solid);
+        assert_eq!(p.color, Rgba::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn images_roundtrip_through_json() {
+        let mut d = Document::default();
+        d.images.insert("abc".into(), std::sync::Arc::new(vec![1, 2, 3, 250]));
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains("AQID+g=="), "{json}");
+        let back: Document = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.images["abc"].as_slice(), &[1, 2, 3, 250]);
     }
 
     #[test]

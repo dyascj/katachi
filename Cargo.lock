@@ -1660,6 +1660,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -1786,9 +1788,11 @@ dependencies = [
 name = "katachi"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "eframe",
  "egui",
  "egui_kittest",
+ "image",
  "lyon",
  "resvg",
  "rfd",

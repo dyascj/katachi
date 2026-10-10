@@ -85,6 +85,7 @@ pub struct App {
     pub frame_labels: Vec<(NodeId, Rect)>,
     pub layer_drag: Option<NodeId>,
     pub canvas_rect: Option<Rect>,
+    pub textures: crate::render::Textures,
     /// Top-level frame pressed on its empty area: selected on click, marquee on drag.
     pub pending_frame: Option<NodeId>,
     undo: Vec<Document>,
@@ -123,6 +124,7 @@ impl App {
             frame_labels: vec![],
             layer_drag: None,
             canvas_rect: None,
+            textures: Default::default(),
             pending_frame: None,
             undo: vec![],
             redo: vec![],
@@ -524,6 +526,16 @@ impl App {
 
     pub fn new_file(&mut self) {
         *self = App { screenshot: self.screenshot.take(), ..App::new(None) };
+    }
+
+    /// Store image bytes in the document, keyed by content hash.
+    pub fn add_image(&mut self, bytes: Vec<u8>) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        bytes.hash(&mut h);
+        let key = format!("{:016x}", h.finish());
+        self.doc.images.entry(key.clone()).or_insert_with(|| std::sync::Arc::new(bytes));
+        key
     }
 
     pub fn toast(&mut self, msg: String) {

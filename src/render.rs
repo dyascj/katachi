@@ -1,8 +1,11 @@
 //! Canvas rendering: every node becomes a lyon path in screen space, tessellated into egui meshes.
 
-use crate::doc::{Document, Kind, Node, NodeId, StrokeAlign};
+use crate::doc::{Document, Kind, Node, NodeId, Paint, PaintKind, StrokeAlign};
+use egui::{ColorImage, TextureHandle, TextureId, TextureOptions};
+use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use egui::epaint::{Mesh, Vertex, WHITE_UV};
-use egui::{Color32, FontFamily, FontId, Painter, Pos2, Rect, Vec2, pos2};
+use egui::{Color32, FontFamily, FontId, Painter, Pos2, Rect, Vec2, pos2, vec2};
 use lyon::math::{Angle, Box2D, Transform, point, vector};
 use lyon::path::builder::BorderRadii;
 use lyon::path::{Path, Winding};
@@ -114,43 +117,151 @@ fn to_mesh(geo: VertexBuffers<Pos2, u32>, color: Color32) -> Mesh {
     }
 }
 
-pub fn fill_mesh(path: &Path, color: Color32) -> Mesh {
+fn fill_geo(path: &Path) -> VertexBuffers<Pos2, u32> {
     let mut geo = VertexBuffers::new();
     let _ = FillTessellator::new().tessellate_path(
         path,
         &FillOptions::tolerance(0.15),
         &mut BuffersBuilder::new(&mut geo, |v: FillVertex| pos2(v.position().x, v.position().y)),
     );
-    to_mesh(geo, color)
+    geo
 }
 
-pub fn stroke_mesh(path: &Path, width: f32, color: Color32) -> Mesh {
+fn stroke_geo(path: &Path, width: f32) -> VertexBuffers<Pos2, u32> {
     let mut geo = VertexBuffers::new();
     let _ = StrokeTessellator::new().tessellate_path(
         path,
         &StrokeOptions::tolerance(0.15).with_line_width(width).with_line_join(LineJoin::Miter),
         &mut BuffersBuilder::new(&mut geo, |v: StrokeVertex| pos2(v.position().x, v.position().y)),
     );
-    to_mesh(geo, color)
+    geo
 }
 
-/// Paint a page. `hide` skips one node's own content (used while editing text in place).
-pub fn draw_page(painter: &Painter, doc: &Document, page: usize, v: &View, hide: Option<NodeId>) {
-    for &id in &doc.pages[page].children {
-        draw_node(painter, doc, id, v, 1.0, hide);
+pub fn fill_mesh(path: &Path, color: Color32) -> Mesh {
+    to_mesh(fill_geo(path), color)
+}
+
+pub fn stroke_mesh(path: &Path, width: f32, color: Color32) -> Mesh {
+    to_mesh(stroke_geo(path, width), color)
+}
+
+/// GPU textures for gradients and image fills, rebuilt only when a paint changes.
+#[derive(Default)]
+pub struct Textures {
+    gradients: HashMap<u64, TextureHandle>,
+    used: HashSet<u64>,
+    images: HashMap<String, Option<(TextureHandle, Vec2)>>,
+}
+
+const GRAD_RES: usize = 256;
+
+impl Textures {
+    /// Drop gradient textures nobody drew last frame.
+    pub fn end_frame(&mut self) {
+        let used = std::mem::take(&mut self.used);
+        self.gradients.retain(|k, _| used.contains(k));
+    }
+
+    fn gradient(&mut self, ctx: &egui::Context, p: &Paint) -> TextureId {
+        let mut h = DefaultHasher::new();
+        (p.kind as u8, p.from.x.to_bits(), p.from.y.to_bits(), p.to.x.to_bits(), p.to.y.to_bits()).hash(&mut h);
+        for (t, c) in &p.stops {
+            (t.to_bits(), c.0).hash(&mut h);
+        }
+        let key = h.finish();
+        self.used.insert(key);
+        self.gradients
+            .entry(key)
+            .or_insert_with(|| {
+                // ponytail: gradients are a 256² texture stretched over the layer; render analytically if banding shows on huge layers
+                let px = (0..GRAD_RES * GRAD_RES)
+                    .map(|i| {
+                        let q = pos2(((i % GRAD_RES) as f32 + 0.5) / GRAD_RES as f32, ((i / GRAD_RES) as f32 + 0.5) / GRAD_RES as f32);
+                        p.sample(p.gradient_t(q)).to32()
+                    })
+                    .collect();
+                let img = ColorImage { size: [GRAD_RES, GRAD_RES], pixels: px, source_size: Vec2::splat(GRAD_RES as f32) };
+                ctx.load_texture(format!("gradient-{key}"), img, TextureOptions::LINEAR)
+            })
+            .id()
+    }
+
+    pub fn image(&mut self, ctx: &egui::Context, doc: &Document, key: &str) -> Option<(TextureId, Vec2)> {
+        let entry = self.images.entry(key.to_string()).or_insert_with(|| {
+            let bytes = doc.images.get(key)?;
+            let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+            let size = [img.width() as usize, img.height() as usize];
+            let color = ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+            Some((ctx.load_texture(format!("image-{key}"), color, TextureOptions::LINEAR), vec2(size[0] as f32, size[1] as f32)))
+        });
+        entry.as_ref().map(|(t, s)| (t.id(), *s))
+    }
+}
+
+/// Everything a draw pass needs besides the painter.
+pub struct Scene<'a> {
+    pub doc: &'a Document,
+    pub view: View,
+    pub hide: Option<NodeId>,
+    pub tex: &'a mut Textures,
+}
+
+/// Paint tessellated geometry with a solid, gradient, or image paint.
+fn paint_geo(painter: &Painter, sc: &mut Scene, n: &Node, geo: VertexBuffers<Pos2, u32>, p: &Paint, a: f32) {
+    let ctx = painter.ctx();
+    let v = sc.view;
+    let tint = Color32::WHITE.gamma_multiply(p.alpha() * a);
+    // Screen position -> the layer's unrotated unit square.
+    let unit = |s: Pos2| {
+        let l = crate::doc::rotate(v.to_world(s), n.rect.center(), -n.rotation);
+        let r = n.rect;
+        pos2((l.x - r.min.x) / r.width().max(1e-6), (l.y - r.min.y) / r.height().max(1e-6))
+    };
+    let (tex, uv): (TextureId, Box<dyn Fn(Pos2) -> Pos2>) = match p.kind {
+        PaintKind::Solid => return void(painter.add(to_mesh(geo, p.color.to32().gamma_multiply(a)))),
+        PaintKind::Linear | PaintKind::Radial => (sc.tex.gradient(ctx, p), Box::new(unit)),
+        PaintKind::Image => match sc.tex.image(ctx, sc.doc, &p.image) {
+            Some((id, size)) => {
+                // "Fill" scale mode: cover the layer, centered.
+                let (la, ia) = (n.rect.width() / n.rect.height().max(1e-6), size.x / size.y.max(1e-6));
+                let (su, sv) = if la > ia { (1.0, ia / la) } else { (la / ia, 1.0) };
+                (id, Box::new(move |s| {
+                    let q = unit(s);
+                    pos2(0.5 + (q.x - 0.5) * su, 0.5 + (q.y - 0.5) * sv)
+                }))
+            }
+            None => return void(painter.add(to_mesh(geo, crate::doc::SHAPE_GRAY.to32().gamma_multiply(a)))),
+        },
+    };
+    painter.add(Mesh {
+        indices: geo.indices,
+        vertices: geo.vertices.into_iter().map(|pos| Vertex { pos, uv: uv(pos), color: tint }).collect(),
+        texture_id: tex,
+    });
+}
+
+fn void<T>(_: T) {}
+
+/// Paint a page.
+pub fn draw_page(painter: &Painter, sc: &mut Scene, page: usize) {
+    for &id in &sc.doc.pages[page].children {
+        draw_node(painter, sc, id, 1.0);
     }
 }
 
 // ponytail: opacity multiplies into colors per node, not true group compositing; use offscreen layers when overlaps matter
-fn draw_node(painter: &Painter, doc: &Document, id: NodeId, v: &View, alpha: f32, hide: Option<NodeId>) {
-    let n = doc.node(id);
+fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
+    let n = sc.doc.node(id);
     if !n.visible {
         return;
     }
+    let v = sc.view;
     let screen = v.rect_to_screen(n.aabb());
     let a = alpha * n.opacity;
-    if Some(id) != hide && painter.clip_rect().intersects(screen.expand(n.stroke_width * v.zoom + 2.0)) {
-        draw_content(painter, n, v, a);
+    let reach = n.stroke_width.max(n.shadows.iter().map(|s| s.blur + s.spread + s.offset.length()).fold(0.0, f32::max));
+    if Some(id) != sc.hide && painter.clip_rect().intersects(screen.expand(reach * v.zoom + 2.0)) {
+        draw_shadows(painter, n, &v, a);
+        draw_content(painter, sc, n, a);
     }
     if n.children.is_empty() {
         return;
@@ -160,17 +271,39 @@ fn draw_node(painter: &Painter, doc: &Document, id: NodeId, v: &View, alpha: f32
     } else {
         painter.clone()
     };
-    for &c in &n.children {
-        draw_node(&child_painter, doc, c, v, a, hide);
+    for &c in &n.children.clone() {
+        draw_node(&child_painter, sc, c, a);
     }
 }
 
-fn draw_content(painter: &Painter, n: &Node, v: &View, a: f32) {
+fn draw_shadows(painter: &Painter, n: &Node, v: &View, a: f32) {
+    for s in n.shadows.iter().filter(|s| s.visible) {
+        let z = v.zoom;
+        let color = s.color.to32().gamma_multiply(a);
+        let rect_like = matches!(n.kind, Kind::Rectangle | Kind::Frame) && n.rotation == 0.0;
+        if rect_like {
+            let r = v.rect_to_screen(n.rect).translate(s.offset * z).expand(s.spread * z);
+            let rad = ((n.radius + s.spread).max(0.0) * z).min(255.0) as u8;
+            painter.add(egui::epaint::RectShape::filled(r, egui::CornerRadius::same(rad), color).with_blur_width(s.blur * z));
+        } else if n.kind != Kind::Group && n.kind != Kind::Text {
+            // ponytail: stacked offsets approximate the blur for non-rect shapes; exact in export
+            let shifted = View { pan: v.pan + s.offset * z, zoom: z };
+            const STEPS: usize = 6;
+            for i in 0..STEPS {
+                let grow = s.spread * z + s.blur * z * ((i as f32 + 0.5) / STEPS as f32 - 0.5);
+                painter.add(fill_mesh(&node_path(n, &shifted, grow), color.gamma_multiply(1.0 / STEPS as f32 * 1.6)));
+            }
+        }
+    }
+}
+
+fn draw_content(painter: &Painter, sc: &mut Scene, n: &Node, a: f32) {
+    let v = sc.view;
     if n.kind == Kind::Group {
         return;
     }
     if n.kind == Kind::Text {
-        if let Some(c) = n.first_fill() {
+        if let Some(c) = n.first_fill().map(|c| c.to32()) {
             let galley = painter.layout_no_wrap(
                 n.text.clone(),
                 FontId::new(n.font_size * v.zoom, font_family(n.font_weight)),
@@ -181,10 +314,10 @@ fn draw_content(painter: &Painter, n: &Node, v: &View, a: f32) {
         }
         return;
     }
-    let path = node_path(n, v, 0.0);
-    for f in n.fills.iter().filter(|f| f.visible) {
-        if n.kind != Kind::Vector || n.closed {
-            painter.add(fill_mesh(&path, f.color.gamma_multiply(a)));
+    let path = node_path(n, &v, 0.0);
+    if n.kind != Kind::Vector || n.closed {
+        for f in n.fills.iter().filter(|f| f.visible) {
+            paint_geo(painter, sc, n, fill_geo(&path), f, a);
         }
     }
     if n.strokes.iter().any(|s| s.visible) && n.stroke_width > 0.0 {
@@ -194,9 +327,9 @@ fn draw_content(painter: &Painter, n: &Node, v: &View, a: f32) {
             StrokeAlign::Center => 0.0,
             StrokeAlign::Outside => w / 2.0,
         };
-        let spath = if grow == 0.0 || n.kind == Kind::Vector { path } else { node_path(n, v, grow) };
+        let spath = if grow == 0.0 || n.kind == Kind::Vector { path } else { node_path(n, &v, grow) };
         for s in n.strokes.iter().filter(|s| s.visible) {
-            painter.add(stroke_mesh(&spath, w, s.color.gamma_multiply(a)));
+            paint_geo(painter, sc, n, stroke_geo(&spath, w), s, a);
         }
     }
 }
