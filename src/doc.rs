@@ -894,7 +894,7 @@ impl Default for Shadow {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Node {
     pub id: NodeId,
@@ -1182,7 +1182,7 @@ impl Node {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Page {
     pub name: String,
     pub children: Vec<NodeId>,

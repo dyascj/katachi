@@ -79,6 +79,7 @@ impl App {
         self.accept_drops(ui, hover_pos.filter(|p| rect.contains(*p)).unwrap_or(rect.center()));
         let ptr = resp.interact_pointer_pos().or(hover_pos);
         let world = ptr.map(|p| self.view.to_world(p));
+        self.pointer_world = hover_pos.filter(|p| rect.contains(*p)).map(|p| self.view.to_world(p));
         let panning = self.tool == Tool::Hand || (space && !typing) || mid || matches!(self.drag, Some(Drag::Pan));
 
         // Hover target for the move tool.
@@ -149,6 +150,7 @@ impl App {
         if self.rulers {
             self.draw_rulers(&painter, rect);
         }
+        self.draw_peers(&painter);
         self.comment_hits = self.draw_comment_pins(&painter);
         self.comment_popups(ui.ctx());
         self.set_cursor(ui, ptr, panning);
@@ -202,7 +204,9 @@ impl App {
                 crate::doc::TextSizing::AutoHeight => vec2(n.rect.width(), size.y),
                 crate::doc::TextSizing::Fixed => n.rect.size(),
             };
-            if (n.rect.size() - want).length() > 0.01 {
+            // In a session, ignore sub-pixel differences between machines so peers don't ping-pong.
+            let tol = if self.collab.is_some() { 1.0 } else { 0.01 };
+            if (n.rect.size() - want).length() > tol {
                 n.rect = Rect::from_min_size(n.rect.min, want);
                 changed = true;
             }
@@ -1022,6 +1026,30 @@ impl App {
             _ => {
                 let pts = n.corners().map(|p| self.view.to_screen(p)).to_vec();
                 painter.add(egui::Shape::closed_line(pts, Stroke::new(width, accent)));
+            }
+        }
+    }
+
+    /// Collaborators' selections and cursors, in their colors.
+    fn draw_peers(&self, painter: &Painter) {
+        let Some(c) = &self.collab else { return };
+        for p in c.peers.values().filter(|p| p.page == self.page) {
+            let col = crate::collab::PEER_COLORS[p.color % crate::collab::PEER_COLORS.len()];
+            for id in &p.selection {
+                if let Some(n) = self.doc.nodes.get(id) {
+                    let pts = n.corners().map(|q| self.view.to_screen(q)).to_vec();
+                    painter.add(egui::Shape::closed_line(pts, Stroke::new(2.0, col)));
+                }
+            }
+            if let Some(w) = p.cursor {
+                let s = self.view.to_screen(w);
+                let arrow = vec![s, s + vec2(0.0, 16.0), s + vec2(4.5, 12.0), s + vec2(8.0, 18.5), s + vec2(10.5, 17.3), s + vec2(7.2, 11.0), s + vec2(12.0, 11.0)];
+                painter.add(egui::Shape::convex_polygon(arrow[..3].to_vec(), col, Stroke::NONE));
+                painter.add(egui::Shape::closed_line(arrow, Stroke::new(1.5, col)));
+                let g = painter.layout_no_wrap(p.name.clone(), FontId::proportional(11.0), Color32::WHITE);
+                let pill = Rect::from_min_size(s + vec2(12.0, 18.0), g.size() + vec2(10.0, 4.0));
+                painter.rect_filled(pill, 4.0, col);
+                painter.galley(pill.min + vec2(5.0, 2.0), g, Color32::WHITE);
             }
         }
     }

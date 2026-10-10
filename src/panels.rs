@@ -617,6 +617,10 @@ impl App {
             self.save(true);
             ui.close();
         }
+        if item(ui, "Collaborate…", "") {
+            self.show_collab = true;
+            ui.close();
+        }
         if item(ui, "Local variables…", "") {
             self.show_variables = true;
             ui.close();
@@ -918,6 +922,20 @@ impl App {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let ctx = ui.ctx().clone();
+                    // Collaborators' avatars; clicking opens the session window.
+                    if let Some(c) = &self.collab {
+                        let mut open = false;
+                        for p in c.peers.values().take(4) {
+                            let (r, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+                            let col = crate::collab::PEER_COLORS[p.color % crate::collab::PEER_COLORS.len()];
+                            ui.painter().circle_filled(r.center(), 10.0, col);
+                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, p.name.chars().next().unwrap_or('?').to_string(), FontId::proportional(10.0), Color32::WHITE);
+                            open |= resp.on_hover_text(&p.name).clicked();
+                        }
+                        if open {
+                            self.show_collab = true;
+                        }
+                    }
                     if icon_button(ui, Icon::Play, false, 24.0, "Present (⌥⌘↵)").clicked() {
                         self.present(ctx.input(|i| i.time));
                     }

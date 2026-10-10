@@ -66,9 +66,14 @@ GitHub Actions. Building from source needs Rust 1.92 or newer.
 - Transitions: instant, dissolve, smart animate, move in, push, slide in
 - Present mode (Cmd Alt Enter) with flows, hotspot hints, and overlays
 
-**Handoff and review**
-- Dev Mode (Shift D) with CSS, SwiftUI, and Jetpack Compose code, colors, and type
+**Collaboration**
+- Real-time multiplayer: host a session from the app (Main menu > Collaborate) or run `katachi serve file.katachi`, and others join by address
+- Live cursors, selections, and avatars; undo only reverts your own changes
 - Comments pinned to frames, with replies and resolve
+
+**Handoff**
+- Dev Mode (Shift D) with CSS, SwiftUI, and Jetpack Compose code, colors, and type
+- Rich text: mixed weights, sizes, colors, and italics within one text layer
 
 **Files**
 - `.katachi` files (JSON), atomic saves, crash-recovery autosave, version history, open recent
@@ -108,10 +113,9 @@ GitHub Actions. Building from source needs Rust 1.92 or newer.
 
 ## Roadmap
 
-- Real-time multiplayer
 - Plugins
 - Importing `.fig` files
-- Rich text (mixed styles in one text box, lists)
+- Lists in text
 
 ## Development
 
@@ -132,6 +136,7 @@ Code map:
 | `src/export.rs` | SVG writer; PNG, JPG, and PDF via resvg and svg2pdf |
 | `src/prototype.rs` | Present mode, interactions, transitions |
 | `src/codegen.rs` | Dev Mode code generation |
+| `src/collab.rs` | Multiplayer relay, diff sync, presence |
 | `src/text.rs` | Shared text layout and system fonts |
 | `src/boolean.rs`, `src/vector_edit.rs`, `src/svg_import.rs` | Vector features |
 

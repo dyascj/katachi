@@ -661,6 +661,20 @@ fn shots() {
     st.sel = vec![sub];
     h.run_steps(4);
     save(&mut h, "23-rich-text");
+    // Multiplayer: host, then show two collaborators' cursors and selections.
+    let ctx = h.ctx.clone();
+    let st = h.state_mut();
+    st.collab_port = 0;
+    st.host_session(&ctx);
+    let find = |st: &App, name: &str| *st.doc.nodes.keys().find(|i| st.doc.node(**i).name == name).unwrap();
+    let (hero, star) = (find(st, "Hero"), find(st, "Star 1"));
+    if let Some(c) = st.collab.as_mut() {
+        c.peers.insert(91, crate::collab::Presence { name: "Luna".into(), color: 2, page: 0, cursor: Some(pos2(300., 120.)), selection: vec![hero] });
+        c.peers.insert(92, crate::collab::Presence { name: "Sam".into(), color: 1, page: 0, cursor: Some(pos2(260., 700.)), selection: vec![star] });
+    }
+    st.sel.clear();
+    h.run_steps(3);
+    save(&mut h, "24-multiplayer");
 }
 
 #[test]
@@ -1166,4 +1180,38 @@ fn rich_text_editing_styles_selection() {
     let n = h.state().doc.node(id);
     assert_eq!(n.text, "Hello world!");
     assert_eq!((n.spans[0].start, n.spans[0].end), (6, 12));
+}
+
+#[test]
+fn multiplayer_host_join_edit_and_undo_only_mine() {
+    let mut a = harness();
+    let mut b = harness();
+    a.state_mut().collab_port = 0;
+    a.state_mut().collab_name = "Ada".into();
+    let ctx = a.ctx.clone();
+    a.state_mut().host_session(&ctx);
+    let port = a.state().collab.as_ref().expect("hosting").address.rsplit(':').next().unwrap().to_string();
+    b.state_mut().collab_name = "Bo".into();
+    let ctx = b.ctx.clone();
+    b.state_mut().join_session(&ctx, &format!("127.0.0.1:{port}"), false);
+    assert!(b.state().collab.is_some(), "joined");
+    // Ada draws; Bo sees it. Bo draws; Ada sees it.
+    let ra = draw(&mut a, Key::R, (0.0, 0.0), (100.0, 100.0));
+    let rb = draw(&mut b, Key::O, (200.0, 0.0), (260.0, 60.0));
+    let settle = |a: &mut Harness<App>, b: &mut Harness<App>| {
+        for _ in 0..60 {
+            a.step();
+            b.step();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    settle(&mut a, &mut b);
+    assert!(b.state().doc.nodes.contains_key(&ra), "Bo sees Ada's rectangle");
+    assert!(a.state().doc.nodes.contains_key(&rb), "Ada sees Bo's ellipse");
+    assert!(a.state().collab.as_ref().unwrap().peers.values().any(|p| p.name == "Bo"), "presence");
+    // Ada undoes: her rectangle goes away everywhere, Bo's ellipse stays.
+    key(&mut a, Modifiers::COMMAND, Key::Z);
+    settle(&mut a, &mut b);
+    assert!(!a.state().doc.nodes.contains_key(&ra) && !b.state().doc.nodes.contains_key(&ra));
+    assert!(a.state().doc.nodes.contains_key(&rb) && b.state().doc.nodes.contains_key(&rb), "undo leaves others' work");
 }

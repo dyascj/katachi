@@ -4,7 +4,7 @@ use crate::app::{App, Tool};
 use crate::doc::Comment;
 use egui::{Color32, FontId, Painter, Pos2, Rect, RichText, Stroke, Ui, vec2};
 
-fn author() -> String {
+pub fn author() -> String {
     let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default();
     let mut c = user.chars();
     match c.next() {

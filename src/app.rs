@@ -155,6 +155,16 @@ pub struct App {
     pub recoverable: Vec<PathBuf>,
     undo: Vec<Document>,
     redo: Vec<Document>,
+    /// In a multiplayer session: nodes this user changed after each undo checkpoint.
+    undo_touched: Vec<std::collections::HashSet<NodeId>>,
+    redo_touched: Vec<std::collections::HashSet<NodeId>>,
+    pub collab: Option<crate::collab::Collab>,
+    pub show_collab: bool,
+    pub collab_name: String,
+    pub collab_address: String,
+    pub collab_port: u16,
+    /// Pointer in world space this frame (shared as presence).
+    pub pointer_world: Option<Pos2>,
     in_gesture: bool,
     pub path: Option<PathBuf>,
     pub dirty: bool,
@@ -225,6 +235,14 @@ impl App {
             recoverable: vec![],
             undo: vec![],
             redo: vec![],
+            undo_touched: vec![],
+            redo_touched: vec![],
+            collab: None,
+            show_collab: false,
+            collab_name: crate::comments::author(),
+            collab_address: String::new(),
+            collab_port: 7878,
+            pointer_world: None,
             in_gesture: false,
             path: None,
             dirty: false,
@@ -273,13 +291,64 @@ impl App {
 
     /// Snapshot before a discrete change.
     pub fn checkpoint(&mut self) {
-        // ponytail: whole-document snapshots, switch to an op log when docs get big or multiplayer lands
+        // Attribute pending multiplayer changes to the step they belong to before starting a new one.
+        self.sync_collab(f64::MAX);
+        // ponytail: whole-document snapshots, switch to an op log when docs get big
         self.undo.push(self.doc.clone());
+        self.undo_touched.push(Default::default());
         if self.undo.len() > 200 {
             self.undo.remove(0);
+            self.undo_touched.remove(0);
         }
         self.redo.clear();
+        self.redo_touched.clear();
         self.dirty = true;
+    }
+
+    /// Exchange changes with the session; remember which nodes this user touched for undo.
+    pub fn sync_collab(&mut self, now: f64) {
+        let Some(c) = self.collab.as_mut() else { return };
+        c.me.page = self.page;
+        c.me.selection = self.sel.clone();
+        c.me.cursor = self.pointer_world;
+        let touched = c.tick(&mut self.doc, now);
+        if !c.connected {
+            self.collab = None;
+            self.toast("Disconnected from the session".into());
+            return;
+        }
+        if let Some(t) = self.undo_touched.last_mut() {
+            t.extend(touched);
+        }
+        self.sel.retain(|id| self.doc.nodes.contains_key(id));
+    }
+
+    /// Bring back only the given nodes from a snapshot (multiplayer undo leaves others' work alone).
+    fn restore_nodes(&mut self, from: &Document, ids: &std::collections::HashSet<NodeId>) {
+        for id in ids {
+            match from.nodes.get(id) {
+                Some(n) => {
+                    self.doc.nodes.insert(*id, n.clone());
+                }
+                None => {
+                    self.doc.nodes.remove(id);
+                }
+            }
+        }
+        for id in ids {
+            for pg in &mut self.doc.pages {
+                pg.children.retain(|c| c != id);
+            }
+        }
+        for id in ids {
+            for (p, pg) in from.pages.iter().enumerate() {
+                if let (Some(i), Some(dst)) = (pg.children.iter().position(|c| c == id), self.doc.pages.get_mut(p)) {
+                    dst.children.insert(i.min(dst.children.len()), *id);
+                }
+            }
+        }
+        crate::collab::repair(&mut self.doc);
+        self.doc.reflow();
     }
 
     /// Snapshot once per continuous gesture (slider scrub, typing in a field).
@@ -291,15 +360,33 @@ impl App {
     }
 
     pub fn undo(&mut self) {
+        self.sync_collab(f64::MAX);
         if let Some(d) = self.undo.pop() {
-            self.redo.push(std::mem::replace(&mut self.doc, d));
+            let touched = self.undo_touched.pop().unwrap_or_default();
+            if self.collab.is_some() {
+                let current = self.doc.clone();
+                self.restore_nodes(&d, &touched);
+                self.redo.push(current);
+            } else {
+                self.redo.push(std::mem::replace(&mut self.doc, d));
+            }
+            self.redo_touched.push(touched);
             self.after_history();
         }
     }
 
     pub fn redo(&mut self) {
+        self.sync_collab(f64::MAX);
         if let Some(d) = self.redo.pop() {
-            self.undo.push(std::mem::replace(&mut self.doc, d));
+            let touched = self.redo_touched.pop().unwrap_or_default();
+            if self.collab.is_some() {
+                let current = self.doc.clone();
+                self.restore_nodes(&d, &touched);
+                self.undo.push(current);
+            } else {
+                self.undo.push(std::mem::replace(&mut self.doc, d));
+            }
+            self.undo_touched.push(touched);
             self.after_history();
         }
     }
@@ -1074,6 +1161,118 @@ impl App {
         self.show_history = open;
     }
 
+    /// Host or join a live session.
+    fn collab_window(&mut self, ctx: &egui::Context) {
+        if !self.show_collab {
+            return;
+        }
+        let mut open = true;
+        let mut action: Option<&str> = None;
+        egui::Window::new("Collaborate").open(&mut open).collapsible(false).resizable(false).default_width(320.0).show(ctx, |ui| {
+            if let Some(c) = &self.collab {
+                ui.label(egui::RichText::new(if c.hosting { "Hosting a live session" } else { "In a live session" }).strong());
+                ui.horizontal(|ui| {
+                    ui.label("Address");
+                    ui.monospace(&c.address);
+                    if ui.small_button("Copy").clicked() {
+                        ui.ctx().copy_text(c.address.clone());
+                    }
+                });
+                ui.separator();
+                ui.label(format!("{} (you)", c.me.name));
+                for p in c.peers.values() {
+                    ui.horizontal(|ui| {
+                        let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                        ui.painter().circle_filled(r.center(), 6.0, crate::collab::PEER_COLORS[p.color % crate::collab::PEER_COLORS.len()]);
+                        ui.label(&p.name);
+                    });
+                }
+                ui.separator();
+                if ui.button("Leave session").clicked() {
+                    action = Some("leave");
+                }
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label("Your name");
+                    ui.text_edit_singleline(&mut self.collab_name);
+                });
+                ui.separator();
+                ui.label(egui::RichText::new("Host").strong());
+                ui.label("Share this file live with people on your network.");
+                ui.horizontal(|ui| {
+                    ui.label("Port");
+                    ui.add(egui::DragValue::new(&mut self.collab_port).range(1024..=65535));
+                    if ui.button("Start session").clicked() {
+                        action = Some("host");
+                    }
+                });
+                ui.separator();
+                ui.label(egui::RichText::new("Join").strong());
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.collab_address).hint_text("192.168.1.20:7878").desired_width(180.0));
+                    if ui.add_enabled(!self.collab_address.trim().is_empty(), egui::Button::new("Join")).clicked() {
+                        action = Some("join");
+                    }
+                });
+            }
+        });
+        match action {
+            Some("leave") => self.collab = None,
+            Some("host") => self.host_session(ctx),
+            Some("join") => {
+                if self.dirty {
+                    self.toast("Save or discard your changes before joining".into());
+                } else {
+                    let addr = self.collab_address.trim().to_string();
+                    self.join_session(ctx, &addr, false);
+                }
+            }
+            _ => {}
+        }
+        self.show_collab = open;
+    }
+
+    pub fn host_session(&mut self, ctx: &egui::Context) {
+        let listener = std::net::TcpListener::bind(("0.0.0.0", self.collab_port)).or_else(|_| std::net::TcpListener::bind(("0.0.0.0", 0)));
+        match listener {
+            Ok(l) => {
+                let port = l.local_addr().map_or(self.collab_port, |a| a.port());
+                crate::collab::serve(l, self.doc.clone());
+                let shared = format!("{}:{port}", crate::collab::local_ip());
+                self.join_session(ctx, &format!("127.0.0.1:{port}"), true);
+                if let Some(c) = self.collab.as_mut() {
+                    c.address = shared;
+                }
+            }
+            Err(e) => self.toast(format!("Couldn't start a session: {e}")),
+        }
+    }
+
+    pub fn join_session(&mut self, ctx: &egui::Context, addr: &str, hosting: bool) {
+        let joined = crate::collab::connect(addr, Some(ctx.clone()))
+            .and_then(|link| crate::collab::Collab::join(link, addr.to_string(), self.collab_name.clone(), hosting));
+        match joined {
+            Ok((c, doc)) => {
+                if !hosting {
+                    // A joined file is new to this machine: no path until saved.
+                    self.path = None;
+                    self.dirty = false;
+                    self.view_ready = false;
+                }
+                self.doc = doc;
+                self.sel.clear();
+                self.page = 0;
+                self.undo.clear();
+                self.undo_touched.clear();
+                self.redo.clear();
+                self.redo_touched.clear();
+                self.collab = Some(c);
+                self.toast(if hosting { "Session started".into() } else { "Joined the session".into() });
+            }
+            Err(e) => self.toast(format!("Couldn't connect: {e}")),
+        }
+    }
+
     fn recovery_prompt(&mut self, ctx: &egui::Context) {
         if self.recoverable.is_empty() {
             return;
@@ -1424,6 +1623,12 @@ impl eframe::App for App {
         }
         self.canvas_panel(ui);
         self.close_guard(&ctx);
+        let now = ctx.input(|i| i.time);
+        self.sync_collab(now);
+        if self.collab.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        self.collab_window(&ctx);
         self.recovery_prompt(&ctx);
         self.history_window(&ctx);
         self.variables_window(&ctx);
