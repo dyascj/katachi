@@ -2122,6 +2122,7 @@ impl Document {
     }
 
     fn reflow_layout(&mut self) {
+        self.fit_component_sets();
         self.fit_groups_only();
         let mut frames: Vec<(usize, NodeId)> = self
             .nodes
@@ -2290,6 +2291,20 @@ impl Document {
                 x += s.x + gap;
             }
             y += rh + l.cross_gap;
+        }
+    }
+
+    /// Component sets grow to keep their variants inside (with padding), like Figma; they never
+    /// shrink on their own, so a set made roomier by hand stays that way.
+    fn fit_component_sets(&mut self) {
+        let sets: Vec<NodeId> = self.nodes.values().filter(|n| n.kind == Kind::ComponentSet && n.layout.mode == LayoutMode::None && !n.children.is_empty()).map(|n| n.id).collect();
+        for s in sets {
+            let kids = self.nodes[&s].children.clone();
+            let b = kids.iter().fold(Rect::NOTHING, |r, c| r.union(self.nodes[c].aabb())).expand(20.0);
+            let r = self.nodes[&s].rect;
+            if !r.contains_rect(b) {
+                self.node_mut(s).rect = r.union(b);
+            }
         }
     }
 
@@ -2836,6 +2851,18 @@ mod tests {
         let mut f = Node::new(Kind::Frame, r(0., 0., 300., 100.));
         f.layout = AutoLayout { mode, gap: 10., padding: [5., 5., 5., 5.], ..Default::default() };
         d.insert(0, None, None, f)
+    }
+
+    #[test]
+    fn component_sets_grow_to_hold_their_variants() {
+        let mut d = Document::default();
+        let set = d.insert(0, None, None, Node::new(Kind::ComponentSet, r(0., 0., 100., 100.)));
+        let c = d.insert(0, Some(set), None, Node::new(Kind::Component, r(20., 20., 200., 40.)));
+        d.reflow();
+        assert_eq!(d.node(set).rect, r(0., 0., 240., 100.));
+        d.node_mut(c).rect = r(20., 20., 20., 20.);
+        d.reflow();
+        assert_eq!(d.node(set).rect.width(), 240., "doesn't shrink on its own");
     }
 
     #[test]
