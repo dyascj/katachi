@@ -16,6 +16,16 @@ git clone https://github.com/dyascj/katachi && cd katachi
 scripts/macos-app.sh --install   # builds Katachi.app into /Applications
 ```
 
+**Linux**
+
+```sh
+sudo apt install libxkbcommon-dev libgtk-3-dev   # build dependencies (Debian/Ubuntu)
+git clone https://github.com/dyascj/katachi && cd katachi
+cargo build --release && scripts/linux-install.sh   # binary, icon, and app-menu entry
+```
+
+From a release tarball, unpack it and run `./linux-install.sh`.
+
 **Any platform**
 
 ```sh

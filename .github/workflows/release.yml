@@ -43,7 +43,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
-      - run: cargo build --release && tar -czf Katachi-linux-x86_64.tar.gz -C target/release katachi
+      - name: Package
+        run: |
+          cargo build --release
+          mkdir -p dist/katachi
+          cp target/release/katachi scripts/linux-install.sh assets/icon/icon.png LICENSE dist/katachi/
+          tar -czf Katachi-linux-x86_64.tar.gz -C dist katachi
       - uses: softprops/action-gh-release@v2
         with:
           files: Katachi-linux-x86_64.tar.gz
