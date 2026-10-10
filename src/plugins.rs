@@ -471,5 +471,46 @@ mod tests {
         assert_eq!(d.nodes.len(), count, "no layers churn between reflows");
         assert_eq!(icon_of(&d, id("swapped")).component, Some(id("b")));
     }
+
+    #[test]
+    fn resized_instances_scale_vectors_once_and_nested_swaps_stick() {
+        let mut d = Document::default();
+        // SVG layers exist after the run that imports them.
+        run(&mut d, 0, &[], r##"
+            const ic = figma.createComponentFromNode(figma.createNodeFromSvg('<svg width="24" height="24" viewBox="0 0 24 24"><path d="M4 4h16v16H4z" stroke="#000" fill="none"/></svg>'));
+            ic.name = "Icon/box";
+        "##).unwrap();
+        let out = run(&mut d, 0, &[], r##"
+            const ic = figma.currentPage.findOne(n => n.name === "Icon/box");
+            for (const v of ic.findAll(() => true)) v.constraints = { horizontal: "SCALE", vertical: "SCALE" };
+            const g = figma.createComponent(); g.name = "Brand/g"; g.resize(18, 18); g.x = 40;
+            const m = figma.createComponent(); m.name = "Brand/m"; m.resize(18, 18); m.x = 80;
+            const sso = figma.createComponent(); sso.name = "SSO"; sso.x = 120; sso.resize(200, 40);
+            const logo = g.createInstance(); sso.appendChild(logo); logo.name = "Logo";
+            const big = ic.createInstance(); big.resize(48, 48); big.y = 100;
+            const b2 = sso.createInstance(); b2.y = 200;
+            b2.findOne(n => n.name === "Logo").swapComponent(m);
+            return { big, b2, m };
+        "##).unwrap();
+        let r: serde_json::Value = serde_json::from_str(out.result.as_deref().unwrap()).unwrap();
+        let id = |k: &str| r[k]["id"].as_str().unwrap().parse::<NodeId>().unwrap();
+        let path_width = |d: &Document| {
+            let v = d.node(d.node(id("big")).children[0]);
+            let xs: Vec<f32> = v.paths.iter().flat_map(|p| p.points.iter().map(|pt| pt.p.x)).collect();
+            xs.iter().cloned().fold(f32::MIN, f32::max) - xs.iter().cloned().fold(f32::MAX, f32::min)
+        };
+        let w = path_width(&d);
+        assert!((w - 32.).abs() < 0.5, "16px square drawn at 2x: {w}");
+        // Reopening the file resyncs every instance (and so does editing the component): the scale must not compound.
+        for i in 0..3 {
+            d = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
+            let c = d.nodes.values().find(|n| n.name == "Icon/box").unwrap().id;
+            d.node_mut(c).opacity -= 0.1 * i as f32;
+            d.reflow();
+        }
+        assert!((path_width(&d) - 32.).abs() < 0.5, "{}", path_width(&d));
+        let logo = d.node(d.node(id("b2")).children[0]);
+        assert_eq!(logo.component, Some(id("m")), "a swapped nested instance stays swapped");
+    }
 }
 

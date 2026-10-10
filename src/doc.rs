@@ -1934,6 +1934,11 @@ impl Document {
             let id = match by_source.get(&cid) {
                 Some(&e) => {
                     merge_from(self.node_mut(e), &src);
+                    // Geometry isn't an override inside instances (as in Figma): the resize below
+                    // rescales it from the component's every time, so it mustn't compound.
+                    if src.kind == Kind::Vector {
+                        self.node_mut(e).paths = src.paths.clone();
+                    }
                     if self.nodes[&e].parent != Some(parent) {
                         self.reparent(e, page, Some(parent), None);
                     }
@@ -2085,12 +2090,16 @@ impl Document {
             self.remove(c);
         }
         // Keep the root's last snapshot: anything not overridden then takes the new variant's value.
+        // An instance nested in another keeps its link (and its place and size) in the outer one.
+        let nested = self.nodes[&inst].source.and_then(|s| self.nodes.get(&s)).is_some_and(|s| s.kind == Kind::Instance);
         let n = self.node_mut(inst);
         n.component = Some(comp);
-        n.source = Some(comp);
-        let size = self.nodes[&comp].rect.size();
-        let n = self.node_mut(inst);
-        n.rect = Rect::from_min_size(n.rect.min, size);
+        if !nested {
+            n.source = Some(comp);
+            let size = self.nodes[&comp].rect.size();
+            let n = self.node_mut(inst);
+            n.rect = Rect::from_min_size(n.rect.min, size);
+        }
         self.sync_instance(inst);
         for d in self.descendants(inst) {
             if let Some(o) = overrides.get(&path(self, d)) {
