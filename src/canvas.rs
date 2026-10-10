@@ -140,7 +140,8 @@ impl App {
 
         self.text_editor(ui, &painter);
         self.draw_overlays(&painter, ptr);
-        if mods.alt && self.drag.is_none() {
+        // Dev Mode shows distances on hover; design mode needs Alt.
+        if (mods.alt || self.dev_mode) && self.drag.is_none() {
             self.draw_measurements(&painter);
         }
         if self.rulers {

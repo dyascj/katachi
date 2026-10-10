@@ -618,6 +618,14 @@ fn shots() {
     st.show_variables = true;
     h.run_steps(4);
     save(&mut h, "20-variables");
+    // Dev Mode on the card.
+    let st = h.state_mut();
+    st.show_variables = false;
+    st.dev_mode = true;
+    let card = *st.doc.nodes.keys().find(|i| st.doc.node(**i).name == "Card" && st.doc.node(**i).kind == Kind::Component).unwrap();
+    st.sel = vec![card];
+    h.run_steps(3);
+    save(&mut h, "21-dev-mode");
 }
 
 #[test]

@@ -890,6 +890,14 @@ impl App {
         egui::Panel::right("right").resizable(false).exact_size(248.0).show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
+                if self.dev_mode {
+                    let green = Color32::from_rgb(0x14, 0xAE, 0x5C);
+                    let pill = egui::Button::new(RichText::new("Dev Mode").color(Color32::WHITE).strong()).fill(green);
+                    if ui.add(pill).on_hover_text("Leave Dev Mode (⇧D)").clicked() {
+                        self.dev_mode = false;
+                    }
+                    return;
+                }
                 for (proto, label) in [(false, "Design"), (true, "Prototype")] {
                     let text = RichText::new(label);
                     let text = if self.prototype_tab == proto { text.strong() } else { text.color(Color32::from_gray(0x80)) };
@@ -924,6 +932,10 @@ impl App {
                 // Never let a long label widen the panel.
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                 ui.spacing_mut().item_spacing.y = 6.0;
+                if self.dev_mode {
+                    self.dev_panel(ui);
+                    return;
+                }
                 if self.prototype_tab {
                     self.prototype_props(ui);
                     return;
@@ -1099,6 +1111,81 @@ impl App {
             self.begin_edit();
             self.doc.node_mut(id).reactions = reactions;
         }
+    }
+
+    /// Dev Mode inspector: size, generated code, colors, and type used by the selection.
+    fn dev_panel(&mut self, ui: &mut Ui) {
+        use crate::codegen::{Lang, generate};
+        let Some(&id) = self.sel.first() else {
+            ui.add_space(12.0);
+            ui.label(RichText::new("Select a layer to inspect its code and properties.").color(Color32::from_gray(0x80)));
+            return;
+        };
+        let n = self.doc.node(id).clone();
+        ui.label(RichText::new(&n.name).strong().size(14.0));
+        ui.label(RichText::new(format!("{}  ·  {} × {}", n.kind.label(), num(n.rect.width()), num(n.rect.height()))).color(Color32::from_gray(0x80)));
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Code").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                for (lang, label) in [(Lang::Compose, "Compose"), (Lang::SwiftUi, "SwiftUI"), (Lang::Css, "CSS")] {
+                    ui.selectable_value(&mut self.code_lang, lang, label);
+                }
+            });
+        });
+        let code = generate(&self.doc, id, self.code_lang);
+        egui::Frame::new().fill(Color32::from_gray(0xF5)).corner_radius(6).inner_margin(8).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.add(egui::Label::new(RichText::new(&code).monospace().size(11.0)).selectable(true));
+        });
+        if ui.add_sized([ui.available_width(), 24.0], egui::Button::new("Copy code")).clicked() {
+            ui.ctx().copy_text(code);
+            self.toast("Code copied".into());
+        }
+        // Every solid color and text style used in the selection, like Dev Mode's lists.
+        let ids: Vec<NodeId> = std::iter::once(id).chain(self.doc.descendants(id)).collect();
+        let mut colors: Vec<Rgba> = vec![];
+        let mut type_styles: Vec<String> = vec![];
+        for &d in &ids {
+            let dn = self.doc.node(d);
+            for p in dn.fills.iter().chain(dn.strokes.iter()).filter(|p| p.visible && p.kind == crate::doc::PaintKind::Solid) {
+                if !colors.contains(&p.color) {
+                    colors.push(p.color);
+                }
+            }
+            if dn.kind == Kind::Text {
+                let t = format!("{} {} · {}px", dn.font_family, crate::text::weight_name(dn.font_weight), num(dn.font_size));
+                if !type_styles.contains(&t) {
+                    type_styles.push(t);
+                }
+            }
+        }
+        if !colors.is_empty() {
+            ui.separator();
+            heading(ui, "Colors");
+            for c in colors {
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                    ui.painter().rect_filled(r, 3.0, c.to32());
+                    ui.painter().rect_stroke(r, 3.0, Stroke::new(1.0, Color32::from_black_alpha(25)), StrokeKind::Inside);
+                    let hex = format!("#{}", c.hex());
+                    let alpha = if c.a() < 255 { format!("  {}%", (c.a() as f32 / 2.55).round()) } else { String::new() };
+                    if ui.add(egui::Label::new(RichText::new(format!("{hex}{alpha}")).monospace()).sense(Sense::click())).on_hover_text("Click to copy").clicked() {
+                        ui.ctx().copy_text(hex);
+                    }
+                });
+            }
+        }
+        if !type_styles.is_empty() {
+            ui.separator();
+            heading(ui, "Typography");
+            for t in type_styles {
+                ui.label(t);
+            }
+        }
+        ui.separator();
+        self.export_props(ui);
     }
 
     fn page_props(&mut self, ui: &mut Ui) {

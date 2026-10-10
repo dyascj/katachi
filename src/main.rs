@@ -1,6 +1,7 @@
 mod app;
 mod boolean;
 mod canvas;
+mod codegen;
 mod doc;
 mod export;
 mod files;

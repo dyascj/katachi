@@ -133,6 +133,9 @@ pub struct App {
     pub show_grids: bool,
     pub show_history: bool,
     pub show_variables: bool,
+    /// Dev Mode: inspect and code instead of design controls.
+    pub dev_mode: bool,
+    pub code_lang: crate::codegen::Lang,
     pub var_collection: Option<u64>,
     /// Properties copied with Cmd+Alt+C.
     pub style_clip: Option<Node>,
@@ -194,6 +197,8 @@ impl App {
             show_grids: true,
             show_history: false,
             show_variables: false,
+            dev_mode: false,
+            code_lang: crate::codegen::Lang::Css,
             var_collection: None,
             style_clip: None,
             layer_search: None,
@@ -1266,6 +1271,7 @@ impl App {
             }
             (true, false, false, Key::Backslash) => self.ui_hidden = !self.ui_hidden,
             (false, true, false, Key::R) => self.rulers = !self.rulers,
+            (false, true, false, Key::D) => self.dev_mode = !self.dev_mode,
             (false, false, true, Key::L) => {
                 for n in self.doc.nodes.values_mut() {
                     n.expanded = false;
