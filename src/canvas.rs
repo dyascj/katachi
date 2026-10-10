@@ -21,8 +21,8 @@ pub fn num(v: f32) -> String {
 
 impl App {
     pub fn canvas_panel(&mut self, ui: &mut Ui) {
-        let bg = self.doc.pages[self.page].background;
-        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(bg.to32())).show(ui, |ui| self.canvas(ui));
+        let bg = crate::appearance::page_bg(ui.ctx(), self.doc.pages[self.page].background);
+        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(bg)).show(ui, |ui| self.canvas(ui));
     }
 
     fn canvas(&mut self, ui: &mut Ui) {
@@ -281,14 +281,14 @@ impl App {
             let color = match (comp, active) {
                 (true, _) => PURPLE,
                 (false, true) => BLUE,
-                _ => Color32::from_gray(0x80),
+                _ => crate::appearance::muted(painter.ctx()),
             };
             let r = self.view.rect_to_screen(n.aabb());
             if n.kind == Kind::Section {
                 // Sections carry their name in a pill inside the top-left corner.
-                let g = painter.layout_no_wrap(n.name.clone(), FontId::proportional(11.0), if active { Color32::WHITE } else { Color32::from_gray(0x1E) });
+                let g = painter.layout_no_wrap(n.name.clone(), FontId::proportional(11.0), if active { Color32::WHITE } else { crate::appearance::ink(painter.ctx()) });
                 let pill = Rect::from_min_size(r.min + vec2(8.0, 8.0), g.size() + vec2(12.0, 6.0));
-                painter.rect_filled(pill, 4.0, if active { BLUE } else { Color32::from_gray(0xE6) });
+                painter.rect_filled(pill, 4.0, if active { BLUE } else { crate::appearance::subtle(painter.ctx()).to_opaque() });
                 painter.galley(pill.min + vec2(6.0, 3.0), g, Color32::WHITE);
                 self.frame_labels.push((id, pill));
                 continue;
@@ -1255,7 +1255,7 @@ impl App {
             return;
         }
         let (a, b) = (self.view.to_world(rect.min), self.view.to_world(rect.max));
-        let stroke = Stroke::new(1.0, Color32::from_black_alpha(18));
+        let stroke = Stroke::new(1.0, if painter.ctx().global_style().visuals.dark_mode { Color32::from_white_alpha(18) } else { Color32::from_black_alpha(18) });
         for x in (a.x.floor() as i64)..=(b.x.ceil() as i64) {
             let sx = self.view.to_screen(pos2(x as f32, 0.0)).x.round() + 0.5;
             painter.line_segment([pos2(sx, rect.min.y), pos2(sx, rect.max.y)], stroke);
@@ -1318,9 +1318,9 @@ impl App {
     /// Shift+R: top and left rulers with the selection's span highlighted.
     fn draw_rulers(&self, painter: &Painter, rect: Rect) {
         const T: f32 = 20.0;
-        let bg = Color32::from_gray(0xFA);
-        let line = Color32::from_gray(0xD0);
-        let text = Color32::from_gray(0x80);
+        let bg = painter.ctx().global_style().visuals.panel_fill.to_opaque();
+        let line = crate::appearance::border(painter.ctx());
+        let text = crate::appearance::muted(painter.ctx());
         let top = Rect::from_min_max(rect.min, pos2(rect.max.x, rect.min.y + T));
         let left = Rect::from_min_max(rect.min, pos2(rect.min.x + T, rect.max.y));
         painter.rect_filled(top, 0.0, bg);

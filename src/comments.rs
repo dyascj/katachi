@@ -150,7 +150,7 @@ impl App {
                         ui.painter().circle_filled(r.center(), 10.0, avatar(who));
                         ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, who.chars().next().unwrap_or('?').to_string(), FontId::proportional(10.0), Color32::WHITE);
                         ui.label(RichText::new(who).strong());
-                        ui.label(RichText::new(ago(*t)).color(Color32::from_gray(0x99)).small());
+                        ui.label(RichText::new(ago(*t)).color(crate::appearance::faint(ui.ctx())).small());
                     });
                     ui.label(text);
                     ui.add_space(4.0);
@@ -201,14 +201,14 @@ impl App {
         ui.separator();
         let list: Vec<Comment> = self.doc.comments.iter().filter(|c| c.page == self.page && (self.show_resolved || !c.resolved)).cloned().collect();
         if list.is_empty() {
-            ui.label(RichText::new("Click anywhere on the canvas to leave a comment.").color(Color32::from_gray(0x80)));
+            ui.label(RichText::new("Click anywhere on the canvas to leave a comment.").color(crate::appearance::muted(ui.ctx())));
         }
         for c in list.iter().rev() {
             let Some((who, text, t)) = c.messages.first() else { continue };
             let r = ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(who).strong());
-                    ui.label(RichText::new(ago(*t)).color(Color32::from_gray(0x99)).small());
+                    ui.label(RichText::new(ago(*t)).color(crate::appearance::faint(ui.ctx())).small());
                     if c.resolved {
                         ui.label(RichText::new("Resolved").color(Color32::from_rgb(0x14, 0xAE, 0x5C)).small());
                     }

@@ -4,7 +4,7 @@ use crate::app::App;
 use crate::canvas::num;
 use crate::doc::{Bindable, Kind, NodeId, Rgba, VarValue};
 use crate::panels::{Icon, icon_button};
-use egui::{Color32, DragValue, RichText, Ui};
+use egui::{DragValue, RichText, Ui};
 
 fn type_name(v: &VarValue) -> &'static str {
     match v {
@@ -100,7 +100,7 @@ impl App {
                         let vid = self.doc.variables[vi].id;
                         ui.horizontal(|ui| {
                             let t = type_name(&self.doc.variables[vi].values[0]);
-                            ui.label(RichText::new(&t[..1]).color(Color32::from_gray(0x99)).monospace()).on_hover_text(t);
+                            ui.label(RichText::new(&t[..1]).color(crate::appearance::faint(ui.ctx())).monospace()).on_hover_text(t);
                             ui.add(egui::TextEdit::singleline(&mut self.doc.variables[vi].name).desired_width(150.0));
                         });
                         for m in 0..modes {

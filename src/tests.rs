@@ -1371,3 +1371,4 @@ fn select_matching_and_paste_to_replace() {
     assert_eq!(d.node(new).kind, Kind::Ellipse);
     assert_eq!(d.node(new).rect.center(), pos2(90., 10.), "centered where the replaced layer was");
 }
+

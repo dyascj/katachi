@@ -338,8 +338,8 @@ pub fn style_preview(ui: &mut Ui, v: &crate::doc::StyleValue) {
         StyleValue::Effect(_) => {
             let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
             ui.painter().rect_filled(r.shrink(3.0).translate(vec2(1.0, 2.0)), 3.0, Color32::from_black_alpha(60));
-            ui.painter().rect_filled(r.shrink(3.0), 3.0, Color32::WHITE);
-            ui.painter().rect_stroke(r.shrink(3.0), 3.0, Stroke::new(1.0, Color32::from_gray(0xCC)), StrokeKind::Inside);
+            ui.painter().rect_filled(r.shrink(3.0), 3.0, crate::appearance::card(ui.ctx()));
+            ui.painter().rect_stroke(r.shrink(3.0), 3.0, Stroke::new(1.0, crate::appearance::border(ui.ctx())), StrokeKind::Inside);
         }
     }
 }
@@ -363,7 +363,7 @@ pub fn style_menu(ui: &mut Ui, id: egui::Id, styles: &[crate::doc::Style], same_
             });
         }
         if !any {
-            ui.label(egui::RichText::new("No styles yet").color(Color32::from_gray(0x99)));
+            ui.label(egui::RichText::new("No styles yet").color(crate::appearance::faint(ui.ctx())));
         }
         ui.separator();
         let name_id = id.with("new-name");

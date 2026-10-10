@@ -587,7 +587,7 @@ fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
         return;
     }
     if sc.outline {
-        let gray = Color32::from_gray(0x40);
+        let gray = if painter.ctx().global_style().visuals.dark_mode { Color32::from_gray(0xC8) } else { Color32::from_gray(0x40) };
         if n.kind == Kind::Text {
             if sc.hide != Some(id) {
                 let (galley, _, _) = crate::text::layout(painter, n, v.zoom, gray);

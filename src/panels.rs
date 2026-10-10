@@ -55,9 +55,7 @@ pub enum Icon {
     Close,
 }
 
-const SUBTLE: Color32 = Color32::from_rgb(0xF5, 0xF5, 0xF5);
-const SEL_BG: Color32 = Color32::from_rgb(0xE5, 0xF4, 0xFF);
-const CHILD_BG: Color32 = Color32::from_rgb(0xF2, 0xF9, 0xFF);
+use crate::appearance as theme;
 
 /// Toolbar groups as in Figma UI3: (tool, icon, "Name  shortcut").
 pub const TOOL_GROUPS: [&[(Tool, Icon, &str)]; 6] = [
@@ -346,9 +344,9 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, selected: bool, size: f32, tip: &str
     let (bg, fg) = if selected {
         (BLUE, Color32::WHITE)
     } else if resp.hovered() {
-        (SUBTLE, Color32::from_gray(0x1E))
+        (theme::subtle(ui.ctx()), theme::ink(ui.ctx()))
     } else {
-        (Color32::TRANSPARENT, Color32::from_gray(0x1E))
+        (Color32::TRANSPARENT, theme::ink(ui.ctx()))
     };
     ui.painter().rect_filled(rect, 5.0, bg);
     paint_icon(ui.painter(), rect, icon, fg);
@@ -415,7 +413,7 @@ fn num_field(ui: &mut Ui, v: &mut f32, label: &str, min: f32, width: f32) -> boo
     );
     if let Some(i) = icon {
         let r = Rect::from_center_size(pos2(resp.rect.min.x + 13.0, resp.rect.center().y), vec2(14.0, 14.0));
-        paint_icon(ui.painter(), r, i, Color32::from_gray(0x80));
+        paint_icon(ui.painter(), r, i, theme::muted(ui.ctx()));
     }
     if resp.changed() {
         *v = tmp;
@@ -453,7 +451,7 @@ fn sizing_menu(ui: &mut Ui, id: egui::Id, mode: &mut Sizing, can_hug: bool, can_
 fn align_grid(ui: &mut Ui, l: &mut AutoLayout) {
     let (rect, resp) = ui.allocate_exact_size(vec2(64.0, 64.0), Sense::click());
     let p = ui.painter();
-    p.rect_filled(rect, 4.0, SUBTLE);
+    p.rect_filled(rect, 4.0, theme::subtle(ui.ctx()));
     let h = l.mode == LayoutMode::Horizontal;
     let idx = |a: AxisAlign| match a {
         AxisAlign::Min => 0,
@@ -474,7 +472,7 @@ fn align_grid(ui: &mut Ui, l: &mut AutoLayout) {
                     p.rect_filled(Rect::from_center_size(at + off, vec2(bw * if h { 1.0 } else { len }, bh * if h { len } else { 1.0 })), 1.0, BLUE);
                 }
             } else {
-                p.circle_filled(at, 1.5, Color32::from_gray(0xB3));
+                p.circle_filled(at, 1.5, theme::dim(ui.ctx()));
             }
         }
     }
@@ -530,7 +528,7 @@ impl App {
             ui.horizontal(|ui| {
                 for (assets, label) in [(false, "File"), (true, "Assets")] {
                     let text = RichText::new(label);
-                    let text = if self.left_tab_assets == assets { text.strong() } else { text.color(Color32::from_gray(0x80)) };
+                    let text = if self.left_tab_assets == assets { text.strong() } else { text.color(theme::muted(ui.ctx())) };
                     if ui.add(egui::Button::new(text).frame(false)).clicked() {
                         self.left_tab_assets = assets;
                     }
@@ -586,7 +584,7 @@ impl App {
             .collect();
         comps.sort_by(|a, b| (a.0, &a.2).cmp(&(b.0, &b.2)));
         if comps.is_empty() {
-            ui.label(RichText::new("Create components with ⌥⌘K to reuse them here.").color(Color32::from_gray(0x80)));
+            ui.label(RichText::new("Create components with ⌥⌘K to reuse them here.").color(theme::muted(ui.ctx())));
         }
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for (page, id, name) in comps {
@@ -595,7 +593,7 @@ impl App {
                         let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
                         paint_icon(ui.painter(), rect, Icon::Component, crate::canvas::PURPLE);
                         ui.label(&name);
-                        ui.label(RichText::new(&self.doc.pages[page].name).color(Color32::from_gray(0x99)).small());
+                        ui.label(RichText::new(&self.doc.pages[page].name).color(theme::faint(ui.ctx())).small());
                     });
                 });
                 if r.response.double_clicked() {
@@ -720,6 +718,10 @@ impl App {
             ui.close();
         }
         ui.separator();
+        if item(ui, "Appearance…", "") {
+            self.show_appearance = true;
+            ui.close();
+        }
         if item(ui, "Zoom to fit", "⇧1") {
             self.zoom_to(&ctx, None, false);
             ui.close();
@@ -750,9 +752,9 @@ impl App {
         for i in 0..self.doc.pages.len() {
             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
             if i == self.page {
-                ui.painter().rect_filled(rect, 4.0, SUBTLE);
+                ui.painter().rect_filled(rect, 4.0, theme::subtle(ui.ctx()));
             } else if resp.hovered() {
-                ui.painter().rect_filled(rect, 4.0, SUBTLE.gamma_multiply(0.6));
+                ui.painter().rect_filled(rect, 4.0, theme::subtle(ui.ctx()).gamma_multiply(0.6));
             }
             if let Some((pi, buf)) = &mut self.renaming_page
                 && *pi == i {
@@ -846,9 +848,9 @@ impl App {
             let in_selected = !selected && self.sel.iter().any(|&s| self.doc.is_ancestor(s, id));
             let p = &ui.painter().clone();
             if selected {
-                p.rect_filled(rect, 0.0, SEL_BG);
+                p.rect_filled(rect, 0.0, theme::sel_bg(ui.ctx()));
             } else if in_selected {
-                p.rect_filled(rect, 0.0, CHILD_BG);
+                p.rect_filled(rect, 0.0, theme::child_bg(ui.ctx()));
             } else if resp.hovered() || self.hover == Some(id) {
                 p.rect_stroke(rect.shrink(0.5), 0.0, Stroke::new(1.0, BLUE), StrokeKind::Inside);
             }
@@ -856,13 +858,13 @@ impl App {
             let fg = match (comp, n.visible) {
                 (true, true) => crate::canvas::PURPLE,
                 (true, false) => crate::canvas::PURPLE.gamma_multiply(0.45),
-                (false, true) => Color32::from_gray(0x1E),
-                (false, false) => Color32::from_gray(0xB3),
+                (false, true) => theme::ink(ui.ctx()),
+                (false, false) => theme::dim(ui.ctx()),
             };
             let x = rect.min.x + 6.0 + depth as f32 * 16.0;
             let chev = Rect::from_center_size(pos2(x + 6.0, rect.center().y), vec2(12.0, 12.0));
             if !n.children.is_empty() {
-                paint_icon(p, chev, Icon::Chevron(n.expanded), Color32::from_gray(0x80));
+                paint_icon(p, chev, Icon::Chevron(n.expanded), theme::muted(ui.ctx()));
             }
             paint_icon(p, Rect::from_center_size(pos2(x + 22.0, rect.center().y), vec2(16.0, 16.0)), kind_icon(n.kind), fg);
             let name_pos = pos2(x + 36.0, rect.center().y);
@@ -892,10 +894,10 @@ impl App {
             let lock_r = Rect::from_center_size(pos2(rect.max.x - 38.0, rect.center().y), vec2(20.0, 20.0));
             let (visible, locked) = (n.visible, n.locked);
             if hovered || !visible {
-                paint_icon(p, eye_r, Icon::Eye(visible), Color32::from_gray(0x60));
+                paint_icon(p, eye_r, Icon::Eye(visible), theme::icon(ui.ctx()));
             }
             if hovered || locked {
-                paint_icon(p, lock_r, Icon::Lock(locked), Color32::from_gray(0x60));
+                paint_icon(p, lock_r, Icon::Lock(locked), theme::icon(ui.ctx()));
             }
             let click_pos = resp.interact_pointer_pos();
             if resp.clicked() {
@@ -991,7 +993,7 @@ impl App {
                 }
                 for (proto, label) in [(false, "Design"), (true, "Prototype")] {
                     let text = RichText::new(label);
-                    let text = if self.prototype_tab == proto { text.strong() } else { text.color(Color32::from_gray(0x80)) };
+                    let text = if self.prototype_tab == proto { text.strong() } else { text.color(theme::muted(ui.ctx())) };
                     if ui.add(egui::Button::new(text).frame(false)).clicked() {
                         self.prototype_tab = proto;
                     }
@@ -1068,7 +1070,7 @@ impl App {
             heading(ui, "Flow starting points");
             let flows = self.doc.pages[self.page].flows.clone();
             if flows.is_empty() {
-                ui.label(RichText::new("Select a frame and mark it as a starting point.").color(Color32::from_gray(0x80)));
+                ui.label(RichText::new("Select a frame and mark it as a starting point.").color(theme::muted(ui.ctx())));
             }
             for f in flows {
                 let name = self.doc.nodes.get(&f).map_or("Missing".into(), |n| n.name.clone());
@@ -1227,12 +1229,12 @@ impl App {
         use crate::codegen::{Lang, generate};
         let Some(&id) = self.sel.first() else {
             ui.add_space(12.0);
-            ui.label(RichText::new("Select a layer to inspect its code and properties.").color(Color32::from_gray(0x80)));
+            ui.label(RichText::new("Select a layer to inspect its code and properties.").color(theme::muted(ui.ctx())));
             return;
         };
         let n = self.doc.node(id).clone();
         ui.label(RichText::new(&n.name).strong().size(14.0));
-        ui.label(RichText::new(format!("{}  ·  {} × {}", n.kind.label(), num(n.rect.width()), num(n.rect.height()))).color(Color32::from_gray(0x80)));
+        ui.label(RichText::new(format!("{}  ·  {} × {}", n.kind.label(), num(n.rect.width()), num(n.rect.height()))).color(theme::muted(ui.ctx())));
         ui.separator();
         ui.horizontal(|ui| {
             ui.label(RichText::new("Code").strong());
@@ -1243,7 +1245,7 @@ impl App {
             });
         });
         let code = generate(&self.doc, id, self.code_lang);
-        egui::Frame::new().fill(Color32::from_gray(0xF5)).corner_radius(6).inner_margin(8).show(ui, |ui| {
+        egui::Frame::new().fill(theme::subtle(ui.ctx())).corner_radius(6).inner_margin(8).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             ui.add(egui::Label::new(RichText::new(&code).monospace().size(11.0)).selectable(true));
@@ -1335,7 +1337,7 @@ impl App {
             if list.is_empty() {
                 continue;
             }
-            ui.label(RichText::new(label).color(Color32::from_gray(0x80)).small());
+            ui.label(RichText::new(label).color(theme::muted(ui.ctx())).small());
             for st in list {
                 ui.horizontal(|ui| {
                     crate::paint_ui::style_preview(ui, &st.value);
@@ -2773,10 +2775,10 @@ impl App {
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::new()
-                    .fill(Color32::WHITE)
+                    .fill(theme::card(ui.ctx()))
                     .corner_radius(CornerRadius::same(12))
                     .inner_margin(6)
-                    .stroke(Stroke::new(1.0, Color32::from_gray(0xE6)))
+                    .stroke(Stroke::new(1.0, theme::border(ui.ctx())))
                     .shadow(egui::Shadow { offset: [0, 2], blur: 10, spread: 0, color: Color32::from_black_alpha(30) })
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
@@ -2796,7 +2798,7 @@ impl App {
                                         for &(t, icon, label) in tools.iter() {
                                             ui.horizontal(|ui| {
                                                 let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
-                                                paint_icon(ui.painter(), r, icon, Color32::from_gray(0x1E));
+                                                paint_icon(ui.painter(), r, icon, theme::ink(ui.ctx()));
                                                 let (name, key) = label.split_once("  ").unwrap_or((label, ""));
                                                 if ui.add(egui::Button::new(name).shortcut_text(key).frame(false).min_size(vec2(140.0, 0.0))).clicked() {
                                                     self.set_tool(t);

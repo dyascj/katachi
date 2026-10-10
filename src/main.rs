@@ -1,4 +1,5 @@
 mod app;
+mod appearance;
 mod boolean;
 mod canvas;
 mod codegen;
@@ -25,7 +26,7 @@ mod vector_edit;
 #[cfg(test)]
 mod tests;
 
-use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, TextStyle};
+use egui::{FontData, FontDefinitions, FontFamily};
 use std::sync::Arc;
 
 fn main() -> eframe::Result {
@@ -46,6 +47,8 @@ fn main() -> eframe::Result {
             .with_title("Katachi")
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([800.0, 500.0])
+            // Always transparent so glass can switch on without a restart; opaque otherwise.
+            .with_transparent(true)
             .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon/icon.png")).unwrap_or_default()),
         multisampling: 4,
         ..Default::default()
@@ -76,34 +79,7 @@ fn setup_style(ctx: &egui::Context) {
     }
     ctx.set_fonts(fonts);
     ctx.options_mut(|o| o.zoom_with_keyboard = false);
-    ctx.set_theme(egui::Theme::Light);
-    ctx.style_mut_of(egui::Theme::Light, |s| {
-        s.text_styles = [
-            (TextStyle::Heading, FontId::proportional(13.0)),
-            (TextStyle::Body, FontId::proportional(12.0)),
-            (TextStyle::Button, FontId::proportional(12.0)),
-            (TextStyle::Small, FontId::proportional(10.0)),
-            (TextStyle::Monospace, FontId::monospace(11.0)),
-        ]
-        .into();
-        s.spacing.button_padding = egui::vec2(8.0, 4.0);
-        s.spacing.interact_size.y = 24.0;
-        let v = &mut s.visuals;
-        v.panel_fill = Color32::WHITE;
-        v.window_fill = Color32::WHITE;
-        v.extreme_bg_color = Color32::from_gray(0xF5);
-        v.override_text_color = Some(Color32::from_gray(0x1E));
-        v.selection.bg_fill = Color32::from_rgb(0xBD, 0xE3, 0xFF);
-        v.selection.stroke.color = canvas::BLUE;
-        v.widgets.noninteractive.bg_stroke.color = Color32::from_gray(0xE6);
-        for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
-            w.corner_radius = egui::CornerRadius::same(5);
-        }
-        v.widgets.inactive.weak_bg_fill = Color32::from_gray(0xF5);
-        v.widgets.inactive.bg_fill = Color32::from_gray(0xF5);
-        v.widgets.hovered.weak_bg_fill = Color32::from_gray(0xEB);
-        v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, Color32::from_gray(0xD0));
-    });
+    appearance::apply(ctx, &appearance::load());
 }
 
 fn serve_headless(args: &[String]) {

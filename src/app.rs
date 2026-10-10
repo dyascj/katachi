@@ -149,6 +149,10 @@ pub struct App {
     pub outline_mode: bool,
     pub show_grids: bool,
     pub show_history: bool,
+    /// Theme and glass settings, and the blur radius last given to the window.
+    pub appearance: crate::appearance::Appearance,
+    pub show_appearance: bool,
+    blur_applied: Option<u8>,
     /// The plugin that's running with a UI, if any.
     pub plugin: Option<PluginRun>,
     /// MCP tool calls from agents, once the server is listening.
@@ -249,6 +253,9 @@ impl App {
             find: (false, String::new(), String::new(), false),
             clip_frag: None,
             plugin: None,
+            appearance: crate::appearance::load(),
+            show_appearance: false,
+            blur_applied: None,
             mcp: None,
             mcp_tried: cfg!(test),
             debug_plugin: std::env::var_os("KATACHI_PLUGIN").map(PathBuf::from),
@@ -1364,6 +1371,23 @@ impl App {
         }
     }
 
+    /// The appearance window, and keeping the window's desktop blur in step with glass.
+    fn appearance_frame(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if self.show_appearance {
+            let mut open = true;
+            if crate::appearance::window(ctx, &mut open, &mut self.appearance) {
+                crate::appearance::apply(ctx, &self.appearance);
+                crate::appearance::save(&self.appearance);
+            }
+            self.show_appearance = open;
+        }
+        let blur = if self.appearance.glass { self.appearance.blur } else { 0 };
+        if self.blur_applied != Some(blur) {
+            crate::appearance::set_window_blur(frame, blur);
+            self.blur_applied = Some(blur);
+        }
+    }
+
     /// Start the MCP server on the first frame, then answer tool calls between frames.
     fn mcp_frame(&mut self, ctx: &egui::Context) {
         if !self.mcp_tried {
@@ -2069,6 +2093,11 @@ impl App {
 fn void(_: bool) {}
 
 impl eframe::App for App {
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        // Glass lets the (blurred) desktop through wherever panels are translucent.
+        if self.appearance.glass { [0.0; 4] } else { visuals.panel_fill.to_normalized_gamma_f32() }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if self.presenting.is_some() {
@@ -2093,6 +2122,7 @@ impl eframe::App for App {
         self.console_window(&ctx);
         self.find_window(&ctx);
         self.plugin_frame(&ctx, frame);
+        self.appearance_frame(&ctx, frame);
         self.mcp_frame(&ctx);
         self.variables_window(&ctx);
         self.autosave(ctx.input(|i| i.time));

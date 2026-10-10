@@ -2545,6 +2545,8 @@ dependencies = [
  "image",
  "lyon",
  "miniz_oxide 0.9.1",
+ "objc2 0.6.5",
+ "raw-window-handle",
  "resvg 0.48.1",
  "rfd",
  "rquickjs",

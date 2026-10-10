@@ -81,6 +81,10 @@ GitHub Actions. Building from source needs Rust 1.92 or newer.
 - `.katachi` files (JSON), atomic saves, crash-recovery autosave, version history, open recent
 - Export presets per layer to PNG, JPG, SVG, and PDF
 
+**Appearance**
+- Light, dark, or system theme (Main menu > Appearance). Pages left at the default canvas color follow the theme
+- Glass: translucent, tinted side panels and toolbars over a blurred desktop, with adjustable opacity, blur (macOS), and tint; the canvas stays solid. On Windows and Linux glass is translucency without the blur
+
 **MCP server (for AI agents)**
 - The app serves MCP at `http://127.0.0.1:3855/mcp` while it's open, like Figma's Dev Mode MCP server, but agents can also edit: `claude mcp add --transport http katachi http://127.0.0.1:3855/mcp` (or Main menu > MCP server to copy the command). Stdio clients use `katachi mcp`
 - Tools: `get_metadata` (XML outline), `get_screenshot`, `get_code` (CSS, SwiftUI, Compose), `get_variable_defs`, `get_components`, `get_selection`, `execute_code` (Figma plugin-API JavaScript, one undo step per call), `list_pages`, `set_page`, `select`, `import_svg`, `place_image`, `save`, `open_file`, `undo`
