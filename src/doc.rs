@@ -348,6 +348,102 @@ pub struct Comment {
     pub resolved: bool,
 }
 
+/// Style overrides for a range of characters in a text layer (unset = the layer's own value).
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpanStyle {
+    pub font_family: Option<String>,
+    pub font_weight: Option<u16>,
+    pub font_size: Option<f32>,
+    pub color: Option<Rgba>,
+    pub decoration: Option<Decoration>,
+    pub italic: Option<bool>,
+}
+
+impl SpanStyle {
+    /// Overlay `patch` on top of self.
+    pub fn merge(&self, patch: &SpanStyle) -> SpanStyle {
+        SpanStyle {
+            font_family: patch.font_family.clone().or(self.font_family.clone()),
+            font_weight: patch.font_weight.or(self.font_weight),
+            font_size: patch.font_size.or(self.font_size),
+            color: patch.color.or(self.color),
+            decoration: patch.decoration.or(self.decoration),
+            italic: patch.italic.or(self.italic),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        *self == SpanStyle::default()
+    }
+}
+
+/// A styled character range [start, end) in a text layer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TextSpan {
+    pub start: usize,
+    pub end: usize,
+    pub style: SpanStyle,
+}
+
+/// Apply a style patch to chars [start, end), splitting and merging spans as needed.
+pub fn style_range(spans: &[TextSpan], len: usize, start: usize, end: usize, patch: &SpanStyle) -> Vec<TextSpan> {
+    let (start, end) = (start.min(len), end.min(len));
+    if start >= end {
+        return spans.to_vec();
+    }
+    // Break the text into pieces at every boundary, then restyle the pieces inside the range.
+    let mut cuts: Vec<usize> = vec![0, len, start, end];
+    for sp in spans {
+        cuts.push(sp.start.min(len));
+        cuts.push(sp.end.min(len));
+    }
+    cuts.sort();
+    cuts.dedup();
+    let mut out: Vec<TextSpan> = vec![];
+    for w in cuts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let base = spans.iter().find(|sp| sp.start <= a && sp.end >= b).map(|sp| sp.style.clone()).unwrap_or_default();
+        let style = if a >= start && b <= end { base.merge(patch) } else { base };
+        if style.is_empty() {
+            continue;
+        }
+        match out.last_mut() {
+            Some(last) if last.end == a && last.style == style => last.end = b,
+            _ => out.push(TextSpan { start: a, end: b, style }),
+        }
+    }
+    out
+}
+
+/// Keep spans attached to their characters across an edit from `old` to `new`.
+/// Typing at the end of a span extends it, as in Figma.
+pub fn shift_spans(spans: &[TextSpan], old: &str, new: &str) -> Vec<TextSpan> {
+    if spans.is_empty() || old == new {
+        return spans.to_vec();
+    }
+    let (o, n): (Vec<char>, Vec<char>) = (old.chars().collect(), new.chars().collect());
+    let prefix = o.iter().zip(&n).take_while(|(a, b)| a == b).count();
+    let max_suffix = o.len().min(n.len()) - prefix;
+    let suffix = o.iter().rev().zip(n.iter().rev()).take(max_suffix).take_while(|(a, b)| a == b).count();
+    let (old_end, new_end) = (o.len() - suffix, n.len() - suffix);
+    let map = |x: usize, is_end: bool| -> usize {
+        if x < prefix || (x == prefix && !is_end) {
+            x
+        } else if x >= old_end && !(x == prefix && is_end) {
+            x + new_end - old_end
+        } else if is_end {
+            new_end
+        } else {
+            prefix
+        }
+    };
+    spans
+        .iter()
+        .map(|sp| TextSpan { start: map(sp.start, false), end: map(sp.end, true), style: sp.style.clone() })
+        .filter(|sp| sp.end > sp.start)
+        .collect()
+}
+
 pub type StyleId = u64;
 
 /// Typography captured by a text style.
@@ -881,6 +977,8 @@ pub struct Node {
     pub letter_spacing: f32,
     pub decoration: Decoration,
     pub text_case: TextCase,
+    /// Styled character ranges (rich text).
+    pub spans: Vec<TextSpan>,
     /// Wrapped lines from the last layout, used by export.
     #[serde(skip)]
     pub lines: Vec<String>,
@@ -950,6 +1048,7 @@ impl Default for Node {
             letter_spacing: 0.0,
             decoration: Decoration::None,
             text_case: TextCase::Original,
+            spans: vec![],
             lines: vec![],
             expanded: true,
         }
@@ -2144,7 +2243,7 @@ fn merge_from(e: &mut Node, src: &Node) {
         name, visible, opacity, fills, strokes, stroke_width, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, constraints, absolute,
         paths, even_odd, text, font_size, font_weight, font_family, text_sizing, text_align, text_valign, line_height, letter_spacing,
         decoration, text_case, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, fill_style,
-        stroke_style, text_style, effect_style, prop_bind, is_mask, blend, bindings, modes
+        stroke_style, text_style, effect_style, prop_bind, is_mask, blend, bindings, modes, spans
     );
     e.synced = Some(Box::new(Node { children: vec![], synced: None, ..src.clone() }));
 }
@@ -2690,6 +2789,28 @@ mod tests {
         d.reflow();
         assert_eq!(d.node(child).radius, 4.0);
         assert!(Bindable::Radius.accepts(&VarValue::Number(1.0)) && !Bindable::Fill.accepts(&VarValue::Number(1.0)));
+    }
+
+    #[test]
+    fn rich_text_spans_style_and_shift() {
+        let bold = SpanStyle { font_weight: Some(700), ..Default::default() };
+        let red = SpanStyle { color: Some(Rgba::rgb(255, 0, 0)), ..Default::default() };
+        // "Hello world": bold "world", then red "lo wo" (overlaps both).
+        let s1 = style_range(&[], 11, 6, 11, &bold);
+        assert_eq!(s1, vec![TextSpan { start: 6, end: 11, style: bold.clone() }]);
+        let s2 = style_range(&s1, 11, 3, 8, &red);
+        assert_eq!(s2.len(), 3);
+        assert_eq!((s2[0].start, s2[0].end), (3, 6));
+        assert_eq!(s2[1].style, bold.merge(&red));
+        assert_eq!((s2[2].start, s2[2].end, s2[2].style.clone()), (8, 11, bold.clone()));
+        // Typing before a span shifts it; typing at its end extends it; deleting through it trims it.
+        let typed = shift_spans(&s1, "Hello world", "Oh Hello world");
+        assert_eq!((typed[0].start, typed[0].end), (9, 14));
+        let extended = shift_spans(&s1, "Hello world", "Hello worlds");
+        assert_eq!((extended[0].start, extended[0].end), (6, 12));
+        let trimmed = shift_spans(&s1, "Hello world", "Hello wd");
+        assert_eq!((trimmed[0].start, trimmed[0].end), (6, 8));
+        assert!(shift_spans(&s1, "Hello world", "Hello ").is_empty(), "span deleted with its text");
     }
 
     #[test]

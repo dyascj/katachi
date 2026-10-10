@@ -165,18 +165,43 @@ pub fn line_pitch(n: &Node) -> f32 {
 
 /// Layout job for a text node at `zoom`. `text` is the raw (un-cased) string.
 pub fn job(n: &Node, text: &str, zoom: f32, color: Color32) -> LayoutJob {
-    let size = n.font_size * zoom;
-    let deco = Stroke::new((n.font_size / 14.0).max(1.0) * zoom, color);
-    let format = TextFormat {
-        font_id: FontId::new(size, font_family(&n.font_family, n.font_weight)),
-        color,
-        extra_letter_spacing: n.letter_spacing / 100.0 * size,
-        line_height: (n.line_height != LineHeight::Auto).then(|| line_pitch(n) * zoom),
-        underline: if n.decoration == Decoration::Underline { deco } else { Stroke::NONE },
-        strikethrough: if n.decoration == Decoration::Strikethrough { deco } else { Stroke::NONE },
-        ..Default::default()
+    let alpha = color.a() as f32 / 255.0;
+    let format = |st: &crate::doc::SpanStyle| {
+        let size = st.font_size.unwrap_or(n.font_size) * zoom;
+        let c = st.color.map_or(color, |c| c.to32().gamma_multiply(alpha));
+        let deco = Stroke::new((n.font_size / 14.0).max(1.0) * zoom, c);
+        let decoration = st.decoration.unwrap_or(n.decoration);
+        let family = st.font_family.as_deref().unwrap_or(&n.font_family);
+        TextFormat {
+            font_id: FontId::new(size, font_family(family, st.font_weight.unwrap_or(n.font_weight))),
+            color: c,
+            extra_letter_spacing: n.letter_spacing / 100.0 * size,
+            line_height: (n.line_height != LineHeight::Auto).then(|| line_pitch(n) * zoom),
+            underline: if decoration == Decoration::Underline { deco } else { Stroke::NONE },
+            strikethrough: if decoration == Decoration::Strikethrough { deco } else { Stroke::NONE },
+            italics: st.italic.unwrap_or(false),
+            ..Default::default()
+        }
     };
-    let mut job = LayoutJob::single_section(apply_case(text, n.text_case), format);
+    let mut job = LayoutJob::default();
+    if n.spans.is_empty() {
+        job.append(&apply_case(text, n.text_case), 0.0, format(&Default::default()));
+    } else {
+        // One section per styled run; char indices are clamped while the editor is a frame ahead.
+        let chars: Vec<char> = text.chars().collect();
+        let mut cuts: Vec<usize> = vec![0, chars.len()];
+        for sp in &n.spans {
+            cuts.push(sp.start.min(chars.len()));
+            cuts.push(sp.end.min(chars.len()));
+        }
+        cuts.sort();
+        cuts.dedup();
+        for w in cuts.windows(2) {
+            let piece: String = chars[w[0]..w[1]].iter().collect();
+            let st = n.spans.iter().find(|sp| sp.start <= w[0] && sp.end >= w[1]).map(|sp| sp.style.clone()).unwrap_or_default();
+            job.append(&apply_case(&piece, n.text_case), 0.0, format(&st));
+        }
+    }
     job.wrap.max_width = match n.text_sizing {
         TextSizing::AutoWidth => f32::INFINITY,
         _ => (n.rect.width() * zoom).max(1.0),
@@ -226,8 +251,21 @@ pub fn layout(painter: &egui::Painter, n: &Node, zoom: f32, color: Color32) -> (
     let text = if n.text.is_empty() { " " } else { n.text.as_str() };
     let galley = painter.layout_job(job(n, text, zoom, color));
     let rows = galley.rows.len();
-    let lines = galley.rows.iter().map(|r| r.glyphs.iter().map(|g| g.chr).collect::<String>()).collect();
+    // Lines keep a trailing newline where the paragraph ended, so export can track char offsets.
+    let lines = galley
+        .rows
+        .iter()
+        .map(|r| {
+            let mut l: String = r.glyphs.iter().map(|g| g.chr).collect();
+            if r.ends_with_newline {
+                l.push('\n');
+            }
+            l
+        })
+        .collect();
     let width = galley.rows.iter().map(|r| r.size.x).fold(0.0, f32::max) / zoom;
-    let size = vec2(width, line_pitch(n) * rows.max(1) as f32);
+    // Mixed sizes make rows taller than the base pitch; take whichever is larger.
+    let laid_out = if n.spans.is_empty() { 0.0 } else { galley.size().y / zoom };
+    let size = vec2(width, (line_pitch(n) * rows.max(1) as f32).max(laid_out));
     (align_rows(galley, n, zoom), size, lines)
 }

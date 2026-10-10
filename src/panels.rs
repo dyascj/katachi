@@ -2031,6 +2031,14 @@ impl App {
             });
         });
         ui.horizontal(|ui| {
+            if ui.selectable_label(false, RichText::new(" I ").italics()).on_hover_text("Italic (selected characters)").clicked() {
+                let on = self
+                    .text_selection(ui.ctx())
+                    .and_then(|(a, _)| n.spans.iter().find(|sp| sp.start <= a && sp.end > a))
+                    .and_then(|sp| sp.style.italic)
+                    .unwrap_or(false);
+                self.style_selection(ui.ctx(), crate::doc::SpanStyle { italic: Some(!on), ..Default::default() });
+            }
             for (d, label) in [(Decoration::Underline, RichText::new(" U ").underline()), (Decoration::Strikethrough, RichText::new(" S ").strikethrough())] {
                 let on = t.decoration == d;
                 if ui.selectable_label(on, label).on_hover_text(format!("{d:?}")).clicked() {
@@ -2048,6 +2056,20 @@ impl App {
             || t.text_sizing != n.text_sizing
             || t.decoration != n.decoration
             || t.text_case != n.text_case;
+        // With characters selected in the editor, changes style just that range (rich text).
+        if changed && self.text_selection(ui.ctx()).is_some() {
+            let patch = crate::doc::SpanStyle {
+                font_family: (t.font_family != n.font_family).then(|| t.font_family.clone()),
+                font_weight: (t.font_weight != n.font_weight).then_some(t.font_weight),
+                font_size: (t.font_size != n.font_size).then_some(t.font_size),
+                decoration: (t.decoration != n.decoration).then_some(t.decoration),
+                ..Default::default()
+            };
+            if !patch.is_empty() {
+                self.style_selection(ui.ctx(), patch);
+                return;
+            }
+        }
         if changed {
             self.begin_edit();
             for &id in &self.sel.clone() {
@@ -2242,6 +2264,12 @@ impl App {
                 });
             });
         }
+        // Recoloring selected characters while editing text.
+        if changed && !stroke && n.kind == Kind::Text && self.text_selection(ui.ctx()).is_some()
+            && let Some(c) = paints.iter().rev().find(|p| p.visible && p.kind == crate::doc::PaintKind::Solid).map(|p| p.color) {
+                self.style_selection(ui.ctx(), crate::doc::SpanStyle { color: Some(c), ..Default::default() });
+                return;
+            }
         if changed || stroke_changed {
             self.begin_edit();
             for &id in &self.sel.clone() {

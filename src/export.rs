@@ -365,16 +365,60 @@ impl Svg<'_> {
                         Decoration::None => {}
                     }
                     let lines: Vec<String> = if n.lines.is_empty() {
-                        crate::text::apply_case(&n.text, n.text_case).split('\n').map(str::to_string).collect()
+                        crate::text::apply_case(&n.text, n.text_case).split('\n').map(|l| format!("{l}\n")).collect()
                     } else {
-                        n.lines.iter().map(|l| l.trim_end_matches('\n').to_string()).collect()
+                        n.lines.clone()
                     };
                     let top = r.min.y + crate::text::draw_offset(n, lines.len()).y;
                     let pitch = crate::text::line_pitch(n);
                     let _ = write!(self.out, r#"<text {attrs} xml:space="preserve">"#);
+                    let mut offset = 0;
                     for (i, line) in lines.iter().enumerate() {
                         let y = top + n.font_size * crate::text::ASCENT + pitch * i as f32;
-                        let _ = write!(self.out, r#"<tspan x="{x}" y="{y}">{}</tspan>"#, esc(line));
+                        let body: Vec<char> = line.trim_end_matches('\n').chars().collect();
+                        // Split the line at span boundaries so each run carries its own style.
+                        let mut cuts = vec![0, body.len()];
+                        for sp in &n.spans {
+                            for b in [sp.start, sp.end] {
+                                if b > offset && b < offset + body.len() {
+                                    cuts.push(b - offset);
+                                }
+                            }
+                        }
+                        cuts.sort();
+                        cuts.dedup();
+                        for (k, w) in cuts.windows(2).enumerate() {
+                            let text: String = body[w[0]..w[1]].iter().collect();
+                            let (a, b) = (offset + w[0], offset + w[1]);
+                            let mut style = String::new();
+                            if let Some(sp) = n.spans.iter().find(|sp| sp.start <= a && sp.end >= b) {
+                                let st = &sp.style;
+                                if let Some(w) = st.font_weight {
+                                    let _ = write!(style, r#" font-weight="{w}""#);
+                                }
+                                if let Some(sz) = st.font_size {
+                                    let _ = write!(style, r#" font-size="{sz}""#);
+                                }
+                                if let Some(f) = &st.font_family {
+                                    let _ = write!(style, r#" font-family="{}""#, esc(f));
+                                }
+                                if let Some(c) = st.color {
+                                    let (c, a) = color_parts(c);
+                                    let _ = write!(style, r#" fill="{c}" fill-opacity="{a:.3}""#);
+                                }
+                                if st.italic == Some(true) {
+                                    style.push_str(r#" font-style="italic""#);
+                                }
+                                match st.decoration {
+                                    Some(Decoration::Underline) => style.push_str(r#" text-decoration="underline""#),
+                                    Some(Decoration::Strikethrough) => style.push_str(r#" text-decoration="line-through""#),
+                                    _ => {}
+                                }
+                            }
+                            let pos = if k == 0 { format!(r#" x="{x}" y="{y}""#) } else { String::new() };
+                            let _ = write!(self.out, r#"<tspan{pos}{style}>{}</tspan>"#, esc(&text));
+                        }
+                        offset += line.chars().count();
                     }
                     self.out.push_str("</text>");
                 }
@@ -796,6 +840,19 @@ mod tests {
         assert_eq!(&jpg[..2], &[0xFF, 0xD8], "JPEG magic");
         let pdf = encode(&d, &svg, ExportFormat::Pdf, 1.0).unwrap();
         assert!(pdf.starts_with(b"%PDF"), "PDF magic");
+    }
+
+    #[test]
+    fn rich_text_exports_styled_runs() {
+        use crate::doc::{SpanStyle, TextSpan};
+        let mut d = Document::default();
+        let mut t = Node::new(Kind::Text, Rect::from_min_size(pos2(0., 0.), vec2(100., 20.)));
+        t.text = "Hello world".into();
+        t.spans = vec![TextSpan { start: 6, end: 11, style: SpanStyle { font_weight: Some(700), color: Some(Rgba::rgb(255, 0, 0)), ..Default::default() } }];
+        let a = d.insert(0, None, None, t);
+        let svg = to_svg(&d, &[a]);
+        assert!(svg.contains(r#"<tspan x="0" y="#) && svg.contains(r##"<tspan font-weight="700" fill="#FF0000""##), "{svg}");
+        assert!(svg.contains(">Hello </tspan>") && svg.contains(">world</tspan>"), "{svg}");
     }
 
     #[test]

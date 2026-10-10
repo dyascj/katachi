@@ -645,6 +645,22 @@ fn shots() {
     st.sel.clear();
     h.run_steps(4);
     save(&mut h, "22-comments");
+    // Rich text: one text layer with mixed weight, color, italic, and size.
+    let st = h.state_mut();
+    st.set_tool(Tool::Move);
+    st.open_comment = None;
+    let sub = *st.doc.nodes.keys().find(|i| st.doc.node(**i).name == "Subtitle").unwrap();
+    let n = st.doc.node_mut(sub);
+    n.text = "Design in Rust, fast and native".into();
+    n.font_size = 16.;
+    n.spans = vec![
+        crate::doc::TextSpan { start: 10, end: 14, style: crate::doc::SpanStyle { font_weight: Some(700), color: Some(Rgba::rgb(242, 72, 34)), ..Default::default() } },
+        crate::doc::TextSpan { start: 16, end: 20, style: crate::doc::SpanStyle { italic: Some(true), ..Default::default() } },
+        crate::doc::TextSpan { start: 25, end: 31, style: crate::doc::SpanStyle { font_size: Some(22.), font_weight: Some(600), color: Some(Rgba::rgb(13, 153, 255)), ..Default::default() } },
+    ];
+    st.sel = vec![sub];
+    h.run_steps(4);
+    save(&mut h, "23-rich-text");
 }
 
 #[test]
@@ -1118,4 +1134,36 @@ fn render_svgs() {
             img.save(p.with_extension("png")).unwrap();
         }
     }
+}
+
+#[test]
+fn rich_text_editing_styles_selection() {
+    let mut h = harness();
+    let mut t = Node::new(Kind::Text, r(0., 0., 10., 10.));
+    t.text = "Hello world".into();
+    t.font_size = 20.;
+    let id = h.state_mut().doc.insert(0, None, None, t);
+    h.state_mut().sel = vec![id];
+    h.state_mut().editing_text = Some(id);
+    h.state_mut().focus_text = true;
+    h.run_steps(3);
+    // Select "world" in the live editor.
+    let edit_id = egui::Id::new("katachi-text-edit");
+    let mut state = egui::TextEdit::load_state(&h.ctx, edit_id).expect("editor state");
+    state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(6), egui::text::CCursor::new(11))));
+    state.store(&h.ctx, edit_id);
+    let ctx = h.ctx.clone();
+    assert_eq!(h.state().text_selection(&ctx), Some((6, 11)));
+    let bold = crate::doc::SpanStyle { font_weight: Some(700), color: Some(crate::doc::Rgba::rgb(242, 72, 34)), ..Default::default() };
+    assert!(h.state_mut().style_selection(&ctx, bold.clone()));
+    assert_eq!(h.state().doc.node(id).spans, vec![crate::doc::TextSpan { start: 6, end: 11, style: bold.clone() }]);
+    // Keep typing at the end: the bold run grows with it.
+    let mut state = egui::TextEdit::load_state(&h.ctx, edit_id).unwrap();
+    state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(11))));
+    state.store(&h.ctx, edit_id);
+    h.event(Event::Text("!".into()));
+    h.run_steps(2);
+    let n = h.state().doc.node(id);
+    assert_eq!(n.text, "Hello world!");
+    assert_eq!((n.spans[0].start, n.spans[0].end), (6, 12));
 }

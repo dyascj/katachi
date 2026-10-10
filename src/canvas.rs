@@ -8,6 +8,8 @@ use egui::{
     Ui, Vec2, pos2, vec2,
 };
 
+const TEXT_EDIT_ID: &str = "katachi-text-edit";
+
 pub const BLUE: Color32 = Color32::from_rgb(0x0D, 0x99, 0xFF);
 pub const PURPLE: Color32 = Color32::from_rgb(0x97, 0x47, 0xFF);
 const SNAP: Color32 = Color32::from_rgb(0xF2, 0x48, 0x22);
@@ -188,6 +190,10 @@ impl App {
         for id in ids {
             let n = self.doc.node(id);
             crate::text::ensure_font(painter.ctx(), &n.font_family, n.font_weight);
+            for sp in &n.spans {
+                let fam = sp.style.font_family.as_deref().unwrap_or(&n.font_family);
+                crate::text::ensure_font(painter.ctx(), fam, sp.style.font_weight.unwrap_or(n.font_weight));
+            }
             let (_, size, lines) = crate::text::layout(painter, n, 1.0, Color32::BLACK);
             let n = self.doc.node_mut(id);
             n.lines = lines;
@@ -1338,6 +1344,7 @@ impl App {
             .show(ui.ctx(), |ui| {
                 ui.add(
                     egui::TextEdit::multiline(&mut text)
+                        .id(egui::Id::new(TEXT_EDIT_ID))
                         .layouter(&mut layouter)
                         .frame(egui::Frame::NONE)
                         .margin(egui::Margin::ZERO)
@@ -1351,9 +1358,30 @@ impl App {
             self.focus_text = false;
         }
         if text != n.text {
-            self.doc.node_mut(id).text = text;
+            let node = self.doc.node_mut(id);
+            node.spans = crate::doc::shift_spans(&node.spans, &n.text, &text);
+            node.text = text;
             self.dirty = true;
         }
+    }
+
+    /// Characters selected in the in-place text editor, if any.
+    pub fn text_selection(&self, ctx: &egui::Context) -> Option<(usize, usize)> {
+        self.editing_text?;
+        let state = egui::TextEdit::load_state(ctx, egui::Id::new(TEXT_EDIT_ID))?;
+        let r = state.cursor.char_range()?;
+        let (a, b) = (r.primary.index.0, r.secondary.index.0);
+        (a != b).then(|| (a.min(b), a.max(b)))
+    }
+
+    /// Restyle the selected characters of the text being edited. Returns whether it applied.
+    pub fn style_selection(&mut self, ctx: &egui::Context, patch: crate::doc::SpanStyle) -> bool {
+        let (Some(id), Some((a, b))) = (self.editing_text, self.text_selection(ctx)) else { return false };
+        self.begin_edit();
+        let n = self.doc.node_mut(id);
+        let len = n.text.chars().count();
+        n.spans = crate::doc::style_range(&n.spans, len, a, b, &patch);
+        true
     }
 
     fn context_menu(&mut self, ui: &mut Ui) {
