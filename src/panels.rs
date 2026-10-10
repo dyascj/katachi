@@ -29,6 +29,8 @@ pub enum Icon {
     Menu,
     ArrowDown,
     ArrowRight,
+    /// Auto layout wrap: across, then back on the next row.
+    Wrap,
     Opacity,
     Radius,
     PadH,
@@ -202,6 +204,14 @@ pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
             p.line_segment([a, b], s);
             p.line_segment([l, b], s);
             p.line_segment([r, b], s);
+        }
+        Icon::Wrap => {
+            let pts = [at(-6., -4.), at(4., -4.), at(6., -2.), at(6., 1.), at(4., 3.), at(-5., 3.)];
+            for w in pts.windows(2) {
+                p.line_segment([w[0], w[1]], s);
+            }
+            p.line_segment([at(-5., 3.), at(-2., 0.)], s);
+            p.line_segment([at(-5., 3.), at(-2., 6.)], s);
         }
         Icon::Opacity => {
             p.circle_stroke(c, 5.0, s);
@@ -414,7 +424,8 @@ fn num_field(ui: &mut Ui, v: &mut f32, label: &str, min: f32, width: f32) -> boo
 }
 
 /// Compact chevron button opening a Fixed / Hug / Fill menu.
-fn sizing_menu(ui: &mut Ui, id: egui::Id, mode: &mut Sizing, can_hug: bool, can_fill: bool) -> bool {
+#[allow(clippy::too_many_arguments)]
+fn sizing_menu(ui: &mut Ui, id: egui::Id, mode: &mut Sizing, can_hug: bool, can_fill: bool, axis: usize, bounds: (&mut Option<f32>, &mut Option<f32>), cur: f32) -> bool {
     let resp = icon_button(ui, Icon::Chevron(true), false, 18.0, "Resizing");
     let mut changed = false;
     egui::Popup::menu(&resp).id(id).show(|ui| {
@@ -422,6 +433,16 @@ fn sizing_menu(ui: &mut Ui, id: egui::Id, mode: &mut Sizing, can_hug: bool, can_
             if ok && ui.selectable_label(*mode == m, label).clicked() && *mode != m {
                 *mode = m;
                 changed = true;
+            }
+        }
+        ui.separator();
+        let dim = if axis == 0 { "width" } else { "height" };
+        for (b, which) in [(bounds.0, "min"), (bounds.1, "max")] {
+            let label = if b.is_some() { format!("Remove {which} {dim}") } else { format!("Add {which} {dim}") };
+            if ui.button(label).clicked() {
+                *b = if b.is_some() { None } else { Some(cur) };
+                changed = true;
+                ui.close();
             }
         }
     });
@@ -1705,6 +1726,7 @@ impl App {
         let parent_al = n.parent.is_some_and(|p| self.doc.node(p).layout.mode != LayoutMode::None) && !n.absolute;
         let can_hug = n.layout.mode != LayoutMode::None;
         let mut sizing = n.sizing;
+        let (mut mins, mut maxs) = (n.min_size, n.max_size);
         let mut sized = false;
         let mut sizing_changed = false;
         ui.horizontal(|ui| {
@@ -1719,13 +1741,29 @@ impl App {
                 let shown = if axis == 1 { shown.replacen('W', "H", 1) } else { shown.to_string() };
                 sized |= num_field(ui, v, &shown, 0.01, wide);
                 if menus {
-                    sizing_changed |= sizing_menu(ui, ui.id().with(("sizing", axis)), &mut sizing[axis], can_hug, parent_al);
+                    let cur = *v;
+                    sizing_changed |= sizing_menu(ui, ui.id().with(("sizing", axis)), &mut sizing[axis], can_hug, parent_al, axis, (&mut mins[axis], &mut maxs[axis]), cur);
                 }
             }
         });
+        // Min / max rows, for the bounds that are set.
+        if roots.len() == 1 && (mins.iter().chain(&maxs).any(|b| b.is_some())) {
+            ui.horizontal_wrapped(|ui| {
+                let [mw, mh] = &mut mins;
+                let [xw, xh] = &mut maxs;
+                for (b, label) in [(mw, "Min W"), (xw, "Max W"), (mh, "Min H"), (xh, "Max H")] {
+                    if let Some(v) = b {
+                        sizing_changed |= num_field(ui, v, label, 0.0, half(ui) - 4.0);
+                    }
+                }
+            });
+        }
         if sizing_changed {
             self.checkpoint();
-            self.doc.node_mut(first).sizing = sizing;
+            let n = self.doc.node_mut(first);
+            n.sizing = sizing;
+            n.min_size = mins;
+            n.max_size = maxs;
             self.doc.reflow();
         }
         if sized {
@@ -1781,9 +1819,15 @@ impl App {
         let mut l = self.doc.node(f).layout;
         let before = l;
         ui.horizontal(|ui| {
-            for (m, icon, tip) in [(LayoutMode::Vertical, Icon::ArrowDown, "Vertical layout"), (LayoutMode::Horizontal, Icon::ArrowRight, "Horizontal layout")] {
-                if icon_button(ui, icon, l.mode == m, 26.0, tip).clicked() {
+            for (m, wrap, icon, tip) in [
+                (LayoutMode::Vertical, false, Icon::ArrowDown, "Vertical layout"),
+                (LayoutMode::Horizontal, false, Icon::ArrowRight, "Horizontal layout"),
+                (LayoutMode::Horizontal, true, Icon::Wrap, "Wrap"),
+            ] {
+                let on = l.mode == m && (m == LayoutMode::Vertical || l.wrap == wrap);
+                if icon_button(ui, icon, on, 26.0, tip).clicked() {
                     l.mode = m;
+                    l.wrap = wrap;
                 }
             }
         });
@@ -1793,7 +1837,11 @@ impl App {
                 ui.add_enabled_ui(!l.space_between, |ui| {
                     num_field(ui, &mut l.gap, if l.mode == LayoutMode::Horizontal { "@gaph" } else { "@gapv" }, 0.0, (ui.available_width()).min(110.0));
                 });
+                if l.wrap && l.mode == LayoutMode::Horizontal {
+                    num_field(ui, &mut l.cross_gap, "@gapv", 0.0, (ui.available_width()).min(110.0));
+                }
                 ui.checkbox(&mut l.space_between, "Auto gap");
+                ui.checkbox(&mut l.strokes_included, "Include strokes").on_hover_text("Strokes take up space in the layout");
             });
         });
         let [t, r, b, lft] = &mut l.padding;
@@ -1821,7 +1869,12 @@ impl App {
         ui.data_mut(|d| d.insert_temp(split_id, split));
         if l != before {
             self.begin_edit();
-            self.doc.node_mut(f).layout = l;
+            let n = self.doc.node_mut(f);
+            // Wrapping rows need a width to wrap at.
+            if l.wrap && !before.wrap && n.sizing[0] == Sizing::Hug {
+                n.sizing[0] = Sizing::Fixed;
+            }
+            n.layout = l;
             self.doc.reflow();
         }
     }

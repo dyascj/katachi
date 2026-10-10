@@ -117,6 +117,12 @@ pub struct AutoLayout {
     pub padding: [f32; 4],
     pub main: AxisAlign,
     pub cross: AxisAlign,
+    /// Horizontal layouts: flow children onto new rows when they run out of width.
+    pub wrap: bool,
+    /// Gap between wrapped rows.
+    pub cross_gap: f32,
+    /// Strokes take up space: the frame's inner stroke pads it, children's outer strokes add to their size.
+    pub strokes_included: bool,
 }
 
 /// How a text box sizes itself.
@@ -482,6 +488,25 @@ pub enum ListKind {
 pub struct ListLine {
     pub kind: ListKind,
     pub indent: u8,
+}
+
+/// How far a layer's visible stroke reaches (inside, outside) its box.
+pub fn stroke_reach(n: &Node) -> (f32, f32) {
+    if n.stroke_width <= 0.0 || !n.strokes.iter().any(|s| s.visible) {
+        return (0.0, 0.0);
+    }
+    let w = n.stroke_width;
+    match n.stroke_align {
+        StrokeAlign::Inside => (w, 0.0),
+        StrokeAlign::Center => (w / 2.0, w / 2.0),
+        StrokeAlign::Outside => (0.0, w),
+    }
+}
+
+/// A size along `axis` kept within the layer's min and max.
+pub fn clamp_size(n: &Node, axis: usize, v: f32) -> f32 {
+    let v = n.min_size[axis].map_or(v, |m| v.max(m));
+    n.max_size[axis].map_or(v, |m| v.min(m))
 }
 
 pub type StyleId = u64;
@@ -970,6 +995,9 @@ pub struct Node {
     pub layout: AutoLayout,
     /// Horizontal, vertical.
     pub sizing: [Sizing; 2],
+    /// Min and max width/height for hugging and filling layers.
+    pub min_size: [Option<f32>; 2],
+    pub max_size: [Option<f32>; 2],
     pub constraints: [Constraint; 2],
     /// Ignores the parent's auto layout.
     pub absolute: bool,
@@ -1061,6 +1089,8 @@ impl Default for Node {
             shadows: vec![],
             layout: AutoLayout::default(),
             sizing: [Sizing::Fixed; 2],
+            min_size: [None; 2],
+            max_size: [None; 2],
             constraints: [Constraint::Min; 2],
             absolute: false,
             bool_op: BoolOp::Union,
@@ -2015,30 +2045,42 @@ impl Document {
         let main = |v: Vec2| if h { v.x } else { v.y };
         let cross = |v: Vec2| if h { v.y } else { v.x };
         let along = |m: f32, c: f32| if h { vec2(m, c) } else { vec2(c, m) };
-        let [pt, pr, pb, pl] = l.padding;
+        let inset = if l.strokes_included { stroke_reach(&n).0 } else { 0.0 };
+        let [pt, pr, pb, pl] = l.padding.map(|p| p + inset);
         let (p0, p1, q0, q1) = if h { (pl, pr, pt, pb) } else { (pt, pb, pl, pr) };
+        // A child's layout box: its bounds, plus its outer stroke when strokes are included.
+        let out = |k: &Node| if l.strokes_included { stroke_reach(k).1 } else { 0.0 };
+        let lsize = |k: &Node| k.aabb().size() + Vec2::splat(2.0 * out(k));
         let kids: Vec<NodeId> = n
             .children
             .iter()
             .copied()
             .filter(|c| self.nodes[c].visible && !self.nodes[c].absolute)
             .collect();
+        if l.wrap && h {
+            return self.layout_wrap(f, &n, &kids, [pt, pr, pb, pl], &out);
+        }
         // Text is always auto-width, so it can only hug.
         let fills = |k: &Node, axis: usize| k.sizing[axis] == Sizing::Fill && k.kind != Kind::Text;
         let count = kids.len() as f32;
         let gaps = l.gap * (count - 1.0).max(0.0);
-        let fixed_main: f32 = kids.iter().map(|c| &self.nodes[c]).filter(|k| !fills(k, ma)).map(|k| main(k.aabb().size())).sum();
+        let fixed_main: f32 = kids.iter().map(|c| &self.nodes[c]).filter(|k| !fills(k, ma)).map(|k| main(lsize(k))).sum();
         let n_fill = kids.iter().filter(|c| fills(&self.nodes[c], ma)).count() as f32;
 
         let mut size = n.rect.size();
         if n.sizing[ma] == Sizing::Hug {
-            let fill_now: f32 = kids.iter().map(|c| &self.nodes[c]).filter(|k| fills(k, ma)).map(|k| main(k.aabb().size())).sum();
+            let fill_now: f32 = kids.iter().map(|c| &self.nodes[c]).filter(|k| fills(k, ma)).map(|k| main(lsize(k))).sum();
             let m = p0 + p1 + fixed_main + fill_now + if l.space_between { 0.0 } else { gaps };
             size = along(m, cross(size));
         }
         if n.sizing[ca] == Sizing::Hug {
-            let c = kids.iter().map(|c| &self.nodes[c]).filter(|k| !fills(k, ca)).map(|k| cross(k.aabb().size())).fold(0.0, f32::max);
+            let c = kids.iter().map(|c| &self.nodes[c]).filter(|k| !fills(k, ca)).map(|k| cross(lsize(k))).fold(0.0, f32::max);
             size = along(main(size), q0 + q1 + c);
+        }
+        for axis in 0..2 {
+            if n.sizing[axis] == Sizing::Hug {
+                size[axis] = clamp_size(&n, axis, size[axis]);
+            }
         }
         if size != n.rect.size() {
             self.node_mut(f).rect = Rect::from_min_size(n.rect.min, size);
@@ -2061,27 +2103,86 @@ impl Document {
         let mut cursor = main(origin.to_vec2()) + p0 + lead;
         for c in kids {
             let k = self.nodes[&c].clone();
-            let mut ks = k.aabb().size();
+            let o = out(&k);
+            let mut ks = lsize(&k);
+            // ponytail: a fill layer stopped by min/max doesn't hand its slack to the others.
             if fills(&k, ma) {
-                ks = along(fill_main, cross(ks));
+                ks = along(clamp_size(&k, ma, fill_main), cross(ks));
             }
             if fills(&k, ca) {
-                ks = along(main(ks), inner_cross);
+                ks = along(main(ks), clamp_size(&k, ca, inner_cross));
             }
-            if (ks - k.aabb().size()).length() > 1e-4 && k.rotation == 0.0 {
-                self.set_rect(c, Rect::from_min_size(k.rect.min, ks));
+            if (ks - lsize(&k)).length() > 1e-4 && k.rotation == 0.0 {
+                self.set_rect(c, Rect::from_min_size(k.rect.min, ks - Vec2::splat(2.0 * o)));
             }
             let off = match l.cross {
                 AxisAlign::Min => 0.0,
                 AxisAlign::Center => (inner_cross - cross(ks)) / 2.0,
                 AxisAlign::Max => inner_cross - cross(ks),
             };
-            let target = along(cursor, cross(origin.to_vec2()) + q0 + off).to_pos2();
+            let target = along(cursor, cross(origin.to_vec2()) + q0 + off).to_pos2() + Vec2::splat(o);
             let cur = self.nodes[&c].aabb().min;
             if cur != target {
                 self.translate(c, target - cur);
             }
             cursor += main(ks) + gap;
+        }
+    }
+
+    /// Horizontal wrap: rows break at the frame's width; each row aligns on its own.
+    fn layout_wrap(&mut self, f: NodeId, n: &Node, kids: &[NodeId], padding: [f32; 4], out: &dyn Fn(&Node) -> f32) {
+        let l = n.layout;
+        let [pt, pr, pb, pl] = padding;
+        let inner_w = (n.rect.width() - pl - pr).max(0.0);
+        let mut rows: Vec<Vec<(NodeId, Vec2)>> = vec![vec![]];
+        let mut used = 0.0;
+        for &c in kids {
+            let k = &self.nodes[&c];
+            let s = k.aabb().size() + Vec2::splat(2.0 * out(k));
+            if !rows.last().unwrap().is_empty() && used + l.gap + s.x > inner_w + 1e-3 {
+                rows.push(vec![]);
+                used = 0.0;
+            }
+            let row = rows.last_mut().unwrap();
+            used += if row.is_empty() { s.x } else { l.gap + s.x };
+            row.push((c, s));
+        }
+        let heights: Vec<f32> = rows.iter().map(|r| r.iter().map(|(_, s)| s.y).fold(0.0, f32::max)).collect();
+        if n.sizing[1] == Sizing::Hug {
+            let content = heights.iter().sum::<f32>() + l.cross_gap * (rows.len() as f32 - 1.0).max(0.0);
+            let h = clamp_size(n, 1, pt + pb + content);
+            self.node_mut(f).rect = Rect::from_min_size(n.rect.min, vec2(n.rect.width(), h));
+        }
+        let mut y = n.rect.min.y + pt;
+        for (row, &rh) in rows.iter().zip(&heights) {
+            let widths: f32 = row.iter().map(|(_, s)| s.x).sum();
+            let count = row.len() as f32;
+            let free = inner_w - widths - l.gap * (count - 1.0).max(0.0);
+            let (lead, gap) = if l.space_between && count > 1.0 {
+                (0.0, (inner_w - widths) / (count - 1.0))
+            } else {
+                let lead = match l.main {
+                    AxisAlign::Min => 0.0,
+                    AxisAlign::Center => free / 2.0,
+                    AxisAlign::Max => free,
+                };
+                (lead, l.gap)
+            };
+            let mut x = n.rect.min.x + pl + lead;
+            for &(c, s) in row {
+                let off = match l.cross {
+                    AxisAlign::Min => 0.0,
+                    AxisAlign::Center => (rh - s.y) / 2.0,
+                    AxisAlign::Max => rh - s.y,
+                };
+                let cur = self.nodes[&c].aabb().min;
+                let target = pos2(x, y + off) + Vec2::splat(out(&self.nodes[&c]));
+                if cur != target {
+                    self.translate(c, target - cur);
+                }
+                x += s.x + gap;
+            }
+            y += rh + l.cross_gap;
         }
     }
 
@@ -2367,7 +2468,7 @@ fn merge_from(e: &mut Node, src: &Node) {
         )*};
     }
     take!(
-        name, visible, opacity, fills, strokes, stroke_width, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, constraints, absolute,
+        name, visible, opacity, fills, strokes, stroke_width, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, min_size, max_size, constraints, absolute,
         paths, even_odd, text, font_size, font_weight, font_family, text_sizing, text_align, text_valign, line_height, letter_spacing,
         decoration, text_case, truncate, max_lines, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, fill_style,
         stroke_style, text_style, effect_style, prop_bind, is_mask, blend, bindings, modes, spans, lists
@@ -2628,6 +2729,49 @@ mod tests {
         let mut f = Node::new(Kind::Frame, r(0., 0., 300., 100.));
         f.layout = AutoLayout { mode, gap: 10., padding: [5., 5., 5., 5.], ..Default::default() };
         d.insert(0, None, None, f)
+    }
+
+    #[test]
+    fn auto_layout_wraps_rows_and_respects_min_max() {
+        let mut d = Document::default();
+        let f = al_frame(&mut d, LayoutMode::Horizontal);
+        d.node_mut(f).rect = r(0., 0., 100., 10.);
+        d.node_mut(f).sizing = [Sizing::Fixed, Sizing::Hug];
+        d.node_mut(f).layout.wrap = true;
+        d.node_mut(f).layout.cross_gap = 4.;
+        // Inner width 90: 40 + 10 + 40 fits, the third wraps.
+        let kids: Vec<NodeId> = [20., 30., 10.].iter().map(|&h| d.insert(0, Some(f), None, Node::new(Kind::Rectangle, r(0., 0., 40., h)))).collect();
+        d.reflow();
+        assert_eq!(d.node(kids[0]).rect, r(5., 5., 40., 20.));
+        assert_eq!(d.node(kids[1]).rect, r(55., 5., 40., 30.));
+        assert_eq!(d.node(kids[2]).rect, r(5., 39., 40., 10.), "second row below the tallest plus the row gap");
+        assert_eq!(d.node(f).rect.height(), 5. + 30. + 4. + 10. + 5.);
+        // Hug height stops at the max; a filling child stops at its min.
+        d.node_mut(f).max_size[1] = Some(40.);
+        d.reflow();
+        assert_eq!(d.node(f).rect.height(), 40.);
+        d.node_mut(f).layout.wrap = false;
+        d.node_mut(f).rect = r(0., 0., 300., 40.);
+        d.node_mut(kids[2]).sizing[0] = Sizing::Fill;
+        d.node_mut(kids[2]).min_size[0] = Some(250.);
+        d.reflow();
+        assert_eq!(d.node(kids[2]).rect.width(), 250.);
+        let css = crate::codegen::css(&d, kids[2]);
+        assert!(css.contains("min-width: 250px"), "{css}");
+        // Included strokes: the frame's inside stroke pads it, a child's outside stroke adds to its box.
+        d.node_mut(kids[2]).sizing[0] = Sizing::Fixed;
+        d.node_mut(kids[2]).min_size[0] = None;
+        let stroke = |n: &mut Node, align| {
+            n.strokes = vec![Paint::solid(Rgba::rgb(0, 0, 0))];
+            n.stroke_width = 2.;
+            n.stroke_align = align;
+        };
+        stroke(d.node_mut(f), StrokeAlign::Inside);
+        stroke(d.node_mut(kids[0]), StrokeAlign::Outside);
+        d.node_mut(f).layout.strokes_included = true;
+        d.reflow();
+        assert_eq!(d.node(kids[0]).rect.min, pos2(9., 9.), "5 padding + 2 frame stroke + 2 own stroke");
+        assert_eq!(d.node(kids[1]).rect.min.x, 9. + 40. + 2. + 10.);
     }
 
     #[test]

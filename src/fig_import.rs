@@ -704,8 +704,15 @@ fn import_node(
             padding: [pt, pr, pb, pl],
             main: align(v.s("stackPrimaryAlignItems")),
             cross: align(v.s("stackCounterAlignItems")),
+            wrap: v.s("stackWrap") == Some("WRAP"),
+            strokes_included: v.b("bordersTakeSpace") == Some(true),
+            cross_gap: v.f("stackCounterSpacing").filter(|g| g.is_finite()).or(v.f("stackSpacing")).unwrap_or(0.0),
         };
     }
+    // Unset bounds are stored as 0 (min) and infinity (max).
+    let bound = |k: &str, axis: &str| v.get(k).and_then(|s| s.get("value")).and_then(|s| s.f(axis)).filter(|x| x.is_finite() && *x > 0.0);
+    n.min_size = [bound("minSize", "x"), bound("minSize", "y")];
+    n.max_size = [bound("maxSize", "x"), bound("maxSize", "y")];
     n.absolute = v.s("stackPositioning") == Some("ABSOLUTE");
     n.constraints = [constraint(v.s("horizontalConstraint")), constraint(v.s("verticalConstraint"))];
     // Layers start collapsed, as in Figma.

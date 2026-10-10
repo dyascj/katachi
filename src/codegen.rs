@@ -62,6 +62,14 @@ pub fn css(doc: &Document, id: NodeId) -> String {
         Sizing::Hug => decl("height", "fit-content".into()),
         _ => decl("height", format!("{}px", num(h))),
     }
+    for (axis, dim) in [(0, "width"), (1, "height")] {
+        if let Some(v) = n.min_size[axis] {
+            decl(&format!("min-{dim}"), format!("{}px", num(v)));
+        }
+        if let Some(v) = n.max_size[axis] {
+            decl(&format!("max-{dim}"), format!("{}px", num(v)));
+        }
+    }
     if n.layout.mode != LayoutMode::None {
         let l = n.layout;
         decl("display", "flex".into());
@@ -75,6 +83,12 @@ pub fn css(doc: &Document, id: NodeId) -> String {
         decl("align-items", a(l.cross).into());
         if !l.space_between && l.gap != 0.0 {
             decl("gap", format!("{}px", num(l.gap)));
+        }
+        if l.wrap && l.mode == LayoutMode::Horizontal {
+            decl("flex-wrap", "wrap".into());
+            if l.cross_gap != 0.0 {
+                decl("row-gap", format!("{}px", num(l.cross_gap)));
+            }
         }
         let [t, r, b, lf] = l.padding;
         if [t, r, b, lf] != [0.0; 4] {

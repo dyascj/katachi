@@ -36,7 +36,7 @@ GitHub Actions. Building from source needs Rust 1.92 or newer.
 - Alt-hover distance measurements, flip (Shift H/V), distribute and tidy up, alignment
 
 **Layout**
-- Auto layout: direction, gap or auto gap, padding, 3x3 alignment, hug / fill / fixed sizing, absolute children, live drag reordering (Shift A)
+- Auto layout: direction, wrap with row gap, gap or auto gap, padding, 3x3 alignment, hug / fill / fixed sizing, min and max width and height, strokes included in layout, absolute children, live drag reordering (Shift A)
 - Constraints (left, right, left and right, center, scale), with Cmd to resize without them
 - Layout guides: grids, columns, and rows, with snapping (Ctrl G to show or hide)
 
