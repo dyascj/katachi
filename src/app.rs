@@ -319,7 +319,7 @@ impl App {
         for (i, &cur) in chain.iter().enumerate() {
             let n = self.doc.node(cur);
             // Top-level frames are click-through; instances act like groups.
-            let top_frame = matches!(n.kind, Kind::Frame | Kind::Component) && n.parent.is_none();
+            let top_frame = matches!(n.kind, Kind::Frame | Kind::Component | Kind::ComponentSet | Kind::Section) && n.parent.is_none();
             let entered = self.sel.iter().any(|&s| s != cur && self.doc.is_ancestor(cur, s));
             if i + 1 == chain.len() || !(top_frame || entered) {
                 return cur;
@@ -718,6 +718,36 @@ impl App {
             n.name = name;
         }
         self.sel = vec![id];
+    }
+
+    pub fn combine_as_variants(&mut self) {
+        let roots = self.sel_roots();
+        if roots.len() < 2 || roots.iter().any(|&r| self.doc.node(r).kind != Kind::Component) {
+            return;
+        }
+        self.checkpoint();
+        if let Some(set) = self.doc.combine_as_variants(&roots) {
+            self.sel = vec![set];
+        }
+    }
+
+    /// Copy the last variant in a set as a new one with the next value of the first property.
+    pub fn add_variant(&mut self, set: NodeId) {
+        let Some(&last) = self.doc.node(set).children.last() else { return };
+        self.checkpoint();
+        let copy = self.doc.duplicate(&[last])[0];
+        let r = self.doc.node(last).rect;
+        self.doc.translate(copy, vec2(r.width() + 20.0, 0.0));
+        let mut pairs = crate::doc::variant_pairs(&self.doc.node(last).name);
+        if let Some((_, v)) = pairs.first_mut() {
+            let n = self.doc.node(set).children.len();
+            *v = format!("Variant{n}");
+        }
+        self.doc.node_mut(copy).name = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(", ");
+        let kids = self.doc.node(set).children.clone();
+        let b = self.doc.bounds(&kids).expand(20.0);
+        self.doc.node_mut(set).rect = b;
+        self.sel = vec![copy];
     }
 
     pub fn detach_selection(&mut self) {

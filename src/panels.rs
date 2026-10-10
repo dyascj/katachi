@@ -339,6 +339,7 @@ fn kind_icon(k: Kind) -> Icon {
         Kind::Frame => Icon::Frame,
         Kind::Component => Icon::Component,
         Kind::Instance => Icon::Instance,
+        Kind::ComponentSet => Icon::Component,
         Kind::Boolean => Icon::Boolean,
         Kind::Polygon => Icon::Polygon,
         Kind::Star => Icon::Star,
@@ -537,8 +538,13 @@ impl App {
             .doc
             .nodes
             .values()
-            .filter(|n| n.kind == Kind::Component && n.name.to_lowercase().contains(&q.to_lowercase()))
-            .map(|n| (self.doc.page_of(n.id), n.id, n.name.clone()))
+            .filter(|n| n.kind == Kind::Component && n.name.to_lowercase().contains(&q.to_lowercase()) || n.kind == Kind::ComponentSet)
+            // A set appears once and places its first variant.
+            .filter(|n| !n.parent.is_some_and(|p| self.doc.node(p).kind == Kind::ComponentSet))
+            .filter_map(|n| match n.kind {
+                Kind::ComponentSet => n.children.first().map(|&v| (self.doc.page_of(n.id), v, n.name.clone())),
+                _ => Some((self.doc.page_of(n.id), n.id, n.name.clone())),
+            })
             .collect();
         comps.sort_by(|a, b| (a.0, &a.2).cmp(&(b.0, &b.2)));
         if comps.is_empty() {
@@ -1173,6 +1179,12 @@ impl App {
         let first = self.sel[0];
         let n = self.doc.node(first).clone();
         self.component_section(ui, first);
+        if roots.len() > 1 && roots.iter().all(|&r| self.doc.node(r).kind == Kind::Component) {
+            if ui.add_sized([ui.available_width(), 24.0], egui::Button::new(RichText::new("Combine as variants").color(crate::canvas::PURPLE))).clicked() {
+                self.combine_as_variants();
+            }
+            ui.separator();
+        }
         let is_bool = roots.len() == 1 && n.kind == Kind::Boolean;
         if roots.len() > 1 || is_bool {
             ui.horizontal(|ui| {
@@ -1228,26 +1240,96 @@ impl App {
     }
 
     fn component_section(&mut self, ui: &mut Ui, id: NodeId) {
+        use crate::doc::{CompProp, PropTarget, PropValue};
         let n = self.doc.node(id).clone();
         let inst = self.owning_instance(id);
-        if n.kind != Kind::Component && inst.is_none() {
+        // The component (not instance) this layer lives in, if any.
+        let owner = std::iter::once(id).chain(self.doc.ancestors(id)).find(|a| matches!(self.doc.node(*a).kind, Kind::Component | Kind::ComponentSet));
+        if owner.is_none() && inst.is_none() {
             return;
         }
+        let purple = crate::canvas::PURPLE;
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-            let icon = if n.kind == Kind::Component { Icon::Component } else { Icon::Instance };
-            paint_icon(ui.painter(), rect, icon, crate::canvas::PURPLE);
-            let title = match (n.kind, inst) {
-                (Kind::Component, _) => n.name.clone(),
-                (_, Some(i)) => {
+            let icon = if inst.is_some() { Icon::Instance } else { Icon::Component };
+            paint_icon(ui.painter(), rect, icon, purple);
+            let title = match inst {
+                Some(i) => {
                     let main = self.doc.node(i).component.and_then(|c| self.doc.nodes.get(&c)).map_or("Missing component".into(), |c| c.name.clone());
                     format!("Instance of {main}")
                 }
-                _ => String::new(),
+                None => self.doc.node(owner.unwrap()).name.clone(),
             };
-            ui.label(RichText::new(title).strong().color(crate::canvas::PURPLE));
+            ui.label(RichText::new(title).strong().color(purple));
         });
-        if let Some(i) = inst {
+        if let Some(i) = inst.filter(|i| *i == id) {
+            let comp = self.doc.node(i).component.filter(|c| self.doc.nodes.contains_key(c));
+            // Variant pickers when the main lives in a component set.
+            if let Some(c) = comp {
+                if let Some(set) = self.doc.node(c).parent.filter(|p| self.doc.node(*p).kind == Kind::ComponentSet) {
+                    let current = crate::doc::variant_pairs(&self.doc.node(c).name);
+                    for (prop, values) in self.doc.variant_props(set) {
+                        let cur = current.iter().find(|(k, _)| *k == prop).map(|(_, v)| v.clone()).unwrap_or_default();
+                        let mut pick = cur.clone();
+                        ui.horizontal(|ui| {
+                            ui.label(&prop);
+                            egui::ComboBox::from_id_salt(("variant", i, &prop)).selected_text(&pick).width(110.0).show_ui(ui, |ui| {
+                                for v in &values {
+                                    ui.selectable_value(&mut pick, v.clone(), v);
+                                }
+                            });
+                        });
+                        if pick != cur {
+                            let mut want = current.clone();
+                            want.retain(|(k, _)| *k != prop);
+                            want.push((prop.clone(), pick));
+                            if let Some(v) = self.doc.find_variant(set, &want) {
+                                self.checkpoint();
+                                self.doc.swap_component(i, v);
+                                self.doc.reflow();
+                            }
+                        }
+                    }
+                }
+                // Component property values.
+                let props = self.doc.props_of(c);
+                let mut values = self.doc.node(i).prop_values.clone();
+                let mut changed = false;
+                for p in &props {
+                    let cur = values.iter().find(|(k, _)| *k == p.name).map(|(_, v)| v.clone()).unwrap_or(p.default.clone());
+                    let mut next = cur.clone();
+                    ui.horizontal(|ui| {
+                        ui.label(&p.name);
+                        match &mut next {
+                            PropValue::Bool(b) => {
+                                ui.checkbox(b, "");
+                            }
+                            PropValue::Text(t) => {
+                                ui.text_edit_singleline(t);
+                            }
+                            PropValue::Swap(target) => {
+                                let comps: Vec<NodeId> = self.doc.nodes.values().filter(|n| n.kind == Kind::Component).map(|n| n.id).collect();
+                                egui::ComboBox::from_id_salt(("swap", i, &p.name)).selected_text(self.doc.nodes.get(target).map_or("Missing".into(), |n| n.name.clone())).show_ui(ui, |ui| {
+                                    for cid in comps {
+                                        let name = self.doc.node(cid).name.clone();
+                                        ui.selectable_value(target, cid, name);
+                                    }
+                                });
+                            }
+                        }
+                    });
+                    if next != cur {
+                        values.retain(|(k, _)| *k != p.name);
+                        values.push((p.name.clone(), next));
+                        changed = true;
+                    }
+                }
+                if changed {
+                    self.begin_edit();
+                    self.doc.node_mut(i).prop_values = values;
+                    self.doc.reflow();
+                }
+            }
             ui.horizontal(|ui| {
                 if ui.button("Go to main").clicked() {
                     self.go_to_main(i);
@@ -1261,11 +1343,102 @@ impl App {
                     self.doc.detach_instance(i);
                 }
             });
-        } else if ui.button("Create instance").clicked() {
-            self.checkpoint();
-            self.sel = self.duplicate_or_instance(&[id]);
-            if let Some(&i) = self.sel.first() {
-                self.doc.translate(i, vec2(n.rect.width() + 40.0, 0.0));
+        } else if let Some(o) = owner.filter(|_| inst.is_none()) {
+            let on = self.doc.node(o).clone();
+            // Properties are defined on the set when there is one.
+            let def = match on.parent.map(|p| self.doc.node(p).kind) {
+                Some(Kind::ComponentSet) if on.kind == Kind::Component => on.parent.unwrap(),
+                _ => o,
+            };
+            if id == o || id == def {
+                let mut props = self.doc.node(def).comp_props.clone();
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Properties").strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let add = icon_button(ui, Icon::Plus, false, 22.0, "Add property");
+                        egui::Popup::menu(&add).id(ui.id().with(("add-prop", def))).show(|ui| {
+                            let fresh = |props: &[CompProp], base: &str| {
+                                (1..).map(|k| format!("{base} {k}")).find(|nm| !props.iter().any(|p| &p.name == nm)).unwrap()
+                            };
+                            if ui.button("Boolean").clicked() {
+                                props.push(CompProp { name: fresh(&props, "Show"), default: PropValue::Bool(true) });
+                                changed = true;
+                            }
+                            if ui.button("Text").clicked() {
+                                props.push(CompProp { name: fresh(&props, "Text"), default: PropValue::Text("Text".into()) });
+                                changed = true;
+                            }
+                            if ui.button("Instance swap").clicked() {
+                                props.push(CompProp { name: fresh(&props, "Icon"), default: PropValue::Swap(o) });
+                                changed = true;
+                            }
+                        });
+                    });
+                });
+                let mut remove = None;
+                for (k, p) in props.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        changed |= ui.add(egui::TextEdit::singleline(&mut p.name).desired_width(90.0)).changed();
+                        match &mut p.default {
+                            PropValue::Bool(b) => changed |= ui.checkbox(b, "").changed(),
+                            PropValue::Text(t) => changed |= ui.add(egui::TextEdit::singleline(t).desired_width(70.0)).changed(),
+                            PropValue::Swap(_) => {
+                                ui.label("Instance");
+                            }
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if icon_button(ui, Icon::Minus, false, 20.0, "Remove").clicked() {
+                                remove = Some(k);
+                            }
+                        });
+                    });
+                }
+                if let Some(k) = remove {
+                    props.remove(k);
+                    changed = true;
+                }
+                if changed {
+                    self.begin_edit();
+                    self.doc.node_mut(def).comp_props = props;
+                    self.doc.reflow();
+                }
+                if self.doc.node(def).kind == Kind::ComponentSet && ui.button("Add variant").clicked() {
+                    self.add_variant(def);
+                }
+                if on.kind == Kind::Component && self.doc.node(def).kind != Kind::ComponentSet && ui.button("Create instance").clicked() {
+                    self.checkpoint();
+                    self.sel = self.duplicate_or_instance(&[o]);
+                    if let Some(&i) = self.sel.first() {
+                        self.doc.translate(i, vec2(on.rect.width() + 40.0, 0.0));
+                    }
+                }
+            } else {
+                // A layer inside a component: bind one of its properties.
+                let props = self.doc.props_of(o);
+                let target = match n.kind {
+                    Kind::Text => PropTarget::Text,
+                    Kind::Instance => PropTarget::Swap,
+                    _ => PropTarget::Visible,
+                };
+                let fits = |p: &CompProp| matches!((&p.default, target), (PropValue::Bool(_), PropTarget::Visible) | (PropValue::Text(_), PropTarget::Text) | (PropValue::Swap(_), PropTarget::Swap) | (PropValue::Bool(_), _));
+                let mut bind = n.prop_bind.clone();
+                ui.horizontal(|ui| {
+                    ui.label("Property");
+                    let shown = bind.as_ref().map_or("None".to_string(), |(nm, _)| nm.clone());
+                    egui::ComboBox::from_id_salt(("bind", id)).selected_text(shown).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut bind, None, "None");
+                        for p in props.iter().filter(|p| fits(p)) {
+                            let t = if matches!(p.default, PropValue::Bool(_)) { PropTarget::Visible } else { target };
+                            ui.selectable_value(&mut bind, Some((p.name.clone(), t)), &p.name);
+                        }
+                    });
+                });
+                if bind != n.prop_bind {
+                    self.checkpoint();
+                    self.doc.node_mut(id).prop_bind = bind;
+                    self.doc.reflow();
+                }
             }
         }
         ui.separator();

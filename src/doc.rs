@@ -13,6 +13,8 @@ pub enum Kind {
     Component,
     /// A live copy of a component.
     Instance,
+    /// Variants of one component, combined.
+    ComponentSet,
     /// A live boolean of its children.
     Boolean,
     /// Regular polygon inscribed in the box.
@@ -35,6 +37,7 @@ impl Kind {
             Kind::Frame => "Frame",
             Kind::Component => "Component",
             Kind::Instance => "Instance",
+            Kind::ComponentSet => "Component set",
             Kind::Boolean => "Boolean",
             Kind::Polygon => "Polygon",
             Kind::Star => "Star",
@@ -52,7 +55,7 @@ impl Kind {
     }
     /// Frames, components, instances, and sections all behave as frames.
     pub fn is_frame(self) -> bool {
-        matches!(self, Kind::Frame | Kind::Component | Kind::Instance | Kind::Section)
+        matches!(self, Kind::Frame | Kind::Component | Kind::Instance | Kind::Section | Kind::ComponentSet)
     }
 }
 
@@ -229,6 +232,36 @@ pub struct Reaction {
     pub action: Action,
     #[serde(default)]
     pub transition: Transition,
+}
+
+/// A component property definition (on a component or component set).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum PropValue {
+    Bool(bool),
+    Text(String),
+    /// Instance swap: the component to show.
+    Swap(NodeId),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CompProp {
+    pub name: String,
+    pub default: PropValue,
+}
+
+/// Which property of a layer a component property drives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PropTarget {
+    Visible,
+    Text,
+    Swap,
+}
+
+/// Parse "Size=Large, State=Hover" into ordered pairs.
+pub fn variant_pairs(name: &str) -> Vec<(String, String)> {
+    name.split(',')
+        .filter_map(|part| part.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
+        .collect()
 }
 
 pub type StyleId = u64;
@@ -540,6 +573,12 @@ pub struct Node {
     pub stroke_style: Option<StyleId>,
     pub text_style: Option<StyleId>,
     pub effect_style: Option<StyleId>,
+    /// Components and sets: property definitions.
+    pub comp_props: Vec<CompProp>,
+    /// A layer inside a component bound to a property.
+    pub prop_bind: Option<(String, PropTarget)>,
+    /// Instances: chosen property values (missing = the default).
+    pub prop_values: Vec<(String, PropValue)>,
     /// Instances: the main component they copy.
     pub component: Option<NodeId>,
     /// Inside an instance (and the instance itself): the component layer this mirrors.
@@ -605,6 +644,9 @@ impl Default for Node {
             stroke_style: None,
             text_style: None,
             effect_style: None,
+            comp_props: vec![],
+            prop_bind: None,
+            prop_values: vec![],
             component: None,
             source: None,
             synced: None,
@@ -638,6 +680,7 @@ impl Node {
                 n.fills = vec![Paint::solid(Rgba::WHITE)];
                 n.clip = true;
             }
+            Kind::ComponentSet => {}
             Kind::Rectangle | Kind::Ellipse | Kind::Star => n.fills = vec![Paint::solid(SHAPE_GRAY)],
             Kind::Polygon => {
                 n.fills = vec![Paint::solid(SHAPE_GRAY)];
@@ -1051,7 +1094,10 @@ impl Document {
 
     /// Create an instance of `comp` with its top-left at `at`.
     pub fn instantiate(&mut self, comp: NodeId, page: usize, parent: Option<NodeId>, index: Option<usize>, at: Pos2) -> NodeId {
-        let c = self.nodes[&comp].clone();
+        let mut c = self.nodes[&comp].clone();
+        if let Some(set) = c.parent.map(|p| &self.nodes[&p]).filter(|p| p.kind == Kind::ComponentSet) {
+            c.name = set.name.clone();
+        }
         let mut n = Node { children: vec![], name: c.name.clone(), ..c.clone() };
         n.kind = Kind::Instance;
         n.component = Some(comp);
@@ -1108,7 +1154,11 @@ impl Document {
             return;
         }
         let page = self.page_of(inst);
-        let c = self.nodes[&comp].clone();
+        let mut c = self.nodes[&comp].clone();
+        // Instances of a variant are named after the component set, as in Figma.
+        if let Some(set) = c.parent.map(|p| &self.nodes[&p]).filter(|p| p.kind == Kind::ComponentSet) {
+            c.name = set.name.clone();
+        }
         // Instance layers by the component layer they mirror.
         let mut by_source: HashMap<NodeId, NodeId> = HashMap::new();
         for d in self.descendants(inst) {
@@ -1173,6 +1223,141 @@ impl Document {
         if actual.size() != c.rect.size() {
             self.set_rect(inst, actual);
         }
+        self.apply_instance_props(inst);
+    }
+
+    /// Property definitions for a component: its own, or its component set's.
+    pub fn props_of(&self, comp: NodeId) -> Vec<CompProp> {
+        let c = &self.nodes[&comp];
+        match c.parent.map(|p| &self.nodes[&p]) {
+            Some(set) if set.kind == Kind::ComponentSet => set.comp_props.clone(),
+            _ => c.comp_props.clone(),
+        }
+    }
+
+    /// Drive bound layers inside an instance from its property values.
+    fn apply_instance_props(&mut self, inst: NodeId) {
+        let Some(comp) = self.nodes[&inst].component.filter(|c| self.nodes.contains_key(c)) else { return };
+        let props = self.props_of(comp);
+        if props.is_empty() {
+            return;
+        }
+        let values = self.nodes[&inst].prop_values.clone();
+        let value = |name: &str| values.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone()).or_else(|| props.iter().find(|p| p.name == name).map(|p| p.default.clone()));
+        for d in self.descendants(inst) {
+            let Some((name, target)) = self.nodes[&d].prop_bind.clone() else { continue };
+            let n = self.node_mut(d);
+            match (target, value(&name)) {
+                (PropTarget::Visible, Some(PropValue::Bool(b))) => n.visible = b,
+                (PropTarget::Text, Some(PropValue::Text(t))) => n.text = t,
+                (PropTarget::Swap, Some(PropValue::Swap(c))) => n.component = Some(c),
+                _ => {}
+            }
+        }
+    }
+
+    /// Switch an instance to another main component, carrying overrides over by layer name.
+    pub fn swap_component(&mut self, inst: NodeId, comp: NodeId) {
+        if self.nodes[&inst].component == Some(comp) || !self.nodes.contains_key(&comp) {
+            return;
+        }
+        let path = |doc: &Document, id: NodeId| {
+            let mut parts = vec![doc.nodes[&id].name.clone()];
+            for a in doc.ancestors(id) {
+                if a == inst {
+                    break;
+                }
+                parts.push(doc.nodes[&a].name.clone());
+            }
+            parts.reverse();
+            parts.join("/")
+        };
+        // Remember each overridden layer (differs from what it last copied).
+        let mut overrides: HashMap<String, Node> = HashMap::new();
+        for d in self.descendants(inst) {
+            let n = &self.nodes[&d];
+            if let Some(snap) = &n.synced
+                && (n.fills != snap.fills || n.text != snap.text || n.visible != snap.visible || n.strokes != snap.strokes || n.opacity != snap.opacity) {
+                    overrides.insert(path(self, d), n.clone());
+                }
+        }
+        for c in self.nodes[&inst].children.clone() {
+            self.remove(c);
+        }
+        // Keep the root's last snapshot: anything not overridden then takes the new variant's value.
+        let n = self.node_mut(inst);
+        n.component = Some(comp);
+        n.source = Some(comp);
+        let size = self.nodes[&comp].rect.size();
+        let n = self.node_mut(inst);
+        n.rect = Rect::from_min_size(n.rect.min, size);
+        self.sync_instance(inst);
+        for d in self.descendants(inst) {
+            if let Some(o) = overrides.get(&path(self, d)) {
+                let n = self.node_mut(d);
+                let snap = n.synced.as_deref().cloned();
+                if let Some(snap) = snap {
+                    if o.fills != snap.fills { n.fills = o.fills.clone() }
+                    if o.text != snap.text { n.text = o.text.clone() }
+                    if o.visible != snap.visible { n.visible = o.visible }
+                    if o.strokes != snap.strokes { n.strokes = o.strokes.clone() }
+                    if o.opacity != snap.opacity { n.opacity = o.opacity }
+                }
+            }
+        }
+    }
+
+    /// Variant properties of a component set: each property with its values in order.
+    pub fn variant_props(&self, set: NodeId) -> Vec<(String, Vec<String>)> {
+        let mut out: Vec<(String, Vec<String>)> = vec![];
+        for &c in &self.nodes[&set].children {
+            for (k, v) in variant_pairs(&self.nodes[&c].name) {
+                match out.iter_mut().find(|(n, _)| *n == k) {
+                    Some((_, vals)) if !vals.contains(&v) => vals.push(v),
+                    Some(_) => {}
+                    None => out.push((k, vec![v])),
+                }
+            }
+        }
+        out
+    }
+
+    /// The variant in `set` matching `want` (property -> value), if any.
+    pub fn find_variant(&self, set: NodeId, want: &[(String, String)]) -> Option<NodeId> {
+        self.nodes[&set].children.iter().copied().find(|&c| {
+            let pairs = variant_pairs(&self.nodes[&c].name);
+            want.iter().all(|(k, v)| pairs.iter().any(|(pk, pv)| pk == k && pv == v))
+        })
+    }
+
+    /// Put components into a new component set, laid out in a row, naming plain ones as variants.
+    pub fn combine_as_variants(&mut self, comps: &[NodeId]) -> Option<NodeId> {
+        let comps = self.sort_by_z(comps);
+        if comps.len() < 2 || comps.iter().any(|c| self.nodes[c].kind != Kind::Component) {
+            return None;
+        }
+        let page = self.page_of(comps[0]);
+        let base = self.nodes[&comps[0]].name.split(',').next().unwrap_or("Component").split('=').next().unwrap_or("Component").trim().to_string();
+        let b = self.bounds(&comps);
+        let mut set = Node::new(Kind::ComponentSet, b.expand(20.0));
+        set.fills.clear();
+        set.clip = false;
+        set.name = base.clone();
+        let set_id = self.insert(page, None, None, set);
+        let mut x = b.min.x;
+        for (i, &c) in comps.iter().enumerate() {
+            self.reparent(c, page, Some(set_id), None);
+            let r = self.nodes[&c].rect;
+            self.translate(c, pos2(x, b.min.y) - r.min);
+            x += r.width() + 20.0;
+            let n = self.node_mut(c);
+            if variant_pairs(&n.name).is_empty() {
+                n.name = format!("Property 1={}", if i == 0 { "Default".to_string() } else { format!("Variant{}", i + 1) });
+            }
+        }
+        let r = self.bounds(&comps).expand(20.0);
+        self.node_mut(set_id).rect = r;
+        Some(set_id)
     }
 
     /// Re-derive everything computed from children: group bounds and auto layout.
@@ -1527,7 +1712,9 @@ impl Document {
         let p = n.to_local(p);
         match n.kind {
             Kind::Group | Kind::Boolean => false,
-            Kind::Frame | Kind::Component | Kind::Instance | Kind::Section | Kind::Rectangle | Kind::Text => n.rect.expand(tol).contains(p),
+            Kind::Frame | Kind::Component | Kind::Instance | Kind::Section | Kind::ComponentSet | Kind::Rectangle | Kind::Text => {
+                n.rect.expand(tol).contains(p)
+            }
             Kind::Slice => false,
             Kind::Polygon | Kind::Star => {
                 let pts = n.star_points();
@@ -1574,7 +1761,7 @@ fn merge_from(e: &mut Node, src: &Node) {
         name, visible, opacity, fills, strokes, stroke_width, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, constraints, absolute,
         paths, even_odd, text, font_size, font_weight, font_family, text_sizing, text_align, text_valign, line_height, letter_spacing,
         decoration, text_case, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, fill_style,
-        stroke_style, text_style, effect_style
+        stroke_style, text_style, effect_style, prop_bind
     );
     e.synced = Some(Box::new(Node { children: vec![], synced: None, ..src.clone() }));
 }
@@ -2030,6 +2217,61 @@ mod tests {
         d.reflow();
         assert_eq!(d.node(a).fill_style, None);
         assert_eq!(d.node(a).fills[0].color, Rgba::rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn variants_swap_and_props_drive_layers() {
+        let mut d = Document::default();
+        let mk = |d: &mut Document, name: &str, color: Rgba, x: f32| {
+            let mut c = Node::new(Kind::Component, r(x, 0., 100., 40.));
+            c.name = name.into();
+            let c = d.insert(0, None, None, c);
+            let mut bg = Node::new(Kind::Rectangle, r(x, 0., 100., 40.));
+            bg.name = "bg".into();
+            bg.fills = vec![Paint::solid(color)];
+            d.insert(0, Some(c), None, bg);
+            let mut t = Node::new(Kind::Text, r(x + 10., 10., 40., 15.));
+            t.name = "label".into();
+            t.text = "Button".into();
+            d.insert(0, Some(c), None, t);
+            c
+        };
+        let a = mk(&mut d, "State=Default", Rgba::rgb(0, 0, 255), 0.);
+        let b = mk(&mut d, "State=Hover", Rgba::rgb(0, 255, 0), 200.);
+        d.node_mut(a).fills = vec![Paint::solid(Rgba::rgb(1, 1, 1))];
+        d.node_mut(b).fills = vec![Paint::solid(Rgba::rgb(2, 2, 2))];
+        let set = d.combine_as_variants(&[a, b]).unwrap();
+        assert_eq!(d.node(set).kind, Kind::ComponentSet);
+        assert_eq!(d.variant_props(set), vec![("State".to_string(), vec!["Default".to_string(), "Hover".to_string()])]);
+        assert_eq!(d.find_variant(set, &[("State".into(), "Hover".into())]), Some(b));
+        // An instance with a text override keeps it when swapped to another variant.
+        let i = d.instantiate(a, 0, None, None, pos2(0., 200.));
+        let label = d.node(i).children[1];
+        d.node_mut(label).text = "Buy".into();
+        d.swap_component(i, b);
+        let kids = d.node(i).children.clone();
+        assert_eq!(d.node(kids[0]).fills[0].color, Rgba::rgb(0, 255, 0), "takes the new variant's look");
+        assert_eq!(d.node(i).fills[0].color, Rgba::rgb(2, 2, 2), "root paint follows the swap too");
+        assert_eq!(d.node(kids[1]).text, "Buy", "override carried over");
+        assert_eq!(d.node(i).name, d.node(set).name, "named after the set");
+        // Boolean and text properties drive bound layers.
+        d.node_mut(set).comp_props = vec![
+            CompProp { name: "Show label".into(), default: PropValue::Bool(true) },
+            CompProp { name: "Label".into(), default: PropValue::Text("Go".into()) },
+        ];
+        for c in [a, b] {
+            let lbl = d.node(c).children[1];
+            d.node_mut(lbl).prop_bind = Some(("Label".into(), PropTarget::Text));
+            let bg = d.node(c).children[0];
+            d.node_mut(bg).prop_bind = Some(("Show label".into(), PropTarget::Visible));
+        }
+        let j = d.instantiate(a, 0, None, None, pos2(0., 300.));
+        let kids = d.node(j).children.clone();
+        assert_eq!(d.node(kids[1]).text, "Go");
+        d.node_mut(j).prop_values = vec![("Label".into(), PropValue::Text("Pay".into())), ("Show label".into(), PropValue::Bool(false))];
+        d.reflow();
+        assert_eq!(d.node(kids[1]).text, "Pay");
+        assert!(!d.node(kids[0]).visible);
     }
 
     #[test]

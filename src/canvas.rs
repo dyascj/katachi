@@ -210,7 +210,7 @@ impl App {
                 continue;
             }
             let active = self.sel.contains(&id) || self.hover == Some(id);
-            let comp = matches!(n.kind, Kind::Component | Kind::Instance);
+            let comp = matches!(n.kind, Kind::Component | Kind::Instance | Kind::ComponentSet);
             let color = match (comp, active) {
                 (true, _) => PURPLE,
                 (false, true) => BLUE,
@@ -918,7 +918,7 @@ impl App {
     pub fn accent(&self, id: NodeId) -> Color32 {
         let comp = std::iter::once(id)
             .chain(self.doc.ancestors(id))
-            .any(|a| matches!(self.doc.node(a).kind, Kind::Component | Kind::Instance));
+            .any(|a| matches!(self.doc.node(a).kind, Kind::Component | Kind::Instance | Kind::ComponentSet));
         if comp { PURPLE } else { BLUE }
     }
 
@@ -986,6 +986,13 @@ impl App {
     }
 
     fn draw_overlays(&self, painter: &Painter, ptr: Option<Pos2>) {
+        // Component sets wear a dashed purple border, as in Figma.
+        for n in self.doc.nodes.values().filter(|n| n.kind == Kind::ComponentSet && self.doc.page_of(n.id) == self.page) {
+            let pts = n.corners().map(|p| self.view.to_screen(p));
+            let mut ring = pts.to_vec();
+            ring.push(pts[0]);
+            painter.extend(egui::Shape::dashed_line(&ring, Stroke::new(1.0, PURPLE), 5.0, 3.0));
+        }
         if self.prototype_tab {
             self.draw_connections(painter, ptr);
         }
@@ -1326,6 +1333,11 @@ impl App {
                 }
             });
         });
+        let comps = self.sel.len() > 1 && self.sel.iter().all(|&s| self.doc.node(s).kind == Kind::Component);
+        if comps && item(ui, "Combine as variants", "", true) {
+            self.combine_as_variants();
+            ui.close();
+        }
         if item(ui, "Flatten", "⌘E", has) {
             self.flatten_selection();
             ui.close();

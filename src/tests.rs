@@ -565,6 +565,33 @@ fn shots() {
     h.state_mut().sel.clear();
     h.run_steps(3);
     save(&mut h, "17-local-styles");
+    // Variants: two button states combined into a set, an instance switched to Hover.
+    let st = h.state_mut();
+    let mk = |st: &mut App, name: &str, color: Rgba, x: f32| {
+        let mut c = Node::new(Kind::Component, r(x, 820., 140., 44.));
+        c.name = name.into();
+        c.radius = 22.;
+        c.fills = vec![crate::doc::Paint::solid(color)];
+        let c = st.doc.insert(0, None, None, c);
+        let mut t = Node::new(Kind::Text, r(x + 40., 832., 60., 20.));
+        t.name = "label".into();
+        t.text = "Continue".into();
+        t.font_size = 15.;
+        t.font_weight = 600;
+        t.fills = vec![crate::doc::Paint::solid(Rgba::WHITE)];
+        st.doc.insert(0, Some(c), None, t);
+        c
+    };
+    let a = mk(st, "State=Default", Rgba::rgb(13, 153, 255), 0.);
+    let b = mk(st, "State=Hover", Rgba::rgb(0, 110, 210), 180.);
+    st.doc.combine_as_variants(&[a, b]);
+    let i = st.doc.instantiate(a, 0, None, None, pos2(420., 840.));
+    st.doc.swap_component(i, b);
+    st.doc.reflow();
+    st.sel = vec![i];
+    st.zoom_to(&egui::Context::default(), None, false);
+    h.run_steps(4);
+    save(&mut h, "18-variants");
 }
 
 #[test]
