@@ -498,6 +498,22 @@ impl App {
             self.request_open();
             ui.close();
         }
+        let recent = crate::files::recent();
+        ui.add_enabled_ui(!recent.is_empty(), |ui| {
+            ui.menu_button("Open recent", |ui| {
+                for p in recent {
+                    let label = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                    if ui.button(label).on_hover_text(p.display().to_string()).clicked() {
+                        if self.dirty {
+                            self.toast("Save or discard changes first (⌘S)".into());
+                        } else {
+                            self.open_path(p);
+                        }
+                        ui.close();
+                    }
+                }
+            });
+        });
         if item(ui, "Save", "⌘S") {
             self.save(false);
             ui.close();

@@ -3,6 +3,7 @@ mod boolean;
 mod canvas;
 mod doc;
 mod export;
+mod files;
 mod paint_ui;
 mod panels;
 mod render;

@@ -101,6 +101,11 @@ pub struct App {
     /// Properties copied with Cmd+Alt+C.
     pub style_clip: Option<Node>,
     pub layer_search: Option<String>,
+    /// This session's crash-recovery autosave.
+    recovery: PathBuf,
+    last_autosave: f64,
+    /// Autosaves from sessions that crashed, offered on launch.
+    pub recoverable: Vec<PathBuf>,
     undo: Vec<Document>,
     redo: Vec<Document>,
     in_gesture: bool,
@@ -148,6 +153,13 @@ impl App {
             rulers: false,
             style_clip: None,
             layer_search: None,
+            recovery: crate::files::recovery_dir().join(format!(
+                "{}-{}.katachi",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis())
+            )),
+            last_autosave: 0.0,
+            recoverable: vec![],
             undo: vec![],
             redo: vec![],
             in_gesture: false,
@@ -162,10 +174,36 @@ impl App {
             title: String::new(),
             screenshot: std::env::var_os("KATACHI_SCREENSHOT").map(|p| (PathBuf::from(p), 0)),
         };
+        app.recoverable = crate::files::orphaned_recoveries(&app.recovery);
         if let Some(p) = path {
             app.open_path(p);
         }
         app
+    }
+
+    fn document_json(&self) -> String {
+        serde_json::json!({ "katachi": 1, "document": self.doc }).to_string()
+    }
+
+    /// Every 30 s while there are unsaved changes, snapshot to the recovery folder.
+    pub fn autosave(&mut self, now: f64) {
+        if self.dirty && now - self.last_autosave > 30.0 {
+            self.last_autosave = now;
+            let _ = crate::files::write_atomic(&self.recovery, self.document_json().as_bytes());
+        }
+    }
+
+    /// The work is saved or deliberately discarded: drop this session's autosave.
+    pub fn clear_recovery(&self) {
+        let _ = std::fs::remove_file(&self.recovery);
+    }
+
+    /// Replace the current document state, keeping session-level things.
+    fn reset_to(&mut self, fresh: App) {
+        self.clear_recovery();
+        let screenshot = self.screenshot.take();
+        let recoverable = std::mem::take(&mut self.recoverable);
+        *self = App { screenshot, recoverable, ..fresh };
     }
 
     // ---------- undo ----------
@@ -739,8 +777,9 @@ impl App {
             .and_then(|v| serde_json::from_value::<Document>(v["document"].clone()).map_err(|e| e.to_string()));
         match parsed {
             Ok(doc) => {
-                *self = App { screenshot: self.screenshot.take(), ..App::new(None) };
+                self.reset_to(App::new(None));
                 self.doc = doc;
+                crate::files::add_recent(&p);
                 self.path = Some(p);
             }
             Err(e) => self.toast(format!("Couldn't open file: {e}")),
@@ -761,11 +800,12 @@ impl App {
                 None => return false,
             },
         };
-        let json = serde_json::json!({ "katachi": 1, "document": self.doc });
-        match std::fs::write(&path, json.to_string()) {
+        match crate::files::write_atomic(&path, self.document_json().as_bytes()) {
             Ok(()) => {
+                crate::files::add_recent(&path);
                 self.path = Some(path);
                 self.dirty = false;
+                self.clear_recovery();
                 true
             }
             Err(e) => {
@@ -807,7 +847,60 @@ impl App {
     }
 
     pub fn new_file(&mut self) {
-        *self = App { screenshot: self.screenshot.take(), ..App::new(None) };
+        self.reset_to(App::new(None));
+    }
+
+    /// Open an autosave from a crashed session as unsaved work.
+    pub fn recover(&mut self, p: &std::path::Path) {
+        let parsed = std::fs::read_to_string(p)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| serde_json::from_value::<Document>(v["document"].clone()).ok());
+        if let Some(doc) = parsed {
+            self.reset_to(App::new(None));
+            self.doc = doc;
+            self.dirty = true;
+            // Re-home the autosave before deleting the old one, so a second crash loses nothing.
+            let _ = crate::files::write_atomic(&self.recovery, self.document_json().as_bytes());
+            let _ = std::fs::remove_file(p);
+            self.recoverable.retain(|q| q != p);
+        }
+    }
+
+    fn recovery_prompt(&mut self, ctx: &egui::Context) {
+        if self.recoverable.is_empty() {
+            return;
+        }
+        let mut action: Option<(PathBuf, bool)> = None;
+        egui::Modal::new("recover".into()).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading("Recover unsaved work?");
+            ui.label("Katachi didn't close cleanly last time. These autosaves are available:");
+            ui.add_space(6.0);
+            for p in &self.recoverable {
+                let when = std::fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map_or(String::new(), |e| {
+                    let m = e.as_secs() / 60;
+                    if m < 60 { format!("{m} min ago") } else { format!("{} h ago", m / 60) }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(when);
+                    if ui.button("Recover").clicked() {
+                        action = Some((p.clone(), true));
+                    }
+                    if ui.button("Discard").clicked() {
+                        action = Some((p.clone(), false));
+                    }
+                });
+            }
+        });
+        match action {
+            Some((p, true)) => self.recover(&p),
+            Some((p, false)) => {
+                let _ = std::fs::remove_file(&p);
+                self.recoverable.retain(|q| *q != p);
+            }
+            None => {}
+        }
     }
 
     /// Place SVG data as a frame centered (or top-left if `!centered`) on `at`.
@@ -1102,6 +1195,8 @@ impl eframe::App for App {
         }
         self.canvas_panel(ui);
         self.close_guard(&ctx);
+        self.recovery_prompt(&ctx);
+        self.autosave(ctx.input(|i| i.time));
         self.debug_screenshot(&ctx);
 
         // A gesture (and its single undo step) ends when the pointer is up and no field is focused.
@@ -1150,12 +1245,14 @@ impl App {
         self.confirm = None;
         match after {
             After::Close => {
+                self.clear_recovery();
                 self.allow_close = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             After::New => self.new_file(),
             After::Open => {
                 self.dirty = false;
+                self.clear_recovery();
                 self.open_dialog();
             }
         }

@@ -5,10 +5,24 @@ use crate::doc::{Kind, Node, NodeId};
 use egui::{Event, Key, Modifiers, PointerButton, Pos2, Rect, pos2, vec2};
 use egui_kittest::Harness;
 
+/// Keep autosaves and recents out of the real user folder.
+fn isolate_data() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = std::env::temp_dir().join(format!("katachi-test-data-{}", std::process::id()));
+        // SAFETY: set once before any test reads it; every test uses the same value.
+        unsafe { std::env::set_var("KATACHI_DATA_DIR", dir) };
+    });
+}
+
 fn harness() -> Harness<'static, App> {
+    isolate_data();
     let mut h = Harness::builder().with_size(vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).build_eframe(|cc| {
         crate::setup_style(&cc.egui_ctx);
-        App::new(None)
+        let mut app = App::new(None);
+        // The recovery test runs in parallel against the same data dir.
+        app.recoverable.clear();
+        app
     });
     h.run_steps(2);
     h
@@ -758,4 +772,25 @@ fn blur_spreads_and_preserves_energy() {
     let alpha: Vec<u8> = px.chunks(4).map(|p| p[3]).collect();
     assert!(alpha[10] < 210 && alpha[10] > 0 && alpha[8] > 0, "{alpha:?}");
     assert!(alpha[10] >= alpha[8] && alpha[8] >= alpha[5], "peaked: {alpha:?}");
+}
+
+#[test]
+fn autosave_and_recovery_roundtrip() {
+    isolate_data();
+    let mut a = App::new(None);
+    a.doc.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 0., 10., 10.)));
+    a.dirty = true;
+    a.autosave(100.0);
+    let left = crate::files::orphaned_recoveries(std::path::Path::new("none"));
+    assert!(!left.is_empty(), "autosave written");
+    // A new session sees the orphan and can recover it as unsaved work.
+    let mut b = App::new(None);
+    assert!(!b.recoverable.is_empty());
+    let p = b.recoverable.iter().find(|p| left.contains(p)).unwrap().clone();
+    b.recover(&p);
+    assert_eq!(b.doc.nodes.len(), 1);
+    assert!(b.dirty);
+    assert!(!p.exists(), "old autosave re-homed");
+    b.new_file();
+    a.clear_recovery();
 }
