@@ -9,12 +9,34 @@ use std::path::PathBuf;
 pub enum Tool {
     Move,
     Hand,
+    /// K: resizing also scales strokes, radii, effects, and text.
+    Scale,
     Frame,
+    Section,
+    Slice,
     Rectangle,
     Ellipse,
     Line,
+    Arrow,
+    Polygon,
+    Star,
     Pen,
+    Pencil,
     Text,
+}
+
+impl Tool {
+    /// Tools that draw a box by dragging (or drop a default one on click).
+    pub fn draws_shape(self) -> bool {
+        matches!(
+            self,
+            Tool::Frame | Tool::Section | Tool::Slice | Tool::Rectangle | Tool::Ellipse | Tool::Line | Tool::Arrow | Tool::Polygon | Tool::Star
+        )
+    }
+    /// Tools that select and transform.
+    pub fn selects(self) -> bool {
+        matches!(self, Tool::Move | Tool::Scale)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +59,7 @@ pub enum Drag {
     Marquee { start: Pos2, base_sel: Vec<NodeId> },
     Vector { base: Document, id: NodeId, grab: crate::vector_edit::Grab },
     PenHandle,
+    Pencil { points: Vec<Pos2> },
 }
 
 /// What the pointer grabbed on the selection frame.
@@ -92,6 +115,8 @@ pub struct App {
     /// Zoom to this layer on the next frame (after page switches settle).
     pub zoom_target: Option<NodeId>,
     pub left_tab_assets: bool,
+    /// Last tool used in each toolbar group (move, frame, shape, pen, text).
+    pub tool_groups: [Tool; 5],
     pub vector_edit: Option<crate::vector_edit::VectorEdit>,
     pub vector_grabbed: Option<crate::vector_edit::Grab>,
     pub vector_start: Pos2,
@@ -146,6 +171,7 @@ impl App {
             pending_frame: None,
             zoom_target: None,
             left_tab_assets: false,
+            tool_groups: [Tool::Move, Tool::Frame, Tool::Rectangle, Tool::Pen, Tool::Text],
             vector_edit: None,
             vector_grabbed: None,
             vector_start: Pos2::ZERO,
@@ -257,6 +283,9 @@ impl App {
         }
         self.end_text_edit();
         self.tool = t;
+        if let Some(g) = crate::panels::TOOL_GROUPS.iter().position(|g| g.iter().any(|(tt, _, _)| *tt == t)) {
+            self.tool_groups[g] = t;
+        }
     }
 
     pub fn select_page(&mut self, i: usize) {
@@ -827,10 +856,18 @@ impl App {
         else {
             return;
         };
+        // A slice exports whatever lies inside it.
+        let svg = match ids.as_slice() {
+            [one] if self.doc.node(*one).kind == Kind::Slice => {
+                let n = self.doc.node(*one);
+                crate::export::region_svg(&self.doc, self.page, n.aabb(), n.id)
+            }
+            _ => crate::export::to_svg(&self.doc, &ids),
+        };
         let data = if self.export_svg {
-            Ok(crate::export::to_svg(&self.doc, &ids).into_bytes())
+            Ok(svg.into_bytes())
         } else {
-            crate::export::to_png(&self.doc, &ids, self.export_scale)
+            crate::export::svg_to_png(&self.doc, &svg, self.export_scale)
         };
         match data.and_then(|d| std::fs::write(&path, d).map_err(|e| e.to_string())) {
             Ok(()) => self.toast(format!("Exported {}", path.file_name().unwrap_or_default().to_string_lossy())),
@@ -1151,6 +1188,11 @@ impl App {
                 }
             }
             (false, false, false, Key::V) => self.set_tool(Tool::Move),
+            (false, false, false, Key::K) => self.set_tool(Tool::Scale),
+            (false, true, false, Key::S) => self.set_tool(Tool::Section),
+            (false, false, false, Key::S) => self.set_tool(Tool::Slice),
+            (false, true, false, Key::L) => self.set_tool(Tool::Arrow),
+            (false, true, false, Key::P) => self.set_tool(Tool::Pencil),
             (false, false, false, Key::H) => self.set_tool(Tool::Hand),
             (false, false, false, Key::F | Key::A) => self.set_tool(Tool::Frame),
             (false, false, false, Key::R) => self.set_tool(Tool::Rectangle),

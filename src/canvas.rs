@@ -216,8 +216,17 @@ impl App {
                 (false, true) => BLUE,
                 _ => Color32::from_gray(0x80),
             };
-            let galley = painter.layout_no_wrap(n.name.clone(), FontId::proportional(11.0), color);
             let r = self.view.rect_to_screen(n.aabb());
+            if n.kind == Kind::Section {
+                // Sections carry their name in a pill inside the top-left corner.
+                let g = painter.layout_no_wrap(n.name.clone(), FontId::proportional(11.0), if active { Color32::WHITE } else { Color32::from_gray(0x1E) });
+                let pill = Rect::from_min_size(r.min + vec2(8.0, 8.0), g.size() + vec2(12.0, 6.0));
+                painter.rect_filled(pill, 4.0, if active { BLUE } else { Color32::from_gray(0xE6) });
+                painter.galley(pill.min + vec2(6.0, 3.0), g, Color32::WHITE);
+                self.frame_labels.push((id, pill));
+                continue;
+            }
+            let galley = painter.layout_no_wrap(n.name.clone(), FontId::proportional(11.0), color);
             let indent = if comp { 14.0 } else { 0.0 };
             let pos = pos2(r.min.x + indent, r.min.y - galley.size().y - 4.0);
             if comp {
@@ -251,7 +260,7 @@ impl App {
     }
 
     fn handle_at(&self, s: Pos2) -> Option<Grip> {
-        if self.editing_text.is_some() || self.tool != Tool::Move || self.vector_edit.is_some() {
+        if self.editing_text.is_some() || !self.tool.selects() || self.vector_edit.is_some() {
             return None;
         }
         let (r, rot) = self.sel_frame()?;
@@ -290,7 +299,7 @@ impl App {
             return;
         }
         match tool {
-            Tool::Move => {
+            Tool::Move | Tool::Scale => {
                 self.vector_edit = None;
                 let handle = self.handle_at(s);
                 let target = if handle.is_some() { None } else { self.target_at(w, s, mods.command) };
@@ -355,7 +364,7 @@ impl App {
             return;
         }
         self.drag = match self.tool {
-            Tool::Move => {
+            Tool::Move | Tool::Scale => {
                 if let Some(grip) = press.handle {
                     self.checkpoint();
                     let (bounds, rot) = self.sel_frame().unwrap_or((Rect::NOTHING, 0.0));
@@ -380,26 +389,15 @@ impl App {
                     Some(Drag::Marquee { start, base_sel })
                 }
             }
-            Tool::Frame | Tool::Rectangle | Tool::Ellipse | Tool::Line | Tool::Text => {
+            Tool::Pencil => Some(Drag::Pencil { points: vec![start] }),
+            t if t.draws_shape() || t == Tool::Text => {
                 self.checkpoint();
                 let start = self.snap_point(start.round(), &[]);
-                let parent = self.frame_at(start, &[]);
-                let rect = Rect::from_min_size(start, Vec2::ZERO);
-                let mut node = match self.tool {
-                    Tool::Frame => Node::new(Kind::Frame, rect),
-                    Tool::Rectangle => Node::new(Kind::Rectangle, rect),
-                    Tool::Ellipse => Node::new(Kind::Ellipse, rect),
-                    Tool::Text => {
-                        let mut n = Node::new(Kind::Text, rect);
-                        n.text_sizing = crate::doc::TextSizing::Fixed;
-                        n
-                    }
-                    _ => {
-                        let mut n = Node::vector(&[PathPoint { p: start, ..Default::default() }; 2], false);
-                        n.name = self.doc.auto_name("Line");
-                        n
-                    }
-                };
+                let parent = if t == Tool::Section { None } else { self.frame_at(start, &[]) };
+                let mut node = self.shape_for(t, Rect::from_min_size(start, Vec2::ZERO));
+                if t == Tool::Text {
+                    node.text_sizing = crate::doc::TextSizing::Fixed;
+                }
                 if node.kind.is_frame() && parent.is_some() {
                     node.clip = true;
                 }
@@ -511,6 +509,21 @@ impl App {
                 let sx = if b.width() > 0.0 { nb.width() / b.width() } else { 1.0 };
                 let sy = if b.height() > 0.0 { nb.height() / b.height() } else { 1.0 };
                 let map = |p: Pos2| pos2(nb.min.x + (p.x - b.min.x) * sx, nb.min.y + (p.y - b.min.y) * sy);
+                if self.tool == Tool::Scale {
+                    // K: strokes, radii, effects, and type scale along with the box.
+                    // A flat box (a line) scales by its one real axis.
+                    let k = match (b.width() > 0.0, b.height() > 0.0) {
+                        (true, true) => (sx.abs() * sy.abs()).sqrt(),
+                        (true, false) => sx.abs(),
+                        _ => sy.abs(),
+                    }
+                    .max(0.001);
+                    for &id in &roots {
+                        for d in std::iter::once(id).chain(self.doc.descendants(id)) {
+                            scale_props(self.doc.node_mut(d), k);
+                        }
+                    }
+                }
                 for id in roots {
                     let r = self.doc.node(id).rect;
                     // Dragging a size by hand pins it, as in Figma.
@@ -573,6 +586,11 @@ impl App {
                 let (base, id, grab) = (base.clone(), *id, *grab);
                 self.vector_drag(&base, id, grab, self.vector_start, w, mods.alt);
             }
+            Drag::Pencil { points } => {
+                if points.last().is_none_or(|l| l.distance(w) * self.view.zoom > 1.5) {
+                    points.push(w);
+                }
+            }
             Drag::PenHandle => {
                 let z = self.view.zoom;
                 if let Some(last) = self.pen.last_mut() {
@@ -592,6 +610,19 @@ impl App {
         self.guides.clear();
         self.vector_grabbed = None;
         match self.drag.take() {
+            Some(Drag::Pencil { points }) => {
+                let pts = smooth_stroke(&points, 1.5 / self.view.zoom);
+                if pts.len() >= 2 {
+                    self.checkpoint();
+                    let parent = self.frame_at(points[0], &[]);
+                    let mut n = Node::vector(&pts, false);
+                    n.stroke_width = 2.0;
+                    n.cap = crate::doc::Cap::Round;
+                    n.join = crate::doc::Join::Round;
+                    let id = self.doc.insert(self.page, parent, None, n);
+                    self.sel = vec![id];
+                }
+            }
             Some(Drag::Move { .. }) => {
                 // Dropping onto a frame nests the layer in it; dragging out un-nests it.
                 let roots = self.sel_roots();
@@ -614,7 +645,7 @@ impl App {
             }
             Some(Drag::Create { id, .. }) => {
                 let n = self.doc.node(id).clone();
-                if n.kind.is_frame() {
+                if matches!(n.kind, Kind::Frame | Kind::Section) {
                     // A new frame drawn around sibling layers adopts them.
                     let (r, parent) = (n.rect, n.parent);
                     let kids: Vec<NodeId> = self
@@ -648,7 +679,7 @@ impl App {
             return;
         }
         match self.tool {
-            Tool::Move => {
+            Tool::Move | Tool::Scale => {
                 if let Some(t) = self.pending_frame.take() {
                     if mods.shift { self.sel.push(t) } else { self.sel = vec![t] }
                 }
@@ -671,30 +702,43 @@ impl App {
                 self.focus_text = true;
                 self.tool = Tool::Move;
             }
-            Tool::Frame | Tool::Rectangle | Tool::Ellipse | Tool::Line => {
+            t if t.draws_shape() => {
                 // A click without a drag drops a default 100×100 shape.
                 self.checkpoint();
                 let p = w.round();
-                let parent = self.frame_at(p, &[]);
-                let node = match self.tool {
-                    Tool::Frame => Node::new(Kind::Frame, Rect::from_min_size(p, vec2(100.0, 100.0))),
-                    Tool::Rectangle => Node::new(Kind::Rectangle, Rect::from_min_size(p, vec2(100.0, 100.0))),
-                    Tool::Ellipse => Node::new(Kind::Ellipse, Rect::from_min_size(p, vec2(100.0, 100.0))),
-                    _ => {
-                        let mut n = Node::vector(
-                            &[PathPoint { p, ..Default::default() }, PathPoint { p: p + vec2(100.0, 0.0), ..Default::default() }],
-                            false,
-                        );
-                        n.name = self.doc.auto_name("Line");
-                        n
-                    }
-                };
+                let parent = if t == Tool::Section { None } else { self.frame_at(p, &[]) };
+                let node = self.shape_for(t, Rect::from_min_size(p, vec2(100.0, 100.0)));
                 let id = self.doc.insert(self.page, parent, None, node);
                 self.sel = vec![id];
                 self.tool = Tool::Move;
                 self.press = None;
             }
             _ => {}
+        }
+    }
+
+    /// The layer a drawing tool makes, spanning `r` (lines run from its top-left to bottom-right).
+    fn shape_for(&self, t: Tool, r: Rect) -> Node {
+        match t {
+            Tool::Frame => Node::new(Kind::Frame, r),
+            Tool::Section => Node::new(Kind::Section, r),
+            Tool::Slice => Node::new(Kind::Slice, r),
+            Tool::Rectangle => Node::new(Kind::Rectangle, r),
+            Tool::Ellipse => Node::new(Kind::Ellipse, r),
+            Tool::Polygon => Node::new(Kind::Polygon, r),
+            Tool::Star => Node::new(Kind::Star, r),
+            Tool::Text => Node::new(Kind::Text, r),
+            _ => {
+                let end = if r.width() == 0.0 && r.height() == 0.0 { r.min } else { pos2(r.max.x, r.min.y) };
+                let mut n = Node::vector(&[PathPoint { p: r.min, ..Default::default() }, PathPoint { p: end, ..Default::default() }], false);
+                if t == Tool::Arrow {
+                    n.end_marker = crate::doc::Marker::Arrow;
+                    n.name = self.doc.auto_name("Arrow");
+                } else {
+                    n.name = self.doc.auto_name("Line");
+                }
+                n
+            }
         }
     }
 
@@ -872,6 +916,13 @@ impl App {
     }
 
     fn draw_overlays(&self, painter: &Painter, ptr: Option<Pos2>) {
+        // Slices are invisible in output but outlined while editing.
+        for n in self.doc.nodes.values().filter(|n| n.kind == Kind::Slice && n.visible && self.doc.page_of(n.id) == self.page) {
+            let pts = n.corners().map(|p| self.view.to_screen(p));
+            let mut ring = pts.to_vec();
+            ring.push(pts[0]);
+            painter.extend(egui::Shape::dashed_line(&ring, Stroke::new(1.0, Color32::from_gray(0x99)), 4.0, 3.0));
+        }
         if let Some(h) = self.hover.filter(|h| !self.sel.contains(h)) {
             self.outline(painter, h, 2.0);
         }
@@ -892,7 +943,7 @@ impl App {
                 .map(|p| self.view.to_screen(rotate(p, fr.center(), rot)));
             let accent = self.accent(roots[0]);
             painter.add(egui::Shape::closed_line(corners.to_vec(), Stroke::new(1.0, accent)));
-            if self.editing_text.is_none() && self.tool == Tool::Move {
+            if self.editing_text.is_none() && self.tool.selects() {
                 for c in corners {
                     let h = Rect::from_center_size(c, vec2(7.0, 7.0));
                     painter.rect_filled(h, 1.0, Color32::WHITE);
@@ -1063,7 +1114,7 @@ impl App {
             if ui.input(|i| i.pointer.any_down()) { CursorIcon::Grabbing } else { CursorIcon::Grab }
         } else {
             match self.tool {
-                Tool::Move => match self.handle_at(p) {
+                Tool::Move | Tool::Scale => match self.handle_at(p) {
                     Some(Grip::Resize(-1, -1) | Grip::Resize(1, 1)) => CursorIcon::ResizeNwSe,
                     Some(Grip::Resize(1, -1) | Grip::Resize(-1, 1)) => CursorIcon::ResizeNeSw,
                     Some(Grip::Resize(_, 0)) => CursorIcon::ResizeHorizontal,
@@ -1248,6 +1299,67 @@ impl App {
             ui.close();
         }
     }
+}
+
+/// Scale-tool property scaling: everything measured in pixels grows with the layer.
+fn scale_props(n: &mut Node, k: f32) {
+    n.stroke_width *= k;
+    n.radius *= k;
+    if let Some(c) = &mut n.corner_radii {
+        c.iter_mut().for_each(|r| *r *= k);
+    }
+    n.font_size *= k;
+    if let crate::doc::LineHeight::Px(px) = &mut n.line_height {
+        *px *= k;
+    }
+    for s in &mut n.shadows {
+        s.blur *= k;
+        s.spread *= k;
+        s.offset *= k;
+    }
+    n.layout.gap *= k;
+    n.layout.padding.iter_mut().for_each(|p| *p *= k);
+    n.dash.iter_mut().for_each(|d| *d *= k);
+}
+
+/// Freehand points -> fewer anchors (Ramer-Douglas-Peucker) with smooth Catmull-Rom handles.
+pub fn smooth_stroke(points: &[Pos2], tol: f32) -> Vec<PathPoint> {
+    fn rdp(p: &[Pos2], tol: f32, out: &mut Vec<Pos2>) {
+        let (a, b) = (p[0], p[p.len() - 1]);
+        let (mut idx, mut dmax) = (0, 0.0);
+        for (i, q) in p.iter().enumerate().take(p.len() - 1).skip(1) {
+            let ab = b - a;
+            let d = if ab.length_sq() > 0.0 { (ab.x * (a.y - q.y) - ab.y * (a.x - q.x)).abs() / ab.length() } else { a.distance(*q) };
+            if d > dmax {
+                (idx, dmax) = (i, d);
+            }
+        }
+        if dmax > tol {
+            rdp(&p[..=idx], tol, out);
+            out.pop();
+            rdp(&p[idx..], tol, out);
+        } else {
+            out.push(a);
+            out.push(b);
+        }
+    }
+    if points.len() < 2 {
+        return vec![];
+    }
+    let mut simple = vec![];
+    rdp(points, tol, &mut simple);
+    simple.dedup();
+    let n = simple.len();
+    (0..n)
+        .map(|i| {
+            let p = simple[i];
+            if i == 0 || i + 1 == n {
+                return PathPoint { p, ..Default::default() };
+            }
+            let t = (simple[i + 1] - simple[i - 1]) / 6.0;
+            PathPoint { p, h_in: -t, h_out: t }
+        })
+        .collect()
 }
 
 fn snap_angle(from: Pos2, to: Pos2) -> Pos2 {

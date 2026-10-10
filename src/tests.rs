@@ -503,6 +503,28 @@ fn shots() {
     st.sel = vec![g];
     h.run_steps(4);
     save(&mut h, "12-effects");
+    // New shapes in a section, with an arrow and a slice.
+    let st = h.state_mut();
+    let mut sec = Node::new(Kind::Section, r(-40., 560., 520., 220.));
+    sec.name = "Shapes".into();
+    let sec = st.doc.insert(0, None, None, sec);
+    let mut pg = Node::new(Kind::Polygon, r(0., 620., 120., 120.));
+    pg.fills = vec![crate::doc::Paint::solid(Rgba::rgb(255, 199, 0))];
+    st.doc.insert(0, Some(sec), None, pg);
+    let mut sr = Node::new(Kind::Star, r(150., 620., 120., 120.));
+    sr.fills = vec![crate::doc::Paint::solid(Rgba::rgb(242, 72, 34))];
+    st.doc.insert(0, Some(sec), None, sr);
+    let mut ar = Node::vector(&[crate::doc::PathPoint { p: pos2(300., 700.), ..Default::default() }, crate::doc::PathPoint { p: pos2(440., 640.), h_in: vec2(-60., 0.), ..Default::default() }], false);
+    ar.end_marker = crate::doc::Marker::Arrow;
+    ar.start_marker = crate::doc::Marker::Circle;
+    ar.stroke_width = 3.;
+    st.doc.insert(0, Some(sec), None, ar);
+    st.doc.insert(0, None, None, Node::new(Kind::Slice, r(520., 600., 200., 150.)));
+    st.sel = vec![];
+    st.set_tool(Tool::Star);
+    st.zoom_to(&egui::Context::default(), None, false);
+    h.run_steps(4);
+    save(&mut h, "13-shapes");
 }
 
 #[test]
@@ -793,4 +815,62 @@ fn autosave_and_recovery_roundtrip() {
     assert!(!p.exists(), "old autosave re-homed");
     b.new_file();
     a.clear_recovery();
+}
+
+#[test]
+fn new_tools_shapes_pencil_sections_slices_scale() {
+    use crate::doc::Marker;
+    let mut h = harness();
+    // Arrow: Shift+L, drag.
+    let a = draw(&mut h, Key::L, (0.0, 0.0), (100.0, 0.0));
+    let _ = a;
+    key(&mut h, Modifiers::SHIFT, Key::L);
+    let (p, q) = (s(&h, 0., 50.), s(&h, 120., 50.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    let arrow = h.state().sel[0];
+    assert_eq!(h.state().doc.node(arrow).end_marker, Marker::Arrow);
+    assert!(crate::export::to_svg(&h.state().doc, &[arrow]).matches("<path").count() >= 2, "line + arrowhead");
+    // Polygon and star from the toolbar groups.
+    h.state_mut().set_tool(Tool::Star);
+    let (p, q) = (s(&h, 200., 0.), s(&h, 300., 100.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    let star = h.state().sel[0];
+    assert_eq!(h.state().doc.node(star).star_points().len(), 10);
+    assert_eq!(h.state().doc.hit(0, pos2(250., 50.), 0.), Some(star));
+    assert_eq!(h.state().doc.hit(0, pos2(205., 5.), 0.), None, "corners of the box are outside the star");
+    // Pencil: freehand squiggle becomes a smooth vector with fewer anchors.
+    key(&mut h, Modifiers::SHIFT, Key::P);
+    let pts: Vec<Pos2> = (0..=40).map(|i| s(&h, i as f32 * 5., 200. + (i as f32 * 0.3).sin() * 20.)).collect();
+    move_to(&mut h, pts[0], Modifiers::NONE);
+    press(&mut h, pts[0], true, Modifiers::NONE);
+    for p in &pts[1..] {
+        move_to(&mut h, *p, Modifiers::NONE);
+    }
+    press(&mut h, pts[40], false, Modifiers::NONE);
+    h.run_steps(2);
+    let pen = h.state().sel[0];
+    let pn = h.state().doc.node(pen);
+    assert_eq!(pn.kind, Kind::Vector);
+    assert!(pn.paths[0].points.len() < 30 && pn.paths[0].points.len() > 3, "{}", pn.paths[0].points.len());
+    // Section around the star adopts it; slice exports what's under it.
+    key(&mut h, Modifiers::SHIFT, Key::S);
+    let (p, q) = (s(&h, 180., -20.), s(&h, 320., 120.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    let sec = h.state().sel[0];
+    assert_eq!(h.state().doc.node(sec).kind, Kind::Section);
+    assert_eq!(h.state().doc.node(star).parent, Some(sec));
+    key(&mut h, Modifiers::NONE, Key::S);
+    let (p, q) = (s(&h, 190., -10.), s(&h, 310., 110.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    let slice = h.state().sel[0];
+    let svg = crate::export::region_svg(&h.state().doc, 0, h.state().doc.node(slice).aabb(), slice);
+    assert!(svg.contains("<polygon"), "star inside the slice");
+    // Scale tool doubles stroke weight with size.
+    h.state_mut().doc.node_mut(arrow).stroke_width = 2.0;
+    h.state_mut().sel = vec![arrow];
+    key(&mut h, Modifiers::NONE, Key::K);
+    let (p, q) = (s(&h, 120., 50.), s(&h, 240., 50.));
+    drag(&mut h, p, q, Modifiers::SHIFT);
+    let n = h.state().doc.node(arrow);
+    assert!((n.stroke_width - 4.0).abs() < 0.1, "{}", n.stroke_width);
 }

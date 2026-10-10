@@ -39,11 +39,34 @@ pub enum Icon {
     Component,
     Instance,
     Boolean,
+    Polygon,
+    Star,
+    Section,
+    Slice,
+    Arrow,
+    Pencil,
+    Scale,
 }
 
 const SUBTLE: Color32 = Color32::from_rgb(0xF5, 0xF5, 0xF5);
 const SEL_BG: Color32 = Color32::from_rgb(0xE5, 0xF4, 0xFF);
 const CHILD_BG: Color32 = Color32::from_rgb(0xF2, 0xF9, 0xFF);
+
+/// Toolbar groups as in Figma UI3: (tool, icon, "Name  shortcut").
+pub const TOOL_GROUPS: [&[(Tool, Icon, &str)]; 5] = [
+    &[(Tool::Move, Icon::Move, "Move  V"), (Tool::Hand, Icon::Hand, "Hand tool  H"), (Tool::Scale, Icon::Scale, "Scale  K")],
+    &[(Tool::Frame, Icon::Frame, "Frame  F"), (Tool::Section, Icon::Section, "Section  ⇧S"), (Tool::Slice, Icon::Slice, "Slice  S")],
+    &[
+        (Tool::Rectangle, Icon::Rect, "Rectangle  R"),
+        (Tool::Line, Icon::Line, "Line  L"),
+        (Tool::Arrow, Icon::Arrow, "Arrow  ⇧L"),
+        (Tool::Ellipse, Icon::Ellipse, "Ellipse  O"),
+        (Tool::Polygon, Icon::Polygon, "Polygon"),
+        (Tool::Star, Icon::Star, "Star"),
+    ],
+    &[(Tool::Pen, Icon::Pen, "Pen  P"), (Tool::Pencil, Icon::Pencil, "Pencil  ⇧P")],
+    &[(Tool::Text, Icon::Text, "Text  T")],
+];
 
 /// Drag payload: a main component dragged from the Assets tab.
 pub struct AssetDrag(pub NodeId);
@@ -227,6 +250,41 @@ pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
             let d = 5.5;
             p.add(Shape::closed_line(vec![at(0., -d), at(d, 0.), at(0., d), at(-d, 0.)], s));
         }
+        Icon::Polygon | Icon::Star => {
+            let star = icon == Icon::Star;
+            let n = if star { 10 } else { 3 };
+            let pts: Vec<Pos2> = (0..n)
+                .map(|i| {
+                    let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * i as f32 / n as f32;
+                    let k = if star && i % 2 == 1 { 2.6 } else { 6.0 };
+                    at(k * a.cos(), k * a.sin() + if star { 0.5 } else { 1.0 })
+                })
+                .collect();
+            p.add(Shape::closed_line(pts, s));
+        }
+        Icon::Section => {
+            p.rect_stroke(Rect::from_center_size(c + vec2(0., 1.), vec2(12., 10.)), 1.5, s, StrokeKind::Middle);
+            p.rect_filled(Rect::from_min_size(at(-6., -6.), vec2(6., 3.)), 1.0, color);
+        }
+        Icon::Slice => {
+            p.line_segment([at(-6., 6.), at(6., -6.)], s);
+            p.rect_stroke(Rect::from_center_size(c, vec2(11., 11.)), 0.0, Stroke::new(1.0, color.gamma_multiply(0.6)), StrokeKind::Middle);
+        }
+        Icon::Arrow => {
+            p.line_segment([at(-5., 5.), at(5., -5.)], s);
+            p.line_segment([at(5., -5.), at(0., -5.)], s);
+            p.line_segment([at(5., -5.), at(5., 0.)], s);
+        }
+        Icon::Pencil => {
+            p.line_segment([at(-5., 5.), at(4., -4.)], Stroke::new(2.2, color));
+            p.line_segment([at(-6., 6.), at(-5., 5.)], s);
+        }
+        Icon::Scale => {
+            p.rect_stroke(Rect::from_min_size(at(-6., -1.), vec2(7., 7.)), 0.5, s, StrokeKind::Middle);
+            p.line_segment([at(-1., 1.), at(6., -6.)], s);
+            p.line_segment([at(6., -6.), at(2., -6.)], s);
+            p.line_segment([at(6., -6.), at(6., -2.)], s);
+        }
         Icon::Boolean => {
             p.rect_stroke(Rect::from_min_size(at(-6., -6.), vec2(8., 8.)), 1.0, s, StrokeKind::Middle);
             p.rect_filled(Rect::from_min_size(at(-2., -2.), vec2(8., 8.)), 1.0, color);
@@ -266,6 +324,10 @@ fn kind_icon(k: Kind) -> Icon {
         Kind::Component => Icon::Component,
         Kind::Instance => Icon::Instance,
         Kind::Boolean => Icon::Boolean,
+        Kind::Polygon => Icon::Polygon,
+        Kind::Star => Icon::Star,
+        Kind::Section => Icon::Section,
+        Kind::Slice => Icon::Slice,
         Kind::Group => Icon::Group,
         Kind::Rectangle => Icon::Rect,
         Kind::Ellipse => Icon::Ellipse,
@@ -878,6 +940,26 @@ impl App {
             ui.separator();
             self.typography_section(ui, &n);
         }
+        if matches!(n.kind, Kind::Polygon | Kind::Star) {
+            let (mut count, mut ratio) = (n.point_count as f32, n.inner_ratio * 100.0);
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                ui.label("Count");
+                changed |= ui.add(DragValue::new(&mut count).range(3.0..=60.0).speed(0.1)).changed();
+                if n.kind == Kind::Star {
+                    ui.label("Ratio");
+                    changed |= ui.add(DragValue::new(&mut ratio).range(1.0..=100.0).speed(0.5).suffix("%")).changed();
+                }
+            });
+            if changed {
+                self.begin_edit();
+                for &id in &self.sel.clone() {
+                    let t = self.doc.node_mut(id);
+                    t.point_count = count.round() as u32;
+                    t.inner_ratio = ratio / 100.0;
+                }
+            }
+        }
         if n.kind != Kind::Group {
             ui.separator();
             self.paints_section(ui, false);
@@ -1423,6 +1505,30 @@ impl App {
                         }
                     });
                 }
+                if n.kind == Kind::Vector && n.paths.iter().any(|p| !p.closed) {
+                    use crate::doc::Marker;
+                    let mut ends = (n.start_marker, n.end_marker);
+                    let label = |m: Marker| match m {
+                        Marker::None => "—",
+                        Marker::Arrow => "→",
+                        Marker::Triangle => "▶",
+                        Marker::Circle => "●",
+                    };
+                    for (i, m) in [&mut ends.0, &mut ends.1].into_iter().enumerate() {
+                        egui::ComboBox::from_id_salt(("marker", i)).width(28.0).selected_text(label(*m)).show_ui(ui, |ui| {
+                            for k in [Marker::None, Marker::Arrow, Marker::Triangle, Marker::Circle] {
+                                ui.selectable_value(m, k, format!("{} {k:?}", label(k)));
+                            }
+                        });
+                    }
+                    if ends != (n.start_marker, n.end_marker) {
+                        self.begin_edit();
+                        for &id in &self.sel.clone() {
+                            let t = self.doc.node_mut(id);
+                            (t.start_marker, t.end_marker) = ends;
+                        }
+                    }
+                }
                 // Dashes, caps, and joins live in a settings popover, like Figma.
                 let more = icon_button(ui, Icon::Menu, false, 22.0, "Advanced stroke");
                 egui::Popup::menu(&more).id(ui.id().with("stroke-more")).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
@@ -1558,21 +1664,33 @@ impl App {
                     .shadow(egui::Shadow { offset: [0, 2], blur: 10, spread: 0, color: Color32::from_black_alpha(30) })
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 2.0;
-                            let tools = [
-                                (Tool::Move, Icon::Move, "Move (V)"),
-                                (Tool::Frame, Icon::Frame, "Frame (F)"),
-                                (Tool::Rectangle, Icon::Rect, "Rectangle (R)"),
-                                (Tool::Ellipse, Icon::Ellipse, "Ellipse (O)"),
-                                (Tool::Line, Icon::Line, "Line (L)"),
-                                (Tool::Pen, Icon::Pen, "Pen (P)"),
-                                (Tool::Text, Icon::Text, "Text (T)"),
-                                (Tool::Hand, Icon::Hand, "Hand tool (H)"),
-                            ];
-                            for (t, icon, tip) in tools {
-                                if icon_button(ui, icon, self.tool == t, 32.0, tip).clicked() {
-                                    self.set_tool(t);
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            for (g, tools) in TOOL_GROUPS.iter().enumerate() {
+                                // The button shows the active tool if it's in this group, else the group's last one.
+                                let current = tools.iter().find(|(t, _, _)| *t == self.tool).unwrap_or_else(|| {
+                                    tools.iter().find(|(t, _, _)| *t == self.tool_groups[g]).unwrap_or(&tools[0])
+                                });
+                                let active = tools.iter().any(|(t, _, _)| *t == self.tool);
+                                if icon_button(ui, current.1, active, 32.0, current.2).clicked() {
+                                    self.set_tool(current.0);
                                 }
+                                if tools.len() > 1 {
+                                    let more = icon_button(ui, Icon::Chevron(true), false, 14.0, "");
+                                    egui::Popup::menu(&more).id(ui.id().with(("tools", g))).show(|ui| {
+                                        for &(t, icon, label) in tools.iter() {
+                                            ui.horizontal(|ui| {
+                                                let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+                                                paint_icon(ui.painter(), r, icon, Color32::from_gray(0x1E));
+                                                let (name, key) = label.split_once("  ").unwrap_or((label, ""));
+                                                if ui.add(egui::Button::new(name).shortcut_text(key).frame(false).min_size(vec2(140.0, 0.0))).clicked() {
+                                                    self.set_tool(t);
+                                                    ui.close();
+                                                }
+                                            });
+                                        }
+                                    });
+                                }
+                                ui.add_space(4.0);
                             }
                         });
                     });

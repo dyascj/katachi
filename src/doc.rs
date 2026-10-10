@@ -15,6 +15,13 @@ pub enum Kind {
     Instance,
     /// A live boolean of its children.
     Boolean,
+    /// Regular polygon inscribed in the box.
+    Polygon,
+    Star,
+    /// A top-level organizer for frames.
+    Section,
+    /// An export region; draws nothing.
+    Slice,
     Group,
     Rectangle,
     Ellipse,
@@ -29,6 +36,10 @@ impl Kind {
             Kind::Component => "Component",
             Kind::Instance => "Instance",
             Kind::Boolean => "Boolean",
+            Kind::Polygon => "Polygon",
+            Kind::Star => "Star",
+            Kind::Section => "Section",
+            Kind::Slice => "Slice",
             Kind::Group => "Group",
             Kind::Rectangle => "Rectangle",
             Kind::Ellipse => "Ellipse",
@@ -39,9 +50,9 @@ impl Kind {
     pub fn is_container(self) -> bool {
         self.is_frame() || matches!(self, Kind::Group | Kind::Boolean)
     }
-    /// Frames, components, and instances all behave as frames.
+    /// Frames, components, instances, and sections all behave as frames.
     pub fn is_frame(self) -> bool {
-        matches!(self, Kind::Frame | Kind::Component | Kind::Instance)
+        matches!(self, Kind::Frame | Kind::Component | Kind::Instance | Kind::Section)
     }
 }
 
@@ -154,6 +165,16 @@ pub enum TextCase {
     Upper,
     Lower,
     Title,
+}
+
+/// What sits at the ends of an open path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Marker {
+    #[default]
+    None,
+    Arrow,
+    Triangle,
+    Circle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -381,6 +402,12 @@ pub struct Node {
     pub dash: Vec<f32>,
     pub cap: Cap,
     pub join: Join,
+    pub start_marker: Marker,
+    pub end_marker: Marker,
+    /// Polygon sides / star points.
+    pub point_count: u32,
+    /// Star inner radius as a fraction of the outer.
+    pub inner_ratio: f32,
     pub clip: bool,
     pub shadows: Vec<Shadow>,
     pub layout: AutoLayout,
@@ -439,6 +466,10 @@ impl Default for Node {
             dash: vec![],
             cap: Cap::None,
             join: Join::Miter,
+            start_marker: Marker::None,
+            end_marker: Marker::None,
+            point_count: 5,
+            inner_ratio: 0.382,
             clip: false,
             shadows: vec![],
             layout: AutoLayout::default(),
@@ -479,7 +510,17 @@ impl Node {
                 n.fills = vec![Paint::solid(Rgba::WHITE)];
                 n.clip = true;
             }
-            Kind::Rectangle | Kind::Ellipse => n.fills = vec![Paint::solid(SHAPE_GRAY)],
+            Kind::Rectangle | Kind::Ellipse | Kind::Star => n.fills = vec![Paint::solid(SHAPE_GRAY)],
+            Kind::Polygon => {
+                n.fills = vec![Paint::solid(SHAPE_GRAY)];
+                n.point_count = 3;
+            }
+            Kind::Section => {
+                n.fills = vec![Paint::solid(Rgba::WHITE)];
+                n.strokes = vec![Paint::solid(Rgba::rgb(0xE6, 0xE6, 0xE6))];
+                n.radius = 2.0;
+            }
+            Kind::Slice => {}
             Kind::Vector => {
                 n.strokes = vec![Paint::solid(Rgba::BLACK)];
                 n.stroke_align = StrokeAlign::Center;
@@ -536,6 +577,23 @@ impl Node {
             }
         }
         self.rect = r;
+    }
+
+    /// Unrotated outline of polygons and stars, in world space.
+    pub fn star_points(&self) -> Vec<Pos2> {
+        let r = self.rect;
+        let (c, rx, ry) = (r.center(), r.width() / 2.0, r.height() / 2.0);
+        let n = self.point_count.max(3) as usize;
+        let star = self.kind == Kind::Star;
+        let steps = if star { n * 2 } else { n };
+        (0..steps)
+            .map(|i| {
+                // Point straight up first, like Figma.
+                let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * i as f32 / steps as f32;
+                let k = if star && i % 2 == 1 { self.inner_ratio } else { 1.0 };
+                pos2(c.x + rx * k * a.cos(), c.y + ry * k * a.sin())
+            })
+            .collect()
     }
 
     /// Corner radii (tl, tr, br, bl), uniform unless set independently.
@@ -1296,7 +1354,12 @@ impl Document {
         let p = n.to_local(p);
         match n.kind {
             Kind::Group | Kind::Boolean => false,
-            Kind::Frame | Kind::Component | Kind::Instance | Kind::Rectangle | Kind::Text => n.rect.expand(tol).contains(p),
+            Kind::Frame | Kind::Component | Kind::Instance | Kind::Section | Kind::Rectangle | Kind::Text => n.rect.expand(tol).contains(p),
+            Kind::Slice => false,
+            Kind::Polygon | Kind::Star => {
+                let pts = n.star_points();
+                contains(&[(pts, true)], p, false)
+            }
             Kind::Ellipse => {
                 let c = n.rect.center();
                 let r = n.rect.size() / 2.0 + Vec2::splat(tol);
@@ -1337,7 +1400,7 @@ fn merge_from(e: &mut Node, src: &Node) {
     take!(
         name, visible, opacity, fills, strokes, stroke_width, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, constraints, absolute,
         paths, even_odd, text, font_size, font_weight, font_family, text_sizing, text_align, text_valign, line_height, letter_spacing,
-        decoration, text_case, rotation, component
+        decoration, text_case, rotation, component, start_marker, end_marker, point_count, inner_ratio
     );
     e.synced = Some(Box::new(Node { children: vec![], synced: None, ..src.clone() }));
 }

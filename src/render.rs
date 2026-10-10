@@ -56,6 +56,17 @@ pub fn node_path(n: &Node, v: &View, grow: f32) -> Path {
         return b.build();
     }
     match n.kind {
+        Kind::Polygon | Kind::Star => {
+            let pts: Vec<Pos2> = n.star_points().iter().map(|p| v.to_screen(*p)).collect();
+            // Grow (stroke alignment) pushes points away from the center.
+            let c = r.center();
+            let pts: Vec<Pos2> = pts.iter().map(|p| *p + (*p - c).normalized() * grow).collect();
+            b.begin(point(pts[0].x, pts[0].y));
+            for p in &pts[1..] {
+                b.line_to(point(p.x, p.y));
+            }
+            b.end(true);
+        }
         Kind::Ellipse => {
             let c = r.center();
             b.add_ellipse(
@@ -151,6 +162,67 @@ pub fn fill_mesh(path: &Path, color: Color32) -> Mesh {
 
 pub fn stroke_mesh(path: &Path, width: f32, color: Color32) -> Mesh {
     to_mesh(stroke_geo(path, width), color)
+}
+
+/// Endpoints of open contours that carry markers: (world tip, outward direction, marker).
+pub fn marker_ends(n: &Node) -> Vec<(Pos2, Vec2, crate::doc::Marker)> {
+    use crate::doc::Marker;
+    if n.kind != Kind::Vector || (n.start_marker == Marker::None && n.end_marker == Marker::None) {
+        return vec![];
+    }
+    let o = n.rect.min.to_vec2();
+    let mut out = vec![];
+    for sp in n.paths.iter().filter(|sp| !sp.closed && sp.points.len() >= 2) {
+        let (a, b) = (sp.points[0], sp.points[1]);
+        let (y, z) = (sp.points[sp.points.len() - 2], sp.points[sp.points.len() - 1]);
+        // Tangent at each end: the handle if there is one, else toward the neighbor.
+        let start_dir = if a.h_out != Vec2::ZERO { -a.h_out } else { a.p - (b.p + b.h_in) };
+        let end_dir = if z.h_in != Vec2::ZERO { -z.h_in } else { z.p - (y.p + y.h_out) };
+        if n.start_marker != Marker::None {
+            out.push((crate::doc::rotate(a.p + o, n.rect.center(), n.rotation), rot_vec(start_dir, n.rotation), n.start_marker));
+        }
+        if n.end_marker != Marker::None {
+            out.push((crate::doc::rotate(z.p + o, n.rect.center(), n.rotation), rot_vec(end_dir, n.rotation), n.end_marker));
+        }
+    }
+    out
+}
+
+fn rot_vec(v: Vec2, deg: f32) -> Vec2 {
+    crate::doc::rotate(Pos2::ZERO + v, Pos2::ZERO, deg).to_vec2()
+}
+
+/// Marker outline points at `tip` pointing along `dir`, sized for stroke width `w` (screen units).
+pub fn marker_shape(tip: Pos2, dir: Vec2, m: crate::doc::Marker, w: f32) -> (Vec<Pos2>, bool) {
+    use crate::doc::Marker;
+    let d = dir.normalized();
+    let n = d.rot90();
+    let s = (w * 3.0).max(6.0);
+    match m {
+        Marker::Arrow => (vec![tip - d * s + n * s * 0.6, tip, tip - d * s - n * s * 0.6], false),
+        Marker::Triangle => (vec![tip + d * s * 0.3, tip - d * s * 0.9 + n * s * 0.6, tip - d * s * 0.9 - n * s * 0.6], true),
+        Marker::Circle => ((0..16).map(|i| tip + Vec2::angled(i as f32 / 16.0 * std::f32::consts::TAU) * s * 0.4).collect(), true),
+        Marker::None => (vec![], false),
+    }
+}
+
+fn draw_marker(painter: &Painter, tip: Pos2, dir: Vec2, m: crate::doc::Marker, w: f32, c: Color32) {
+    let (pts, filled) = marker_shape(tip, dir, m, w);
+    if pts.len() < 2 {
+        return;
+    }
+    let mut b = Path::builder();
+    b.begin(point(pts[0].x, pts[0].y));
+    for p in &pts[1..] {
+        b.line_to(point(p.x, p.y));
+    }
+    b.end(filled);
+    let path = b.build();
+    if filled {
+        painter.add(fill_mesh(&path, c));
+    } else {
+        painter.add(to_mesh(stroke_geo_styled(&path, w, Cap::Round, Join::Round), c));
+    }
 }
 
 /// Approximate a Gaussian blur (std dev `sigma` px) with three box blurs per axis.
@@ -482,7 +554,7 @@ fn draw_shadows(painter: &Painter, n: &Node, v: &View, a: f32) {
 
 fn draw_content(painter: &Painter, sc: &mut Scene, n: &Node, a: f32) {
     let v = sc.view;
-    if n.kind == Kind::Group {
+    if matches!(n.kind, Kind::Group | Kind::Slice) {
         return;
     }
     if n.kind == Kind::Text {
@@ -511,6 +583,11 @@ fn draw_content(painter: &Painter, sc: &mut Scene, n: &Node, a: f32) {
         let spath = if n.dash.iter().any(|d| *d > 0.0) { dashed(&spath, &n.dash.iter().map(|d| d * v.zoom).collect::<Vec<_>>()) } else { spath };
         for s in n.strokes.iter().filter(|s| s.visible) {
             paint_geo(painter, sc, n, stroke_geo_styled(&spath, w, n.cap, n.join), s, a);
+        }
+        if let Some(c) = n.strokes.iter().rev().find(|s| s.visible).map(|s| s.color.to32().gamma_multiply(a)) {
+            for (tip, dir, m) in marker_ends(n) {
+                draw_marker(painter, v.to_screen(tip), dir, m, w, c);
+            }
         }
     }
 }

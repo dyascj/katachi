@@ -32,6 +32,18 @@ fn shape(n: &Node, o: Vec2, grow: f32, attrs: &str) -> String {
             r.width().max(0.0) / 2.0,
             r.height().max(0.0) / 2.0
         ),
+        Kind::Polygon | Kind::Star => {
+            let c = n.rect.center();
+            let pts: Vec<String> = n
+                .star_points()
+                .iter()
+                .map(|p| {
+                    let q = *p + (*p - c).normalized() * grow - o;
+                    format!("{} {}", q.x, q.y)
+                })
+                .collect();
+            format!(r#"<polygon points="{}" {attrs}/>"#, pts.join(" "))
+        }
         Kind::Vector => format!(
             r#"<path d="{}"{} {attrs}/>"#,
             path_data(n, o),
@@ -307,7 +319,7 @@ impl Svg<'_> {
             let _ = write!(self.out, "<g{turn}>");
         }
         match n.kind {
-            Kind::Group => {}
+            Kind::Group | Kind::Slice => {}
             Kind::Text => {
                 if let Some(f) = n.fills.iter().rev().find(|f| f.visible) {
                     let r = n.rect.translate(-o);
@@ -362,6 +374,19 @@ impl Svg<'_> {
                     for s in n.strokes.iter().filter(|s| s.visible) {
                         let attrs = format!(r#"fill="none" {} stroke-width="{}"{}"#, self.paint("stroke", s, n), n.stroke_width, stroke_style(n));
                         self.out.push_str(&shape(n, o, grow, &attrs));
+                    }
+                    if let Some(s) = n.strokes.iter().rev().find(|s| s.visible) {
+                        let (c, a) = color_parts(s.color);
+                        for (tip, dir, m) in crate::render::marker_ends(n) {
+                            let (pts, filled) = crate::render::marker_shape(tip - o, dir, m, n.stroke_width);
+                            let d: Vec<String> = pts.iter().map(|p| format!("{} {}", p.x, p.y)).collect();
+                            let style = if filled {
+                                format!(r#"fill="{c}" fill-opacity="{a:.3}""#)
+                            } else {
+                                format!(r#"fill="none" stroke="{c}" stroke-opacity="{a:.3}" stroke-width="{}" stroke-linecap="round" stroke-linejoin="round""#, n.stroke_width)
+                            };
+                            let _ = write!(self.out, r#"<path d="M{}{}" {style}/>"#, d.join("L"), if filled { "Z" } else { "" });
+                        }
                     }
                 }
             }
@@ -488,8 +513,27 @@ pub fn rasterize(svg: &str, scale: f32) -> Option<(Vec<u8>, [usize; 2])> {
     Some((pix.data().to_vec(), [pix.width() as usize, pix.height() as usize]))
 }
 
+/// Everything on `page` inside `region` (a slice), clipped to it.
+pub fn region_svg(doc: &Document, page: usize, region: Rect, skip: NodeId) -> String {
+    let mut svg = Svg { doc, o: region.min.to_vec2(), out: String::new(), defs: String::new(), next: 0 };
+    for &r in &doc.pages[page].children {
+        if r != skip && doc.node(r).aabb().intersects(region) {
+            svg.node(r);
+        }
+    }
+    let (w, h) = (region.width().max(1.0), region.height().max(1.0));
+    format!(
+        r#"<svg width="{w}" height="{h}" viewBox="0 0 {w} {h}" fill="none" xmlns="http://www.w3.org/2000/svg"><defs>{}</defs>{}</svg>"#,
+        svg.defs, svg.out
+    )
+}
+
+#[cfg(test)]
 pub fn to_png(doc: &Document, ids: &[NodeId], scale: f32) -> Result<Vec<u8>, String> {
-    let svg = to_svg(doc, ids);
+    svg_to_png(doc, &to_svg(doc, ids), scale)
+}
+
+pub fn svg_to_png(doc: &Document, svg: &str, scale: f32) -> Result<Vec<u8>, String> {
     let mut opt = resvg::usvg::Options::default();
     // System fonts only when a layer uses one; Inter is always bundled.
     let needs_system = doc.nodes.values().any(|n| n.kind == Kind::Text && n.font_family != "Inter");
@@ -499,7 +543,7 @@ pub fn to_png(doc: &Document, ids: &[NodeId], scale: f32) -> Result<Vec<u8>, Str
     for f in FONTS {
         opt.fontdb_mut().load_font_data(f.to_vec());
     }
-    let tree = resvg::usvg::Tree::from_str(&svg, &opt).map_err(|e| e.to_string())?;
+    let tree = resvg::usvg::Tree::from_str(svg, &opt).map_err(|e| e.to_string())?;
     let size = tree.size();
     let (w, h) = ((size.width() * scale).ceil() as u32, (size.height() * scale).ceil() as u32);
     let mut pix = resvg::tiny_skia::Pixmap::new(w.max(1), h.max(1)).ok_or("export too large")?;
