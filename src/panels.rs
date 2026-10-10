@@ -635,6 +635,32 @@ impl App {
             self.show_history = true;
             ui.close();
         }
+        ui.menu_button("Plugins", |ui| {
+            for p in crate::plugins::installed() {
+                if ui.button(&p.name).clicked() {
+                    match crate::plugins::main_code(&p) {
+                        Ok(code) => self.run_plugin(&p.name, &code),
+                        Err(e) => self.toast(format!("{}: {e}", p.name)),
+                    }
+                    ui.close();
+                }
+            }
+            ui.menu_button("Development", |ui| {
+                if ui.button("Import plugin from manifest…").clicked() {
+                    if let Some(f) = rfd::FileDialog::new().add_filter("Plugin manifest", &["json"]).pick_file() {
+                        match crate::plugins::install(&f) {
+                            Ok(p) => self.toast(format!("Installed {}", p.name)),
+                            Err(e) => self.toast(format!("Couldn't import plugin: {e}")),
+                        }
+                    }
+                    ui.close();
+                }
+                if ui.button("Run script…").clicked() {
+                    self.show_console = true;
+                    ui.close();
+                }
+            });
+        });
         if item(ui, "Place image / SVG…", "⇧⌘K") {
             self.import_dialog();
             ui.close();

@@ -80,6 +80,10 @@ GitHub Actions. Building from source needs Rust 1.92 or newer.
 - `.katachi` files (JSON), atomic saves, crash-recovery autosave, version history, open recent
 - Export presets per layer to PNG, JPG, SVG, and PDF
 
+**Plugins**
+- Run Figma plugins headlessly: Main menu > Plugins > Development > Import plugin from manifest. Plugins use the core of Figma's plugin API (`figma.currentPage`, selection, `findAll`, `create*`, fills, text, `notify`, async) and each run is one undo step
+- Plugins > Development > Run script for quick one-off scripts; see `examples/plugins/tidy-names`
+
 | Auto layout | Components and variants |
 | --- | --- |
 | ![Auto layout](docs/auto-layout.png) | ![Components](docs/components.png) |
@@ -114,7 +118,7 @@ GitHub Actions. Building from source needs Rust 1.92 or newer.
 
 ## Roadmap
 
-- Plugins
+- Plugin UIs (`figma.showUI`) and the rest of the plugin API
 - Instance overrides and variables from `.fig` files
 - Lists in text
 

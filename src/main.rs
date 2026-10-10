@@ -10,6 +10,7 @@ mod fig_import;
 mod files;
 mod kiwi;
 mod paint_ui;
+mod plugins;
 mod panels;
 mod prototype;
 mod render;

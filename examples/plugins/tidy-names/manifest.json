@@ -1,0 +1,7 @@
+{
+  "name": "Tidy names",
+  "id": "katachi-example-tidy-names",
+  "api": "1.0.0",
+  "main": "code.js",
+  "editorType": ["figma"]
+}

@@ -134,6 +134,9 @@ pub struct App {
     pub rulers: bool,
     pub show_grids: bool,
     pub show_history: bool,
+    /// Plugins > Run script console.
+    pub show_console: bool,
+    pub console_code: String,
     pub show_variables: bool,
     /// Dev Mode: inspect and code instead of design controls.
     pub dev_mode: bool,
@@ -216,6 +219,8 @@ impl App {
             rulers: false,
             show_grids: true,
             show_history: false,
+            show_console: false,
+            console_code: "for (const n of figma.currentPage.selection) {\n  n.rotation += 15;\n}\nfigma.notify(`Rotated ${figma.currentPage.selection.length} layers`);\n".into(),
             show_variables: false,
             dev_mode: false,
             code_lang: crate::codegen::Lang::Css,
@@ -1186,6 +1191,47 @@ impl App {
         self.show_history = open;
     }
 
+    /// Run plugin code on the current page as one undoable step.
+    pub fn run_plugin(&mut self, name: &str, code: &str) {
+        let before = self.doc.clone();
+        match crate::plugins::run(&mut self.doc, self.page, &self.sel, code) {
+            Ok(out) => {
+                if self.doc.nodes != before.nodes || self.doc.pages != before.pages {
+                    let after = std::mem::replace(&mut self.doc, before);
+                    self.checkpoint();
+                    self.doc = after;
+                }
+                self.sel = out.selection;
+                self.toast(out.notes.last().cloned().unwrap_or_else(|| format!("Ran {name}")));
+            }
+            Err(e) => {
+                self.doc = before;
+                self.toast(format!("{name} failed: {}", e.lines().next().unwrap_or_default()));
+                eprintln!("{name}: {e}");
+            }
+        }
+    }
+
+    fn console_window(&mut self, ctx: &egui::Context) {
+        if !self.show_console {
+            return;
+        }
+        let mut open = true;
+        let mut run = false;
+        egui::Window::new("Run script").open(&mut open).collapsible(false).default_width(420.0).show(ctx, |ui| {
+            ui.label(egui::RichText::new("JavaScript against Figma's plugin API (figma.currentPage, createRectangle, notify...)").weak());
+            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                ui.add(egui::TextEdit::multiline(&mut self.console_code).code_editor().desired_rows(12).desired_width(f32::INFINITY));
+            });
+            run = ui.button("Run").clicked();
+        });
+        if run {
+            let code = self.console_code.clone();
+            self.run_plugin("Script", &code);
+        }
+        self.show_console = open;
+    }
+
     /// Host or join a live session.
     fn collab_window(&mut self, ctx: &egui::Context) {
         if !self.show_collab {
@@ -1656,6 +1702,7 @@ impl eframe::App for App {
         self.collab_window(&ctx);
         self.recovery_prompt(&ctx);
         self.history_window(&ctx);
+        self.console_window(&ctx);
         self.variables_window(&ctx);
         self.autosave(ctx.input(|i| i.time));
         self.debug_screenshot(&ctx);

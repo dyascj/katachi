@@ -15,6 +15,7 @@ lyon = "1.0.19"
 miniz_oxide = "0.9.1"
 resvg = "0.48.1"
 rfd = "0.17.2"
+rquickjs = "0.14.0"
 ruzstd = "0.9.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
