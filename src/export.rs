@@ -176,6 +176,15 @@ impl Svg<'_> {
             }
             PaintKind::Image => {
                 let Some(bytes) = self.doc.images.get(&p.image) else { return format!(r#"{name}="none""#) };
+                // Adjusted images are baked into a PNG.
+                let adjusted = (!p.adjust.is_identity()).then(|| image::load_from_memory(bytes).ok()).flatten().and_then(|img| {
+                    let mut img = img.to_rgba8();
+                    p.adjust.apply(&mut img);
+                    let mut out = std::io::Cursor::new(vec![]);
+                    img.write_to(&mut out, image::ImageFormat::Png).ok()?;
+                    Some(std::sync::Arc::new(out.into_inner()))
+                });
+                let bytes = adjusted.as_ref().unwrap_or(bytes);
                 use base64::Engine;
                 let mime = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) { "image/png" } else { "image/jpeg" };
                 let data = base64::engine::general_purpose::STANDARD.encode(bytes.as_slice());

@@ -239,6 +239,26 @@ fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEve
                     }
                 }
             });
+            ui.separator();
+            let a = &mut paint.adjust;
+            for (v, label) in [
+                (&mut a.exposure, "Exposure"),
+                (&mut a.contrast, "Contrast"),
+                (&mut a.saturation, "Saturation"),
+                (&mut a.temperature, "Temperature"),
+                (&mut a.tint, "Tint"),
+                (&mut a.highlights, "Highlights"),
+                (&mut a.shadows, "Shadows"),
+            ] {
+                let mut pct = (*v * 100.0).round();
+                ui.horizontal(|ui| {
+                    ui.add_sized([76.0, 18.0], egui::Label::new(label));
+                    if ui.add(egui::Slider::new(&mut pct, -100.0..=100.0).show_value(false)).changed() {
+                        *v = pct / 100.0;
+                        ev = Some(PaintEvent::Changed);
+                    }
+                });
+            }
             if paint.scale_mode == crate::doc::ScaleMode::Tile {
                 let mut pct = paint.tile_scale * 100.0;
                 if ui.add(DragValue::new(&mut pct).range(1.0..=1000.0).suffix("%").prefix("Scale ")).changed() {

@@ -892,6 +892,54 @@ pub struct Paint {
     /// Tile size relative to the image's pixels.
     #[serde(default = "one")]
     pub tile_scale: f32,
+    /// Image paints: color adjustments.
+    #[serde(default)]
+    pub adjust: ImageAdjust,
+}
+
+/// Figma's image adjustments, each -1..=1 (0 = unchanged).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImageAdjust {
+    pub exposure: f32,
+    pub contrast: f32,
+    pub saturation: f32,
+    pub temperature: f32,
+    pub tint: f32,
+    pub highlights: f32,
+    pub shadows: f32,
+}
+
+impl ImageAdjust {
+    pub fn is_identity(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Adjust unpremultiplied RGBA pixels in place.
+    /// ponytail: simple per-pixel curves, close to Figma's look but not its exact math.
+    pub fn apply(&self, px: &mut [u8]) {
+        if self.is_identity() {
+            return;
+        }
+        let gain = 2f32.powf(self.exposure);
+        for p in px.chunks_exact_mut(4) {
+            let mut c = [p[0], p[1], p[2]].map(|v| v as f32 / 255.0);
+            for v in &mut c {
+                *v = (*v * gain - 0.5) * (1.0 + self.contrast) + 0.5;
+            }
+            let luma = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+            let tone = if luma > 0.5 { self.highlights * (luma - 0.5) } else { self.shadows * (0.5 - luma) };
+            for v in &mut c {
+                *v = luma + (*v - luma) * (1.0 + self.saturation) + tone * 0.5;
+            }
+            c[0] += self.temperature * 0.12;
+            c[2] -= self.temperature * 0.12;
+            c[1] -= self.tint * 0.1;
+            for (o, v) in p.iter_mut().zip(c) {
+                *o = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+            }
+        }
+    }
 }
 
 fn one() -> f32 {
@@ -910,6 +958,7 @@ impl Paint {
             image: String::new(),
             scale_mode: ScaleMode::Fill,
             tile_scale: 1.0,
+            adjust: ImageAdjust::default(),
         }
     }
 
@@ -2787,6 +2836,21 @@ mod tests {
         let mut f = Node::new(Kind::Frame, r(0., 0., 300., 100.));
         f.layout = AutoLayout { mode, gap: 10., padding: [5., 5., 5., 5.], ..Default::default() };
         d.insert(0, None, None, f)
+    }
+
+    #[test]
+    fn image_adjustments_change_pixels() {
+        let px = |adj: ImageAdjust| {
+            let mut p = vec![100, 50, 25, 255];
+            adj.apply(&mut p);
+            p
+        };
+        assert_eq!(px(ImageAdjust::default()), vec![100, 50, 25, 255]);
+        assert_eq!(px(ImageAdjust { exposure: 1.0, ..Default::default() }), vec![200, 100, 50, 255], "one stop brighter");
+        let gray = px(ImageAdjust { saturation: -1.0, ..Default::default() });
+        assert!(gray[0] == gray[1] && gray[1] == gray[2], "{gray:?}");
+        let warm = px(ImageAdjust { temperature: 1.0, ..Default::default() });
+        assert!(warm[0] > 100 && warm[2] < 25);
     }
 
     #[test]

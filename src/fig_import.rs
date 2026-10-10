@@ -142,6 +142,18 @@ fn paints(list: &[Value]) -> Vec<Paint> {
                     _ => ScaleMode::Fill,
                 };
                 i.tile_scale = p.f("scale").unwrap_or(1.0);
+                if let Some(f) = p.get("paintFilter") {
+                    let g = |k: &str| f.f(k).unwrap_or(0.0);
+                    i.adjust = crate::doc::ImageAdjust {
+                        exposure: g("exposure"),
+                        contrast: g("contrast"),
+                        saturation: g("saturation"),
+                        temperature: g("temperature"),
+                        tint: g("tint"),
+                        highlights: g("highlights"),
+                        shadows: g("shadows"),
+                    };
+                }
                 i
             }
             _ => continue,

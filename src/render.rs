@@ -437,10 +437,17 @@ impl Textures {
     }
 
     /// Image texture with a 1px transparent border (so Fit letterboxes cleanly), and its pixel size.
-    pub fn image(&mut self, ctx: &egui::Context, doc: &Document, key: &str) -> Option<(TextureId, Vec2)> {
-        let entry = self.images.entry(key.to_string()).or_insert_with(|| {
+    pub fn image(&mut self, ctx: &egui::Context, doc: &Document, key: &str, adj: &crate::doc::ImageAdjust) -> Option<(TextureId, Vec2)> {
+        let cache = if adj.is_identity() { key.to_string() } else { format!("{key}/{adj:?}") };
+        // Dragging an adjustment slider makes a new version each step; drop old ones once they pile up.
+        let prefix = format!("{key}/");
+        if !self.images.contains_key(&cache) && self.images.keys().filter(|k| k.starts_with(&prefix)).count() >= 4 {
+            self.images.retain(|k, _| !k.starts_with(&prefix));
+        }
+        let entry = self.images.entry(cache).or_insert_with(|| {
             let bytes = doc.images.get(key)?;
-            let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+            let mut img = image::load_from_memory(bytes).ok()?.to_rgba8();
+            adj.apply(&mut img);
             let (w, h) = (img.width() as usize, img.height() as usize);
             let mut padded = vec![0u8; (w + 2) * (h + 2) * 4];
             for y in 0..h {
@@ -449,15 +456,21 @@ impl Textures {
                 padded[at..at + w * 4].copy_from_slice(src);
             }
             let color = ColorImage::from_rgba_unmultiplied([w + 2, h + 2], &padded);
-            Some((ctx.load_texture(format!("image-{key}"), color, TextureOptions::LINEAR), vec2(w as f32, h as f32)))
+            Some((ctx.load_texture(format!("image-{key}-{adj:?}"), color, TextureOptions::LINEAR), vec2(w as f32, h as f32)))
         });
         entry.as_ref().map(|(t, s)| (t.id(), *s))
     }
 
     /// The same image as a repeating texture, for Tile mode.
-    pub fn image_tile(&mut self, ctx: &egui::Context, doc: &Document, key: &str) -> Option<TextureId> {
-        let entry = self.tiles.entry(key.to_string()).or_insert_with(|| {
-            let img = image::load_from_memory(doc.images.get(key)?).ok()?.to_rgba8();
+    pub fn image_tile(&mut self, ctx: &egui::Context, doc: &Document, key: &str, adj: &crate::doc::ImageAdjust) -> Option<TextureId> {
+        let cache = if adj.is_identity() { key.to_string() } else { format!("{key}/{adj:?}") };
+        let prefix = format!("{key}/");
+        if !self.tiles.contains_key(&cache) && self.tiles.keys().filter(|k| k.starts_with(&prefix)).count() >= 4 {
+            self.tiles.retain(|k, _| !k.starts_with(&prefix));
+        }
+        let entry = self.tiles.entry(cache).or_insert_with(|| {
+            let mut img = image::load_from_memory(doc.images.get(key)?).ok()?.to_rgba8();
+            adj.apply(&mut img);
             let color = ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
             let opts = TextureOptions { wrap_mode: egui::TextureWrapMode::Repeat, ..TextureOptions::LINEAR };
             Some(ctx.load_texture(format!("tile-{key}"), color, opts))
@@ -504,7 +517,7 @@ fn paint_geo(painter: &Painter, sc: &mut Scene, n: &Node, geo: VertexBuffers<Pos
     let (tex, uv): (TextureId, Box<dyn Fn(Pos2) -> Pos2>) = match p.kind {
         PaintKind::Solid => return void(painter.add(to_mesh(geo, p.color.to32().gamma_multiply(a)))),
         PaintKind::Linear | PaintKind::Radial => (sc.tex.gradient(ctx, p), Box::new(unit)),
-        PaintKind::Image if p.scale_mode == crate::doc::ScaleMode::Tile => match (sc.tex.image_tile(ctx, sc.doc, &p.image), sc.tex.image(ctx, sc.doc, &p.image)) {
+        PaintKind::Image if p.scale_mode == crate::doc::ScaleMode::Tile => match (sc.tex.image_tile(ctx, sc.doc, &p.image, &p.adjust), sc.tex.image(ctx, sc.doc, &p.image, &p.adjust)) {
             (Some(id), Some((_, size))) => {
                 let tile = size * p.tile_scale.max(0.01);
                 let r = n.rect.size();
@@ -515,7 +528,7 @@ fn paint_geo(painter: &Painter, sc: &mut Scene, n: &Node, geo: VertexBuffers<Pos
             }
             _ => return void(painter.add(to_mesh(geo, crate::doc::SHAPE_GRAY.to32().gamma_multiply(a)))),
         },
-        PaintKind::Image => match sc.tex.image(ctx, sc.doc, &p.image) {
+        PaintKind::Image => match sc.tex.image(ctx, sc.doc, &p.image, &p.adjust) {
             Some((id, size)) => {
                 let (la, ia) = (n.rect.width() / n.rect.height().max(1e-6), size.x / size.y.max(1e-6));
                 // How much of the image's unit square spans the layer, per axis.

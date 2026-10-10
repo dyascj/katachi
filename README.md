@@ -54,7 +54,7 @@ GitHub Actions. Building from source needs Rust 1.92 or newer.
 - Flatten (Cmd E), outline stroke (Alt Cmd O), SVG import by paste, drag-and-drop, or File > Place
 
 **Paint and effects**
-- Solid, linear, and radial gradient fills, and images (fill, fit, stretch, tile)
+- Solid, linear, and radial gradient fills, and images (fill, fit, stretch, tile) with exposure, contrast, saturation, temperature, tint, highlights, and shadows
 - Strokes with inside / center / outside alignment, individual side weights, dashes, caps, joins, and arrow markers
 - Drop shadow, inner shadow, layer blur, background blur, blend modes, masks, independent corner radii
 - Selection colors: every color in a selection, editable in one place
