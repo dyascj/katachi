@@ -40,6 +40,10 @@ impl App {
         if let Some(t) = self.zoom_target.take().filter(|t| self.doc.nodes.contains_key(t)) {
             self.view = View::fit(self.doc.node(t).aabb(), rect, 1.0);
         }
+        if let Some(ve) = &self.vector_edit
+            && (self.sel != [ve.id] || !self.doc.nodes.contains_key(&ve.id) || self.tool != Tool::Move) {
+                self.vector_edit = None;
+            }
         self.fit_texts(&painter);
 
         let typing = ui.ctx().egui_wants_keyboard_input();
@@ -139,7 +143,7 @@ impl App {
         self.draw_toast(&painter, rect);
     }
 
-    /// Image files dropped on the canvas become image-filled rectangles at natural size.
+    /// Files dropped on the canvas: images become image-filled rectangles, SVGs become vectors.
     fn accept_drops(&mut self, ui: &Ui, at: Pos2) {
         let files = ui.input(|i| i.raw.dropped_files.clone());
         let mut placed = vec![];
@@ -153,30 +157,16 @@ impl App {
                 },
                 _ => continue,
             };
-            let Ok(img) = image::load_from_memory(&bytes) else {
-                self.toast(format!("Can't import {}", f.name));
-                continue;
-            };
-            if placed.is_empty() {
-                self.checkpoint();
-            }
-            let size = vec2(img.width() as f32, img.height() as f32);
-            let key = self.add_image(bytes);
-            let w = self.view.to_world(at) + vec2(offset, offset);
-            let mut n = Node::new(Kind::Rectangle, Rect::from_center_size(w.round(), size));
-            let mut p = crate::doc::Paint::solid(crate::doc::Rgba::WHITE);
-            p.convert(crate::doc::PaintKind::Image);
-            p.image = key;
-            n.fills = vec![p];
             let stem = f.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned());
-            n.name = stem.unwrap_or_else(|| f.name.clone());
-            let parent = self.frame_at(w, &[]);
-            placed.push(self.doc.insert(self.page, parent, None, n));
+            let name = stem.unwrap_or_else(|| f.name.clone());
+            let w = self.view.to_world(at) + vec2(offset, offset);
+            let is_svg = f.name.to_lowercase().ends_with(".svg") || f.path.as_ref().is_some_and(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg")));
+            let id = if is_svg { self.import_svg(&bytes, &name, w, true) } else { self.place_image(bytes, &name, w) };
+            placed.extend(id);
             offset += 20.0;
         }
         if !placed.is_empty() {
             self.sel = placed;
-            self.tool = Tool::Move;
         }
     }
 
@@ -254,7 +244,7 @@ impl App {
     }
 
     fn handle_at(&self, s: Pos2) -> Option<Grip> {
-        if self.editing_text.is_some() || self.tool != Tool::Move {
+        if self.editing_text.is_some() || self.tool != Tool::Move || self.vector_edit.is_some() {
             return None;
         }
         let (r, rot) = self.sel_frame()?;
@@ -287,8 +277,14 @@ impl App {
     }
 
     fn on_press(&mut self, s: Pos2, w: Pos2, mods: egui::Modifiers) {
-        match self.tool {
+        let tool = self.tool;
+        if tool == Tool::Move && self.vector_edit.is_some() && self.vector_press(s, mods.shift) {
+            self.press = Some(Press { world: w, target: None, handle: None, toggle_off: false });
+            return;
+        }
+        match tool {
             Tool::Move => {
+                self.vector_edit = None;
                 let handle = self.handle_at(s);
                 let target = if handle.is_some() { None } else { self.target_at(w, s, mods.command) };
                 let mut toggle_off = false;
@@ -346,6 +342,11 @@ impl App {
         };
         self.pending_frame = None;
         let start = press.world;
+        if self.vector_edit.is_some() {
+            self.drag = self.vector_drag_start();
+            self.vector_start = start;
+            return;
+        }
         self.drag = match self.tool {
             Tool::Move => {
                 if let Some(grip) = press.handle {
@@ -536,7 +537,10 @@ impl App {
                     }
                     let n = self.doc.node_mut(*id);
                     n.rect = Rect::from_min_size(Pos2::ZERO, Vec2::ZERO);
-                    n.points = vec![PathPoint { p: a, ..Default::default() }, PathPoint { p: b, ..Default::default() }];
+                    n.paths = vec![crate::doc::SubPath {
+                        points: vec![PathPoint { p: a, ..Default::default() }, PathPoint { p: b, ..Default::default() }],
+                        closed: false,
+                    }];
                     n.refit_vector();
                 } else {
                     if mods.shift {
@@ -558,6 +562,10 @@ impl App {
                 }
                 self.sel = sel;
             }
+            Drag::Vector { base, id, grab } => {
+                let (base, id, grab) = (base.clone(), *id, *grab);
+                self.vector_drag(&base, id, grab, self.vector_start, w, mods.alt);
+            }
             Drag::PenHandle => {
                 let z = self.view.zoom;
                 if let Some(last) = self.pen.last_mut() {
@@ -575,6 +583,7 @@ impl App {
 
     fn on_drag_end(&mut self, w: Pos2) {
         self.guides.clear();
+        self.vector_grabbed = None;
         match self.drag.take() {
             Some(Drag::Move { .. }) => {
                 // Dropping onto a frame nests the layer in it; dragging out un-nests it.
@@ -627,6 +636,10 @@ impl App {
     }
 
     fn on_click(&mut self, w: Pos2, mods: egui::Modifiers) {
+        if self.vector_edit.is_some() {
+            self.press = None;
+            return;
+        }
         match self.tool {
             Tool::Move => {
                 if let Some(t) = self.pending_frame.take() {
@@ -679,6 +692,18 @@ impl App {
     }
 
     fn on_double_click(&mut self, w: Pos2) {
+        if self.vector_edit.is_some() {
+            let s = self.view.to_screen(w);
+            self.vector_toggle_smooth(s);
+            return;
+        }
+        if let [one] = self.sel[..]
+            && matches!(self.doc.node(one).kind, Kind::Vector | Kind::Rectangle | Kind::Ellipse)
+                && self.doc.node(one).aabb().expand(4.0 / self.view.zoom).contains(w)
+            {
+                self.enter_vector_edit(one);
+                return;
+            }
         let Some(hit) = self.doc.hit(self.page, w, 3.0 / self.view.zoom) else { return };
         let Some(&cur) = self.sel.first() else { return };
         if self.doc.node(cur).kind == Kind::Text {
@@ -825,7 +850,8 @@ impl App {
     }
 
     fn outline(&self, painter: &Painter, id: NodeId, width: f32) {
-        let n = self.doc.node(id);
+        // The hovered layer can vanish mid-frame (flattened, deleted).
+        let Some(n) = self.doc.nodes.get(&id) else { return };
         let accent = self.accent(id);
         match n.kind {
             Kind::Vector | Kind::Ellipse => {
@@ -841,6 +867,11 @@ impl App {
     fn draw_overlays(&self, painter: &Painter, ptr: Option<Pos2>) {
         if let Some(h) = self.hover.filter(|h| !self.sel.contains(h)) {
             self.outline(painter, h, 2.0);
+        }
+        if self.vector_edit.is_some() {
+            self.draw_vector_edit(painter);
+            self.draw_pen(painter, ptr);
+            return;
         }
         let roots = self.sel_roots();
         if !roots.is_empty() {
@@ -1037,6 +1068,10 @@ impl App {
         ui.separator();
         if item(ui, "Group selection", "⌘G", has) {
             self.group_selection(false);
+            ui.close();
+        }
+        if item(ui, "Flatten", "⌘E", has) {
+            self.flatten_selection();
             ui.close();
         }
         if item(ui, "Frame selection", "⌥⌘G", has) {

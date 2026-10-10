@@ -159,6 +159,13 @@ pub struct PathPoint {
     pub h_out: Vec2,
 }
 
+/// One contour of a vector. Anchors are relative to the node's `rect.min`.
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+pub struct SubPath {
+    pub points: Vec<PathPoint>,
+    pub closed: bool,
+}
+
 /// Unmultiplied sRGBA. Unlike egui's premultiplied `Color32`, a 0% opacity color keeps its hue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -328,8 +335,9 @@ pub struct Node {
     pub source: Option<NodeId>,
     /// The source's values as last copied; a property that differs from this is an override.
     pub synced: Option<Box<Node>>,
-    pub points: Vec<PathPoint>,
-    pub closed: bool,
+    pub paths: Vec<SubPath>,
+    /// Even-odd fill rule (holes by parity) instead of non-zero winding.
+    pub even_odd: bool,
     pub text: String,
     pub font_size: f32,
     pub font_weight: u16,
@@ -375,8 +383,8 @@ impl Default for Node {
             component: None,
             source: None,
             synced: None,
-            points: vec![],
-            closed: false,
+            paths: vec![],
+            even_odd: false,
             text: String::new(),
             font_size: 12.0,
             font_weight: 400,
@@ -418,36 +426,48 @@ impl Node {
 
     /// Build a vector node from absolute anchors; bounds come from the anchors and handles.
     pub fn vector(abs: &[PathPoint], closed: bool) -> Self {
+        Node::vector_paths(vec![SubPath { points: abs.to_vec(), closed }])
+    }
+
+    /// Build a vector node from absolute contours.
+    pub fn vector_paths(abs: Vec<SubPath>) -> Self {
         let mut n = Node::new(Kind::Vector, Rect::NOTHING);
-        n.points = abs.to_vec();
-        n.closed = closed;
+        n.paths = abs;
         n.refit_vector();
         n
     }
 
-    /// Re-derive `rect` from absolute-ized points so `rect` tightly wraps the path.
+    /// Whether the shape encloses area that fills can paint.
+    pub fn has_area(&self) -> bool {
+        self.kind != Kind::Vector || self.paths.iter().any(|p| p.closed)
+    }
+
+    /// Re-derive `rect` so it tightly wraps every contour (anchors relative to it).
     pub fn refit_vector(&mut self) {
         let origin = if self.rect.is_finite() { self.rect.min.to_vec2() } else { Vec2::ZERO };
-        let abs: Vec<PathPoint> = self
-            .points
-            .iter()
-            .map(|pt| PathPoint { p: pt.p + origin, ..*pt })
-            .collect();
         let mut r = Rect::NOTHING;
-        for (i, pt) in abs.iter().enumerate() {
-            r.extend_with(pt.p);
-            // ponytail: bounds include handle tips, tight curve bounds if users notice
-            if i > 0 || self.closed {
-                r.extend_with(pt.p + pt.h_in);
+        for sp in &mut self.paths {
+            for pt in sp.points.iter_mut() {
+                pt.p += origin;
             }
-            if i + 1 < abs.len() || self.closed {
-                r.extend_with(pt.p + pt.h_out);
+            let k = sp.points.len();
+            if k == 1 {
+                r.extend_with(sp.points[0].p);
+            }
+            let segs = if sp.closed { k } else { k.saturating_sub(1) };
+            for i in 0..segs {
+                let (a, b) = (sp.points[i], sp.points[(i + 1) % k]);
+                r = r.union(cubic_bounds(a.p, a.p + a.h_out, b.p + b.h_in, b.p));
             }
         }
         if !r.is_finite() {
             r = Rect::from_min_size(Pos2::ZERO, Vec2::ZERO);
         }
-        self.points = abs.iter().map(|pt| PathPoint { p: pt.p - r.min.to_vec2(), ..*pt }).collect();
+        for sp in &mut self.paths {
+            for pt in &mut sp.points {
+                pt.p -= r.min.to_vec2();
+            }
+        }
         self.rect = r;
     }
 
@@ -685,7 +705,7 @@ impl Document {
         let map = |p: Pos2| pos2(r.min.x + (p.x - old.min.x) * sx, r.min.y + (p.y - old.min.y) * sy);
         let node = self.node_mut(id);
         node.rect = r;
-        for pt in &mut node.points {
+        for pt in node.paths.iter_mut().flat_map(|sp| sp.points.iter_mut()) {
             pt.p = pos2(pt.p.x * sx, pt.p.y * sy);
             pt.h_in = vec2(pt.h_in.x * sx, pt.h_in.y * sy);
             pt.h_out = vec2(pt.h_out.x * sx, pt.h_out.y * sy);
@@ -1128,14 +1148,16 @@ impl Document {
                 (d.x / r.x).powi(2) + (d.y / r.y).powi(2) <= 1.0
             }
             Kind::Vector => {
-                let filled = n.closed && n.fills.iter().any(|f| f.visible);
-                let poly = flatten(n);
-                if filled && point_in_polygon(&poly, p) {
+                let polys = flatten(n);
+                let filled = n.fills.iter().any(|f| f.visible) && n.has_area();
+                if filled && contains(&polys, p, n.even_odd) {
                     return true;
                 }
                 let reach = tol + n.stroke_width / 2.0;
-                let segs = poly.len().saturating_sub(if n.closed { 0 } else { 1 });
-                (0..segs).any(|i| seg_dist(p, poly[i], poly[(i + 1) % poly.len()]) <= reach)
+                polys.iter().any(|(poly, closed)| {
+                    let segs = poly.len().saturating_sub(if *closed { 0 } else { 1 });
+                    (0..segs).any(|i| seg_dist(p, poly[i], poly[(i + 1) % poly.len()]) <= reach)
+                })
             }
         }
     }
@@ -1158,10 +1180,41 @@ fn merge_from(e: &mut Node, src: &Node) {
     }
     take!(
         name, visible, opacity, fills, strokes, stroke_width, stroke_align, radius, clip, shadows, layout, sizing, constraints, absolute,
-        points, closed, text, font_size, font_weight, font_family, text_sizing, text_align, text_valign, line_height, letter_spacing,
+        paths, even_odd, text, font_size, font_weight, font_family, text_sizing, text_align, text_valign, line_height, letter_spacing,
         decoration, text_case, rotation, component
     );
     e.synced = Some(Box::new(Node { children: vec![], synced: None, ..src.clone() }));
+}
+
+/// Tight bounds of a cubic Bezier: endpoints plus the curve's extrema on each axis.
+pub fn cubic_bounds(p0: Pos2, p1: Pos2, p2: Pos2, p3: Pos2) -> Rect {
+    let mut r = Rect::from_two_pos(p0, p3);
+    let at = |t: f32| {
+        let u = 1.0 - t;
+        (p0.to_vec2() * u * u * u + p1.to_vec2() * 3.0 * u * u * t + p2.to_vec2() * 3.0 * u * t * t + p3.to_vec2() * t * t * t).to_pos2()
+    };
+    for axis in 0..2 {
+        let (a0, a1, a2, a3) = (p0[axis], p1[axis], p2[axis], p3[axis]);
+        // B'(t)/3 = A t² + B t + C
+        let (a, b, c) = (-a0 + 3.0 * a1 - 3.0 * a2 + a3, 2.0 * (a0 - 2.0 * a1 + a2), a1 - a0);
+        let mut roots = vec![];
+        if a.abs() < 1e-9 {
+            if b.abs() > 1e-9 {
+                roots.push(-c / b);
+            }
+        } else {
+            let disc = b * b - 4.0 * a * c;
+            if disc >= 0.0 {
+                let sq = disc.sqrt();
+                roots.push((-b + sq) / (2.0 * a));
+                roots.push((-b - sq) / (2.0 * a));
+            }
+        }
+        for t in roots.into_iter().filter(|t| *t > 0.0 && *t < 1.0) {
+            r.extend_with(at(t));
+        }
+    }
+    r
 }
 
 /// Rotate `p` around `c` by `deg` counter-clockwise on screen (y points down).
@@ -1186,42 +1239,60 @@ pub fn normalize_deg(d: f32) -> f32 {
     if r > 180.0 { r - 360.0 } else { r }
 }
 
-/// Absolute polyline approximating a vector node (16 steps per curve).
-pub fn flatten(n: &Node) -> Vec<Pos2> {
+/// Absolute polylines approximating each contour (16 steps per curve), with closed flags.
+pub fn flatten(n: &Node) -> Vec<(Vec<Pos2>, bool)> {
     let o = n.rect.min.to_vec2();
-    let pts = &n.points;
-    let mut out = vec![];
-    let segs = if n.closed { pts.len() } else { pts.len().saturating_sub(1) };
-    if let Some(first) = pts.first() {
-        out.push(first.p + o);
-    }
-    for i in 0..segs {
-        let a = pts[i];
-        let b = pts[(i + 1) % pts.len()];
-        let (p0, p1, p2, p3) = (a.p + o, a.p + a.h_out + o, b.p + b.h_in + o, b.p + o);
-        for s in 1..=16 {
-            let t = s as f32 / 16.0;
-            let u = 1.0 - t;
-            let v = p0.to_vec2() * u * u * u
-                + p1.to_vec2() * 3.0 * u * u * t
-                + p2.to_vec2() * 3.0 * u * t * t
-                + p3.to_vec2() * t * t * t;
-            out.push(v.to_pos2());
-        }
-    }
-    out
+    n.paths
+        .iter()
+        .filter(|sp| !sp.points.is_empty())
+        .map(|sp| {
+            let pts = &sp.points;
+            let mut out = vec![pts[0].p + o];
+            let segs = if sp.closed { pts.len() } else { pts.len() - 1 };
+            for i in 0..segs {
+                let a = pts[i];
+                let b = pts[(i + 1) % pts.len()];
+                let (p0, p1, p2, p3) = (a.p + o, a.p + a.h_out + o, b.p + b.h_in + o, b.p + o);
+                if a.h_out == Vec2::ZERO && b.h_in == Vec2::ZERO {
+                    out.push(p3);
+                    continue;
+                }
+                for s in 1..=16 {
+                    let t = s as f32 / 16.0;
+                    let u = 1.0 - t;
+                    let v = p0.to_vec2() * u * u * u + p1.to_vec2() * 3.0 * u * u * t + p2.to_vec2() * 3.0 * u * t * t + p3.to_vec2() * t * t * t;
+                    out.push(v.to_pos2());
+                }
+            }
+            if sp.closed && out.len() > 1 && out.first() == out.last() {
+                out.pop();
+            }
+            (out, sp.closed)
+        })
+        .collect()
 }
 
-fn point_in_polygon(poly: &[Pos2], p: Pos2) -> bool {
-    let mut inside = false;
-    let n = poly.len();
-    for i in 0..n {
-        let (a, b) = (poly[i], poly[(i + n - 1) % n]);
-        if (a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x {
-            inside = !inside;
+/// Point-in-shape across closed contours with the given fill rule.
+pub fn contains(polys: &[(Vec<Pos2>, bool)], p: Pos2, even_odd: bool) -> bool {
+    let mut winding = 0i32;
+    let mut crossings = 0;
+    for (poly, closed) in polys {
+        if !closed || poly.len() < 3 {
+            continue;
+        }
+        let n = poly.len();
+        for i in 0..n {
+            let (a, b) = (poly[i], poly[(i + 1) % n]);
+            if (a.y <= p.y) != (b.y <= p.y) {
+                let x = a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x);
+                if p.x < x {
+                    crossings += 1;
+                    winding += if b.y > a.y { 1 } else { -1 };
+                }
+            }
         }
     }
-    inside
+    if even_odd { crossings % 2 == 1 } else { winding != 0 }
 }
 
 fn seg_dist(p: Pos2, a: Pos2, b: Pos2) -> f32 {
@@ -1315,7 +1386,7 @@ mod tests {
         assert_eq!(d.hit(0, pos2(50., 11.), 1.), Some(v));
         assert_eq!(d.hit(0, pos2(50., 20.), 1.), None);
         d.set_rect(v, r(10., 10., 50., 0.));
-        assert_eq!(d.node(v).points[1].p, pos2(50., 0.));
+        assert_eq!(d.node(v).paths[0].points[1].p, pos2(50., 0.));
     }
 
     #[test]
@@ -1509,6 +1580,24 @@ mod tests {
         let kid = d.node(i).children[0];
         assert_eq!(d.node(kid).rect, r(180., 100., 20., 20.), "pinned right");
         assert_eq!(d.node(i).rect.width(), 200.0, "size override kept");
+    }
+
+    #[test]
+    fn holes_follow_fill_rule() {
+        let sq = |x: f32, w: f32| SubPath {
+            points: [(x, x), (x + w, x), (x + w, x + w), (x, x + w)].map(|(a, b)| PathPoint { p: pos2(a, b), ..Default::default() }).to_vec(),
+            closed: true,
+        };
+        let mut d = Document::default();
+        let mut n = Node::vector_paths(vec![sq(0., 100.), sq(25., 50.)]);
+        n.fills = vec![Paint::solid(Rgba::BLACK)];
+        n.even_odd = true;
+        let v = d.insert(0, None, None, n);
+        assert_eq!(d.node(v).rect, r(0., 0., 100., 100.));
+        assert_eq!(d.hit(0, pos2(10., 10.), 0.), Some(v));
+        assert_eq!(d.hit(0, pos2(50., 50.), 0.), None, "even-odd hole");
+        d.node_mut(v).even_odd = false;
+        assert_eq!(d.hit(0, pos2(50., 50.), 0.), Some(v), "same winding fills");
     }
 
     #[test]

@@ -32,7 +32,11 @@ fn shape(n: &Node, o: Vec2, grow: f32, attrs: &str) -> String {
             r.width().max(0.0) / 2.0,
             r.height().max(0.0) / 2.0
         ),
-        Kind::Vector => format!(r#"<path d="{}" {attrs}/>"#, path_data(n, o)),
+        Kind::Vector => format!(
+            r#"<path d="{}"{} {attrs}/>"#,
+            path_data(n, o),
+            if n.even_odd { r#" fill-rule="evenodd""# } else { "" }
+        ),
         _ => {
             let rad = (n.radius + grow).clamp(0.0, r.width().min(r.height()).max(0.0) / 2.0);
             format!(
@@ -53,20 +57,22 @@ pub fn path_data(n: &Node, o: Vec2) -> String {
         let a = q + base;
         format!("{} {}", a.x, a.y)
     };
-    let pts = &n.points;
-    let Some(first) = pts.first() else { return String::new() };
-    let mut d = format!("M{}", p(first.p));
-    let segs = if n.closed { pts.len() } else { pts.len() - 1 };
-    for i in 0..segs {
-        let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
-        if a.h_out == Vec2::ZERO && b.h_in == Vec2::ZERO {
-            let _ = write!(d, "L{}", p(b.p));
-        } else {
-            let _ = write!(d, "C{} {} {}", p(a.p + a.h_out), p(b.p + b.h_in), p(b.p));
+    let mut d = String::new();
+    for sp in n.paths.iter().filter(|sp| !sp.points.is_empty()) {
+        let pts = &sp.points;
+        let _ = write!(d, "M{}", p(pts[0].p));
+        let segs = if sp.closed { pts.len() } else { pts.len() - 1 };
+        for i in 0..segs {
+            let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+            if a.h_out == Vec2::ZERO && b.h_in == Vec2::ZERO {
+                let _ = write!(d, "L{}", p(b.p));
+            } else {
+                let _ = write!(d, "C{} {} {}", p(a.p + a.h_out), p(b.p + b.h_in), p(b.p));
+            }
         }
-    }
-    if n.closed {
-        d.push('Z');
+        if sp.closed {
+            d.push('Z');
+        }
     }
     d
 }
@@ -241,7 +247,7 @@ impl Svg<'_> {
                 }
             }
             _ => {
-                if n.kind != Kind::Vector || n.closed {
+                if n.has_area() {
                     for f in n.fills.iter().filter(|f| f.visible) {
                         let a = self.paint("fill", f, n);
                         self.out.push_str(&shape(n, o, 0.0, &a));

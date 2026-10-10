@@ -5,7 +5,9 @@ mod export;
 mod paint_ui;
 mod panels;
 mod render;
+mod svg_import;
 mod text;
+mod vector_edit;
 #[cfg(test)]
 mod tests;
 

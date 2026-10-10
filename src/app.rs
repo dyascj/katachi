@@ -35,6 +35,7 @@ pub enum Drag {
     Rotate { base: Document, center: Pos2, start_angle: f32, start_rot: f32, deg: f32 },
     Create { base: Document, start: Pos2, id: NodeId },
     Marquee { start: Pos2, base_sel: Vec<NodeId> },
+    Vector { base: Document, id: NodeId, grab: crate::vector_edit::Grab },
     PenHandle,
 }
 
@@ -91,6 +92,9 @@ pub struct App {
     /// Zoom to this layer on the next frame (after page switches settle).
     pub zoom_target: Option<NodeId>,
     pub left_tab_assets: bool,
+    pub vector_edit: Option<crate::vector_edit::VectorEdit>,
+    pub vector_grabbed: Option<crate::vector_edit::Grab>,
+    pub vector_start: Pos2,
     undo: Vec<Document>,
     redo: Vec<Document>,
     in_gesture: bool,
@@ -131,6 +135,9 @@ impl App {
             pending_frame: None,
             zoom_target: None,
             left_tab_assets: false,
+            vector_edit: None,
+            vector_grabbed: None,
+            vector_start: Pos2::ZERO,
             undo: vec![],
             redo: vec![],
             in_gesture: false,
@@ -188,6 +195,7 @@ impl App {
 
     fn after_history(&mut self) {
         self.dirty = true;
+        self.vector_edit = None;
         self.editing_text = None;
         self.page = self.page.min(self.doc.pages.len() - 1);
         self.sel.retain(|id| self.doc.nodes.contains_key(id));
@@ -452,6 +460,9 @@ impl App {
             }
             self.doc.reflow();
             self.sel = out;
+        } else if crate::svg_import::looks_like_svg(text) {
+            let at = self.view_center_world();
+            self.import_svg(text.as_bytes(), "Vector", at, true);
         } else if !text.trim().is_empty() {
             // Plain text becomes a text layer, like Figma.
             self.checkpoint();
@@ -679,6 +690,91 @@ impl App {
         *self = App { screenshot: self.screenshot.take(), ..App::new(None) };
     }
 
+    /// Place SVG data as a frame centered (or top-left if `!centered`) on `at`.
+    pub fn import_svg(&mut self, data: &[u8], name: &str, at: Pos2, centered: bool) -> Option<NodeId> {
+        let before = self.doc.clone();
+        self.checkpoint();
+        let parent = self.frame_at(at, &[]);
+        match crate::svg_import::import(&mut self.doc, data, name, self.page, parent, at) {
+            Ok((f, images)) => {
+                for (id, bytes) in images {
+                    let key = self.add_image(bytes);
+                    let mut p = crate::doc::Paint::solid(crate::doc::Rgba::WHITE);
+                    p.convert(crate::doc::PaintKind::Image);
+                    p.image = key;
+                    self.doc.node_mut(id).fills = vec![p];
+                }
+                if centered {
+                    let size = self.doc.node(f).rect.size();
+                    self.doc.translate(f, (-size / 2.0).round());
+                }
+                self.sel = vec![f];
+                self.tool = Tool::Move;
+                Some(f)
+            }
+            Err(e) => {
+                self.doc = before;
+                self.undo.pop();
+                self.toast(format!("Couldn't import SVG: {e}"));
+                None
+            }
+        }
+    }
+
+    /// File > Place image / Import: SVG, PNG, or JPEG at the center of the view.
+    pub fn import_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new().add_filter("Images", &["svg", "png", "jpg", "jpeg"]).pick_file() else { return };
+        let Ok(bytes) = std::fs::read(&path) else { return };
+        let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let at = self.view_center_world();
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg")) {
+            self.import_svg(&bytes, &name, at, true);
+        } else {
+            self.place_image(bytes, &name, at);
+        }
+    }
+
+    /// A raster image as an image-filled rectangle at natural size, centered on `at`.
+    pub fn place_image(&mut self, bytes: Vec<u8>, name: &str, at: Pos2) -> Option<NodeId> {
+        let Ok(img) = image::load_from_memory(&bytes) else {
+            self.toast(format!("Can't import {name}"));
+            return None;
+        };
+        self.checkpoint();
+        let size = vec2(img.width() as f32, img.height() as f32);
+        let key = self.add_image(bytes);
+        let mut n = Node::new(Kind::Rectangle, Rect::from_center_size(at.round(), size));
+        let mut p = crate::doc::Paint::solid(crate::doc::Rgba::WHITE);
+        p.convert(crate::doc::PaintKind::Image);
+        p.image = key;
+        n.fills = vec![p];
+        n.name = name.to_string();
+        let parent = self.frame_at(at, &[]);
+        let id = self.doc.insert(self.page, parent, None, n);
+        self.sel = vec![id];
+        self.tool = Tool::Move;
+        Some(id)
+    }
+
+    /// Cmd+E: merge the selection into one vector with exact outlines.
+    pub fn flatten_selection(&mut self) {
+        let roots = self.sel_roots();
+        if roots.is_empty() || roots.iter().all(|&id| self.doc.node(id).kind == Kind::Vector && roots.len() == 1) {
+            return;
+        }
+        let Some(mut v) = crate::svg_import::outline(&self.doc, &roots) else { return };
+        self.checkpoint();
+        let top = *self.doc.sort_by_z(&roots).last().unwrap();
+        let (parent, index) = (self.doc.node(top).parent, self.doc.index_in_parent(top));
+        v.name = if roots.len() == 1 { self.doc.node(roots[0]).name.clone() } else { "Vector".into() };
+        let id = self.doc.insert(self.page, parent, Some(index + 1), v);
+        for r in roots {
+            self.doc.remove(r);
+        }
+        self.doc.reflow();
+        self.sel = vec![id];
+    }
+
     /// Store image bytes in the document, keyed by content hash.
     pub fn add_image(&mut self, bytes: Vec<u8>) -> String {
         use std::hash::{Hash, Hasher};
@@ -726,6 +822,13 @@ impl App {
         if key == Key::Escape && self.editing_text.is_some() {
             return self.end_text_edit();
         }
+        if self.vector_edit.is_some() && !typing && !cmd {
+            match key {
+                Key::Escape | Key::Enter => return self.exit_vector_edit(),
+                Key::Delete | Key::Backspace => return self.vector_delete_points(),
+                _ => {}
+            }
+        }
         if typing {
             return;
         }
@@ -737,6 +840,8 @@ impl App {
             (true, false, false, Key::A) => self.select_all(),
             (true, false, true, Key::G) => self.group_selection(true),
             (true, false, true, Key::K) => self.create_component(),
+            (true, true, false, Key::K) => self.import_dialog(),
+            (true, false, false, Key::E) => self.flatten_selection(),
             (true, false, true, Key::B) => self.detach_selection(),
             (true, false, false, Key::G) => self.group_selection(false),
             (true, true, false, Key::G) => self.ungroup_selection(),
@@ -779,7 +884,9 @@ impl App {
                     self.finish_pen(false);
                 } else if let [one] = self.sel[..] {
                     let n = self.doc.node(one);
-                    if n.kind == Kind::Text {
+                    if n.kind == Kind::Vector {
+                        self.enter_vector_edit(one);
+                    } else if n.kind == Kind::Text {
                         self.checkpoint();
                         self.editing_text = Some(one);
                         self.focus_text = true;

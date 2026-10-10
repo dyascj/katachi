@@ -262,7 +262,7 @@ fn pen_draws_paths() {
     key(&mut h, Modifiers::NONE, Key::Enter);
     let id = h.state().sel[0];
     let n = h.state().doc.node(id);
-    assert_eq!((n.kind, n.points.len(), n.closed), (Kind::Vector, 3, false));
+    assert_eq!((n.kind, n.paths[0].points.len(), n.paths[0].closed), (Kind::Vector, 3, false));
     assert_eq!(n.rect, r(0., 0., 100., 100.));
     // Clicking the first anchor closes the shape.
     key(&mut h, Modifiers::NONE, Key::P);
@@ -271,8 +271,8 @@ fn pen_draws_paths() {
         click(&mut h, p, Modifiers::NONE);
     }
     let id = h.state().sel[0];
-    assert!(h.state().doc.node(id).closed);
-    assert_eq!(h.state().doc.node(id).points.len(), 3);
+    assert!(h.state().doc.node(id).paths[0].closed);
+    assert_eq!(h.state().doc.node(id).paths[0].points.len(), 3);
 }
 
 #[test]
@@ -569,4 +569,63 @@ fn text_wraps_aligns_and_spaces_lines() {
     h.event(Event::Text("Hi".into()));
     h.run_steps(2);
     assert_eq!(rect(&h, t2), r(200., 0., 100., 80.), "fixed boxes keep their size");
+}
+
+fn double_click(h: &mut Harness<App>, p: Pos2) {
+    h.run_steps(30);
+    move_to(h, p, Modifiers::NONE);
+    for _ in 0..2 {
+        press(h, p, true, Modifiers::NONE);
+        press(h, p, false, Modifiers::NONE);
+    }
+    h.run_steps(2);
+}
+
+#[test]
+fn vector_edit_moves_adds_and_deletes_points() {
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    let p = s(&h, 50., 50.);
+    double_click(&mut h, p);
+    let v = h.state().sel[0];
+    assert!(h.state().vector_edit.is_some(), "double-click enters vector edit");
+    assert_ne!(v, id, "rectangle was converted to a path");
+    assert_eq!(h.state().doc.node(v).paths[0].points.len(), 4);
+    // Drag the bottom-right anchor out by (20, 10).
+    let (a, b) = (s(&h, 100., 100.), s(&h, 120., 110.));
+    drag(&mut h, a, b, Modifiers::NONE);
+    assert_eq!(rect(&h, v), r(0., 0., 120., 110.));
+    // Click the top edge to add an anchor, then delete it.
+    let p = s(&h, 50., 0.);
+    click(&mut h, p, Modifiers::NONE);
+    assert_eq!(h.state().doc.node(v).paths[0].points.len(), 5);
+    key(&mut h, Modifiers::NONE, Key::Backspace);
+    assert_eq!(h.state().doc.node(v).paths[0].points.len(), 4);
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    assert!(h.state().vector_edit.is_none());
+    assert_eq!(h.state().sel, vec![v], "still selected after leaving edit mode");
+}
+
+#[test]
+fn paste_svg_and_flatten() {
+    let mut h = harness();
+    h.event(Event::Paste(r##"<svg width="24" height="24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="10" fill="#f00"/></svg>"##.into()));
+    h.run_steps(2);
+    let f = h.state().sel[0];
+    assert_eq!(h.state().doc.node(f).kind, Kind::Frame);
+    assert_eq!(h.state().doc.node(f).rect.size(), vec2(24., 24.));
+    // Flatten a rotated ellipse: one vector, same visual bounds.
+    let e = draw(&mut h, Key::O, (100.0, 0.0), (160.0, 40.0));
+    let c = h.state().doc.node(e).rect.center();
+    h.state_mut().doc.rotate(e, 30.0, c);
+    key(&mut h, Modifiers::COMMAND, Key::E);
+    let v = h.state().sel[0];
+    let n = h.state().doc.node(v);
+    assert_eq!(n.kind, Kind::Vector);
+    assert_eq!(n.rotation, 0.0, "rotation baked into the outline");
+    // Analytic bounds of a 60x40 ellipse turned 30°, centered at (130, 20).
+    let (hx, hy) = ((30f32 * 0.866).hypot(20. * 0.5), (30f32 * 0.5).hypot(20. * 0.866));
+    let want = Rect::from_center_size(pos2(130., 20.), vec2(2. * hx, 2. * hy));
+    assert!((n.rect.min - want.min).length() < 1.0 && (n.rect.max - want.max).length() < 1.0, "{:?} vs {want:?}", n.rect);
+    assert!(!h.state().doc.nodes.contains_key(&e));
 }

@@ -490,6 +490,10 @@ impl App {
             self.save(true);
             ui.close();
         }
+        if item(ui, "Place image / SVG…", "⇧⌘K") {
+            self.import_dialog();
+            ui.close();
+        }
         if item(ui, "Export…", "⇧⌘E") {
             self.export();
             ui.close();
@@ -1094,10 +1098,10 @@ impl App {
         };
         let mut changed = false;
         ui.horizontal(|ui| {
-            for axis in 0..2 {
-                egui::ComboBox::from_id_salt(("constraint", axis)).width(half(ui) - 12.0).selected_text(names(axis, c[axis])).show_ui(ui, |ui| {
+            for (axis, cur) in c.iter_mut().enumerate() {
+                egui::ComboBox::from_id_salt(("constraint", axis)).width(half(ui) - 12.0).selected_text(names(axis, *cur)).show_ui(ui, |ui| {
                     for k in [Constraint::Min, Constraint::Max, Constraint::Stretch, Constraint::Center, Constraint::Scale] {
-                        changed |= ui.selectable_value(&mut c[axis], k, names(axis, k)).changed();
+                        changed |= ui.selectable_value(cur, k, names(axis, k)).changed();
                     }
                 });
             }

@@ -71,15 +71,15 @@ pub fn node_path(n: &Node, v: &View, grow: f32) -> Path {
                 let q = v.to_screen(p + o);
                 point(q.x, q.y)
             };
-            let pts = &n.points;
-            if pts.len() >= 2 {
+            for sp in n.paths.iter().filter(|sp| sp.points.len() >= 2 || (sp.closed && !sp.points.is_empty())) {
+                let pts = &sp.points;
                 b.begin(s(pts[0].p));
-                let segs = if n.closed { pts.len() } else { pts.len() - 1 };
+                let segs = if sp.closed { pts.len() } else { pts.len() - 1 };
                 for i in 0..segs {
                     let (a, c) = (pts[i], pts[(i + 1) % pts.len()]);
                     b.cubic_bezier_to(s(a.p + a.h_out), s(c.p + c.h_in), s(c.p));
                 }
-                b.end(n.closed);
+                b.end(sp.closed);
             }
         }
         _ => {
@@ -108,11 +108,12 @@ fn to_mesh(geo: VertexBuffers<Pos2, u32>, color: Color32) -> Mesh {
     }
 }
 
-fn fill_geo(path: &Path) -> VertexBuffers<Pos2, u32> {
+fn fill_geo(path: &Path, even_odd: bool) -> VertexBuffers<Pos2, u32> {
     let mut geo = VertexBuffers::new();
+    let rule = if even_odd { lyon::tessellation::FillRule::EvenOdd } else { lyon::tessellation::FillRule::NonZero };
     let _ = FillTessellator::new().tessellate_path(
         path,
-        &FillOptions::tolerance(0.15),
+        &FillOptions::tolerance(0.15).with_fill_rule(rule),
         &mut BuffersBuilder::new(&mut geo, |v: FillVertex| pos2(v.position().x, v.position().y)),
     );
     geo
@@ -129,7 +130,7 @@ fn stroke_geo(path: &Path, width: f32) -> VertexBuffers<Pos2, u32> {
 }
 
 pub fn fill_mesh(path: &Path, color: Color32) -> Mesh {
-    to_mesh(fill_geo(path), color)
+    to_mesh(fill_geo(path, false), color)
 }
 
 pub fn stroke_mesh(path: &Path, width: f32, color: Color32) -> Mesh {
@@ -303,9 +304,9 @@ fn draw_content(painter: &Painter, sc: &mut Scene, n: &Node, a: f32) {
         return;
     }
     let path = node_path(n, &v, 0.0);
-    if n.kind != Kind::Vector || n.closed {
+    if n.has_area() {
         for f in n.fills.iter().filter(|f| f.visible) {
-            paint_geo(painter, sc, n, fill_geo(&path), f, a);
+            paint_geo(painter, sc, n, fill_geo(&path, n.even_odd), f, a);
         }
     }
     if n.strokes.iter().any(|s| s.visible) && n.stroke_width > 0.0 {
