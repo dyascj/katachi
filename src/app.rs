@@ -134,6 +134,8 @@ pub struct App {
     pub rulers: bool,
     pub show_grids: bool,
     pub show_history: bool,
+    /// Find and replace (Cmd F): (open, query, replacement, focus the field next frame).
+    pub find: (bool, String, String, bool),
     /// Plugins > Run script console.
     pub show_console: bool,
     pub console_code: String,
@@ -219,6 +221,7 @@ impl App {
             rulers: false,
             show_grids: true,
             show_history: false,
+            find: (false, String::new(), String::new(), false),
             show_console: false,
             console_code: "for (const n of figma.currentPage.selection) {\n  n.rotation += 15;\n}\nfigma.notify(`Rotated ${figma.currentPage.selection.length} layers`);\n".into(),
             show_variables: false,
@@ -1212,6 +1215,74 @@ impl App {
         }
     }
 
+    fn find_window(&mut self, ctx: &egui::Context) {
+        if !self.find.0 {
+            return;
+        }
+        let mut open = true;
+        let (mut jump, mut replace) = (None, false);
+        let q = self.find.1.trim().to_lowercase();
+        // Matches across every page: layer names, and the content of text layers.
+        let hits: Vec<(usize, NodeId)> = if q.is_empty() {
+            vec![]
+        } else {
+            let mut hits = vec![];
+            for (pi, p) in self.doc.pages.iter().enumerate() {
+                for id in p.children.iter().flat_map(|&r| std::iter::once(r).chain(self.doc.descendants(r))) {
+                    let n = self.doc.node(id);
+                    if n.name.to_lowercase().contains(&q) || (n.kind == Kind::Text && n.text.to_lowercase().contains(&q)) {
+                        hits.push((pi, id));
+                    }
+                }
+            }
+            hits
+        };
+        egui::Window::new("Find and replace").open(&mut open).collapsible(false).default_width(320.0).show(ctx, |ui| {
+            let r = ui.add(egui::TextEdit::singleline(&mut self.find.1).hint_text("Find layers and text").desired_width(f32::INFINITY));
+            if std::mem::take(&mut self.find.3) {
+                r.request_focus();
+            }
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.find.2).hint_text("Replace text with").desired_width(ui.available_width() - 90.0));
+                let texts = hits.iter().filter(|(_, id)| self.doc.node(*id).kind == Kind::Text && self.doc.node(*id).text.to_lowercase().contains(&q)).count();
+                replace = ui.add_enabled(texts > 0, egui::Button::new("Replace all")).clicked();
+            });
+            if !q.is_empty() {
+                ui.label(egui::RichText::new(format!("{} results", hits.len())).weak());
+            }
+            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                for &(pi, id) in hits.iter().take(500) {
+                    let n = self.doc.node(id);
+                    let detail = if n.kind == Kind::Text && n.text.to_lowercase().contains(&q) { n.text.lines().find(|l| l.to_lowercase().contains(&q)).unwrap_or("").to_string() } else { String::new() };
+                    let page = if self.doc.pages.len() > 1 { format!("{}: ", self.doc.pages[pi].name) } else { String::new() };
+                    let label = if detail.is_empty() { format!("{page}{}", n.name) } else { format!("{page}{}  \u{201C}{detail}\u{201D}", n.name) };
+                    if ui.add(egui::Button::new(label).truncate().frame(false)).clicked() {
+                        jump = Some((pi, id));
+                    }
+                }
+            });
+        });
+        if let Some((pi, id)) = jump {
+            self.select_page(pi);
+            self.sel = vec![id];
+            self.zoom_to(ctx, Some(vec![id]), false);
+        }
+        if replace {
+            self.checkpoint();
+            let with = self.find.2.clone();
+            let mut count = 0;
+            for &(_, id) in &hits {
+                let n = self.doc.node_mut(id);
+                if n.kind == Kind::Text {
+                    count += crate::doc::replace_text(n, &q, &with);
+                }
+            }
+            self.doc.reflow();
+            self.toast(format!("Replaced {count} matches"));
+        }
+        self.find.0 = open;
+    }
+
     fn console_window(&mut self, ctx: &egui::Context) {
         if !self.show_console {
             return;
@@ -1507,6 +1578,11 @@ impl App {
             (true, false, Key::O) => return self.request_open(),
             (true, false, Key::N) => return self.request_new(),
             (true, true, Key::E) => return self.export(),
+            (true, false, Key::F) => {
+                self.find.0 = true;
+                self.find.3 = true;
+                return;
+            }
             (true, true, Key::Num7) => return self.toggle_list(ctx, crate::doc::ListKind::Number),
             (true, true, Key::Num8) => return self.toggle_list(ctx, crate::doc::ListKind::Bullet),
             _ => {}
@@ -1705,6 +1781,7 @@ impl eframe::App for App {
         self.recovery_prompt(&ctx);
         self.history_window(&ctx);
         self.console_window(&ctx);
+        self.find_window(&ctx);
         self.variables_window(&ctx);
         self.autosave(ctx.input(|i| i.time));
         self.debug_screenshot(&ctx);

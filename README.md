@@ -116,6 +116,8 @@ GitHub Actions. Building from source needs Rust 1.92 or newer.
 | Rulers, layout guides, hide UI | Shift R, Ctrl G, Cmd \ |
 | Dev Mode, present | Shift D, Alt Cmd Enter |
 | Save, open, place image, export | Cmd S, Cmd O, Shift Cmd K, Shift Cmd E |
+| Find and replace | Cmd F |
+| Numbered, bulleted list | Shift Cmd 7, Shift Cmd 8 |
 
 ## Roadmap
 

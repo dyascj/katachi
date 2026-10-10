@@ -450,6 +450,36 @@ pub fn shift_spans(spans: &[TextSpan], old: &str, new: &str) -> Vec<TextSpan> {
         .collect()
 }
 
+/// Replace every case-insensitive match of `find` (lowercase) in a text layer, keeping spans and lists
+/// on the characters they styled. Returns how many were replaced.
+pub fn replace_text(n: &mut Node, find: &str, with: &str) -> usize {
+    let f: Vec<char> = find.chars().collect();
+    if f.is_empty() {
+        return 0;
+    }
+    let chars: Vec<char> = n.text.chars().collect();
+    let same = |a: char, b: char| a == b || a.to_lowercase().eq(b.to_lowercase());
+    let mut starts = vec![];
+    let mut i = 0;
+    while i + f.len() <= chars.len() {
+        if chars[i..i + f.len()].iter().zip(&f).all(|(a, b)| same(*a, *b)) {
+            starts.push(i);
+            i += f.len();
+        } else {
+            i += 1;
+        }
+    }
+    // Last match first, so earlier indices stay put; each step is one contiguous edit.
+    for &s in starts.iter().rev() {
+        let cur: Vec<char> = n.text.chars().collect();
+        let next: String = cur[..s].iter().collect::<String>() + with + &cur[s + f.len()..].iter().collect::<String>();
+        n.spans = shift_spans(&n.spans, &n.text, &next);
+        n.lists = shift_lists(&n.lists, &n.text, &next);
+        n.text = next;
+    }
+    starts.len()
+}
+
 /// Paragraphs after an edit: list formatting follows its paragraph, and new
 /// paragraphs typed inside a list item continue the list.
 pub fn shift_lists(lists: &[ListLine], old: &str, new: &str) -> Vec<ListLine> {
@@ -3128,6 +3158,12 @@ mod tests {
         assert_eq!(shift_lists(&l, "Title\nOne", "Title\nOne\nTwo"), vec![ListLine::default(), b, b], "enter continues the list");
         assert_eq!(shift_lists(&l, "Title\nOne", "Intro\nTitle\nOne"), vec![ListLine::default(), ListLine::default(), b], "earlier paragraphs shift it");
         assert!(shift_lists(&l, "Title\nOne", "TitleOne").is_empty(), "joined into the plain paragraph");
+        let mut t = Node::new(Kind::Text, Rect::ZERO);
+        t.text = "Cat and cat".into();
+        t.spans = vec![TextSpan { start: 8, end: 11, style: SpanStyle { font_weight: Some(700), ..Default::default() } }];
+        assert_eq!(replace_text(&mut t, "cat", "Dog"), 2);
+        assert_eq!(t.text, "Dog and Dog");
+        assert_eq!((t.spans[0].start, t.spans[0].end), (8, 11), "the bold word stays bold");
     }
 
     #[test]
