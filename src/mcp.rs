@@ -139,7 +139,7 @@ fn tools() -> Vec<Value> {
         tool("get_components", "Main components and component sets with their properties and variants.", json!({}), &[]),
         tool(
             "execute_code",
-            "Run JavaScript against Figma's plugin API on the current page (async allowed). Changes are one undo step. `return` a JSON-serializable value to get it back; nodes come back as {id, type, name}.",
+            "Run JavaScript against Figma's plugin API on the current page (async allowed). Changes are one undo step. `return` a JSON-serializable value to get it back; nodes come back as {id, type, name}. Supported: create* (Frame, Text, Rectangle, Ellipse, Line, Polygon, Star, Component, Section), createNodeFromSvg, createInstance, combineAsVariants, group, union/subtract/intersect/exclude; layer properties including auto layout (layoutMode, layoutWrap, itemSpacing, counterAxisSpacing, padding*, primary/counterAxisAlignItems, primary/counterAxisSizingMode, layoutSizingHorizontal/Vertical, layoutGrow, layoutAlign, layoutPositioning, min/max sizes), fills/strokes (solid, gradient, image), effects, corner radii, text (characters, fontName, fontSize, lineHeight, letterSpacing, alignment, textAutoResize, setRange*), constraints; styles (createPaintStyle/TextStyle/EffectStyle, *StyleId); variables (figma.variables.createVariableCollection, createVariable, setValueForMode, setBoundVariable, setBoundVariableForPaint, setExplicitVariableModeForCollection); component properties (addComponentProperty, componentPropertyReferences, setProperties). Text sizes settle after the call returns.",
             json!({ "code": { "type": "string" } }),
             &["code"],
         ),

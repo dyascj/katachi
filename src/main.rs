@@ -12,6 +12,7 @@ mod kiwi;
 mod mcp;
 mod mcp_tools;
 mod paint_ui;
+mod plugin_doc;
 mod plugin_view;
 mod plugins;
 mod panels;

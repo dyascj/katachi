@@ -2,276 +2,11 @@
 //! A plugin session keeps its JS state alive; each event (start, a UI message, a selection change)
 //! runs against a fresh JS copy of the current page, and the changes come back as one batch.
 
-use crate::doc::{Document, Kind, Node, NodeId, Paint, PaintKind, Rgba};
-use egui::{Rect, pos2, vec2};
-use serde_json::{Value, json};
-use std::collections::HashMap;
+use crate::doc::{Document, NodeId};
+use serde_json::Value;
 
-/// `figma` global and node prototype, implemented over plain objects.
-const PRELUDE: &str = r#"
-const __nodes = new Map();
-let __removed = [], __notes = [], __closed = false, __newId = 0, __errors = [], __outbox = [], __ui = null, __storage = {}, __result;
-const __handlers = {}, __uiHandlers = [];
-function __reset() { __removed = []; __notes = []; __errors = []; __outbox = []; __result = undefined; }
-// A returned value as plain JSON: layers become { id, type, name }.
-function __plain(v, depth) {
-  depth = depth || 0;
-  if (v === null || typeof v !== "object" || depth > 20) return typeof v === "function" || typeof v === "symbol" ? undefined : v;
-  if (Object.getPrototypeOf(v) === __NodeProto) return { id: v.id, type: v.type, name: v.name };
-  if (Array.isArray(v)) return v.map(x => __plain(x, depth + 1));
-  const o = {};
-  for (const k of Object.keys(v)) o[k] = __plain(v[k], depth + 1);
-  return o;
-}
-function __safe(f) { try { Promise.resolve(f()).catch(e => __errors.push(String(e) + (e && e.stack ? '\n' + e.stack : ''))); } catch (e) { __errors.push(String(e) + (e && e.stack ? '\n' + e.stack : '')); } }
-function __deliver(json) {
-  const msg = JSON.parse(json);
-  if (typeof figma.ui.onmessage === "function") __safe(() => figma.ui.onmessage(msg, { origin: "null" }));
-  for (const h of __uiHandlers) __safe(() => h(msg, { origin: "null" }));
-}
-function __emit(type, arg) { for (const h of __handlers[type] || []) __safe(() => h(arg)); }
-function __listens(type) { return (__handlers[type] || []).length > 0; }
-function __link(n) {
-  Object.setPrototypeOf(n, __NodeProto);
-  __nodes.set(n.id, n);
-  return n;
-}
-const __NodeProto = {
-  resize(w, h) { this.width = w; this.height = h; },
-  resizeWithoutConstraints(w, h) { this.resize(w, h); },
-  remove() {
-    __removed.push(this.id);
-    if (this.parent) this.parent.children = this.parent.children.filter(c => c !== this);
-    __nodes.delete(this.id);
-    this.removed = true;
-  },
-  appendChild(c) { this.insertChild((this.children || []).length, c); },
-  insertChild(i, c) {
-    if (c.parent && c.parent.children) c.parent.children = c.parent.children.filter(x => x !== c);
-    this.children = this.children || [];
-    this.children.splice(i, 0, c);
-    c.parent = this;
-  },
-  clone() {
-    const copy = (n, parent) => {
-      const c = __link(Object.assign({}, n, { id: "new:" + (++__newId), parent, children: undefined }));
-      if (n.children) c.children = n.children.map(k => copy(k, c));
-      c.fills = JSON.parse(JSON.stringify(n.fills || []));
-      c.strokes = JSON.parse(JSON.stringify(n.strokes || []));
-      return c;
-    };
-    const c = copy(this, this.parent);
-    if (this.parent) { const s = this.parent.children; s.splice(s.indexOf(this) + 1, 0, c); }
-    return c;
-  },
-  findAll(fn) {
-    const out = [];
-    const walk = n => { for (const c of n.children || []) { if (!fn || fn(c)) out.push(c); walk(c); } };
-    walk(this);
-    return out;
-  },
-  findOne(fn) { return this.findAll(fn)[0] || null; },
-  findChildren(fn) { return (this.children || []).filter(fn || (() => true)); },
-  findChild(fn) { return this.findChildren(fn)[0] || null; },
-  findAllWithCriteria(c) { return this.findAll(n => !c.types || c.types.includes(n.type)); },
-  setPluginData() {}, getPluginData() { return ""; },
-  setRelaunchData() {},
-  get absoluteBoundingBox() {
-    let x = this.x, y = this.y;
-    for (let p = this.parent; p && p.type !== "PAGE"; p = p.parent) { x += p.x; y += p.y; }
-    return { x, y, width: this.width, height: this.height };
-  },
-};
-function __create(type, defaults) {
-  const n = __link(Object.assign({ id: "new:" + (++__newId), type, name: type[0] + type.slice(1).toLowerCase(), x: 0, y: 0, width: 100, height: 100,
-    rotation: 0, opacity: 1, visible: true, locked: false, fills: [], strokes: [], strokeWeight: 1, cornerRadius: 0,
-    children: ["FRAME", "GROUP", "COMPONENT"].includes(type) ? [] : undefined }, defaults || {}));
-  figma.currentPage.appendChild(n);
-  return n;
-}
-const __gray = [{ type: "SOLID", color: { r: 0.851, g: 0.851, b: 0.851 }, opacity: 1, visible: true }];
-const figma = {
-  apiVersion: "1.0.0", editorType: "figma", mixed: Symbol("mixed"),
-  notify(m) { __notes.push(String(m)); return { cancel() {} }; },
-  closePlugin(m) { if (m) __notes.push(String(m)); __closed = true; },
-  showUI(html, opts) {
-    opts = opts || {};
-    __ui = { html: String(html), width: opts.width || 300, height: opts.height || 200, visible: opts.visible !== false, title: opts.title || null };
-  },
-  ui: {
-    postMessage(m) { __outbox.push(JSON.stringify(m === undefined ? null : m)); },
-    onmessage: undefined,
-    on(type, cb) { if (type === "message") __uiHandlers.push(cb); },
-    once(type, cb) { this.on(type, cb); },
-    off(type, cb) { const i = __uiHandlers.indexOf(cb); if (i >= 0) __uiHandlers.splice(i, 1); },
-    resize(w, h) { if (__ui) { __ui.width = w; __ui.height = h; } },
-    show() { if (__ui) __ui.visible = true; },
-    hide() { if (__ui) __ui.visible = false; },
-    close() { __ui = null; },
-  },
-  on(type, cb) { (__handlers[type] = __handlers[type] || []).push(cb); },
-  once(type, cb) { this.on(type, cb); },
-  off(type, cb) { const l = __handlers[type] || []; const i = l.indexOf(cb); if (i >= 0) l.splice(i, 1); },
-  loadFontAsync() { return Promise.resolve(); },
-  listAvailableFontsAsync() { return Promise.resolve([]); },
-  getNodeById(id) { return __nodes.get(id) || null; },
-  getNodeByIdAsync(id) { return Promise.resolve(__nodes.get(id) || null); },
-  createRectangle() { return __create("RECTANGLE", { fills: JSON.parse(JSON.stringify(__gray)) }); },
-  createEllipse() { return __create("ELLIPSE", { fills: JSON.parse(JSON.stringify(__gray)) }); },
-  createPolygon() { return __create("POLYGON", { fills: JSON.parse(JSON.stringify(__gray)), pointCount: 3 }); },
-  createStar() { return __create("STAR", { fills: JSON.parse(JSON.stringify(__gray)), pointCount: 5 }); },
-  createLine() { return __create("LINE", { height: 0, strokes: [{ type: "SOLID", color: { r: 0, g: 0, b: 0 }, opacity: 1, visible: true }] }); },
-  createFrame() { return __create("FRAME", { fills: [{ type: "SOLID", color: { r: 1, g: 1, b: 1 }, opacity: 1, visible: true }] }); },
-  createComponent() { return __create("COMPONENT", { fills: [{ type: "SOLID", color: { r: 1, g: 1, b: 1 }, opacity: 1, visible: true }] }); },
-  createText() { return __create("TEXT", { characters: "", fontSize: 12, fontName: { family: "Inter", style: "Regular" },
-    fills: [{ type: "SOLID", color: { r: 0, g: 0, b: 0 }, opacity: 1, visible: true }] }); },
-  group(nodes, parent) {
-    const g = __create("GROUP", { children: [] });
-    const xs = nodes.map(n => n.x), ys = nodes.map(n => n.y);
-    g.x = Math.min(...xs); g.y = Math.min(...ys);
-    g.width = Math.max(...nodes.map(n => n.x + n.width)) - g.x; g.height = Math.max(...nodes.map(n => n.y + n.height)) - g.y;
-    (parent || figma.currentPage).appendChild(g);
-    for (const n of nodes) { n.x -= g.x; n.y -= g.y; g.appendChild(n); }
-    return g;
-  },
-  viewport: { center: { x: 0, y: 0 }, zoom: 1, scrollAndZoomIntoView() {} },
-  clientStorage: {
-    getAsync(k) { return Promise.resolve(__storage[k]); },
-    setAsync(k, v) { __storage[k] = v; return Promise.resolve(); },
-    deleteAsync(k) { delete __storage[k]; return Promise.resolve(); },
-    keysAsync() { return Promise.resolve(Object.keys(__storage)); },
-  },
-  util: { rgb(c) { return c; }, solidPaint(c) { return { type: "SOLID", color: c, opacity: 1, visible: true }; } },
-};
-function __load(page) {
-  __nodes.clear();
-  const link = (raw, parent) => {
-    const n = __link(raw);
-    n.parent = parent;
-    if (raw.children) n.children = raw.children.map(c => link(c, n));
-    return n;
-  };
-  const p = { type: "PAGE", id: "page", name: page.name, children: [] };
-  p.children = page.children.map(c => link(c, p));
-  Object.setPrototypeOf(p, __NodeProto);
-  let sel = page.selection.map(id => __nodes.get(id)).filter(Boolean);
-  Object.defineProperty(p, "selection", { get() { return sel; }, set(v) { sel = [...v]; } });
-  figma.currentPage = p;
-  figma.root = { type: "DOCUMENT", name: "Document", children: [p] };
-}
-function __collect() {
-  const out = [];
-  const walk = (n, parentId) => {
-    for (const c of n.children || []) {
-      const { parent, children, ...rest } = c;
-      out.push(Object.assign(rest, { parentId, childIds: children ? children.map(k => k.id) : null }));
-      walk(c, c.id);
-    }
-  };
-  walk(figma.currentPage, null);
-  return JSON.stringify({ nodes: out, top: figma.currentPage.children.map(c => c.id), removed: __removed, notes: __notes,
-    selection: figma.currentPage.selection.map(n => n.id), closed: __closed, errors: __errors, outbox: __outbox, ui: __ui,
-    storage: JSON.stringify(__storage), result: __result === undefined ? null : JSON.stringify(__plain(__result)) });
-}
-"#;
-
-fn figma_type(k: Kind) -> &'static str {
-    match k {
-        Kind::Frame => "FRAME",
-        Kind::Group => "GROUP",
-        Kind::Rectangle => "RECTANGLE",
-        Kind::Ellipse => "ELLIPSE",
-        Kind::Vector => "VECTOR",
-        Kind::Text => "TEXT",
-        Kind::Component => "COMPONENT",
-        Kind::Instance => "INSTANCE",
-        Kind::ComponentSet => "COMPONENT_SET",
-        Kind::Boolean => "BOOLEAN_OPERATION",
-        Kind::Polygon => "POLYGON",
-        Kind::Star => "STAR",
-        Kind::Section => "SECTION",
-        Kind::Slice => "SLICE",
-    }
-}
-
-fn kind_of(t: &str) -> Kind {
-    match t {
-        "FRAME" => Kind::Frame,
-        "GROUP" => Kind::Group,
-        "ELLIPSE" => Kind::Ellipse,
-        "TEXT" => Kind::Text,
-        "COMPONENT" => Kind::Component,
-        "POLYGON" => Kind::Polygon,
-        "STAR" => Kind::Star,
-        "SECTION" => Kind::Section,
-        "LINE" | "VECTOR" => Kind::Vector,
-        _ => Kind::Rectangle,
-    }
-}
-
-fn paint_json(p: &Paint) -> Value {
-    let c = |c: Rgba| json!({ "r": c.0[0] as f32 / 255.0, "g": c.0[1] as f32 / 255.0, "b": c.0[2] as f32 / 255.0 });
-    match p.kind {
-        PaintKind::Solid => json!({ "type": "SOLID", "color": c(p.color), "opacity": p.alpha(), "visible": p.visible }),
-        PaintKind::Linear | PaintKind::Radial => json!({
-            "type": if p.kind == PaintKind::Linear { "GRADIENT_LINEAR" } else { "GRADIENT_RADIAL" },
-            "gradientStops": p.stops.iter().map(|(t, s)| json!({ "position": t, "color": { "r": s.0[0] as f32 / 255.0, "g": s.0[1] as f32 / 255.0, "b": s.0[2] as f32 / 255.0, "a": s.a() as f32 / 255.0 } })).collect::<Vec<_>>(),
-            "opacity": p.alpha(), "visible": p.visible,
-        }),
-        PaintKind::Image => json!({ "type": "IMAGE", "imageHash": p.image, "scaleMode": "FILL", "opacity": p.alpha(), "visible": p.visible }),
-    }
-}
-
-fn paint_from(v: &Value, original: Option<&Paint>) -> Option<Paint> {
-    let f = |c: &Value, k: &str| c.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
-    let byte = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
-    let opacity = v.get("opacity").and_then(|x| x.as_f64()).unwrap_or(1.0) as f32;
-    let visible = v.get("visible").and_then(|x| x.as_bool()).unwrap_or(true);
-    let mut p = match v.get("type")?.as_str()? {
-        "SOLID" => {
-            let c = v.get("color")?;
-            Paint::solid(Rgba([byte(f(c, "r")), byte(f(c, "g")), byte(f(c, "b")), byte(opacity)]))
-        }
-        // Other paint types round-trip unchanged when the plugin left them alone.
-        _ => original.cloned()?,
-    };
-    p.visible = visible;
-    Some(p)
-}
-
-/// The current page as Figma-shaped JSON (x/y relative to the parent, like the plugin API).
-fn snapshot(doc: &Document, page: usize, sel: &[NodeId]) -> Value {
-    fn node(doc: &Document, id: NodeId, origin: egui::Pos2) -> Value {
-        let n = doc.node(id);
-        let r = n.rect;
-        let mut v = json!({
-            "id": id.to_string(), "type": figma_type(n.kind), "name": n.name,
-            "x": r.min.x - origin.x, "y": r.min.y - origin.y, "width": r.width(), "height": r.height(),
-            "rotation": n.rotation, "opacity": n.opacity, "visible": n.visible, "locked": n.locked,
-            "fills": n.fills.iter().map(paint_json).collect::<Vec<_>>(),
-            "strokes": n.strokes.iter().map(paint_json).collect::<Vec<_>>(),
-            "strokeWeight": n.stroke_width, "cornerRadius": n.radius,
-        });
-        if n.kind == Kind::Text {
-            v["characters"] = json!(n.text);
-            v["fontSize"] = json!(n.font_size);
-            v["fontName"] = json!({ "family": n.font_family, "style": crate::text::weight_name(n.font_weight) });
-        }
-        if matches!(n.kind, Kind::Polygon | Kind::Star) {
-            v["pointCount"] = json!(n.point_count);
-        }
-        if n.kind.is_container() {
-            v["children"] = json!(n.children.iter().map(|&c| node(doc, c, r.min)).collect::<Vec<_>>());
-        }
-        v
-    }
-    let p = &doc.pages[page];
-    json!({
-        "name": p.name,
-        "children": p.children.iter().map(|&c| node(doc, c, egui::Pos2::ZERO)).collect::<Vec<_>>(),
-        "selection": sel.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-    })
-}
+/// The `figma` global (see plugin_api.js).
+const PRELUDE: &str = include_str!("plugin_api.js");
 
 pub struct Outcome {
     pub notes: Vec<String>,
@@ -352,7 +87,7 @@ impl Session {
 
     /// Load the page into JS, run `js`, settle promises, and apply the changes.
     fn step(&mut self, doc: &mut Document, page: usize, sel: &[NodeId], js: &str) -> Result<Outcome, String> {
-        let snap = snapshot(doc, page, sel).to_string();
+        let snap = crate::plugin_doc::snapshot(doc, page, sel).to_string();
         self.eval(&format!("__reset(); __load({snap});"))?;
         self.eval(js)?;
         for _ in 0..100_000 {
@@ -376,7 +111,7 @@ impl Session {
             let _ = crate::files::write_atomic(path, now.as_bytes());
             *saved = now.to_string();
         }
-        let ids = apply(doc, page, &out);
+        let ids = crate::plugin_doc::apply(doc, page, &out);
         let strings = |k: &str| out[k].as_array().map(|a| a.iter().filter_map(|n| n.as_str().map(String::from)).collect()).unwrap_or_default();
         let ui = out["ui"].as_object().map(|u| UiRequest {
             html: u.get("html").and_then(|h| h.as_str()).unwrap_or("").to_string(),
@@ -409,106 +144,6 @@ impl Session {
 #[cfg(test)]
 pub fn run(doc: &mut Document, page: usize, sel: &[NodeId], code: &str) -> Result<Outcome, String> {
     Session::start(doc, page, sel, "Script", None, code, None).map(|(_, out)| out)
-}
-
-fn apply(doc: &mut Document, page: usize, out: &Value) -> HashMap<String, NodeId> {
-    let nodes = out["nodes"].as_array().cloned().unwrap_or_default();
-    // Removed layers first.
-    for id in out["removed"].as_array().into_iter().flatten().filter_map(|v| v.as_str()?.parse::<NodeId>().ok()) {
-        if doc.nodes.contains_key(&id) {
-            doc.remove(id);
-        }
-    }
-    // Map JS ids to document ids, creating new layers.
-    let mut ids: HashMap<String, NodeId> = HashMap::new();
-    for v in &nodes {
-        let jid = v["id"].as_str().unwrap_or_default().to_string();
-        match jid.parse::<NodeId>().ok().filter(|i| doc.nodes.contains_key(i)) {
-            Some(i) => {
-                ids.insert(jid, i);
-            }
-            None => {
-                let kind = kind_of(v["type"].as_str().unwrap_or("RECTANGLE"));
-                let mut n = Node::new(kind, Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 100.0)));
-                if v["type"] == "LINE" {
-                    n = Node::vector(&[Default::default(), crate::doc::PathPoint { p: pos2(100.0, 0.0), ..Default::default() }], false);
-                }
-                n.name = v["name"].as_str().unwrap_or("").to_string();
-                let id = doc.insert(page, None, None, n);
-                ids.insert(jid, id);
-            }
-        }
-    }
-    // Structure: page order, then each container's children, top-down.
-    let top: Vec<NodeId> = out["top"].as_array().into_iter().flatten().filter_map(|v| ids.get(v.as_str()?).copied()).collect();
-    for (i, &id) in top.iter().enumerate() {
-        if doc.node(id).parent.is_some() || doc.index_in_parent(id) != i {
-            doc.reparent(id, page, None, Some(i));
-        }
-    }
-    for v in &nodes {
-        let Some(&id) = v["id"].as_str().and_then(|s| ids.get(s)) else { continue };
-        if let Some(kids) = v["childIds"].as_array() {
-            for (i, k) in kids.iter().enumerate() {
-                if let Some(&c) = k.as_str().and_then(|s| ids.get(s)) {
-                    if doc.node(c).parent != Some(id) || doc.index_in_parent(c) != i {
-                        doc.reparent(c, page, Some(id), Some(i));
-                    }
-                }
-            }
-        }
-    }
-    // Properties, parents before children so relative positions resolve.
-    let order: Vec<&Value> = {
-        let mut o: Vec<&Value> = nodes.iter().collect();
-        o.sort_by_key(|v| v["id"].as_str().and_then(|s| ids.get(s)).map_or(0, |&i| doc.ancestors(i).len()));
-        o
-    };
-    for v in order {
-        let Some(&id) = v["id"].as_str().and_then(|s| ids.get(s)) else { continue };
-        let origin = doc.node(id).parent.map_or(egui::Pos2::ZERO, |p| doc.node(p).rect.min);
-        let num = |k: &str| v[k].as_f64().map(|x| x as f32);
-        let old = doc.node(id).clone();
-        let (x, y) = (num("x").unwrap_or(old.rect.min.x - origin.x), num("y").unwrap_or(old.rect.min.y - origin.y));
-        let (w, h) = (num("width").unwrap_or(old.rect.width()).max(0.0), num("height").unwrap_or(old.rect.height()).max(0.0));
-        let r = Rect::from_min_size(pos2(origin.x + x, origin.y + y), vec2(w, h));
-        if r.min != old.rect.min {
-            doc.translate(id, r.min - old.rect.min);
-        }
-        if r.size() != old.rect.size() {
-            let cur = doc.node(id).rect;
-            doc.set_rect(id, Rect::from_min_size(cur.min, r.size()));
-        }
-        let n = doc.node_mut(id);
-        n.name = v["name"].as_str().unwrap_or(&old.name).to_string();
-        n.rotation = num("rotation").unwrap_or(old.rotation);
-        n.opacity = num("opacity").unwrap_or(old.opacity).clamp(0.0, 1.0);
-        n.visible = v["visible"].as_bool().unwrap_or(old.visible);
-        n.locked = v["locked"].as_bool().unwrap_or(old.locked);
-        n.stroke_width = num("strokeWeight").unwrap_or(old.stroke_width);
-        n.radius = num("cornerRadius").unwrap_or(old.radius);
-        if let Some(fs) = v["fills"].as_array() {
-            n.fills = fs.iter().enumerate().filter_map(|(i, p)| paint_from(p, old.fills.get(i))).collect();
-        }
-        if let Some(ss) = v["strokes"].as_array() {
-            n.strokes = ss.iter().enumerate().filter_map(|(i, p)| paint_from(p, old.strokes.get(i))).collect();
-        }
-        if let Some(t) = v["characters"].as_str() {
-            n.text = t.to_string();
-        }
-        n.font_size = num("fontSize").unwrap_or(old.font_size);
-        if let Some(f) = v.get("fontName") {
-            n.font_family = f["family"].as_str().unwrap_or(&old.font_family).to_string();
-            if let Some(st) = f["style"].as_str() {
-                n.font_weight = [100, 200, 300, 400, 500, 600, 700, 800, 900].into_iter().find(|w| crate::text::weight_name(*w).eq_ignore_ascii_case(st)).unwrap_or(old.font_weight);
-            }
-        }
-        if let Some(pc) = v["pointCount"].as_u64() {
-            n.point_count = pc as u32;
-        }
-    }
-    doc.reflow();
-    ids
 }
 
 // ---------- installed plugins ----------
@@ -553,6 +188,8 @@ pub fn load(p: &Installed) -> Result<(String, Option<String>, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::doc::{Kind, Node, Rgba};
+    use egui::{Rect, pos2, vec2};
 
     #[test]
     fn plugin_api_edits_creates_and_removes() {
@@ -621,5 +258,101 @@ mod tests {
         assert!(s.emit(&mut d, 0, &[], "currentpagechange").unwrap().is_none(), "not listening");
         let out = s.message(&mut d, 0, &[], r#"{"type":"done"}"#).unwrap();
         assert!(out.closed && out.notes == vec!["Bye".to_string()]);
+    }
+
+    #[test]
+    fn design_system_api_variables_styles_components_variants() {
+        use crate::doc::{Bindable, LayoutMode, PropTarget, PropValue, Sizing, StyleValue, VarValue};
+        let mut d = Document::default();
+        let code = r##"
+            const coll = figma.variables.createVariableCollection("Theme");
+            coll.renameMode(coll.modes[0].modeId, "Light");
+            const dark = coll.addMode("Dark");
+            const bg = figma.variables.createVariable("bg/surface", coll, "COLOR");
+            bg.setValueForMode(coll.defaultModeId, { r: 1, g: 1, b: 1, a: 1 });
+            bg.setValueForMode(dark, { r: 0, g: 0, b: 0, a: 1 });
+            const space = figma.variables.createVariable("space/md", coll.id, "FLOAT");
+            space.setValueForMode(coll.defaultModeId, 12);
+            space.setValueForMode(dark, 12);
+
+            const h1 = figma.createTextStyle();
+            h1.name = "Heading/H1"; h1.fontSize = 28; h1.fontName = { family: "Inter", style: "Bold" };
+            const brand = figma.createPaintStyle();
+            brand.name = "Brand/Primary"; brand.paints = [figma.util.solidPaint("#8E72FF")];
+
+            const btn = figma.createComponent();
+            btn.name = "Button";
+            btn.layoutMode = "HORIZONTAL";
+            btn.paddingLeft = btn.paddingRight = 16; btn.paddingTop = btn.paddingBottom = 8; btn.itemSpacing = 8;
+            btn.primaryAxisSizingMode = "AUTO"; btn.counterAxisSizingMode = "AUTO";
+            btn.cornerRadius = 8; btn.fillStyleId = brand.id;
+            const label = figma.createText(); label.characters = "Button"; btn.appendChild(label);
+            const prop = btn.addComponentProperty("Label", "TEXT", "Button");
+            label.componentPropertyReferences = { characters: prop };
+
+            const card = figma.createFrame();
+            card.name = "Card"; card.layoutMode = "VERTICAL"; card.x = 300;
+            card.fills = [figma.variables.setBoundVariableForPaint(figma.util.solidPaint("#ffffff"), "color", bg)];
+            card.setBoundVariable("itemSpacing", space);
+            card.setExplicitVariableModeForCollection(coll, dark);
+            const title = figma.createText(); title.characters = "Title"; title.textStyleId = h1.id; card.appendChild(title);
+            const inst = btn.createInstance(); card.appendChild(inst);
+            inst.setProperties({ Label: "Save" });
+            const inst2 = btn.createInstance(); card.appendChild(inst2);
+            inst2.children[0].fills = [figma.util.solidPaint("#ff0000")];
+
+            const a = figma.createComponent(); a.name = "State=Default";
+            const b = figma.createComponent(); b.name = "State=Hover"; b.x = 200;
+            const set = figma.combineAsVariants([a, b], figma.currentPage);
+            set.name = "Chip";
+            const chip = a.createInstance();
+            chip.setProperties({ State: "Hover" });
+            return { btn, card, inst, inst2, set, chip };
+        "##;
+        let out = run(&mut d, 0, &[], code).unwrap();
+        let r: serde_json::Value = serde_json::from_str(out.result.as_deref().unwrap()).unwrap();
+        let id = |k: &str| r[k]["id"].as_str().unwrap().parse::<NodeId>().unwrap();
+        // Variables and styles.
+        let theme = &d.collections[0];
+        assert_eq!((theme.name.as_str(), theme.modes.clone()), ("Theme", vec!["Light".to_string(), "Dark".to_string()]));
+        let bg = d.variables.iter().find(|v| v.name == "bg/surface").unwrap();
+        assert_eq!(bg.values, vec![VarValue::Color(Rgba::rgb(255, 255, 255)), VarValue::Color(Rgba::rgb(0, 0, 0))]);
+        let h1 = d.styles.iter().find(|s| s.name == "Heading/H1").unwrap();
+        assert!(matches!(&h1.value, StyleValue::Text(t) if t.font_size == 28.0 && t.font_weight == 700));
+        // The component: auto layout that hugs, linked to the paint style, with a text property.
+        let btn = d.node(id("btn"));
+        assert_eq!(btn.kind, Kind::Component);
+        assert_eq!((btn.layout.mode, btn.layout.padding, btn.layout.gap, btn.sizing), (LayoutMode::Horizontal, [8., 16., 8., 16.], 8., [Sizing::Hug, Sizing::Hug]));
+        assert_eq!(btn.fills[0].color, Rgba::rgb(0x8E, 0x72, 0xFF), "paint style applied");
+        assert_eq!(btn.comp_props[0].name, "Label");
+        assert_eq!(d.node(btn.children[0]).prop_bind, Some(("Label".to_string(), PropTarget::Text)));
+        // Variable bindings resolve in the frame's explicit mode.
+        let card = d.node(id("card"));
+        assert!(card.bindings.contains(&(Bindable::Gap, bg.id + 1)) || card.bindings.iter().any(|(b, _)| *b == Bindable::Gap));
+        assert_eq!(card.fills[0].color, Rgba::rgb(0, 0, 0), "dark mode");
+        assert_eq!(card.layout.gap, 12.0);
+        let title = d.node(card.children[0]);
+        assert_eq!(title.font_size, 28.0, "text style applied");
+        // Instances: property values and overrides on synced layers.
+        let inst = d.node(id("inst"));
+        assert_eq!((inst.kind, inst.component), (Kind::Instance, Some(id("btn"))));
+        assert_eq!(inst.prop_values, vec![("Label".to_string(), PropValue::Text("Save".into()))]);
+        assert_eq!(d.node(inst.children[0]).text, "Save");
+        let inst2 = d.node(id("inst2"));
+        assert_eq!(d.node(inst2.children[0]).fills[0].color, Rgba::rgb(255, 0, 0), "override kept");
+        assert_eq!(d.node(inst2.children[0]).text, "Button");
+        // Variants.
+        let set = d.node(id("set"));
+        assert_eq!((set.kind, set.name.as_str(), set.children.len()), (Kind::ComponentSet, "Chip", 2));
+        let hover = set.children.iter().copied().find(|c| d.node(*c).name == "State=Hover").unwrap();
+        assert_eq!(d.node(id("chip")).component, Some(hover), "setProperties switched the variant");
+        // A second run sees everything it made.
+        let out = run(&mut d, 0, &[], r#"
+            const v = figma.variables.getLocalVariables("COLOR")[0];
+            const s = figma.getLocalTextStyles()[0];
+            const btn = figma.currentPage.findOne(n => n.type === "COMPONENT" && n.name === "Button");
+            return [v.name, s.fontSize, btn.componentPropertyDefinitions.Label.defaultValue, btn.layoutMode, btn.primaryAxisSizingMode];
+        "#).unwrap();
+        assert_eq!(out.result.as_deref(), Some(r#"["bg/surface",28,"Button","HORIZONTAL","AUTO"]"#));
     }
 }
