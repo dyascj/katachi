@@ -1,0 +1,49 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build universal app
+        run: |
+          TARGET=aarch64-apple-darwin scripts/macos-app.sh
+          cargo build --release --target x86_64-apple-darwin
+          lipo -create target/aarch64-apple-darwin/release/katachi target/x86_64-apple-darwin/release/katachi \
+            -output target/Katachi.app/Contents/MacOS/katachi
+          codesign --force --deep --sign - target/Katachi.app
+          hdiutil create -volname Katachi -srcfolder target/Katachi.app -ov -format UDZO Katachi-macos.dmg
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: Katachi-macos.dmg
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: Compress-Archive -Path target/release/katachi.exe -DestinationPath Katachi-windows.zip
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: Katachi-windows.zip
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - run: cargo build --release && tar -czf Katachi-linux-x86_64.tar.gz -C target/release katachi
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: Katachi-linux-x86_64.tar.gz

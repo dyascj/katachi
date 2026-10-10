@@ -1,0 +1,739 @@
+//! App state, document actions, undo, clipboard, files, and keyboard shortcuts.
+
+use crate::doc::{Document, Kind, Node, NodeId, Order};
+use crate::render::View;
+use egui::{Event, Key, Modifiers, Pos2, Rect, Vec2, vec2};
+use std::path::PathBuf;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tool {
+    Move,
+    Hand,
+    Frame,
+    Rectangle,
+    Ellipse,
+    Line,
+    Pen,
+    Text,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Align {
+    Left,
+    HCenter,
+    Right,
+    Top,
+    VCenter,
+    Bottom,
+}
+
+pub enum Drag {
+    Pan,
+    Move { base: Document, start: Pos2 },
+    Resize { base: Document, handle: (i8, i8), bounds: Rect },
+    Create { base: Document, start: Pos2, id: NodeId },
+    Marquee { start: Pos2, base_sel: Vec<NodeId> },
+    PenHandle,
+}
+
+/// Mouse-down state for the move tool, resolved into a click or a drag.
+pub struct Press {
+    pub world: Pos2,
+    pub target: Option<NodeId>,
+    pub handle: Option<(i8, i8)>,
+    /// Shift-click on an already-selected node: deselect it if no drag follows.
+    pub toggle_off: bool,
+}
+
+/// What to do once the user has dealt with unsaved changes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum After {
+    Close,
+    New,
+    Open,
+}
+
+const CLIP_TAG: &str = "katachi/nodes:";
+
+pub struct App {
+    pub doc: Document,
+    pub page: usize,
+    pub view: View,
+    pub view_ready: bool,
+    pub tool: Tool,
+    pub sel: Vec<NodeId>,
+    pub hover: Option<NodeId>,
+    pub drag: Option<Drag>,
+    pub press: Option<Press>,
+    pub pen: Vec<crate::doc::PathPoint>,
+    pub editing_text: Option<NodeId>,
+    pub focus_text: bool,
+    pub renaming: Option<(NodeId, String)>,
+    pub renaming_page: Option<(usize, String)>,
+    pub guides: Vec<[Pos2; 2]>,
+    pub frame_labels: Vec<(NodeId, Rect)>,
+    pub layer_drag: Option<NodeId>,
+    pub canvas_rect: Option<Rect>,
+    /// Top-level frame pressed on its empty area: selected on click, marquee on drag.
+    pub pending_frame: Option<NodeId>,
+    undo: Vec<Document>,
+    redo: Vec<Document>,
+    in_gesture: bool,
+    pub path: Option<PathBuf>,
+    pub dirty: bool,
+    pub export_scale: f32,
+    pub export_svg: bool,
+    pub confirm: Option<After>,
+    pub prev_sel: Vec<NodeId>,
+    allow_close: bool,
+    pub toast: Option<(String, f64)>,
+    title: String,
+    screenshot: Option<(PathBuf, u32)>,
+}
+
+impl App {
+    pub fn new(path: Option<PathBuf>) -> Self {
+        let mut app = App {
+            doc: Document::default(),
+            page: 0,
+            view: View { pan: Vec2::ZERO, zoom: 1.0 },
+            view_ready: false,
+            tool: Tool::Move,
+            sel: vec![],
+            hover: None,
+            drag: None,
+            press: None,
+            pen: vec![],
+            editing_text: None,
+            focus_text: false,
+            renaming: None,
+            renaming_page: None,
+            guides: vec![],
+            frame_labels: vec![],
+            layer_drag: None,
+            canvas_rect: None,
+            pending_frame: None,
+            undo: vec![],
+            redo: vec![],
+            in_gesture: false,
+            path: None,
+            dirty: false,
+            export_scale: 1.0,
+            export_svg: false,
+            confirm: None,
+            prev_sel: vec![],
+            allow_close: false,
+            toast: None,
+            title: String::new(),
+            screenshot: std::env::var_os("KATACHI_SCREENSHOT").map(|p| (PathBuf::from(p), 0)),
+        };
+        if let Some(p) = path {
+            app.open_path(p);
+        }
+        app
+    }
+
+    // ---------- undo ----------
+
+    /// Snapshot before a discrete change.
+    pub fn checkpoint(&mut self) {
+        // ponytail: whole-document snapshots, switch to an op log when docs get big or multiplayer lands
+        self.undo.push(self.doc.clone());
+        if self.undo.len() > 200 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+        self.dirty = true;
+    }
+
+    /// Snapshot once per continuous gesture (slider scrub, typing in a field).
+    pub fn begin_edit(&mut self) {
+        if !self.in_gesture {
+            self.checkpoint();
+            self.in_gesture = true;
+        }
+    }
+
+    pub fn undo(&mut self) {
+        if let Some(d) = self.undo.pop() {
+            self.redo.push(std::mem::replace(&mut self.doc, d));
+            self.after_history();
+        }
+    }
+
+    pub fn redo(&mut self) {
+        if let Some(d) = self.redo.pop() {
+            self.undo.push(std::mem::replace(&mut self.doc, d));
+            self.after_history();
+        }
+    }
+
+    fn after_history(&mut self) {
+        self.dirty = true;
+        self.editing_text = None;
+        self.page = self.page.min(self.doc.pages.len() - 1);
+        self.sel.retain(|id| self.doc.nodes.contains_key(id));
+    }
+
+    // ---------- selection & structure ----------
+
+    pub fn set_tool(&mut self, t: Tool) {
+        if self.tool == Tool::Pen && t != Tool::Pen {
+            self.finish_pen(false);
+        }
+        self.end_text_edit();
+        self.tool = t;
+    }
+
+    pub fn select_page(&mut self, i: usize) {
+        if i != self.page {
+            self.end_text_edit();
+            self.page = i;
+            self.sel.clear();
+            self.view_ready = false;
+        }
+    }
+
+    /// Which node a click on `hit` should select: groups and nested frames are entered
+    /// only when the current selection is already inside them (Figma's click-through rules).
+    pub fn selectable(&self, hit: NodeId, deep: bool) -> NodeId {
+        if deep {
+            return hit;
+        }
+        let mut chain = self.doc.ancestors(hit);
+        chain.reverse();
+        chain.push(hit);
+        for (i, &cur) in chain.iter().enumerate() {
+            let n = self.doc.node(cur);
+            let top_frame = n.kind == Kind::Frame && n.parent.is_none();
+            let entered = self.sel.iter().any(|&s| s != cur && self.doc.is_ancestor(cur, s));
+            if i + 1 == chain.len() || !(top_frame || entered) {
+                return cur;
+            }
+        }
+        hit
+    }
+
+    pub fn delete_selection(&mut self) {
+        if self.sel.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for id in std::mem::take(&mut self.sel) {
+            self.doc.remove(id);
+        }
+        self.doc.fit_groups();
+    }
+
+    /// Top-most selected roots only (drop nodes whose ancestor is also selected).
+    pub fn sel_roots(&self) -> Vec<NodeId> {
+        self.sel
+            .iter()
+            .copied()
+            .filter(|&id| !self.sel.iter().any(|&o| o != id && self.doc.is_ancestor(o, id)))
+            .collect()
+    }
+
+    pub fn group_selection(&mut self, as_frame: bool) {
+        let roots = self.sel_roots();
+        if roots.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        if let Some(g) = self.doc.group(&roots) {
+            if as_frame {
+                let r = self.doc.node(g).rect;
+                let name = self.doc.auto_name("Frame");
+                let n = self.doc.node_mut(g);
+                *n = Node { id: n.id, parent: n.parent, children: n.children.clone(), name, ..Node::new(Kind::Frame, r) };
+            }
+            self.sel = vec![g];
+        }
+    }
+
+    pub fn ungroup_selection(&mut self) {
+        let targets: Vec<NodeId> =
+            self.sel.iter().copied().filter(|id| self.doc.node(*id).kind.is_container()).collect();
+        if targets.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        let mut out: Vec<NodeId> = self.sel.iter().copied().filter(|id| !targets.contains(id)).collect();
+        for g in targets {
+            out.extend(self.doc.ungroup(g));
+        }
+        self.sel = out;
+    }
+
+    pub fn reorder_selection(&mut self, order: Order) {
+        if self.sel.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        let mut ids = self.doc.sort_by_z(&self.sel);
+        if matches!(order, Order::Forward | Order::Front) {
+            ids.reverse();
+        }
+        for id in ids {
+            self.doc.reorder(id, order);
+        }
+    }
+
+    pub fn select_all(&mut self) {
+        let parent = self.sel.first().and_then(|&s| self.doc.node(s).parent);
+        self.sel = self.doc.children_of(self.page, parent).clone();
+    }
+
+    pub fn nudge(&mut self, d: Vec2) {
+        if self.sel.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for id in self.sel_roots() {
+            self.doc.translate(id, d);
+        }
+        self.doc.fit_groups();
+    }
+
+    pub fn toggle_visible(&mut self) {
+        if let Some(&f) = self.sel.first() {
+            self.checkpoint();
+            let v = !self.doc.node(f).visible;
+            for &id in &self.sel {
+                self.doc.node_mut(id).visible = v;
+            }
+        }
+    }
+
+    pub fn toggle_locked(&mut self) {
+        if let Some(&f) = self.sel.first() {
+            self.checkpoint();
+            let v = !self.doc.node(f).locked;
+            for &id in &self.sel {
+                self.doc.node_mut(id).locked = v;
+            }
+            if v {
+                self.sel.clear();
+            }
+        }
+    }
+
+    pub fn align(&mut self, a: Align) {
+        let roots = self.sel_roots();
+        let Some(&first) = roots.first() else { return };
+        // One layer aligns to its parent frame; several align to their shared bounds.
+        let target = if roots.len() == 1 {
+            match self.doc.node(first).parent {
+                Some(p) => self.doc.node(p).rect,
+                None => return,
+            }
+        } else {
+            self.doc.bounds(&roots)
+        };
+        self.checkpoint();
+        for id in roots {
+            let r = self.doc.node(id).rect;
+            let d = match a {
+                Align::Left => vec2(target.min.x - r.min.x, 0.0),
+                Align::HCenter => vec2(target.center().x - r.center().x, 0.0),
+                Align::Right => vec2(target.max.x - r.max.x, 0.0),
+                Align::Top => vec2(0.0, target.min.y - r.min.y),
+                Align::VCenter => vec2(0.0, target.center().y - r.center().y),
+                Align::Bottom => vec2(0.0, target.max.y - r.max.y),
+            };
+            self.doc.translate(id, vec2(d.x.round(), d.y.round()));
+        }
+        self.doc.fit_groups();
+    }
+
+    // ---------- clipboard ----------
+
+    pub fn copy(&mut self, ctx: &egui::Context) {
+        let roots = self.sel_roots();
+        if roots.is_empty() {
+            return;
+        }
+        let frag = self.doc.extract(&roots);
+        if let Ok(json) = serde_json::to_string(&frag) {
+            ctx.copy_text(format!("{CLIP_TAG}{json}"));
+        }
+    }
+
+    pub fn paste_text(&mut self, text: &str) {
+        if let Some(frag) = text.strip_prefix(CLIP_TAG).and_then(|j| serde_json::from_str::<Vec<Node>>(j).ok()) {
+            self.checkpoint();
+            // Paste into a selected frame, otherwise next to the original.
+            let parent = match self.sel.as_slice() {
+                [one] if self.doc.node(*one).kind == Kind::Frame => Some(*one),
+                [one, ..] => self.doc.node(*one).parent,
+                [] => None,
+            };
+            self.sel = self.doc.paste(&frag, self.page, parent, None);
+        } else if !text.trim().is_empty() {
+            // Plain text becomes a text layer, like Figma.
+            self.checkpoint();
+            let mut n = Node::new(Kind::Text, Rect::from_min_size(self.view_center_world(), Vec2::ZERO));
+            n.text = text.to_string();
+            let id = self.doc.insert(self.page, None, None, n);
+            self.sel = vec![id];
+        }
+    }
+
+    pub fn duplicate_selection(&mut self) {
+        let roots = self.sel_roots();
+        if roots.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        self.sel = self.doc.duplicate(&roots);
+    }
+
+    pub fn view_center_world(&self) -> Pos2 {
+        self.view.to_world(self.canvas_rect.map_or(Pos2::ZERO, |r| r.center())).round()
+    }
+
+    // ---------- text & pen ----------
+
+    pub fn end_text_edit(&mut self) {
+        if let Some(id) = self.editing_text.take()
+            && self.doc.nodes.get(&id).is_some_and(|n| n.text.trim().is_empty()) {
+                self.doc.remove(id);
+                self.sel.retain(|s| *s != id);
+                self.doc.fit_groups();
+            }
+    }
+
+    pub fn finish_pen(&mut self, closed: bool) {
+        let pts = std::mem::take(&mut self.pen);
+        if pts.len() >= 2 {
+            self.checkpoint();
+            let parent = self.frame_at(pts[0].p, &[]);
+            let id = self.doc.insert(self.page, parent, None, Node::vector(&pts, closed));
+            self.sel = vec![id];
+            self.tool = Tool::Move;
+        }
+    }
+
+    /// Deepest visible frame containing `p`, ignoring `exclude` subtrees.
+    pub fn frame_at(&self, p: Pos2, exclude: &[NodeId]) -> Option<NodeId> {
+        fn walk(app: &App, list: &[NodeId], p: Pos2, ex: &[NodeId]) -> Option<NodeId> {
+            for &id in list.iter().rev() {
+                let n = app.doc.node(id);
+                if ex.contains(&id) || !n.visible || n.locked {
+                    continue;
+                }
+                if n.kind == Kind::Frame && n.rect.contains(p) {
+                    return walk(app, &n.children, p, ex).or(Some(id));
+                }
+                if n.kind == Kind::Group
+                    && let Some(f) = walk(app, &n.children, p, ex) {
+                        return Some(f);
+                    }
+            }
+            None
+        }
+        walk(self, &self.doc.pages[self.page].children, p, exclude)
+    }
+
+    // ---------- files ----------
+
+    pub fn open_path(&mut self, p: PathBuf) {
+        let parsed = std::fs::read_to_string(&p)
+            .map_err(|e| e.to_string())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).map_err(|e| e.to_string()))
+            .and_then(|v| serde_json::from_value::<Document>(v["document"].clone()).map_err(|e| e.to_string()));
+        match parsed {
+            Ok(doc) => {
+                *self = App { screenshot: self.screenshot.take(), ..App::new(None) };
+                self.doc = doc;
+                self.path = Some(p);
+            }
+            Err(e) => self.toast(format!("Couldn't open file: {e}")),
+        }
+    }
+
+    pub fn open_dialog(&mut self) {
+        if let Some(p) = rfd::FileDialog::new().add_filter("Katachi", &["katachi"]).pick_file() {
+            self.open_path(p);
+        }
+    }
+
+    pub fn save(&mut self, save_as: bool) -> bool {
+        let path = match (&self.path, save_as) {
+            (Some(p), false) => p.clone(),
+            _ => match rfd::FileDialog::new().add_filter("Katachi", &["katachi"]).set_file_name("Untitled.katachi").save_file() {
+                Some(p) => p,
+                None => return false,
+            },
+        };
+        let json = serde_json::json!({ "katachi": 1, "document": self.doc });
+        match std::fs::write(&path, json.to_string()) {
+            Ok(()) => {
+                self.path = Some(path);
+                self.dirty = false;
+                true
+            }
+            Err(e) => {
+                self.toast(format!("Couldn't save: {e}"));
+                false
+            }
+        }
+    }
+
+    pub fn export(&mut self) {
+        let ids = if self.sel.is_empty() { self.doc.pages[self.page].children.clone() } else { self.sel_roots() };
+        if ids.is_empty() {
+            return;
+        }
+        let name = if ids.len() == 1 { self.doc.node(ids[0]).name.clone() } else { "Export".into() };
+        let ext = if self.export_svg { "svg" } else { "png" };
+        let suffix = if self.export_scale != 1.0 && !self.export_svg { format!("@{}x", self.export_scale) } else { String::new() };
+        let Some(path) = rfd::FileDialog::new().add_filter(ext.to_uppercase(), &[ext]).set_file_name(format!("{name}{suffix}.{ext}")).save_file()
+        else {
+            return;
+        };
+        let data = if self.export_svg {
+            Ok(crate::export::to_svg(&self.doc, &ids).into_bytes())
+        } else {
+            crate::export::to_png(&self.doc, &ids, self.export_scale)
+        };
+        match data.and_then(|d| std::fs::write(&path, d).map_err(|e| e.to_string())) {
+            Ok(()) => self.toast(format!("Exported {}", path.file_name().unwrap_or_default().to_string_lossy())),
+            Err(e) => self.toast(format!("Export failed: {e}")),
+        }
+    }
+
+    pub fn request_new(&mut self) {
+        if self.dirty { self.confirm = Some(After::New) } else { self.new_file() }
+    }
+
+    pub fn request_open(&mut self) {
+        if self.dirty { self.confirm = Some(After::Open) } else { self.open_dialog() }
+    }
+
+    pub fn new_file(&mut self) {
+        *self = App { screenshot: self.screenshot.take(), ..App::new(None) };
+    }
+
+    pub fn toast(&mut self, msg: String) {
+        self.toast = Some((msg, 0.0));
+    }
+
+    // ---------- shortcuts ----------
+
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        let typing = ctx.egui_wants_keyboard_input();
+        let events = ctx.input(|i| i.events.clone());
+        for e in events {
+            match e {
+                Event::Copy if !typing => self.copy(ctx),
+                Event::Cut if !typing => {
+                    self.copy(ctx);
+                    self.delete_selection();
+                }
+                Event::Paste(t) if !typing => self.paste_text(&t),
+                Event::Key { key, pressed: true, modifiers: m, .. } => self.key(ctx, key, m, typing),
+                _ => {}
+            }
+        }
+    }
+
+    fn key(&mut self, ctx: &egui::Context, key: Key, m: Modifiers, typing: bool) {
+        let cmd = m.command;
+        // Global shortcuts that work even while a field has focus.
+        match (cmd, m.shift, key) {
+            (true, false, Key::S) => return void(self.save(false)),
+            (true, true, Key::S) => return void(self.save(true)),
+            (true, false, Key::O) => return self.request_open(),
+            (true, false, Key::N) => return self.request_new(),
+            (true, true, Key::E) => return self.export(),
+            _ => {}
+        }
+        if key == Key::Escape && self.editing_text.is_some() {
+            return self.end_text_edit();
+        }
+        if typing {
+            return;
+        }
+        let step = if m.shift { 10.0 } else { 1.0 };
+        match (cmd, m.shift, m.alt, key) {
+            (true, false, _, Key::Z) => self.undo(),
+            (true, true, _, Key::Z) | (true, false, _, Key::Y) => self.redo(),
+            (true, false, false, Key::D) => self.duplicate_selection(),
+            (true, false, false, Key::A) => self.select_all(),
+            (true, false, true, Key::G) => self.group_selection(true),
+            (true, false, false, Key::G) => self.group_selection(false),
+            (true, true, false, Key::G) => self.ungroup_selection(),
+            (true, true, false, Key::H) => self.toggle_visible(),
+            (true, true, false, Key::L) => self.toggle_locked(),
+            (true, false, false, Key::CloseBracket) => self.reorder_selection(Order::Forward),
+            (true, false, false, Key::OpenBracket) => self.reorder_selection(Order::Backward),
+            (true, false, true, Key::CloseBracket) => self.reorder_selection(Order::Front),
+            (true, false, true, Key::OpenBracket) => self.reorder_selection(Order::Back),
+            (true, _, _, Key::Equals | Key::Plus) => self.zoom_step(ctx, 2.0),
+            (true, _, _, Key::Minus) => self.zoom_step(ctx, 0.5),
+            (false, true, _, Key::Num0) => self.zoom_to(ctx, None, true),
+            (false, true, _, Key::Num1) => self.zoom_to(ctx, None, false),
+            (false, true, _, Key::Num2) => {
+                let s = self.sel_roots();
+                if !s.is_empty() {
+                    self.zoom_to(ctx, Some(s), false)
+                }
+            }
+            (false, _, _, Key::Delete | Key::Backspace) => self.delete_selection(),
+            (false, _, _, Key::ArrowLeft) => self.nudge(vec2(-step, 0.0)),
+            (false, _, _, Key::ArrowRight) => self.nudge(vec2(step, 0.0)),
+            (false, _, _, Key::ArrowUp) => self.nudge(vec2(0.0, -step)),
+            (false, _, _, Key::ArrowDown) => self.nudge(vec2(0.0, step)),
+            (false, false, false, Key::Escape) => {
+                if !self.pen.is_empty() {
+                    self.finish_pen(false);
+                } else if self.tool != Tool::Move {
+                    self.set_tool(Tool::Move);
+                } else {
+                    // Step out to the parent, then clear.
+                    let parent = self.sel.first().and_then(|&s| self.doc.node(s).parent);
+                    self.sel = parent.into_iter().collect();
+                }
+            }
+            (false, false, false, Key::Enter) => {
+                if !self.pen.is_empty() {
+                    self.finish_pen(false);
+                } else if let [one] = self.sel[..] {
+                    let n = self.doc.node(one);
+                    if n.kind == Kind::Text {
+                        self.checkpoint();
+                        self.editing_text = Some(one);
+                        self.focus_text = true;
+                    } else if !n.children.is_empty() {
+                        self.sel = n.children.clone();
+                    }
+                }
+            }
+            (false, false, false, Key::V) => self.set_tool(Tool::Move),
+            (false, false, false, Key::H) => self.set_tool(Tool::Hand),
+            (false, false, false, Key::F | Key::A) => self.set_tool(Tool::Frame),
+            (false, false, false, Key::R) => self.set_tool(Tool::Rectangle),
+            (false, false, false, Key::O) => self.set_tool(Tool::Ellipse),
+            (false, false, false, Key::L) => self.set_tool(Tool::Line),
+            (false, false, false, Key::P) => self.set_tool(Tool::Pen),
+            (false, false, false, Key::T) => self.set_tool(Tool::Text),
+            _ => {}
+        }
+    }
+
+    pub fn zoom_step(&mut self, ctx: &egui::Context, f: f32) {
+        let c = ctx.content_rect().center();
+        self.view.zoom_at(c, f);
+    }
+
+    /// Zoom to fit `ids` (None = whole page); `actual` = 100% centered on content.
+    pub fn zoom_to(&mut self, ctx: &egui::Context, ids: Option<Vec<NodeId>>, actual: bool) {
+        let screen = self.canvas_rect.unwrap_or(ctx.content_rect());
+        if actual {
+            let c = self.view.to_world(screen.center());
+            self.view = View { zoom: 1.0, pan: screen.center().to_vec2() - c.to_vec2() };
+            return;
+        }
+        let ids = ids.unwrap_or_else(|| self.doc.pages[self.page].children.clone());
+        let r = self.doc.bounds(&ids);
+        if r.is_finite() {
+            self.view = View::fit(r, screen, 256.0);
+        }
+    }
+}
+
+fn void(_: bool) {}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.shortcuts(&ctx);
+        self.left_panel(ui);
+        self.right_panel(ui);
+        self.canvas_panel(ui);
+        self.close_guard(&ctx);
+        self.debug_screenshot(&ctx);
+
+        // A gesture (and its single undo step) ends when the pointer is up and no field is focused.
+        if !ctx.input(|i| i.pointer.any_down()) && !ctx.egui_wants_keyboard_input() {
+            self.in_gesture = false;
+        }
+        let name = self.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned());
+        let title = format!("{}{} – Katachi", name.as_deref().unwrap_or("Untitled"), if self.dirty { " (Edited)" } else { "" });
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
+    }
+}
+
+impl App {
+    /// Never lose work: closing, New, or Open with unsaved changes asks first.
+    fn close_guard(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested()) && self.dirty && !self.allow_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm = Some(After::Close);
+        }
+        let Some(after) = self.confirm else { return };
+        let mut choice = None;
+        egui::Modal::new("confirm-unsaved".into()).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.heading("Save changes?");
+            ui.label("Your changes will be lost if you don't save them.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    choice = Some(true);
+                }
+                if ui.button("Don't save").clicked() {
+                    choice = Some(false);
+                }
+                if ui.button("Cancel").clicked() {
+                    self.confirm = None;
+                }
+            });
+        });
+        let Some(save) = choice else { return };
+        if save && !self.save(false) {
+            return;
+        }
+        self.confirm = None;
+        match after {
+            After::Close => {
+                self.allow_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            After::New => self.new_file(),
+            After::Open => {
+                self.dirty = false;
+                self.open_dialog();
+            }
+        }
+    }
+
+    /// `KATACHI_SCREENSHOT=out.png katachi file` renders a few frames, saves a PNG, and quits.
+    fn debug_screenshot(&mut self, ctx: &egui::Context) {
+        let Some((path, frames)) = &mut self.screenshot else { return };
+        *frames += 1;
+        if *frames == 10 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+        }
+        ctx.request_repaint();
+        let shot = ctx.input(|i| {
+            i.raw.events.iter().find_map(|e| match e {
+                Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        if let Some(img) = shot {
+            let [w, h] = img.size;
+            let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
+            if let Some(pix) = resvg::tiny_skia::Pixmap::from_vec(bytes, resvg::tiny_skia::IntSize::from_wh(w as u32, h as u32).unwrap()) {
+                let _ = pix.save_png(path.clone());
+            }
+            self.allow_close = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+}

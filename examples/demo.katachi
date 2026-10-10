@@ -1,0 +1,356 @@
+{
+ "katachi": 1,
+ "document": {
+  "pages": [
+   {
+    "name": "Page 1",
+    "children": [
+     1,
+     7
+    ],
+    "background": [
+     245,
+     245,
+     245,
+     255
+    ]
+   }
+  ],
+  "nodes": {
+   "1": {
+    "id": 1,
+    "name": "Landing",
+    "kind": "Frame",
+    "parent": null,
+    "children": [
+     2,
+     3,
+     4,
+     5,
+     6
+    ],
+    "rect": {
+     "min": {
+      "x": 0,
+      "y": 0
+     },
+     "max": {
+      "x": 480,
+      "y": 320
+     }
+    },
+    "fills": [
+     {
+      "color": [
+       255,
+       255,
+       255,
+       255
+      ],
+      "visible": true
+     }
+    ],
+    "clip": true
+   },
+   "2": {
+    "id": 2,
+    "name": "Hero",
+    "kind": "Rectangle",
+    "parent": 1,
+    "children": [],
+    "rect": {
+     "min": {
+      "x": 24,
+      "y": 24
+     },
+     "max": {
+      "x": 456,
+      "y": 164
+     }
+    },
+    "fills": [
+     {
+      "color": [
+       13,
+       153,
+       255,
+       255
+      ],
+      "visible": true
+     }
+    ],
+    "radius": 12
+   },
+   "3": {
+    "id": 3,
+    "name": "Avatar",
+    "kind": "Ellipse",
+    "parent": 1,
+    "children": [],
+    "rect": {
+     "min": {
+      "x": 40,
+      "y": 184
+     },
+     "max": {
+      "x": 104,
+      "y": 248
+     }
+    },
+    "fills": [
+     {
+      "color": [
+       255,
+       199,
+       0,
+       255
+      ],
+      "visible": true
+     }
+    ]
+   },
+   "4": {
+    "id": 4,
+    "name": "Title",
+    "kind": "Text",
+    "parent": 1,
+    "children": [],
+    "rect": {
+     "min": {
+      "x": 120,
+      "y": 196
+     },
+     "max": {
+      "x": 130,
+      "y": 206
+     }
+    },
+    "text": "Katachi",
+    "font_size": 28,
+    "font_weight": 700,
+    "fills": [
+     {
+      "color": [
+       30,
+       30,
+       30,
+       255
+      ],
+      "visible": true
+     }
+    ]
+   },
+   "5": {
+    "id": 5,
+    "name": "Subtitle",
+    "kind": "Text",
+    "parent": 1,
+    "children": [],
+    "rect": {
+     "min": {
+      "x": 120,
+      "y": 232
+     },
+     "max": {
+      "x": 130,
+      "y": 242
+     }
+    },
+    "text": "Design in Rust",
+    "font_size": 14,
+    "fills": [
+     {
+      "color": [
+       120,
+       120,
+       120,
+       255
+      ],
+      "visible": true
+     }
+    ]
+   },
+   "6": {
+    "id": 6,
+    "name": "Squiggle",
+    "kind": "Vector",
+    "parent": 1,
+    "children": [],
+    "rect": {
+     "min": {
+      "x": 300,
+      "y": 190
+     },
+     "max": {
+      "x": 440,
+      "y": 270
+     }
+    },
+    "strokes": [
+     {
+      "color": [
+       242,
+       72,
+       34,
+       255
+      ],
+      "visible": true
+     }
+    ],
+    "stroke_width": 3,
+    "stroke_align": "Center",
+    "points": [
+     {
+      "p": {
+       "x": 0,
+       "y": 40
+      },
+      "h_in": {
+       "x": 0,
+       "y": 0
+      },
+      "h_out": {
+       "x": 30,
+       "y": -60
+      }
+     },
+     {
+      "p": {
+       "x": 70,
+       "y": 40
+      },
+      "h_in": {
+       "x": -30,
+       "y": 60
+      },
+      "h_out": {
+       "x": 30,
+       "y": -60
+      }
+     },
+     {
+      "p": {
+       "x": 140,
+       "y": 40
+      },
+      "h_in": {
+       "x": -30,
+       "y": 60
+      },
+      "h_out": {
+       "x": 0,
+       "y": 0
+      }
+     }
+    ],
+    "closed": false
+   },
+   "7": {
+    "id": 7,
+    "name": "Card",
+    "kind": "Frame",
+    "parent": null,
+    "children": [
+     8,
+     9
+    ],
+    "rect": {
+     "min": {
+      "x": 540,
+      "y": 0
+     },
+     "max": {
+      "x": 780,
+      "y": 320
+     }
+    },
+    "fills": [
+     {
+      "color": [
+       30,
+       30,
+       30,
+       255
+      ],
+      "visible": true
+     }
+    ],
+    "clip": true,
+    "radius": 16
+   },
+   "8": {
+    "id": 8,
+    "name": "Button",
+    "kind": "Rectangle",
+    "parent": 7,
+    "children": [],
+    "rect": {
+     "min": {
+      "x": 564,
+      "y": 248
+     },
+     "max": {
+      "x": 756,
+      "y": 296
+     }
+    },
+    "fills": [
+     {
+      "color": [
+       255,
+       255,
+       255,
+       255
+      ],
+      "visible": true
+     }
+    ],
+    "radius": 24,
+    "strokes": [
+     {
+      "color": [
+       13,
+       153,
+       255,
+       255
+      ],
+      "visible": true
+     }
+    ],
+    "stroke_width": 2
+   },
+   "9": {
+    "id": 9,
+    "name": "Label",
+    "kind": "Text",
+    "parent": 7,
+    "children": [],
+    "rect": {
+     "min": {
+      "x": 624,
+      "y": 262
+     },
+     "max": {
+      "x": 634,
+      "y": 272
+     }
+    },
+    "text": "Get started",
+    "font_size": 16,
+    "font_weight": 600,
+    "fills": [
+     {
+      "color": [
+       30,
+       30,
+       30,
+       255
+      ],
+      "visible": true
+     }
+    ]
+   }
+  },
+  "next_id": 10
+ }
+}
