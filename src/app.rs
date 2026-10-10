@@ -236,11 +236,16 @@ impl App {
             var_collection: None,
             style_clip: None,
             layer_search: None,
-            recovery: crate::files::recovery_dir().join(format!(
-                "{}-{}.katachi",
-                std::process::id(),
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis())
-            )),
+            recovery: {
+                // Unique per window, even for two opened in the same millisecond.
+                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                crate::files::recovery_dir().join(format!(
+                    "{}-{}-{}.katachi",
+                    std::process::id(),
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis()),
+                    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ))
+            },
             last_autosave: 0.0,
             recoverable: vec![],
             undo: vec![],
