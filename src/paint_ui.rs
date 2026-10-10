@@ -86,6 +86,20 @@ fn swatch(ui: &mut Ui, p: &Paint) -> egui::Response {
     resp
 }
 
+/// A bare color row: swatch with picker, hex, and opacity.
+pub fn color_row(ui: &mut Ui, id: egui::Id, color: &mut Rgba) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        let sw = swatch(ui, &Paint::solid(*color));
+        Popup::menu(&sw).id(id.with("popup")).close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+            changed |= rgb_picker(ui, color);
+        });
+        changed |= hex_field(ui, id.with("hex"), color, 56.0);
+        changed |= alpha_field(ui, color);
+    });
+    changed
+}
+
 pub enum PaintEvent {
     None,
     Changed,

@@ -1425,8 +1425,65 @@ impl App {
         }
         ui.separator();
         self.effects_section(ui);
+        self.selection_colors(ui, &roots);
         if roots.len() == 1 {
             self.variables_section(ui, roots[0]);
+        }
+    }
+
+    /// Every solid color in the selection and its layers; editing one recolors all its uses.
+    fn selection_colors(&mut self, ui: &mut Ui, roots: &[NodeId]) {
+        if roots.len() < 2 && self.doc.node(roots[0]).children.is_empty() {
+            return;
+        }
+        let ids: Vec<NodeId> = roots.iter().flat_map(|&r| std::iter::once(r).chain(self.doc.descendants(r))).collect();
+        let mut colors: Vec<Rgba> = vec![];
+        for &id in &ids {
+            let n = self.doc.node(id);
+            for p in n.fills.iter().chain(&n.strokes).filter(|p| p.visible && p.kind == crate::doc::PaintKind::Solid) {
+                if !colors.contains(&p.color) {
+                    colors.push(p.color);
+                }
+            }
+        }
+        if colors.is_empty() {
+            return;
+        }
+        ui.separator();
+        heading(ui, "Selection colors");
+        let all_id = ui.id().with("selection-colors-all");
+        let all = ui.data(|d| d.get_temp::<bool>(all_id)).unwrap_or(false);
+        let mut edit = None;
+        for (i, &c) in colors.iter().enumerate().take(if all { usize::MAX } else { 6 }) {
+            let mut nc = c;
+            if crate::paint_ui::color_row(ui, ui.id().with(("selection-color", i)), &mut nc) {
+                edit = Some((c, nc));
+            }
+        }
+        if colors.len() > 6 && ui.link(if all { "Show fewer".to_string() } else { format!("See all {} colors", colors.len()) }).clicked() {
+            ui.data_mut(|d| d.insert_temp(all_id, !all));
+        }
+        if let Some((old, new)) = edit {
+            self.begin_edit();
+            for id in ids {
+                let n = self.doc.node_mut(id);
+                // A recolored paint no longer follows its style or variable.
+                let mut hit = [false; 2];
+                for (k, paints) in [&mut n.fills, &mut n.strokes].into_iter().enumerate() {
+                    for p in paints.iter_mut().filter(|p| p.visible && p.kind == crate::doc::PaintKind::Solid && p.color == old) {
+                        p.color = new;
+                        hit[k] = true;
+                    }
+                }
+                if hit[0] {
+                    n.fill_style = None;
+                    n.bindings.retain(|(b, _)| *b != crate::doc::Bindable::Fill);
+                }
+                if hit[1] {
+                    n.stroke_style = None;
+                    n.bindings.retain(|(b, _)| *b != crate::doc::Bindable::Stroke);
+                }
+            }
         }
     }
 

@@ -4,6 +4,7 @@ use crate::app::{App, Tool};
 use crate::doc::{Kind, Node, NodeId};
 use egui::{Event, Key, Modifiers, PointerButton, Pos2, Rect, pos2, vec2};
 use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
 
 /// Keep autosaves and recents out of the real user folder.
 fn isolate_data() {
@@ -1291,3 +1292,31 @@ fn perf_file() {
 }
 
 
+
+#[test]
+fn selection_colors_recolor_every_use() {
+    use crate::doc::{Paint, Rgba};
+    let mut h = harness();
+    let mut f = Node::new(Kind::Frame, r(0., 0., 200., 100.));
+    f.fills = vec![Paint::solid(Rgba::rgb(255, 255, 255))];
+    let f = h.state_mut().doc.insert(0, None, None, f);
+    let mut ids = vec![];
+    for (x, c) in [(10., Rgba::rgb(255, 0, 0)), (60., Rgba::rgb(0, 0, 255)), (110., Rgba::rgb(255, 0, 0))] {
+        let mut k = Node::new(Kind::Rectangle, r(x, 10., 40., 40.));
+        k.fills = vec![Paint::solid(c)];
+        ids.push(h.state_mut().doc.insert(0, Some(f), None, k));
+    }
+    h.state_mut().sel = vec![f];
+    h.run_steps(3);
+    h.get_all_by_value("FF0000").next().unwrap().focus();
+    h.run_steps(1);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.get_all_by_value("FF0000").next().unwrap().type_text("00FF00");
+    h.run_steps(1);
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    let d = &h.state().doc;
+    assert_eq!(d.node(ids[0]).fills[0].color, Rgba::rgb(0, 255, 0));
+    assert_eq!(d.node(ids[2]).fills[0].color, Rgba::rgb(0, 255, 0));
+    assert_eq!(d.node(ids[1]).fills[0].color, Rgba::rgb(0, 0, 255), "other colors untouched");
+}
