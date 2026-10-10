@@ -59,7 +59,7 @@ pub fn read(data: &[u8]) -> Result<FigFile, String> {
 
 // ---------- mapping onto Katachi ----------
 
-use crate::doc::{CompProp, PropTarget, PropValue, 
+use crate::doc::{Bindable, CompProp, PropTarget, PropValue, VarId, VarValue, 
     AutoLayout, AxisAlign, Cap, Constraint, Decoration, Document, EffectKind, Join, Kind, LayoutMode, LineHeight, Node, NodeId, Page, Paint,
     PaintKind, PathPoint, Rgba, ScaleMode, Shadow, StrokeAlign, SubPath, TextAlign, TextCase, TextSizing, VAlign,
 };
@@ -289,6 +289,7 @@ pub fn to_document(fig: &FigFile) -> Result<Document, String> {
             None => doc.node_mut(inst).kind = Kind::Frame,
         }
     }
+    import_variables(&mut doc, changes, &by_guid, &ids);
     // Component properties: definitions, the layers bound to them, and instance values.
     let mut defs: HashMap<Guid, (String, String)> = HashMap::new();
     for n in changes {
@@ -361,6 +362,111 @@ pub fn to_document(fig: &FigFile) -> Result<Document, String> {
     }
     doc.reflow();
     Ok(doc)
+}
+
+/// Variable collections, variables, layer bindings, and explicit modes.
+fn import_variables(doc: &mut Document, changes: &[Value], by_guid: &HashMap<Guid, &Value>, ids: &HashMap<Guid, NodeId>) {
+    let live = |n: &&Value, ty: &str| n.s("type") == Some(ty) && n.b("isSoftDeleted") != Some(true);
+    // Sets and variables are referenced by guid, or by library key for ones that came from a library.
+    let refs = |n: &Value| -> Vec<String> { [guid(n.get("guid")).map(|g| format!("{g:?}")), n.s("key").map(String::from)].into_iter().flatten().collect() };
+    let ref_of = |r: Option<&Value>| -> Option<String> {
+        let r = r?;
+        guid(r.get("guid")).map(|g| format!("{g:?}")).or_else(|| r.get("assetRef").and_then(|a| a.s("key")).map(String::from))
+    };
+    let mut sets: HashMap<String, (u64, HashMap<Guid, usize>)> = HashMap::new();
+    for n in changes.iter().filter(|n| live(n, "VARIABLE_SET")) {
+        let mut modes: Vec<&Value> = n.arr("variableSetModes").iter().collect();
+        modes.sort_by(|a, b| a.s("sortPosition").unwrap_or("").as_bytes().cmp(b.s("sortPosition").unwrap_or("").as_bytes()));
+        let id = doc.add_collection(n.s("name").unwrap_or("Collection").to_string());
+        doc.collections.last_mut().unwrap().modes = modes.iter().map(|m| m.s("name").unwrap_or("Mode").to_string()).collect();
+        let index: HashMap<Guid, usize> = modes.iter().enumerate().filter_map(|(i, m)| Some((guid(m.get("id"))?, i))).collect();
+        for r in refs(n) {
+            sets.insert(r, (id, index.clone()));
+        }
+    }
+    let mut vars: HashMap<String, VarId> = HashMap::new();
+    let mut aliases: Vec<(VarId, usize, String)> = vec![];
+    for n in changes.iter().filter(|n| live(n, "VARIABLE")) {
+        let Some((coll, modes)) = ref_of(n.get("variableSetID")).and_then(|r| sets.get(&r)) else { continue };
+        let entries = n.get("variableDataValues").map(|v| v.arr("entries")).unwrap_or_default();
+        let id = doc.add_variable(*coll, n.s("name").unwrap_or("Variable").to_string(), VarValue::Number(0.0));
+        for e in entries {
+            let Some(&m) = guid(e.get("modeID")).and_then(|g| modes.get(&g)) else { continue };
+            let Some(val) = e.get("variableData").and_then(|d| d.get("value")) else { continue };
+            let value = if let Some(c) = val.get("colorValue") {
+                VarValue::Color(rgba(Some(c), 1.0))
+            } else if let Some(f) = val.f("floatValue") {
+                VarValue::Number(f)
+            } else if let Some(t) = val.s("textValue") {
+                VarValue::Text(t.to_string())
+            } else if let Some(b) = val.b("boolValue") {
+                VarValue::Bool(b)
+            } else if let Some(r) = ref_of(val.get("alias")) {
+                aliases.push((id, m, r));
+                continue;
+            } else {
+                continue;
+            };
+            if let Some(v) = doc.variables.last_mut().unwrap().values.get_mut(m) {
+                *v = value;
+            }
+        }
+        for r in refs(n) {
+            vars.insert(r, id);
+        }
+    }
+    for (id, m, r) in aliases {
+        if let (Some(&target), Some(v)) = (vars.get(&r), doc.variables.iter_mut().find(|v| v.id == id)) {
+            v.values[m] = VarValue::Alias(target);
+        }
+    }
+    if vars.is_empty() {
+        return;
+    }
+    let bound = |d: Option<&Value>| ref_of(d?.get("value")?.get("alias")).and_then(|r| vars.get(&r).copied());
+    for (g, &id) in ids {
+        let v = by_guid[g];
+        let mut bindings = vec![];
+        // Katachi binds the top paint.
+        if let Some(var) = bound(v.arr("fillPaints").last().and_then(|p| p.get("colorVar"))) {
+            bindings.push((Bindable::Fill, var));
+        }
+        if let Some(var) = bound(v.arr("strokePaints").last().and_then(|p| p.get("colorVar"))) {
+            bindings.push((Bindable::Stroke, var));
+        }
+        for e in v.get("variableConsumptionMap").map(|m| m.arr("entries")).unwrap_or_default() {
+            let field = match e.s("variableField").unwrap_or("") {
+                "OPACITY" => Bindable::Opacity,
+                "CORNER_RADIUS" => Bindable::Radius,
+                "WIDTH" => Bindable::Width,
+                "HEIGHT" => Bindable::Height,
+                "STACK_SPACING" => Bindable::Gap,
+                "STACK_PADDING_LEFT" | "STACK_PADDING_TOP" | "STACK_PADDING_RIGHT" | "STACK_PADDING_BOTTOM" => Bindable::Padding,
+                "STROKE_WEIGHT" => Bindable::StrokeWidth,
+                "FONT_SIZE" => Bindable::FontSize,
+                "TEXT_DATA" => Bindable::Text,
+                "VISIBLE" => Bindable::Visible,
+                _ => continue,
+            };
+            if let Some(var) = bound(e.get("variableData")) {
+                bindings.retain(|(b, _)| *b != field);
+                bindings.push((field, var));
+            }
+        }
+        let modes: Vec<(u64, usize)> = v
+            .get("variableModeBySetMap")
+            .map(|m| m.arr("entries"))
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|e| {
+                let (coll, modes) = sets.get(&ref_of(e.get("variableSetID"))?)?;
+                Some((*coll, *modes.get(&guid(e.get("variableModeID"))?)?))
+            })
+            .collect();
+        let n = doc.node_mut(id);
+        n.bindings = bindings;
+        n.modes = modes;
+    }
 }
 
 struct Props<'a> {
@@ -782,6 +888,36 @@ mod tests {
         assert!(!kids[1].visible, "boolean property hides the bound layer");
         let comp = doc.nodes.values().find(|n| n.kind == Kind::Component).unwrap();
         assert_eq!(doc.node(comp.children[0]).text, "Button", "main component untouched");
+    }
+
+    #[test]
+    fn variables_bindings_and_modes_import() {
+        use serde_json::json;
+        let g = |l: u64| json!({ "sessionID": 1, "localID": l });
+        let at = |l: u64, pos: &str| json!({ "guid": g(l), "position": pos });
+        let xf = json!({ "m00": 1.0, "m01": 0.0, "m02": 0.0, "m10": 0.0, "m11": 1.0, "m12": 0.0 });
+        let color = |r: f32| json!({ "colorValue": { "r": r, "g": 0.0, "b": 0.0, "a": 1.0 } });
+        let msg = json!({ "nodeChanges": [
+            { "guid": g(0), "type": "DOCUMENT" },
+            { "guid": g(1), "type": "CANVAS", "name": "Page", "parentIndex": at(0, "a") },
+            { "guid": g(10), "type": "VARIABLE_SET", "name": "Theme", "key": "lib-set",
+              "variableSetModes": [{ "id": g(11), "name": "Light", "sortPosition": "a" }, { "id": g(12), "name": "Dark", "sortPosition": "b" }] },
+            { "guid": g(20), "type": "VARIABLE", "name": "bg", "variableSetID": { "guid": g(10) },
+              "variableDataValues": { "entries": [{ "modeID": g(11), "variableData": { "value": color(1.0) } }, { "modeID": g(12), "variableData": { "value": color(0.0) } }] } },
+            { "guid": g(2), "type": "FRAME", "name": "Dark frame", "parentIndex": at(1, "a"), "size": { "x": 100, "y": 100 }, "transform": xf,
+              "variableModeBySetMap": { "entries": [{ "variableSetID": { "assetRef": { "key": "lib-set" } }, "variableModeID": g(12) }] } },
+            { "guid": g(3), "type": "RECTANGLE", "name": "Box", "parentIndex": at(2, "a"), "size": { "x": 10, "y": 10 }, "transform": xf,
+              "fillPaints": [{ "type": "SOLID", "color": { "r": 0.0, "g": 0.0, "b": 0.0, "a": 1.0 }, "opacity": 1.0, "visible": true,
+                "colorVar": { "dataType": "ALIAS", "value": { "alias": { "guid": g(20) } } } }] },
+        ] });
+        let mut doc = to_document(&FigFile { message: kv(msg), images: HashMap::new() }).unwrap();
+        assert_eq!(doc.collections[0].modes, vec!["Light", "Dark"]);
+        let rect = doc.nodes.values().find(|n| n.kind == Kind::Rectangle).unwrap().id;
+        assert_eq!(doc.node(rect).fills[0].color, Rgba::rgb(0, 0, 0), "dark mode value");
+        let frame = doc.node(rect).parent.unwrap();
+        doc.node_mut(frame).modes.clear();
+        doc.reflow();
+        assert_eq!(doc.node(rect).fills[0].color, Rgba::rgb(255, 0, 0), "switching back to the default mode");
     }
 
     /// Import a real file and report what came through.
