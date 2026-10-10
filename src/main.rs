@@ -10,6 +10,7 @@ mod export;
 mod fig_import;
 mod files;
 mod kiwi;
+mod macos_open;
 mod mcp;
 mod mcp_tools;
 mod paint_ui;
@@ -42,6 +43,7 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+    macos_open::install();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Katachi")

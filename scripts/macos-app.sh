@@ -27,6 +27,22 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>$VERSION</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Katachi document</string>
+      <key>CFBundleTypeRole</key><string>Editor</string>
+      <key>LSHandlerRank</key><string>Owner</string>
+      <key>CFBundleTypeExtensions</key><array><string>katachi</string></array>
+      <key>CFBundleTypeIconFile</key><string>Katachi</string>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>Figma file</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>CFBundleTypeExtensions</key><array><string>fig</string></array>
+    </dict>
+  </array>
 </dict>
 </plist>
 PLIST
@@ -37,5 +53,7 @@ echo "Built $APP"
 if [[ "${1:-}" == "--install" ]]; then
   rm -rf /Applications/Katachi.app
   cp -R "$APP" /Applications/
+  # Let Finder know Katachi opens .katachi (and .fig) files.
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/Katachi.app || true
   echo "Installed /Applications/Katachi.app"
 fi

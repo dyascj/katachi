@@ -341,7 +341,9 @@ impl App {
         self.clear_recovery();
         let screenshot = self.screenshot.take();
         let recoverable = std::mem::take(&mut self.recoverable);
-        *self = App { screenshot, recoverable, ..fresh };
+        // The MCP server and the window's appearance belong to the session, not the document.
+        let (mcp, mcp_tried, appearance, glass_applied) = (self.mcp.take(), self.mcp_tried, self.appearance.clone(), self.glass_applied);
+        *self = App { screenshot, recoverable, mcp, mcp_tried, appearance, glass_applied, ..fresh };
     }
 
     // ---------- undo ----------
@@ -2142,6 +2144,14 @@ impl eframe::App for App {
             return;
         }
         self.shortcuts(&ctx);
+        // Files opened from Finder or the Dock.
+        for p in crate::macos_open::take() {
+            if self.dirty {
+                self.toast(format!("Save or discard changes before opening {}", p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()));
+            } else {
+                self.open_path(p);
+            }
+        }
         self.title_bar(ui);
         if !self.ui_hidden {
             self.left_panel(ui);
