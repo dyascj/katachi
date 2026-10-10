@@ -1,7 +1,7 @@
 //! Infinite canvas: navigation, tools, selection, snapping, and on-canvas overlays.
 
-use crate::app::{App, Drag, Press, Tool};
-use crate::doc::{Kind, Node, NodeId, Order, PathPoint};
+use crate::app::{App, Drag, Grip, Press, Tool};
+use crate::doc::{Kind, Node, NodeId, Order, PathPoint, rotate};
 use crate::render::{self, View};
 use egui::{
     Color32, CornerRadius, CursorIcon, FontId, Key, Painter, PointerButton, Pos2, Rect, Sense, Stroke, StrokeKind,
@@ -148,7 +148,7 @@ impl App {
             let active = self.sel.contains(&id) || self.hover == Some(id);
             let color = if active { BLUE } else { Color32::from_gray(0x80) };
             let galley = painter.layout_no_wrap(n.name.clone(), FontId::proportional(11.0), color);
-            let r = self.view.rect_to_screen(n.rect);
+            let r = self.view.rect_to_screen(n.aabb());
             let pos = pos2(r.min.x, r.min.y - galley.size().y - 4.0);
             self.frame_labels.push((id, Rect::from_min_size(pos, galley.size())));
             painter.galley(pos, galley, color);
@@ -163,11 +163,26 @@ impl App {
         self.doc.hit(self.page, w, 3.0 / self.view.zoom).map(|h| self.selectable(h, deep))
     }
 
-    fn handle_at(&self, s: Pos2) -> Option<(i8, i8)> {
-        if self.sel.is_empty() || self.editing_text.is_some() || self.tool != Tool::Move {
+    /// Unrotated rect and rotation of the selection: a lone layer keeps its own frame.
+    pub fn sel_frame(&self) -> Option<(Rect, f32)> {
+        match self.sel_roots().as_slice() {
+            [] => None,
+            [one] => {
+                let n = self.doc.node(*one);
+                Some((n.rect, n.rotation))
+            }
+            many => Some((self.doc.bounds(many), 0.0)),
+        }
+    }
+
+    fn handle_at(&self, s: Pos2) -> Option<Grip> {
+        if self.editing_text.is_some() || self.tool != Tool::Move {
             return None;
         }
-        let b = self.view.rect_to_screen(self.doc.bounds(&self.sel_roots()));
+        let (r, rot) = self.sel_frame()?;
+        // Work in the selection's own (unrotated) screen frame.
+        let s = self.view.to_screen(rotate(self.view.to_world(s), r.center(), -rot));
+        let b = self.view.rect_to_screen(r);
         let near = |a: f32, b: f32| (a - b).abs() <= 5.0;
         let side = |v: f32, lo: f32, hi: f32| -> i8 {
             if near(v, lo) {
@@ -182,12 +197,15 @@ impl App {
         let in_x = s.x > b.min.x - 5.0 && s.x < b.max.x + 5.0;
         let in_y = s.y > b.min.y - 5.0 && s.y < b.max.y + 5.0;
         match (hx, hy) {
-            (0, 0) => None,
-            (x, 0) if in_y => Some((x, 0)),
-            (0, y) if in_x => Some((0, y)),
-            (x, y) if x != 0 && y != 0 => Some((x, y)),
-            _ => None,
+            (x, 0) if x != 0 && in_y => return Some(Grip::Resize(x, 0)),
+            (0, y) if y != 0 && in_x => return Some(Grip::Resize(0, y)),
+            (x, y) if x != 0 && y != 0 => return Some(Grip::Resize(x, y)),
+            _ => {}
         }
+        let corner = [b.left_top(), b.right_top(), b.left_bottom(), b.right_bottom()]
+            .iter()
+            .any(|c| c.distance(s) < 20.0);
+        (corner && !b.expand(5.0).contains(s)).then_some(Grip::Rotate)
     }
 
     fn on_press(&mut self, s: Pos2, w: Pos2, mods: egui::Modifiers) {
@@ -249,10 +267,18 @@ impl App {
         let start = press.world;
         self.drag = match self.tool {
             Tool::Move => {
-                if let Some(handle) = press.handle {
+                if let Some(grip) = press.handle {
                     self.checkpoint();
-                    let bounds = self.doc.bounds(&self.sel_roots());
-                    Some(Drag::Resize { base: self.doc.clone(), handle, bounds })
+                    let (bounds, rot) = self.sel_frame().unwrap_or((Rect::NOTHING, 0.0));
+                    let base = self.doc.clone();
+                    match grip {
+                        Grip::Resize(x, y) => Some(Drag::Resize { base, handle: (x, y), bounds, rot }),
+                        Grip::Rotate => {
+                            let c = bounds.center();
+                            let a = (start - c).angle();
+                            Some(Drag::Rotate { base, center: c, start_angle: a, start_rot: rot, deg: 0.0 })
+                        }
+                    }
                 } else if press.target.is_some() && !self.sel.is_empty() {
                     self.checkpoint();
                     if mods.alt {
@@ -309,11 +335,25 @@ impl App {
                 }
                 self.doc.fit_groups();
             }
-            Drag::Resize { base, handle, bounds } => {
+            Drag::Rotate { base, center, start_angle, start_rot, deg } => {
+                self.doc = base.clone();
+                let mut d = -((w - *center).angle() - *start_angle).to_degrees();
+                if mods.shift {
+                    d = ((*start_rot + d) / 15.0).round() * 15.0 - *start_rot;
+                }
+                *deg = crate::doc::normalize_deg(*start_rot + d);
+                for id in self.sel_roots() {
+                    self.doc.rotate(id, d, *center);
+                }
+            }
+            Drag::Resize { base, handle, bounds, rot } => {
                 self.doc = base.clone();
                 let roots = self.sel_roots();
                 let (hx, hy) = *handle;
                 let b = *bounds;
+                let rot = *rot;
+                // Rotated layers resize along their own axes.
+                let w = rotate(w, b.center(), -rot);
                 let mut nb = b;
                 match hx {
                     -1 => nb.min.x = w.x,
@@ -325,7 +365,11 @@ impl App {
                     1 => nb.max.y = w.y,
                     _ => {}
                 }
-                let corr = self.snap(nb, &roots, [hx == -1, false, hx == 1], [hy == -1, false, hy == 1]);
+                let corr = if rot == 0.0 {
+                    self.snap(nb, &roots, [hx == -1, false, hx == 1], [hy == -1, false, hy == 1])
+                } else {
+                    Vec2::ZERO
+                };
                 if hx == -1 { nb.min.x += corr.x } else if hx == 1 { nb.max.x += corr.x }
                 if hy == -1 { nb.min.y += corr.y } else if hy == 1 { nb.max.y += corr.y }
                 if mods.shift && b.width() > 0.0 && b.height() > 0.0 {
@@ -349,6 +393,13 @@ impl App {
                     if hy == 1 { nb.min.y = 2.0 * c.y - nb.max.y }
                 }
                 let nb = Rect::from_two_pos(nb.min.round(), nb.max.round());
+                if rot != 0.0 {
+                    // Keep the fixed side planted: move the new center back into world space.
+                    let c = rotate(nb.center(), b.center(), rot);
+                    self.doc.set_rect(roots[0], Rect::from_center_size(c, nb.size()));
+                    self.drag = Some(drag);
+                    return;
+                }
                 let sx = if b.width() > 0.0 { nb.width() / b.width() } else { 1.0 };
                 let sy = if b.height() > 0.0 { nb.height() / b.height() } else { 1.0 };
                 let map = |p: Pos2| pos2(nb.min.x + (p.x - b.min.x) * sx, nb.min.y + (p.y - b.min.y) * sy);
@@ -433,7 +484,7 @@ impl App {
                         .children_of(self.page, parent)
                         .iter()
                         .copied()
-                        .filter(|&c| c != id && r.contains_rect(self.doc.node(c).rect))
+                        .filter(|&c| c != id && r.contains_rect(self.doc.node(c).aabb()))
                         .collect();
                     for c in kids {
                         self.doc.reparent(c, self.page, Some(id), None);
@@ -533,12 +584,12 @@ impl App {
             if !usable(n) {
                 continue;
             }
-            if n.kind == Kind::Frame && !n.children.is_empty() && !r.contains_rect(n.rect) {
+            if n.kind == Kind::Frame && !n.children.is_empty() && !r.contains_rect(n.aabb()) {
                 out.extend(n.children.iter().copied().filter(|c| {
                     let c = self.doc.node(*c);
-                    usable(c) && r.intersects(c.rect)
+                    usable(c) && r.intersects(c.aabb())
                 }));
-            } else if r.intersects(n.rect) {
+            } else if r.intersects(n.aabb()) {
                 out.push(id);
             }
         }
@@ -556,10 +607,10 @@ impl App {
             .filter(|c| !exclude.contains(c))
             .map(|c| self.doc.node(*c))
             .filter(|n| n.visible)
-            .map(|n| n.rect)
+            .map(|n| n.aabb())
             .collect();
         if let Some(p) = parent {
-            out.push(self.doc.node(p).rect);
+            out.push(self.doc.node(p).aabb());
         }
         out
     }
@@ -617,7 +668,8 @@ impl App {
                 painter.add(render::stroke_mesh(&render::node_path(n, &self.view, 0.0), width, BLUE));
             }
             _ => {
-                painter.rect_stroke(self.view.rect_to_screen(n.rect), 0.0, Stroke::new(width, BLUE), StrokeKind::Middle);
+                let pts = n.corners().map(|p| self.view.to_screen(p)).to_vec();
+                painter.add(egui::Shape::closed_line(pts, Stroke::new(width, BLUE)));
             }
         }
     }
@@ -633,17 +685,22 @@ impl App {
                     self.outline(painter, id, 1.0);
                 }
             }
-            let b = self.view.rect_to_screen(self.doc.bounds(&roots));
-            painter.rect_stroke(b, 0.0, Stroke::new(1.0, BLUE), StrokeKind::Middle);
+            let (fr, rot) = self.sel_frame().unwrap_or((Rect::NOTHING, 0.0));
+            let corners = [fr.left_top(), fr.right_top(), fr.right_bottom(), fr.left_bottom()]
+                .map(|p| self.view.to_screen(rotate(p, fr.center(), rot)));
+            painter.add(egui::Shape::closed_line(corners.to_vec(), Stroke::new(1.0, BLUE)));
             if self.editing_text.is_none() && self.tool == Tool::Move {
-                for c in [b.left_top(), b.right_top(), b.left_bottom(), b.right_bottom()] {
+                for c in corners {
                     let h = Rect::from_center_size(c, vec2(7.0, 7.0));
                     painter.rect_filled(h, 1.0, Color32::WHITE);
                     painter.rect_stroke(h, 1.0, Stroke::new(1.0, BLUE), StrokeKind::Middle);
                 }
             }
-            let wb = self.doc.bounds(&roots);
-            let label = format!("{} × {}", num(wb.width()), num(wb.height()));
+            let b = self.view.rect_to_screen(self.doc.bounds(&roots));
+            let label = match &self.drag {
+                Some(Drag::Rotate { deg, .. }) => format!("{}°", num(*deg)),
+                _ => format!("{} × {}", num(fr.width()), num(fr.height())),
+            };
             let g = painter.layout_no_wrap(label, FontId::proportional(11.0), Color32::WHITE);
             let pill = Rect::from_center_size(b.center_bottom() + vec2(0.0, 8.0 + g.size().y / 2.0 + 2.0), g.size() + vec2(8.0, 4.0));
             painter.rect_filled(pill, 2.0, BLUE);
@@ -695,10 +752,11 @@ impl App {
         } else {
             match self.tool {
                 Tool::Move => match self.handle_at(p) {
-                    Some((-1, -1) | (1, 1)) => CursorIcon::ResizeNwSe,
-                    Some((1, -1) | (-1, 1)) => CursorIcon::ResizeNeSw,
-                    Some((_, 0)) => CursorIcon::ResizeHorizontal,
-                    Some((0, _)) => CursorIcon::ResizeVertical,
+                    Some(Grip::Resize(-1, -1) | Grip::Resize(1, 1)) => CursorIcon::ResizeNwSe,
+                    Some(Grip::Resize(1, -1) | Grip::Resize(-1, 1)) => CursorIcon::ResizeNeSw,
+                    Some(Grip::Resize(_, 0)) => CursorIcon::ResizeHorizontal,
+                    Some(Grip::Resize(0, _)) => CursorIcon::ResizeVertical,
+                    Some(Grip::Rotate) => CursorIcon::Alias,
                     _ => CursorIcon::Default,
                 },
                 Tool::Text => CursorIcon::Text,

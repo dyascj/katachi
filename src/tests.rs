@@ -366,4 +366,32 @@ fn shots() {
     let p = s(&h, 300., 450.);
     move_to(&mut h, p, Modifiers::NONE);
     save(&mut h, "3-pen");
+    // A rotated, selected card.
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    let card = *h.state().doc.pages[0].children.last().unwrap();
+    let c = h.state().doc.node(card).rect.center();
+    h.state_mut().doc.rotate(card, -12.0, c);
+    h.state_mut().sel = vec![card];
+    h.run_steps(3);
+    save(&mut h, "4-rotated");
+}
+
+#[test]
+fn rotate_by_corner_drag_and_resize_rotated() {
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    // Grab just outside the top-right corner and swing it up and around: shift snaps to 15°.
+    let c = s(&h, 50., 50.);
+    let a = s(&h, 110., -10.);
+    let b = c + vec2(-80.0, -80.0); // 90° counter-clockwise from the start direction
+    drag(&mut h, a, b, Modifiers::SHIFT);
+    assert_eq!(h.state().doc.node(id).rotation, 90.0);
+    assert_eq!(rect(&h, id), r(0., 0., 100., 100.), "rotates in place");
+    // Right edge of the rotated box (its local max-x) now faces up: drag it up 50.
+    let (p, q) = (s(&h, 50., 0.), s(&h, 50., -50.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    let n = h.state().doc.node(id);
+    assert_eq!(n.rect.size(), vec2(150., 100.), "{:?}", n.rect);
+    assert_eq!(n.aabb(), r(0., -50., 100., 150.), "bottom edge stays planted");
 }

@@ -91,6 +91,15 @@ fn node_svg(doc: &Document, id: NodeId, o: Vec2, out: &mut String, defs: &mut St
     if wrap {
         let _ = write!(out, r#"<g opacity="{:.3}">"#, n.opacity);
     }
+    let c = n.rect.center() - o;
+    let turn = if n.rotation != 0.0 && n.kind != Kind::Group {
+        format!(r#" transform="rotate({} {} {})""#, -n.rotation, c.x, c.y)
+    } else {
+        String::new()
+    };
+    if !turn.is_empty() {
+        let _ = write!(out, "<g{turn}>");
+    }
     match n.kind {
         Kind::Group => {}
         Kind::Text => {
@@ -129,10 +138,13 @@ fn node_svg(doc: &Document, id: NodeId, o: Vec2, out: &mut String, defs: &mut St
             }
         }
     }
+    if !turn.is_empty() {
+        out.push_str("</g>");
+    }
     if !n.children.is_empty() {
         if n.kind == Kind::Frame && n.clip {
             let cid = format!("clip{id}");
-            let _ = write!(defs, r#"<clipPath id="{cid}">{}</clipPath>"#, shape(n, o, 0.0, ""));
+            let _ = write!(defs, r#"<clipPath id="{cid}">{}</clipPath>"#, shape(n, o, 0.0, turn.trim()));
             let _ = write!(out, r#"<g clip-path="url(#{cid})">"#);
         } else {
             out.push_str("<g>");
@@ -208,5 +220,15 @@ mod tests {
         // 80x40 at 2x: width/height live in the IHDR chunk
         assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 80);
         assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 40);
+    }
+
+    #[test]
+    fn rotated_export_uses_rotated_bounds() {
+        let mut d = Document::default();
+        let a = d.insert(0, None, None, Node::new(Kind::Rectangle, Rect::from_min_size(pos2(0., 0.), vec2(100., 10.))));
+        d.rotate(a, 90.0, pos2(50., 5.));
+        let svg = to_svg(&d, &[a]);
+        assert!(svg.contains(r#"width="10" height="100""#), "{svg}");
+        assert!(svg.contains(r#"transform="rotate(-90 5 50)""#), "{svg}");
     }
 }

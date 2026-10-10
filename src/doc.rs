@@ -68,6 +68,8 @@ pub struct Node {
     pub parent: Option<NodeId>,
     pub children: Vec<NodeId>,
     pub rect: Rect,
+    /// Degrees counter-clockwise around the rect center, as shown in Figma.
+    pub rotation: f32,
     pub visible: bool,
     pub locked: bool,
     pub opacity: f32,
@@ -94,6 +96,7 @@ impl Default for Node {
             parent: None,
             children: vec![],
             rect: Rect::from_min_size(Pos2::ZERO, vec2(100.0, 100.0)),
+            rotation: 0.0,
             visible: true,
             locked: false,
             opacity: 1.0,
@@ -168,6 +171,25 @@ impl Node {
         }
         self.points = abs.iter().map(|pt| PathPoint { p: pt.p - r.min.to_vec2(), ..*pt }).collect();
         self.rect = r;
+    }
+
+    /// World corners (top-left, top-right, bottom-right, bottom-left), rotation applied.
+    pub fn corners(&self) -> [Pos2; 4] {
+        let r = self.rect;
+        [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()].map(|p| rotate(p, r.center(), self.rotation))
+    }
+
+    /// Axis-aligned bounds in world space.
+    pub fn aabb(&self) -> Rect {
+        if self.rotation == 0.0 {
+            return self.rect;
+        }
+        Rect::from_points(&self.corners())
+    }
+
+    /// World point mapped into the node's unrotated frame.
+    pub fn to_local(&self, p: Pos2) -> Pos2 {
+        rotate(p, self.rect.center(), -self.rotation)
     }
 
     pub fn first_fill(&self) -> Option<Color32> {
@@ -334,6 +356,20 @@ impl Document {
         }
     }
 
+    /// Rotate a subtree by `deg` (counter-clockwise) around `pivot`.
+    /// Groups stay axis-aligned and re-hug their rotated children.
+    pub fn rotate(&mut self, id: NodeId, deg: f32, pivot: Pos2) {
+        for n in std::iter::once(id).chain(self.descendants(id)) {
+            let node = self.node_mut(n);
+            let c = rotate(node.rect.center(), pivot, deg);
+            node.rect = Rect::from_center_size(c, node.rect.size());
+            if node.kind != Kind::Group {
+                node.rotation = normalize_deg(node.rotation + deg);
+            }
+        }
+        self.fit_groups();
+    }
+
     /// Resize a node. Groups and vectors scale their contents; frames keep children in place.
     pub fn set_rect(&mut self, id: NodeId, r: Rect) {
         let old = self.nodes[&id].rect;
@@ -370,7 +406,7 @@ impl Document {
                 self.remove(g);
                 continue;
             }
-            let r = kids.iter().fold(Rect::NOTHING, |r, c| r.union(self.nodes[c].rect));
+            let r = kids.iter().fold(Rect::NOTHING, |r, c| r.union(self.nodes[c].aabb()));
             self.node_mut(g).rect = r;
         }
     }
@@ -490,7 +526,7 @@ impl Document {
             if !n.visible || n.locked {
                 continue;
             }
-            if n.kind == Kind::Frame && n.clip && !n.rect.expand(tol).contains(p) {
+            if n.kind == Kind::Frame && n.clip && !n.rect.expand(tol).contains(n.to_local(p)) {
                 continue;
             }
             if let Some(h) = self.hit_in(&n.children, p, tol) {
@@ -504,6 +540,7 @@ impl Document {
     }
 
     fn hit_self(&self, n: &Node, p: Pos2, tol: f32) -> bool {
+        let p = n.to_local(p);
         match n.kind {
             Kind::Group => false,
             Kind::Frame | Kind::Rectangle | Kind::Text => n.rect.expand(tol).contains(p),
@@ -527,8 +564,30 @@ impl Document {
     }
 
     pub fn bounds(&self, ids: &[NodeId]) -> Rect {
-        ids.iter().fold(Rect::NOTHING, |r, id| r.union(self.nodes[id].rect))
+        ids.iter().fold(Rect::NOTHING, |r, id| r.union(self.nodes[id].aabb()))
     }
+}
+
+/// Rotate `p` around `c` by `deg` counter-clockwise on screen (y points down).
+pub fn rotate(p: Pos2, c: Pos2, deg: f32) -> Pos2 {
+    if deg == 0.0 {
+        return p;
+    }
+    // Exact quarter turns keep coordinates on whole pixels.
+    let (s, co) = match normalize_deg(deg) {
+        90.0 => (-1.0, 0.0),
+        180.0 => (0.0, -1.0),
+        -90.0 => (1.0, 0.0),
+        _ => (-deg.to_radians()).sin_cos(),
+    };
+    let d = p - c;
+    c + vec2(d.x * co - d.y * s, d.x * s + d.y * co)
+}
+
+/// Wrap to (-180, 180].
+pub fn normalize_deg(d: f32) -> f32 {
+    let r = d.rem_euclid(360.0);
+    if r > 180.0 { r - 360.0 } else { r }
 }
 
 /// Absolute polyline approximating a vector node (16 steps per curve).
@@ -661,6 +720,28 @@ mod tests {
         assert_eq!(d.hit(0, pos2(50., 20.), 1.), None);
         d.set_rect(v, r(10., 10., 50., 0.));
         assert_eq!(d.node(v).points[1].p, pos2(50., 0.));
+    }
+
+    #[test]
+    fn rotation_hits_and_bounds() {
+        let mut d = Document::default();
+        let a = d.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 0., 100., 10.)));
+        d.rotate(a, 90.0, pos2(50., 5.));
+        let n = d.node(a);
+        assert_eq!(n.rotation, 90.0);
+        let b = n.aabb();
+        assert!((b.width() - 10.0).abs() < 0.01 && (b.height() - 100.0).abs() < 0.01, "{b:?}");
+        assert_eq!(d.hit(0, pos2(50., 40.), 0.), Some(a), "inside rotated box");
+        assert_eq!(d.hit(0, pos2(90., 5.), 0.), None, "outside rotated box");
+        // Counter-clockwise: the right end swings up.
+        let tr = n.corners()[1];
+        assert!(tr.y < -40.0, "{tr:?}");
+        // Groups re-hug rotated children and carry them around a pivot.
+        let g = d.group(&[a]).unwrap();
+        d.rotate(g, 90.0, pos2(50., 5.));
+        assert_eq!(d.node(a).rotation, 180.0);
+        assert_eq!(d.node(g).rotation, 0.0);
+        assert!((d.node(g).rect.width() - 100.0).abs() < 0.01);
     }
 
     #[test]

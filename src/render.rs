@@ -3,7 +3,7 @@
 use crate::doc::{Document, Kind, Node, NodeId, StrokeAlign};
 use egui::epaint::{Mesh, Vertex, WHITE_UV};
 use egui::{Color32, FontFamily, FontId, Painter, Pos2, Rect, Vec2, pos2};
-use lyon::math::{Angle, Box2D, point, vector};
+use lyon::math::{Angle, Box2D, Transform, point, vector};
 use lyon::path::builder::BorderRadii;
 use lyon::path::{Path, Winding};
 use lyon::tessellation::{
@@ -94,7 +94,16 @@ pub fn node_path(n: &Node, v: &View, grow: f32) -> Path {
             b.add_rounded_rectangle(&bx, &BorderRadii::new(rad), Winding::Positive);
         }
     }
-    b.build()
+    let path = b.build();
+    if n.rotation == 0.0 {
+        return path;
+    }
+    // Screen y points down, so a counter-clockwise turn is a negative angle.
+    let c = v.to_screen(n.rect.center());
+    let t = Transform::translation(-c.x, -c.y)
+        .then_rotate(Angle::degrees(-n.rotation))
+        .then_translate(vector(c.x, c.y));
+    path.transformed(&t)
 }
 
 fn to_mesh(geo: VertexBuffers<Pos2, u32>, color: Color32) -> Mesh {
@@ -138,7 +147,7 @@ fn draw_node(painter: &Painter, doc: &Document, id: NodeId, v: &View, alpha: f32
     if !n.visible {
         return;
     }
-    let screen = v.rect_to_screen(n.rect);
+    let screen = v.rect_to_screen(n.aabb());
     let a = alpha * n.opacity;
     if Some(id) != hide && painter.clip_rect().intersects(screen.expand(n.stroke_width * v.zoom + 2.0)) {
         draw_content(painter, n, v, a);
@@ -167,7 +176,8 @@ fn draw_content(painter: &Painter, n: &Node, v: &View, a: f32) {
                 FontId::new(n.font_size * v.zoom, font_family(n.font_weight)),
                 c.gamma_multiply(a),
             );
-            painter.galley(v.to_screen(n.rect.min), galley, c);
+            let pos = v.to_screen(crate::doc::rotate(n.rect.min, n.rect.center(), n.rotation));
+            painter.add(egui::epaint::TextShape::new(pos, galley, c).with_angle(-n.rotation.to_radians()));
         }
         return;
     }

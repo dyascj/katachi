@@ -30,17 +30,28 @@ pub enum Align {
 pub enum Drag {
     Pan,
     Move { base: Document, start: Pos2 },
-    Resize { base: Document, handle: (i8, i8), bounds: Rect },
+    /// `bounds` is the unrotated selection frame, `rot` its rotation (single layer only).
+    Resize { base: Document, handle: (i8, i8), bounds: Rect, rot: f32 },
+    Rotate { base: Document, center: Pos2, start_angle: f32, start_rot: f32, deg: f32 },
     Create { base: Document, start: Pos2, id: NodeId },
     Marquee { start: Pos2, base_sel: Vec<NodeId> },
     PenHandle,
+}
+
+/// What the pointer grabbed on the selection frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Grip {
+    /// Resize: -1 = min edge, 1 = max edge, 0 = untouched axis.
+    Resize(i8, i8),
+    /// Just outside a corner.
+    Rotate,
 }
 
 /// Mouse-down state for the move tool, resolved into a click or a drag.
 pub struct Press {
     pub world: Pos2,
     pub target: Option<NodeId>,
-    pub handle: Option<(i8, i8)>,
+    pub handle: Option<Grip>,
     /// Shift-click on an already-selected node: deselect it if no drag follows.
     pub toggle_off: bool,
 }
@@ -422,7 +433,7 @@ impl App {
                 if ex.contains(&id) || !n.visible || n.locked {
                     continue;
                 }
-                if n.kind == Kind::Frame && n.rect.contains(p) {
+                if n.kind == Kind::Frame && n.rect.contains(n.to_local(p)) {
                     return walk(app, &n.children, p, ex).or(Some(id));
                 }
                 if n.kind == Kind::Group

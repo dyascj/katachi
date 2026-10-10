@@ -633,7 +633,13 @@ impl App {
             .find(|a| self.doc.node(*a).kind == Kind::Frame)
             .map(|f| self.doc.node(f).rect.min.to_vec2())
             .unwrap_or_default();
-        let (mut x, mut y, mut w, mut h) = (b.min.x - origin.x, b.min.y - origin.y, b.width(), b.height());
+        // A lone rotated layer reports its own size and its rotated top-left corner, like Figma.
+        let single = (roots.len() == 1).then(|| self.doc.node(first).clone()).filter(|n| n.rotation != 0.0);
+        let (anchor, size) = match &single {
+            Some(n) => (n.corners()[0], n.rect.size()),
+            None => (b.min, b.size()),
+        };
+        let (mut x, mut y, mut w, mut h) = (anchor.x - origin.x, anchor.y - origin.y, size.x, size.y);
         let half = (ui.available_width() - 8.0) / 2.0;
         let field = |ui: &mut Ui, v: &mut f32, prefix: &str, min: f32| {
             ui.add_sized([half, 22.0], DragValue::new(v).prefix(prefix).speed(1.0).range(min..=1e6).custom_formatter(|v, _| num(v as f32)))
@@ -650,13 +656,20 @@ impl App {
         });
         if moved {
             self.begin_edit();
-            let d = vec2(x + origin.x, y + origin.y) - b.min.to_vec2();
+            let d = vec2(x + origin.x, y + origin.y) - anchor.to_vec2();
             for &id in &roots {
                 self.doc.translate(id, d);
             }
             self.doc.fit_groups();
         }
-        if sized && (b.width() > 0.0 || b.height() > 0.0) {
+        if let (true, Some(n)) = (sized, &single) {
+            // Grow from the rotated top-left corner.
+            self.begin_edit();
+            let local = Rect::from_min_size(n.rect.min, vec2(w, h));
+            let c = crate::doc::rotate(local.center(), n.rect.center(), n.rotation);
+            self.doc.set_rect(n.id, Rect::from_center_size(c, local.size()));
+            self.doc.fit_groups();
+        } else if sized && (b.width() > 0.0 || b.height() > 0.0) {
             self.begin_edit();
             let nb = Rect::from_min_size(b.min, vec2(w, h));
             let sx = if b.width() > 0.0 { w / b.width() } else { 1.0 };
@@ -668,6 +681,20 @@ impl App {
             }
             self.doc.fit_groups();
         }
+        // Rotation: a lone layer turns around its center, several turn around their shared center.
+        let mut rot = if roots.len() == 1 { self.doc.node(first).rotation } else { 0.0 };
+        let old = rot;
+        ui.horizontal(|ui| {
+            ui.label("Rotation");
+            if ui.add(DragValue::new(&mut rot).speed(0.5).suffix("°").custom_formatter(|v, _| num(v as f32))).changed() {
+                self.begin_edit();
+                let c = self.doc.bounds(&roots).center();
+                for &id in &roots {
+                    let pivot = if roots.len() == 1 { self.doc.node(id).rect.center() } else { c };
+                    self.doc.rotate(id, rot - old, pivot);
+                }
+            }
+        });
         let n = self.doc.node(first).clone();
         if matches!(n.kind, Kind::Rectangle | Kind::Frame) {
             let mut r = n.radius;
