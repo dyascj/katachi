@@ -870,6 +870,12 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
             n.clip = v["clipsContent"].as_bool().unwrap_or(true);
         }
     }
+    // Resizing stops hugging on that axis, as in Figma (explicit sizing below still wins).
+    for (k, axis) in [("width", 0), ("height", 1)] {
+        if changed(k) && n.sizing[axis] == Sizing::Hug && n.kind != Kind::Text {
+            n.sizing[axis] = Sizing::Fixed;
+        }
+    }
     // Sizing: the frame's own hugging, then the older child terms, then layoutSizing* (most explicit) last.
     let (ma, ca) = if n.layout.mode == LayoutMode::Horizontal { (0, 1) } else { (1, 0) };
     if n.kind.is_frame() && n.layout.mode != LayoutMode::None {
@@ -1215,6 +1221,17 @@ pub fn apply(doc: &mut Document, out: &Value) -> HashMap<String, NodeId> {
                 doc.node_mut(inst).kind = Kind::Instance;
                 doc.node_mut(inst).component = Some(c);
                 doc.sync_instance(inst);
+                // A size the script gave the new instance (resize) wins over the component's.
+                let cur = doc.node(inst).rect;
+                let want = vec2(f(v, "width").map_or(cur.width(), |w| w as f32), f(v, "height").map_or(cur.height(), |h| h as f32));
+                if (want - cur.size()).length() > 1e-3 {
+                    for axis in 0..2 {
+                        if want[axis] != cur.size()[axis] && doc.node(inst).sizing[axis] == Sizing::Hug {
+                            doc.node_mut(inst).sizing[axis] = Sizing::Fixed;
+                        }
+                    }
+                    doc.set_rect(inst, Rect::from_min_size(cur.min, want));
+                }
             }
             Some(c) if doc.node(inst).component != Some(c) => doc.swap_component(inst, c),
             _ => {}

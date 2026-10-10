@@ -305,6 +305,7 @@ mod tests {
             const inst = btn.createInstance(); card.appendChild(inst);
             inst.setProperties({ Label: "Save" });
             const inst2 = btn.createInstance(); card.appendChild(inst2);
+            const big = btn.createInstance(); big.resize(300, 60); big.layoutPositioning = "ABSOLUTE";
             inst2.children[0].fills = [figma.util.solidPaint("#ff0000")];
 
             const a = figma.createComponent(); a.name = "State=Default";
@@ -313,7 +314,7 @@ mod tests {
             set.name = "Chip";
             const chip = a.createInstance();
             chip.setProperties({ State: "Hover" });
-            return { btn, card, inst, inst2, set, chip };
+            return { btn, card, inst, inst2, set, chip, big };
         "##;
         let out = run(&mut d, 0, &[], code).unwrap();
         let r: serde_json::Value = serde_json::from_str(out.result.as_deref().unwrap()).unwrap();
@@ -347,6 +348,7 @@ mod tests {
         let inst2 = d.node(id("inst2"));
         assert_eq!(d.node(inst2.children[0]).fills[0].color, Rgba::rgb(255, 0, 0), "override kept");
         assert_eq!(d.node(inst2.children[0]).text, "Button");
+        assert_eq!(d.node(id("big")).rect.size(), vec2(300., 60.), "a new instance keeps the size it was given");
         // Variants.
         let set = d.node(id("set"));
         assert_eq!((set.kind, set.name.as_str(), set.children.len()), (Kind::ComponentSet, "Chip", 2));
