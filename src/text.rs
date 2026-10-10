@@ -271,7 +271,7 @@ pub fn list_markers(n: &Node) -> Vec<String> {
 /// Shift each row for list indents and horizontal alignment within the box (egui lays out left-aligned).
 pub fn align_rows(galley: Arc<Galley>, n: &Node, zoom: f32) -> Arc<Galley> {
     let lists = n.lists.iter().any(|l| l.kind != ListKind::Plain);
-    if !lists && (n.text_align == TextAlign::Left || n.text_align == TextAlign::Justify) {
+    if !lists && n.paragraph_spacing == 0.0 && (n.text_align == TextAlign::Left || n.text_align == TextAlign::Justify) {
         return galley;
     }
     let paras = row_paragraphs(&galley);
@@ -286,10 +286,13 @@ pub fn align_rows(galley: Arc<Galley>, n: &Node, zoom: f32) -> Arc<Galley> {
         _ => 0.0,
     };
     let mut g = (*galley).clone();
-    for (row, i) in g.rows.iter_mut().zip(&indents) {
+    let gap = n.paragraph_spacing * zoom;
+    for ((row, i), p) in g.rows.iter_mut().zip(&indents).zip(&paras) {
         row.pos.x = i + (width - i - row.size.x) * f;
+        row.pos.y += gap * *p as f32;
     }
-    g.rect = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(width, g.rect.height()));
+    let extra = gap * paras.last().copied().unwrap_or(0) as f32;
+    g.rect = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(width, g.rect.height() + extra));
     Arc::new(g)
 }
 
@@ -325,7 +328,7 @@ pub fn marker_galley(painter: &egui::Painter, n: &Node, marker: &str, zoom: f32,
 pub fn draw_offset(n: &Node, rows: usize) -> Vec2 {
     let pitch = line_pitch(n);
     let half_leading = if n.line_height == LineHeight::Auto { 0.0 } else { (pitch - n.font_size * NATURAL_LINE) / 2.0 };
-    let text_h = pitch * rows.max(1) as f32;
+    let text_h = pitch * rows.max(1) as f32 + n.paragraph_spacing * n.text.matches('\n').count() as f32;
     let v = if n.text_sizing == TextSizing::Fixed {
         let f = match n.text_valign {
             VAlign::Top => 0.0,
@@ -359,6 +362,6 @@ pub fn layout(painter: &egui::Painter, n: &Node, zoom: f32, color: Color32) -> (
     let width = galley.rows.iter().zip(row_paragraphs(&galley)).map(|(r, p)| r.size.x + list_indent(n, p) * zoom).fold(0.0, f32::max) / zoom;
     // Mixed sizes make rows taller than the base pitch; take whichever is larger.
     let laid_out = if n.spans.is_empty() { 0.0 } else { galley.size().y / zoom };
-    let size = vec2(width, (line_pitch(n) * rows.max(1) as f32).max(laid_out));
+    let size = vec2(width, (line_pitch(n) * rows.max(1) as f32).max(laid_out) + n.paragraph_spacing * n.text.matches('\n').count() as f32);
     (align_rows(galley, n, zoom), size, lines)
 }

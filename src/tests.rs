@@ -840,6 +840,25 @@ fn lists_indent_number_and_export() {
 }
 
 #[test]
+fn paragraph_spacing_separates_paragraphs_only() {
+    use crate::doc::{LineHeight, TextSizing};
+    let mut h = harness();
+    let mut n = Node::new(Kind::Text, r(0., 0., 400., 10.));
+    n.text = "First paragraph\nSecond".into();
+    n.font_size = 10.0;
+    n.text_sizing = TextSizing::AutoHeight;
+    n.line_height = LineHeight::Px(20.0);
+    n.paragraph_spacing = 8.0;
+    let id = h.state_mut().doc.insert(0, None, None, n);
+    h.run_steps(3);
+    assert_eq!(h.state().doc.node(id).rect.height(), 48.0, "two lines plus one paragraph gap");
+    let svg = crate::export::to_svg(&h.state().doc, &[id]);
+    let ys: Vec<f32> = svg.match_indices(" y=\"").map(|(i, _)| svg[i + 4..].split('"').next().unwrap().parse().unwrap()).collect();
+    assert_eq!(ys.len(), 2, "{svg}");
+    assert_eq!(ys[1] - ys[0], 28.0);
+}
+
+#[test]
 fn truncated_text_stops_at_max_lines_with_ellipsis() {
     use crate::doc::{LineHeight, TextSizing};
     let mut h = harness();

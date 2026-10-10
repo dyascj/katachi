@@ -2208,6 +2208,9 @@ impl App {
                     t.decoration = if on { Decoration::None } else { d };
                 }
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                num_field(ui, &mut t.paragraph_spacing, "¶", 0.0, 64.0);
+            });
         });
         ui.horizontal(|ui| {
             for (kind, label, tip) in [(crate::doc::ListKind::Bullet, " • ", "Bulleted list (⇧⌘8)"), (crate::doc::ListKind::Number, " 1. ", "Numbered list (⇧⌘7)")] {
@@ -2235,6 +2238,7 @@ impl App {
             || t.decoration != n.decoration
             || t.text_case != n.text_case
             || t.truncate != n.truncate
+            || t.paragraph_spacing != n.paragraph_spacing
             || t.max_lines != n.max_lines;
         // With characters selected in the editor, changes style just that range (rich text).
         if changed && self.text_selection(ui.ctx()).is_some() {
@@ -2267,6 +2271,7 @@ impl App {
                 d.decoration = t.decoration;
                 d.text_case = t.text_case;
                 d.truncate = t.truncate;
+                d.paragraph_spacing = t.paragraph_spacing.max(0.0);
                 d.max_lines = t.max_lines;
             }
         }

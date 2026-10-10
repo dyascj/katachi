@@ -771,6 +771,9 @@ fn text_props(n: &mut Node, v: &Value) {
     if let Some(sz) = v.f("fontSize") {
         n.font_size = sz;
     }
+    if let Some(ps) = v.f("paragraphSpacing") {
+        n.paragraph_spacing = ps;
+    }
     if let Some(lh) = v.get("lineHeight") {
         let val = lh.f("value").unwrap_or(100.0);
         n.line_height = match lh.s("units") {

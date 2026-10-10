@@ -376,7 +376,7 @@ impl Svg<'_> {
                     let markers = crate::text::list_markers(n);
                     let (mut para, mut first) = (0, true);
                     for (i, line) in lines.iter().enumerate() {
-                        let y = top + n.font_size * crate::text::ASCENT + pitch * i as f32;
+                        let y = top + n.font_size * crate::text::ASCENT + pitch * i as f32 + n.paragraph_spacing * para as f32;
                         let indent = crate::text::list_indent(n, para);
                         let lx = if anchor == "start" { x + indent } else { x };
                         if first && let Some(m) = markers.get(para).filter(|m| !m.is_empty()) {
