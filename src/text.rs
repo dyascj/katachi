@@ -1,6 +1,6 @@
 //! Text layout shared by the canvas, the in-place editor, and export; system font loading.
 
-use crate::doc::{Decoration, LineHeight, Node, TextAlign, TextCase, TextSizing, VAlign};
+use crate::doc::{Decoration, LineHeight, ListKind, Node, TextAlign, TextCase, TextSizing, VAlign};
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontFamily, FontId, Galley, Stroke, Vec2, vec2};
 use resvg::usvg::fontdb;
@@ -208,9 +208,11 @@ pub fn job(ctx: &egui::Context, n: &Node, text: &str, zoom: f32, color: Color32)
             job.append(&apply_case(&piece, n.text_case), 0.0, format(&st));
         }
     }
+    // List rows shift right by their indent afterwards, so they wrap that much narrower.
+    let indent = (0..n.lists.len()).map(|p| list_indent(n, p)).fold(0.0, f32::max);
     job.wrap.max_width = match n.text_sizing {
         TextSizing::AutoWidth => f32::INFINITY,
-        _ => (n.rect.width() * zoom).max(1.0),
+        _ => ((n.rect.width() - indent) * zoom).max(1.0),
     };
     if n.truncate {
         let fit = if n.text_sizing == TextSizing::Fixed { (n.rect.height() / line_pitch(n)).floor().max(1.0) as usize } else { usize::MAX };
@@ -220,22 +222,102 @@ pub fn job(ctx: &egui::Context, n: &Node, text: &str, zoom: f32, color: Color32)
     job
 }
 
-/// Shift each row for horizontal alignment within the box (egui lays out left-aligned).
+/// Hanging indent of paragraph `p` (world units): room for the marker, per nesting level.
+pub fn list_indent(n: &Node, p: usize) -> f32 {
+    match n.lists.get(p) {
+        Some(l) if l.kind != ListKind::Plain => n.font_size * 1.5 * (l.indent as f32 + 1.0),
+        _ => 0.0,
+    }
+}
+
+/// Paragraph index of each laid-out row.
+pub fn row_paragraphs(galley: &Galley) -> Vec<usize> {
+    let mut p = 0;
+    galley
+        .rows
+        .iter()
+        .map(|r| {
+            let me = p;
+            if r.ends_with_newline {
+                p += 1;
+            }
+            me
+        })
+        .collect()
+}
+
+/// Marker text per paragraph ("" for plain): bullets, or numbers counted per level.
+pub fn list_markers(n: &Node) -> Vec<String> {
+    let mut counts = [0usize; 8];
+    n.lists
+        .iter()
+        .map(|l| match l.kind {
+            ListKind::Plain => {
+                counts = [0; 8];
+                String::new()
+            }
+            ListKind::Bullet => "•".into(),
+            ListKind::Number => {
+                let lvl = (l.indent as usize).min(7);
+                counts[lvl] += 1;
+                counts[lvl + 1..].fill(0);
+                let k = counts[lvl];
+                if lvl % 2 == 1 { format!("{}.", (b'a' + ((k - 1) % 26) as u8) as char) } else { format!("{k}.") }
+            }
+        })
+        .collect()
+}
+
+/// Shift each row for list indents and horizontal alignment within the box (egui lays out left-aligned).
 pub fn align_rows(galley: Arc<Galley>, n: &Node, zoom: f32) -> Arc<Galley> {
-    if n.text_align == TextAlign::Left || n.text_align == TextAlign::Justify {
+    let lists = n.lists.iter().any(|l| l.kind != ListKind::Plain);
+    if !lists && (n.text_align == TextAlign::Left || n.text_align == TextAlign::Justify) {
         return galley;
     }
+    let paras = row_paragraphs(&galley);
+    let indents: Vec<f32> = paras.iter().map(|&p| list_indent(n, p) * zoom).collect();
     let width = match n.text_sizing {
-        TextSizing::AutoWidth => galley.size().x,
+        TextSizing::AutoWidth => galley.rows.iter().zip(&indents).map(|(r, i)| r.size.x + i).fold(0.0, f32::max),
         _ => n.rect.width() * zoom,
     };
-    let f = if n.text_align == TextAlign::Center { 0.5 } else { 1.0 };
+    let f = match n.text_align {
+        TextAlign::Center => 0.5,
+        TextAlign::Right => 1.0,
+        _ => 0.0,
+    };
     let mut g = (*galley).clone();
-    for row in &mut g.rows {
-        row.pos.x = (width - row.size.x) * f;
+    for (row, i) in g.rows.iter_mut().zip(&indents) {
+        row.pos.x = i + (width - i - row.size.x) * f;
     }
     g.rect = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(width, g.rect.height()));
     Arc::new(g)
+}
+
+/// List markers to paint: each paragraph's first row gets one, left of its indent.
+/// Returns (top-left relative to the galley origin at `zoom`, marker).
+pub fn markers(n: &Node, galley: &Galley, zoom: f32) -> Vec<(Vec2, String)> {
+    if n.lists.is_empty() {
+        return vec![];
+    }
+    let names = list_markers(n);
+    let mut out = vec![];
+    let mut prev = usize::MAX;
+    for (row, p) in galley.rows.iter().zip(row_paragraphs(galley)) {
+        if p != prev && let Some(m) = names.get(p).filter(|m| !m.is_empty()) {
+            out.push((vec2(row.pos.x - n.font_size * 1.2 * zoom, row.pos.y), m.clone()));
+        }
+        prev = p;
+    }
+    out
+}
+
+/// A galley for a list marker in the paragraph's base style.
+pub fn marker_galley(painter: &egui::Painter, n: &Node, marker: &str, zoom: f32, color: Color32) -> Arc<Galley> {
+    let mut m = n.clone();
+    m.spans.clear();
+    m.lists.clear();
+    m.text_sizing = TextSizing::AutoWidth;
+    painter.layout_job(job(painter.ctx(), &m, marker, zoom, color))
 }
 
 /// Offset (world units) from the box's top-left to where the galley is drawn:
@@ -274,7 +356,7 @@ pub fn layout(painter: &egui::Painter, n: &Node, zoom: f32, color: Color32) -> (
             l
         })
         .collect();
-    let width = galley.rows.iter().map(|r| r.size.x).fold(0.0, f32::max) / zoom;
+    let width = galley.rows.iter().zip(row_paragraphs(&galley)).map(|(r, p)| r.size.x + list_indent(n, p) * zoom).fold(0.0, f32::max) / zoom;
     // Mixed sizes make rows taller than the base pitch; take whichever is larger.
     let laid_out = if n.spans.is_empty() { 0.0 } else { galley.size().y / zoom };
     let size = vec2(width, (line_pitch(n) * rows.max(1) as f32).max(laid_out));

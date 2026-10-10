@@ -444,6 +444,46 @@ pub fn shift_spans(spans: &[TextSpan], old: &str, new: &str) -> Vec<TextSpan> {
         .collect()
 }
 
+/// Paragraphs after an edit: list formatting follows its paragraph, and new
+/// paragraphs typed inside a list item continue the list.
+pub fn shift_lists(lists: &[ListLine], old: &str, new: &str) -> Vec<ListLine> {
+    if lists.is_empty() || old == new {
+        return lists.to_vec();
+    }
+    let (o, n): (Vec<char>, Vec<char>) = (old.chars().collect(), new.chars().collect());
+    let prefix = o.iter().zip(&n).take_while(|(a, b)| a == b).count();
+    let max_suffix = o.len().min(n.len()) - prefix;
+    let suffix = o.iter().rev().zip(n.iter().rev()).take(max_suffix).take_while(|(a, b)| a == b).count();
+    let nl = |s: &[char]| s.iter().filter(|c| **c == '\n').count();
+    let p = nl(&o[..prefix]);
+    let removed = nl(&o[prefix..o.len() - suffix]);
+    let added = nl(&n[prefix..n.len() - suffix]);
+    let mut all = lists.to_vec();
+    all.resize(nl(&o) + 1, ListLine::default());
+    let mut out: Vec<ListLine> = all[..=p].to_vec();
+    out.extend(std::iter::repeat_n(all[p], added));
+    out.extend_from_slice(&all[(p + 1 + removed).min(all.len())..]);
+    while out.last().is_some_and(|l| l.kind == ListKind::Plain) {
+        out.pop();
+    }
+    out
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ListKind {
+    #[default]
+    Plain,
+    Bullet,
+    Number,
+}
+
+/// One paragraph's list formatting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListLine {
+    pub kind: ListKind,
+    pub indent: u8,
+}
+
 pub type StyleId = u64;
 
 /// Typography captured by a text style.
@@ -983,6 +1023,8 @@ pub struct Node {
     pub max_lines: u32,
     /// Styled character ranges (rich text).
     pub spans: Vec<TextSpan>,
+    /// List formatting per paragraph (missing paragraphs are plain).
+    pub lists: Vec<ListLine>,
     /// Wrapped lines from the last layout, used by export.
     #[serde(skip)]
     pub lines: Vec<String>,
@@ -1055,6 +1097,7 @@ impl Default for Node {
             truncate: false,
             max_lines: 0,
             spans: vec![],
+            lists: vec![],
             lines: vec![],
             expanded: true,
         }
@@ -2327,7 +2370,7 @@ fn merge_from(e: &mut Node, src: &Node) {
         name, visible, opacity, fills, strokes, stroke_width, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, constraints, absolute,
         paths, even_odd, text, font_size, font_weight, font_family, text_sizing, text_align, text_valign, line_height, letter_spacing,
         decoration, text_case, truncate, max_lines, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, fill_style,
-        stroke_style, text_style, effect_style, prop_bind, is_mask, blend, bindings, modes, spans
+        stroke_style, text_style, effect_style, prop_bind, is_mask, blend, bindings, modes, spans, lists
     );
     e.synced = Some(Box::new(Node { children: vec![], synced: None, ..src.clone() }));
 }
@@ -2895,6 +2938,11 @@ mod tests {
         let trimmed = shift_spans(&s1, "Hello world", "Hello wd");
         assert_eq!((trimmed[0].start, trimmed[0].end), (6, 8));
         assert!(shift_spans(&s1, "Hello world", "Hello ").is_empty(), "span deleted with its text");
+        let b = ListLine { kind: ListKind::Bullet, indent: 0 };
+        let l = vec![ListLine::default(), b];
+        assert_eq!(shift_lists(&l, "Title\nOne", "Title\nOne\nTwo"), vec![ListLine::default(), b, b], "enter continues the list");
+        assert_eq!(shift_lists(&l, "Title\nOne", "Intro\nTitle\nOne"), vec![ListLine::default(), ListLine::default(), b], "earlier paragraphs shift it");
+        assert!(shift_lists(&l, "Title\nOne", "TitleOne").is_empty(), "joined into the plain paragraph");
     }
 
     #[test]

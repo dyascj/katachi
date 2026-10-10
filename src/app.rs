@@ -1507,6 +1507,8 @@ impl App {
             (true, false, Key::O) => return self.request_open(),
             (true, false, Key::N) => return self.request_new(),
             (true, true, Key::E) => return self.export(),
+            (true, true, Key::Num7) => return self.toggle_list(ctx, crate::doc::ListKind::Number),
+            (true, true, Key::Num8) => return self.toggle_list(ctx, crate::doc::ListKind::Bullet),
             _ => {}
         }
         if key == Key::Escape && self.editing_text.is_some() {

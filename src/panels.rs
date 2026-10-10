@@ -2094,6 +2094,15 @@ impl App {
                     t.decoration = if on { Decoration::None } else { d };
                 }
             }
+        });
+        ui.horizontal(|ui| {
+            for (kind, label, tip) in [(crate::doc::ListKind::Bullet, " • ", "Bulleted list (⇧⌘8)"), (crate::doc::ListKind::Number, " 1. ", "Numbered list (⇧⌘7)")] {
+                let on = !n.lists.is_empty() && n.lists.iter().all(|l| l.kind == kind);
+                if ui.selectable_label(on, label).on_hover_text(tip).clicked() {
+                    self.toggle_list(ui.ctx(), kind);
+                    return;
+                }
+            }
             ui.add_space(6.0);
             ui.checkbox(&mut t.truncate, "Truncate");
             if t.truncate {

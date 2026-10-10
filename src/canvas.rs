@@ -1401,6 +1401,10 @@ impl App {
             let g = ui.painter().layout_job(crate::text::job(ui.ctx(), &n, buf.as_str(), zoom, color));
             crate::text::align_rows(g, &n, zoom)
         };
+        for (off, m) in crate::text::markers(&n, &galley, zoom) {
+            let g = crate::text::marker_galley(painter, &n, &m, zoom, color);
+            painter.galley(self.view.to_screen(local) + off, g, color);
+        }
         let out = egui::Area::new(egui::Id::new("canvas-text-edit"))
             .fixed_pos(self.view.to_screen(local))
             .order(egui::Order::Foreground)
@@ -1423,6 +1427,7 @@ impl App {
         if text != n.text {
             let node = self.doc.node_mut(id);
             node.spans = crate::doc::shift_spans(&node.spans, &n.text, &text);
+            node.lists = crate::doc::shift_lists(&node.lists, &n.text, &text);
             node.text = text;
             self.dirty = true;
         }
@@ -1435,6 +1440,37 @@ impl App {
         let r = state.cursor.char_range()?;
         let (a, b) = (r.primary.index.0, r.secondary.index.0);
         (a != b).then(|| (a.min(b), a.max(b)))
+    }
+
+    /// Toggle a list on the paragraphs under the editor's cursor, or every paragraph of the selected text layers.
+    pub fn toggle_list(&mut self, ctx: &egui::Context, kind: crate::doc::ListKind) {
+        use crate::doc::{ListKind, ListLine};
+        let ids: Vec<NodeId> = match self.editing_text {
+            Some(id) => vec![id],
+            None => self.sel.iter().copied().filter(|&i| self.doc.node(i).kind == Kind::Text).collect(),
+        };
+        if ids.is_empty() {
+            return;
+        }
+        let range = self.editing_text.and_then(|id| {
+            let r = egui::TextEdit::load_state(ctx, egui::Id::new(TEXT_EDIT_ID))?.cursor.char_range()?;
+            let para = |i: usize| self.doc.node(id).text.chars().take(i).filter(|c| *c == '\n').count();
+            Some((para(r.primary.index.0.min(r.secondary.index.0)), para(r.primary.index.0.max(r.secondary.index.0))))
+        });
+        self.checkpoint();
+        for id in ids {
+            let n = self.doc.node_mut(id);
+            let count = n.text.matches('\n').count() + 1;
+            let (a, b) = range.unwrap_or((0, count - 1));
+            n.lists.resize(count.max(n.lists.len()), ListLine::default());
+            let on = (a..=b).all(|p| n.lists[p].kind == kind);
+            for l in &mut n.lists[a..=b] {
+                l.kind = if on { ListKind::Plain } else { kind };
+            }
+            while n.lists.last().is_some_and(|l| l.kind == ListKind::Plain) {
+                n.lists.pop();
+            }
+        }
     }
 
     /// Restyle the selected characters of the text being edited. Returns whether it applied.
@@ -1575,6 +1611,7 @@ fn text_key(ctx: &egui::Context, n: &Node) -> u64 {
     (n.font_size.to_bits(), n.letter_spacing.to_bits(), n.text_sizing as u8, n.text_case as u8).hash(&mut h);
     format!("{:?}", n.line_height).hash(&mut h);
     (n.truncate, n.max_lines).hash(&mut h);
+    format!("{:?}", n.lists).hash(&mut h);
     if n.truncate && n.text_sizing == crate::doc::TextSizing::Fixed {
         n.rect.height().to_bits().hash(&mut h);
     }

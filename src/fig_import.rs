@@ -59,7 +59,7 @@ pub fn read(data: &[u8]) -> Result<FigFile, String> {
 
 // ---------- mapping onto Katachi ----------
 
-use crate::doc::{Bindable, CompProp, PropTarget, PropValue, VarId, VarValue, 
+use crate::doc::{Bindable, ListKind, ListLine, CompProp, PropTarget, PropValue, VarId, VarValue, 
     AutoLayout, AxisAlign, Cap, Constraint, Decoration, Document, EffectKind, Join, Kind, LayoutMode, LineHeight, Node, NodeId, Page, Paint,
     PaintKind, PathPoint, Rgba, ScaleMode, Shadow, StrokeAlign, SubPath, TextAlign, TextCase, TextSizing, VAlign,
 };
@@ -726,11 +726,32 @@ fn import_node(
 
 /// Text properties present on `v` (a node or an instance override).
 fn text_props(n: &mut Node, v: &Value) {
-    if let Some(t) = v.get("textData").and_then(|t| t.s("characters")) {
-        if t != n.text {
-            n.spans.clear();
+    if let Some(td) = v.get("textData") {
+        if let Some(t) = td.s("characters") {
+            if t != n.text {
+                n.spans.clear();
+            }
+            n.text = t.to_string();
         }
-        n.text = t.to_string();
+        if !td.arr("lines").is_empty() {
+            n.lists = td
+                .arr("lines")
+                .iter()
+                .map(|l| {
+                    let kind = match l.s("lineType") {
+                        Some("ORDERED_LIST") => ListKind::Number,
+                        Some("UNORDERED_LIST") => ListKind::Bullet,
+                        _ => ListKind::Plain,
+                    };
+                    // List levels count from 1; plain paragraphs sit at 0.
+                    let indent = if kind == ListKind::Plain { 0 } else { l.u("indentationLevel").unwrap_or(1).saturating_sub(1) as u8 };
+                    ListLine { kind, indent }
+                })
+                .collect();
+            while n.lists.last().is_some_and(|l| l.kind == ListKind::Plain) {
+                n.lists.pop();
+            }
+        }
     }
     if let Some(f) = v.get("fontName") {
         n.font_family = f.s("family").unwrap_or("Inter").to_string();

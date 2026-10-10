@@ -703,6 +703,11 @@ fn draw_content(painter: &Painter, sc: &mut Scene, n: &Node, a: f32) {
         if let Some(c) = n.first_fill().map(|c| c.to32().gamma_multiply(a)) {
             let (galley, _, _) = crate::text::layout(painter, n, v.zoom, c);
             let local = n.rect.min + crate::text::draw_offset(n, galley.rows.len());
+            for (off, m) in crate::text::markers(n, &galley, v.zoom) {
+                let g = crate::text::marker_galley(painter, n, &m, v.zoom, c);
+                let pos = v.to_screen(crate::doc::rotate(local + off / v.zoom, n.rect.center(), n.rotation));
+                painter.add(egui::epaint::TextShape::new(pos, g, c).with_angle(-n.rotation.to_radians()));
+            }
             let pos = v.to_screen(crate::doc::rotate(local, n.rect.center(), n.rotation));
             painter.add(egui::epaint::TextShape::new(pos, galley, c).with_angle(-n.rotation.to_radians()));
         }

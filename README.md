@@ -73,7 +73,7 @@ GitHub Actions. Building from source needs Rust 1.92 or newer.
 
 **Handoff**
 - Dev Mode (Shift D) with CSS, SwiftUI, and Jetpack Compose code, colors, and type
-- Rich text: mixed weights, sizes, colors, and italics within one text layer
+- Rich text: mixed weights, sizes, colors, and italics within one text layer; bulleted and numbered lists (Shift Cmd 8, Shift Cmd 7); truncation with max lines
 
 **Files**
 - Open Figma `.fig` files (Main menu > Open, or drop one on the canvas): pages, frames, sections, components, component sets, instances with overrides and component properties, variables and modes, vectors, text, images, effects, auto layout, and constraints
@@ -119,7 +119,6 @@ GitHub Actions. Building from source needs Rust 1.92 or newer.
 ## Roadmap
 
 - Plugin UIs (`figma.showUI`) and the rest of the plugin API
-- Lists in text
 
 ## Development
 

@@ -810,6 +810,35 @@ fn text_wraps_aligns_and_spaces_lines() {
 }
 
 #[test]
+fn lists_indent_number_and_export() {
+    use crate::doc::{ListKind, ListLine};
+    let mut h = harness();
+    let mut n = Node::new(Kind::Text, r(0., 0., 10., 10.));
+    n.text = "Steps\nOne\nTwo".into();
+    n.font_size = 10.0;
+    let plain = Node { lists: vec![], ..n.clone() };
+    let id = h.state_mut().doc.insert(0, None, None, n);
+    let p = h.state_mut().doc.insert(0, None, None, plain);
+    h.state_mut().sel = vec![id];
+    h.run_steps(2);
+    // Shift Cmd 7 numbers every paragraph of the selected layer.
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::Num7);
+    h.run_steps(2);
+    let t = h.state().doc.node(id).clone();
+    assert_eq!(t.lists, vec![ListLine { kind: ListKind::Number, indent: 0 }; 3]);
+    assert_eq!(crate::text::list_markers(&t), vec!["1.", "2.", "3."]);
+    assert!((t.rect.width() - h.state().doc.node(p).rect.width() - 15.0).abs() < 0.5, "auto width grows by the indent");
+    let svg = crate::export::to_svg(&h.state().doc, &[id]);
+    assert!(svg.contains(">2.</tspan>") && svg.contains(r#"x="15""#), "{svg}");
+    // Undo restores plain text; a mixed list numbers only its own items.
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert!(h.state().doc.node(id).lists.is_empty());
+    let n = h.state_mut().doc.node_mut(id);
+    n.lists = vec![ListLine::default(), ListLine { kind: ListKind::Number, indent: 0 }, ListLine { kind: ListKind::Number, indent: 0 }];
+    assert_eq!(crate::text::list_markers(n), vec!["", "1.", "2."]);
+}
+
+#[test]
 fn truncated_text_stops_at_max_lines_with_ellipsis() {
     use crate::doc::{LineHeight, TextSizing};
     let mut h = harness();
@@ -1260,3 +1289,4 @@ fn perf_file() {
     h.state_mut().doc.reflow();
     eprintln!("reflow {:?}", t.elapsed());
 }
+

@@ -373,8 +373,19 @@ impl Svg<'_> {
                     let pitch = crate::text::line_pitch(n);
                     let _ = write!(self.out, r#"<text {attrs} xml:space="preserve">"#);
                     let mut offset = 0;
+                    let markers = crate::text::list_markers(n);
+                    let (mut para, mut first) = (0, true);
                     for (i, line) in lines.iter().enumerate() {
                         let y = top + n.font_size * crate::text::ASCENT + pitch * i as f32;
+                        let indent = crate::text::list_indent(n, para);
+                        let lx = if anchor == "start" { x + indent } else { x };
+                        if first && let Some(m) = markers.get(para).filter(|m| !m.is_empty()) {
+                            let _ = write!(self.out, r#"<tspan x="{}" y="{y}">{}</tspan>"#, r.min.x + indent - n.font_size * 1.2, esc(m));
+                        }
+                        first = line.ends_with('\n');
+                        if first {
+                            para += 1;
+                        }
                         let body: Vec<char> = line.trim_end_matches('\n').chars().collect();
                         // Split the line at span boundaries so each run carries its own style.
                         let mut cuts = vec![0, body.len()];
@@ -415,7 +426,7 @@ impl Svg<'_> {
                                     _ => {}
                                 }
                             }
-                            let pos = if k == 0 { format!(r#" x="{x}" y="{y}""#) } else { String::new() };
+                            let pos = if k == 0 { format!(r#" x="{lx}" y="{y}""#) } else { String::new() };
                             let _ = write!(self.out, r#"<tspan{pos}{style}>{}</tspan>"#, esc(&text));
                         }
                         offset += line.chars().count();
