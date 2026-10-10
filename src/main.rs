@@ -49,6 +49,10 @@ fn main() -> eframe::Result {
             .with_min_inner_size([800.0, 500.0])
             // Always transparent so glass can switch on without a restart; opaque otherwise.
             .with_transparent(true)
+            // macOS: Katachi draws its own title bar (so it can be glass too); the traffic lights sit on it.
+            .with_fullsize_content_view(true)
+            .with_titlebar_shown(false)
+            .with_title_shown(false)
             .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon/icon.png")).unwrap_or_default()),
         multisampling: 4,
         ..Default::default()

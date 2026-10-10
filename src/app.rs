@@ -1371,6 +1371,30 @@ impl App {
         }
     }
 
+    /// macOS: the title bar strip under the traffic lights, in the panel color (glass when glass is on).
+    /// Drag to move the window, double-click to zoom.
+    fn title_bar(&mut self, ui: &mut egui::Ui) {
+        if !cfg!(target_os = "macos") || cfg!(test) {
+            return;
+        }
+        let ctx = ui.ctx().clone();
+        let fill = ui.visuals().panel_fill;
+        let line = crate::appearance::border(&ctx);
+        egui::Panel::top("titlebar").exact_size(28.0).resizable(false).show_separator_line(false).frame(egui::Frame::NONE.fill(fill)).show(ui, |ui| {
+            let r = ui.max_rect();
+            let resp = ui.interact(r, egui::Id::new("titlebar-drag"), egui::Sense::click_and_drag());
+            if resp.drag_started() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            if resp.double_clicked() {
+                let max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
+            }
+            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, &self.title, egui::FontId::proportional(12.5), crate::appearance::muted(&ctx));
+            ui.painter().hline(r.x_range(), r.max.y - 0.5, egui::Stroke::new(1.0, line));
+        });
+    }
+
     /// The appearance window, and keeping the window's desktop blur in step with glass.
     fn appearance_frame(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         if self.show_appearance {
@@ -2118,6 +2142,7 @@ impl eframe::App for App {
             return;
         }
         self.shortcuts(&ctx);
+        self.title_bar(ui);
         if !self.ui_hidden {
             self.left_panel(ui);
             self.right_panel(ui);
