@@ -46,6 +46,7 @@ pub enum Icon {
     Arrow,
     Pencil,
     Scale,
+    Play,
 }
 
 const SUBTLE: Color32 = Color32::from_rgb(0xF5, 0xF5, 0xF5);
@@ -284,6 +285,9 @@ pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
             p.line_segment([at(-1., 1.), at(6., -6.)], s);
             p.line_segment([at(6., -6.), at(2., -6.)], s);
             p.line_segment([at(6., -6.), at(6., -2.)], s);
+        }
+        Icon::Play => {
+            p.add(Shape::convex_polygon(vec![at(-3.5, -5.), at(5., 0.), at(-3.5, 5.)], color, Stroke::NONE));
         }
         Icon::Boolean => {
             p.rect_stroke(Rect::from_min_size(at(-6., -6.), vec2(8., 8.)), 1.0, s, StrokeKind::Middle);
@@ -619,7 +623,7 @@ impl App {
                 if icon_button(ui, Icon::Plus, false, 22.0, "Add page").clicked() {
                     self.checkpoint();
                     let n = self.doc.pages.len() + 1;
-                    self.doc.pages.push(Page { name: format!("Page {n}"), children: vec![], background: crate::doc::PAGE_BG });
+                    self.doc.pages.push(Page { name: format!("Page {n}"), children: vec![], background: crate::doc::PAGE_BG, flows: vec![] });
                     self.select_page(n - 1);
                 }
             });
@@ -860,9 +864,18 @@ impl App {
         egui::Panel::right("right").resizable(false).exact_size(248.0).show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Design").strong());
+                for (proto, label) in [(false, "Design"), (true, "Prototype")] {
+                    let text = RichText::new(label);
+                    let text = if self.prototype_tab == proto { text.strong() } else { text.color(Color32::from_gray(0x80)) };
+                    if ui.add(egui::Button::new(text).frame(false)).clicked() {
+                        self.prototype_tab = proto;
+                    }
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let ctx = ui.ctx().clone();
+                    if icon_button(ui, Icon::Play, false, 24.0, "Present (⌥⌘↵)").clicked() {
+                        self.present(ctx.input(|i| i.time));
+                    }
                     ui.menu_button(format!("{}%", (self.view.zoom * 100.0).round()), |ui| {
                         if ui.add(egui::Button::new("Zoom in").shortcut_text("⌘+")).clicked() {
                             self.zoom_step(&ctx, 2.0);
@@ -885,6 +898,10 @@ impl App {
                 // Never let a long label widen the panel.
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                 ui.spacing_mut().item_spacing.y = 6.0;
+                if self.prototype_tab {
+                    self.prototype_props(ui);
+                    return;
+                }
                 if self.sel.is_empty() {
                     self.page_props(ui);
                 } else {
@@ -894,6 +911,168 @@ impl App {
                 self.export_props(ui);
             });
         });
+    }
+
+    fn prototype_props(&mut self, ui: &mut Ui) {
+        use crate::doc::{Action, Direction, Reaction, TransitionKind, Trigger};
+        use crate::prototype::{describe, frames_on_page, top_frame};
+        let frames = frames_on_page(&self.doc, self.page);
+        let Some(&id) = self.sel.first() else {
+            heading(ui, "Flow starting points");
+            let flows = self.doc.pages[self.page].flows.clone();
+            if flows.is_empty() {
+                ui.label(RichText::new("Select a frame and mark it as a starting point.").color(Color32::from_gray(0x80)));
+            }
+            for f in flows {
+                let name = self.doc.nodes.get(&f).map_or("Missing".into(), |n| n.name.clone());
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                    paint_icon(ui.painter(), r, Icon::Play, BLUE);
+                    ui.label(name);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icon_button(ui, Icon::Minus, false, 22.0, "Remove").clicked() {
+                            self.checkpoint();
+                            self.doc.pages[self.page].flows.retain(|x| *x != f);
+                        }
+                    });
+                });
+            }
+            return;
+        };
+        let top = top_frame(&self.doc, id);
+        if top == id && self.doc.node(id).kind.is_frame() {
+            let mut start = self.doc.pages[self.page].flows.contains(&id);
+            if ui.checkbox(&mut start, "Flow starting point").changed() {
+                self.checkpoint();
+                let flows = &mut self.doc.pages[self.page].flows;
+                if start { flows.push(id) } else { flows.retain(|x| *x != id) }
+            }
+            ui.separator();
+        }
+        let mut reactions = self.doc.node(id).reactions.clone();
+        let mut changed = false;
+        if section_title(ui, "Interactions") {
+            let to = frames.iter().copied().find(|f| *f != top);
+            reactions.push(Reaction { action: to.map_or(Action::Back, Action::Navigate), ..Default::default() });
+            changed = true;
+        }
+        let name = |doc: &crate::doc::Document, f: NodeId| doc.nodes.get(&f).map_or("Missing".to_string(), |n| n.name.clone());
+        let mut remove = None;
+        for (i, r) in reactions.iter_mut().enumerate() {
+            let pid = ui.id().with(("reaction", id, i));
+            ui.horizontal(|ui| {
+                let open = ui.add(egui::Button::new(describe(&self.doc, r)).frame(false).truncate());
+                egui::Popup::menu(&open).id(pid).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                    ui.set_width(240.0);
+                    let before = r.clone();
+                    egui::Grid::new(pid.with("grid")).num_columns(2).show(ui, |ui| {
+                        ui.label("Trigger");
+                        let t_label = |t: &Trigger| match t {
+                            Trigger::OnClick => "On click".into(),
+                            Trigger::OnHover => "On hover".into(),
+                            Trigger::WhilePressed => "While pressing".into(),
+                            Trigger::AfterDelay(ms) => format!("After delay {ms}ms"),
+                        };
+                        egui::ComboBox::from_id_salt(pid.with("trig")).selected_text(t_label(&r.trigger)).show_ui(ui, |ui| {
+                            for t in [Trigger::OnClick, Trigger::OnHover, Trigger::WhilePressed, Trigger::AfterDelay(800)] {
+                                let label = t_label(&t);
+                                ui.selectable_value(&mut r.trigger, t, label);
+                            }
+                        });
+                        ui.end_row();
+                        if let Trigger::AfterDelay(ms) = &mut r.trigger {
+                            ui.label("Delay");
+                            ui.add(DragValue::new(ms).range(0..=60000).suffix("ms").speed(10.0));
+                            ui.end_row();
+                        }
+                        ui.label("Action");
+                        let a_label = match &r.action {
+                            Action::None => "None",
+                            Action::Navigate(_) => "Navigate to",
+                            Action::Back => "Back",
+                            Action::OpenOverlay(_) => "Open overlay",
+                            Action::CloseOverlay => "Close overlay",
+                            Action::OpenUrl(_) => "Open link",
+                        };
+                        let first = frames.iter().copied().find(|f| *f != top).unwrap_or(top);
+                        egui::ComboBox::from_id_salt(pid.with("act")).selected_text(a_label).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut r.action, Action::Navigate(first), "Navigate to");
+                            ui.selectable_value(&mut r.action, Action::Back, "Back");
+                            ui.selectable_value(&mut r.action, Action::OpenOverlay(first), "Open overlay");
+                            ui.selectable_value(&mut r.action, Action::CloseOverlay, "Close overlay");
+                            ui.selectable_value(&mut r.action, Action::OpenUrl("https://".into()), "Open link");
+                            ui.selectable_value(&mut r.action, Action::None, "None");
+                        });
+                        ui.end_row();
+                        match &mut r.action {
+                            Action::Navigate(dest) | Action::OpenOverlay(dest) => {
+                                ui.label("Destination");
+                                egui::ComboBox::from_id_salt(pid.with("dest")).selected_text(name(&self.doc, *dest)).show_ui(ui, |ui| {
+                                    for &f in &frames {
+                                        ui.selectable_value(dest, f, name(&self.doc, f));
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                            Action::OpenUrl(url) => {
+                                ui.label("URL");
+                                ui.text_edit_singleline(url);
+                                ui.end_row();
+                            }
+                            _ => {}
+                        }
+                        if matches!(r.action, Action::Navigate(_) | Action::Back) {
+                            ui.label("Animation");
+                            let k_label = |k: TransitionKind| match k {
+                                TransitionKind::Instant => "Instant",
+                                TransitionKind::Dissolve => "Dissolve",
+                                TransitionKind::SmartAnimate => "Smart animate",
+                                TransitionKind::MoveIn => "Move in",
+                                TransitionKind::Push => "Push",
+                                TransitionKind::SlideIn => "Slide in",
+                            };
+                            egui::ComboBox::from_id_salt(pid.with("kind")).selected_text(k_label(r.transition.kind)).show_ui(ui, |ui| {
+                                for k in [TransitionKind::Instant, TransitionKind::Dissolve, TransitionKind::SmartAnimate, TransitionKind::MoveIn, TransitionKind::Push, TransitionKind::SlideIn] {
+                                    ui.selectable_value(&mut r.transition.kind, k, k_label(k));
+                                }
+                            });
+                            ui.end_row();
+                            if matches!(r.transition.kind, TransitionKind::MoveIn | TransitionKind::Push | TransitionKind::SlideIn) {
+                                ui.label("Direction");
+                                ui.horizontal(|ui| {
+                                    for (d, l) in [(Direction::Left, "←"), (Direction::Right, "→"), (Direction::Up, "↑"), (Direction::Down, "↓")] {
+                                        ui.selectable_value(&mut r.transition.direction, d, l);
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                            if r.transition.kind != TransitionKind::Instant {
+                                ui.label("Duration");
+                                let mut ms = (r.transition.duration * 1000.0).round();
+                                if ui.add(DragValue::new(&mut ms).range(0.0..=10000.0).suffix("ms").speed(10.0)).changed() {
+                                    r.transition.duration = ms / 1000.0;
+                                }
+                                ui.end_row();
+                            }
+                        }
+                    });
+                    changed |= *r != before;
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, Icon::Minus, false, 22.0, "Remove").clicked() {
+                        remove = Some(i);
+                    }
+                });
+            });
+        }
+        if let Some(i) = remove {
+            reactions.remove(i);
+            changed = true;
+        }
+        if changed {
+            self.begin_edit();
+            self.doc.node_mut(id).reactions = reactions;
+        }
     }
 
     fn page_props(&mut self, ui: &mut Ui) {

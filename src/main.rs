@@ -6,6 +6,7 @@ mod export;
 mod files;
 mod paint_ui;
 mod panels;
+mod prototype;
 mod render;
 mod svg_import;
 mod text;

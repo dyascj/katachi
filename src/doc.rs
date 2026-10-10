@@ -167,6 +167,70 @@ pub enum TextCase {
     Title,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Trigger {
+    #[default]
+    OnClick,
+    OnHover,
+    WhilePressed,
+    /// Fires this many milliseconds after the frame appears.
+    AfterDelay(u32),
+}
+
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+pub enum Action {
+    #[default]
+    None,
+    Navigate(NodeId),
+    Back,
+    OpenOverlay(NodeId),
+    CloseOverlay,
+    OpenUrl(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TransitionKind {
+    #[default]
+    Instant,
+    Dissolve,
+    SmartAnimate,
+    MoveIn,
+    Push,
+    SlideIn,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Direction {
+    #[default]
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Transition {
+    pub kind: TransitionKind,
+    pub direction: Direction,
+    /// Seconds.
+    pub duration: f32,
+}
+
+impl Default for Transition {
+    fn default() -> Self {
+        Self { kind: TransitionKind::Instant, direction: Direction::Left, duration: 0.3 }
+    }
+}
+
+/// A prototype interaction on a layer.
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+pub struct Reaction {
+    pub trigger: Trigger,
+    pub action: Action,
+    #[serde(default)]
+    pub transition: Transition,
+}
+
 /// What sits at the ends of an open path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Marker {
@@ -417,6 +481,8 @@ pub struct Node {
     /// Ignores the parent's auto layout.
     pub absolute: bool,
     pub bool_op: BoolOp,
+    /// Prototype interactions.
+    pub reactions: Vec<Reaction>,
     /// Instances: the main component they copy.
     pub component: Option<NodeId>,
     /// Inside an instance (and the instance itself): the component layer this mirrors.
@@ -477,6 +543,7 @@ impl Default for Node {
             constraints: [Constraint::Min; 2],
             absolute: false,
             bool_op: BoolOp::Union,
+            reactions: vec![],
             component: None,
             source: None,
             synced: None,
@@ -630,6 +697,9 @@ pub struct Page {
     pub name: String,
     pub children: Vec<NodeId>,
     pub background: Rgba,
+    /// Prototype starting frames, in order.
+    #[serde(default)]
+    pub flows: Vec<NodeId>,
 }
 
 pub const PAGE_BG: Rgba = Rgba::rgb(0xF5, 0xF5, 0xF5);
@@ -675,7 +745,7 @@ pub enum Order {
 impl Default for Document {
     fn default() -> Self {
         Self {
-            pages: vec![Page { name: "Page 1".into(), children: vec![], background: PAGE_BG }],
+            pages: vec![Page { name: "Page 1".into(), children: vec![], background: PAGE_BG, flows: vec![] }],
             nodes: HashMap::new(),
             next_id: 1,
             images: HashMap::new(),
@@ -1400,7 +1470,7 @@ fn merge_from(e: &mut Node, src: &Node) {
     take!(
         name, visible, opacity, fills, strokes, stroke_width, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, constraints, absolute,
         paths, even_odd, text, font_size, font_weight, font_family, text_sizing, text_align, text_valign, line_height, letter_spacing,
-        decoration, text_case, rotation, component, start_marker, end_marker, point_count, inner_ratio
+        decoration, text_case, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions
     );
     e.synced = Some(Box::new(Node { children: vec![], synced: None, ..src.clone() }));
 }

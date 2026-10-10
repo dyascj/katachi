@@ -477,6 +477,11 @@ pub fn draw_page(painter: &Painter, sc: &mut Scene, page: usize) {
     }
 }
 
+/// Paint one layer and its children (prototype playback).
+pub fn draw_subtree(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
+    draw_node(painter, sc, id, alpha);
+}
+
 // ponytail: opacity multiplies into colors per node, not true group compositing; use offscreen layers when overlaps matter
 fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
     let n = sc.doc.node(id);

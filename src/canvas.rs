@@ -298,6 +298,12 @@ impl App {
             self.press = Some(Press { world: w, target: None, handle: None, toggle_off: false });
             return;
         }
+        if tool.selects() && self.prototype_tab
+            && let Some(from) = self.connect_handle_at(s) {
+                self.connecting = Some(from);
+                self.press = Some(Press { world: w, target: None, handle: None, toggle_off: false });
+                return;
+            }
         match tool {
             Tool::Move | Tool::Scale => {
                 self.vector_edit = None;
@@ -361,6 +367,10 @@ impl App {
         if self.vector_edit.is_some() {
             self.drag = self.vector_drag_start();
             self.vector_start = start;
+            return;
+        }
+        if let Some(from) = self.connecting.take() {
+            self.drag = Some(Drag::Connect { from });
             return;
         }
         self.drag = match self.tool {
@@ -601,7 +611,7 @@ impl App {
                     }
                 }
             }
-            Drag::Pan => {}
+            Drag::Pan | Drag::Connect { .. } => {}
         }
         self.drag = Some(drag);
     }
@@ -610,6 +620,18 @@ impl App {
         self.guides.clear();
         self.vector_grabbed = None;
         match self.drag.take() {
+            Some(Drag::Connect { from }) => {
+                // Dropping on a frame wires an On click → Navigate interaction to it.
+                let top = crate::prototype::top_frame(&self.doc, from);
+                let target = crate::prototype::frames_on_page(&self.doc, self.page)
+                    .into_iter()
+                    .rev()
+                    .find(|f| *f != top && self.doc.node(*f).aabb().contains(w));
+                if let Some(t) = target {
+                    self.checkpoint();
+                    self.doc.node_mut(from).reactions.push(crate::doc::Reaction { action: crate::doc::Action::Navigate(t), ..Default::default() });
+                }
+            }
             Some(Drag::Pencil { points }) => {
                 let pts = smooth_stroke(&points, 1.5 / self.view.zoom);
                 if pts.len() >= 2 {
@@ -915,7 +937,58 @@ impl App {
         }
     }
 
+    /// Prototype tab: the "+" circle on the right edge of a single selection.
+    fn connect_handle_at(&self, s: Pos2) -> Option<NodeId> {
+        let [one] = self.sel[..] else { return None };
+        let b = self.view.rect_to_screen(self.doc.node(one).aabb());
+        (pos2(b.max.x, b.center().y).distance(s) < 9.0).then_some(one)
+    }
+
+    /// Blue noodles from layers to their destinations, as in Figma's Prototype tab.
+    fn draw_connections(&self, painter: &Painter, ptr: Option<Pos2>) {
+        let stroke = Stroke::new(1.5, BLUE);
+        let noodle = |a: Pos2, b: Pos2| {
+            let dx = ((b.x - a.x).abs() / 2.0).max(40.0);
+            let pts = [a, a + vec2(dx, 0.0), b - vec2(dx, 0.0), b];
+            painter.add(egui::epaint::CubicBezierShape::from_points_stroke(pts, false, Color32::TRANSPARENT, stroke));
+            painter.circle_filled(a, 3.5, BLUE);
+            painter.add(egui::Shape::convex_polygon(vec![b, b + vec2(-8.0, -4.5), b + vec2(-8.0, 4.5)], BLUE, Stroke::NONE));
+        };
+        for n in self.doc.nodes.values().filter(|n| !n.reactions.is_empty() && self.doc.page_of(n.id) == self.page) {
+            let a = self.view.rect_to_screen(n.aabb());
+            for r in &n.reactions {
+                if let crate::doc::Action::Navigate(t) | crate::doc::Action::OpenOverlay(t) = r.action
+                    && let Some(tn) = self.doc.nodes.get(&t) {
+                        let b = self.view.rect_to_screen(tn.aabb());
+                        noodle(pos2(a.max.x, a.center().y), pos2(b.min.x, b.center().y));
+                    }
+            }
+        }
+        for &f in &self.doc.pages[self.page].flows {
+            if let Some(n) = self.doc.nodes.get(&f) {
+                let r = self.view.rect_to_screen(n.aabb());
+                let g = painter.layout_no_wrap("▶ Flow".into(), FontId::proportional(10.0), Color32::WHITE);
+                let pill = Rect::from_min_size(pos2(r.max.x - g.size().x - 10.0, r.min.y - g.size().y - 8.0), g.size() + vec2(10.0, 4.0));
+                painter.rect_filled(pill, 3.0, BLUE);
+                painter.galley(pill.min + vec2(5.0, 2.0), g, Color32::WHITE);
+            }
+        }
+        if let [one] = self.sel[..] {
+            let b = self.view.rect_to_screen(self.doc.node(one).aabb());
+            let h = pos2(b.max.x, b.center().y);
+            if let (Some(Drag::Connect { .. }), Some(p)) = (&self.drag, ptr) {
+                noodle(h, p);
+            }
+            painter.circle(h, 6.0, Color32::WHITE, Stroke::new(1.5, BLUE));
+            painter.line_segment([h - vec2(3.0, 0.0), h + vec2(3.0, 0.0)], Stroke::new(1.5, BLUE));
+            painter.line_segment([h - vec2(0.0, 3.0), h + vec2(0.0, 3.0)], Stroke::new(1.5, BLUE));
+        }
+    }
+
     fn draw_overlays(&self, painter: &Painter, ptr: Option<Pos2>) {
+        if self.prototype_tab {
+            self.draw_connections(painter, ptr);
+        }
         // Slices are invisible in output but outlined while editing.
         for n in self.doc.nodes.values().filter(|n| n.kind == Kind::Slice && n.visible && self.doc.page_of(n.id) == self.page) {
             let pts = n.corners().map(|p| self.view.to_screen(p));

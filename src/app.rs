@@ -60,6 +60,8 @@ pub enum Drag {
     Vector { base: Document, id: NodeId, grab: crate::vector_edit::Grab },
     PenHandle,
     Pencil { points: Vec<Pos2> },
+    /// Prototype tab: dragging a connection from a layer to a frame.
+    Connect { from: NodeId },
 }
 
 /// What the pointer grabbed on the selection frame.
@@ -117,6 +119,11 @@ pub struct App {
     pub left_tab_assets: bool,
     /// Last tool used in each toolbar group (move, frame, shape, pen, text).
     pub tool_groups: [Tool; 5],
+    pub presenting: Option<crate::prototype::Presentation>,
+    /// Right panel shows the Prototype tab instead of Design.
+    pub prototype_tab: bool,
+    /// Pressed the prototype connect handle on this layer.
+    pub connecting: Option<NodeId>,
     pub vector_edit: Option<crate::vector_edit::VectorEdit>,
     pub vector_grabbed: Option<crate::vector_edit::Grab>,
     pub vector_start: Pos2,
@@ -172,6 +179,9 @@ impl App {
             zoom_target: None,
             left_tab_assets: false,
             tool_groups: [Tool::Move, Tool::Frame, Tool::Rectangle, Tool::Pen, Tool::Text],
+            presenting: None,
+            prototype_tab: false,
+            connecting: None,
             vector_edit: None,
             vector_grabbed: None,
             vector_start: Pos2::ZERO,
@@ -1128,6 +1138,7 @@ impl App {
             (true, false, false, Key::A) => self.select_all(),
             (true, false, true, Key::G) => self.group_selection(true),
             (true, false, true, Key::K) => self.create_component(),
+            (true, false, true, Key::Enter) => self.present(ctx.input(|i| i.time)),
             (true, true, false, Key::K) => self.import_dialog(),
             (true, false, false, Key::E) => self.flatten_selection(),
             (true, false, true, Key::B) => self.detach_selection(),
@@ -1230,6 +1241,10 @@ fn void(_: bool) {}
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if self.presenting.is_some() {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.presentation_ui(ui));
+            return;
+        }
         self.shortcuts(&ctx);
         if !self.ui_hidden {
             self.left_panel(ui);

@@ -525,6 +525,27 @@ fn shots() {
     st.zoom_to(&egui::Context::default(), None, false);
     h.run_steps(4);
     save(&mut h, "13-shapes");
+    // Prototype tab: noodles from the hero to the cards, a flow start, then present.
+    let st = h.state_mut();
+    st.set_tool(Tool::Move);
+    let find = |st: &App, name: &str| *st.doc.nodes.keys().find(|i| st.doc.node(**i).name == name).unwrap();
+    let (hero, landing) = (find(st, "Hero"), find(st, "Landing"));
+    let cards: Vec<NodeId> = st.doc.pages[0].children.iter().copied().filter(|c| st.doc.node(*c).name == "Card").collect();
+    st.doc.node_mut(hero).reactions = vec![crate::doc::Reaction {
+        action: crate::doc::Action::Navigate(cards[0]),
+        transition: crate::doc::Transition { kind: crate::doc::TransitionKind::Dissolve, ..Default::default() },
+        ..Default::default()
+    }];
+    st.doc.pages[0].flows = vec![landing];
+    st.prototype_tab = true;
+    st.sel = vec![hero];
+    h.run_steps(3);
+    save(&mut h, "14-prototype");
+    let st = h.state_mut();
+    st.sel = vec![landing];
+    st.present(0.0);
+    h.run_steps(3);
+    save(&mut h, "15-present");
 }
 
 #[test]
@@ -873,4 +894,38 @@ fn new_tools_shapes_pencil_sections_slices_scale() {
     drag(&mut h, p, q, Modifiers::SHIFT);
     let n = h.state().doc.node(arrow);
     assert!((n.stroke_width - 4.0).abs() < 0.1, "{}", n.stroke_width);
+}
+
+#[test]
+fn prototype_connect_present_and_navigate() {
+    use crate::doc::{Action, Trigger};
+    let mut h = harness();
+    let a = draw(&mut h, Key::F, (0.0, 0.0), (200.0, 150.0));
+    let b = draw(&mut h, Key::F, (300.0, 0.0), (500.0, 150.0));
+    let btn = draw(&mut h, Key::R, (20.0, 20.0), (80.0, 50.0));
+    assert_eq!(h.state().doc.node(btn).parent, Some(a));
+    // Prototype tab: drag the connect handle from the button onto frame B.
+    h.state_mut().prototype_tab = true;
+    h.state_mut().sel = vec![btn];
+    h.run_steps(1);
+    let (p, q) = (s(&h, 80., 35.), s(&h, 400., 75.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    assert_eq!(h.state().doc.node(btn).reactions[0].action, Action::Navigate(b));
+    // B goes back after a short delay.
+    h.state_mut().doc.node_mut(b).reactions.push(crate::doc::Reaction { trigger: Trigger::AfterDelay(500), action: Action::Back, ..Default::default() });
+    // Present from A and click the button: lands on B.
+    h.state_mut().sel = vec![a];
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::Enter);
+    assert_eq!(h.state().presenting.as_ref().map(|p| p.frame), Some(a));
+    h.run_steps(2);
+    let screen = h.state().presenting.as_ref().map(|_| ()).and(Some(egui::Rect::from_min_size(Pos2::ZERO, vec2(1440., 900.)))).unwrap();
+    let view = crate::render::View::fit(h.state().doc.node(a).rect, screen, 1.0);
+    let at = view.to_screen(pos2(50., 35.));
+    click(&mut h, at, Modifiers::NONE);
+    assert_eq!(h.state().presenting.as_ref().map(|p| p.frame), Some(b));
+    // After the delay, Back returns to A; Esc leaves present mode.
+    h.run_steps(40);
+    assert_eq!(h.state().presenting.as_ref().map(|p| p.frame), Some(a));
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    assert!(h.state().presenting.is_none());
 }
