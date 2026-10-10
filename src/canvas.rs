@@ -70,6 +70,7 @@ impl App {
         let mut scene = render::Scene { doc: &self.doc, view: self.view, hide: self.editing_text, tex: &mut self.textures };
         render::draw_page(&painter, &mut scene, self.page);
         self.textures.end_frame();
+        self.draw_pixel_grid(&painter, rect);
         self.layout_frame_labels(&painter);
 
         self.accept_drops(ui, hover_pos.filter(|p| rect.contains(*p)).unwrap_or(rect.center()));
@@ -138,6 +139,12 @@ impl App {
 
         self.text_editor(ui, &painter);
         self.draw_overlays(&painter, ptr);
+        if mods.alt && self.drag.is_none() {
+            self.draw_measurements(&painter);
+        }
+        if self.rulers {
+            self.draw_rulers(&painter, rect);
+        }
         self.set_cursor(ui, ptr, panning);
         self.toolbar(ui.ctx(), rect);
         self.draw_toast(&painter, rect);
@@ -939,6 +946,115 @@ impl App {
             painter.rect_filled(r, 0.0, Color32::WHITE);
             painter.rect_stroke(r, 0.0, Stroke::new(1.0, BLUE), StrokeKind::Middle);
         }
+    }
+
+    /// Figma shows a pixel grid from 800% zoom.
+    fn draw_pixel_grid(&self, painter: &Painter, rect: Rect) {
+        if self.view.zoom < 8.0 {
+            return;
+        }
+        let (a, b) = (self.view.to_world(rect.min), self.view.to_world(rect.max));
+        let stroke = Stroke::new(1.0, Color32::from_black_alpha(18));
+        for x in (a.x.floor() as i64)..=(b.x.ceil() as i64) {
+            let sx = self.view.to_screen(pos2(x as f32, 0.0)).x.round() + 0.5;
+            painter.line_segment([pos2(sx, rect.min.y), pos2(sx, rect.max.y)], stroke);
+        }
+        for y in (a.y.floor() as i64)..=(b.y.ceil() as i64) {
+            let sy = self.view.to_screen(pos2(0.0, y as f32)).y.round() + 0.5;
+            painter.line_segment([pos2(rect.min.x, sy), pos2(rect.max.x, sy)], stroke);
+        }
+    }
+
+    /// Hold Alt over another layer to see distances from the selection (red lines).
+    fn draw_measurements(&self, painter: &Painter) {
+        let roots = self.sel_roots();
+        let Some(&first) = roots.first() else { return };
+        let s = self.doc.bounds(&roots);
+        let target = self
+            .hover
+            .filter(|h| !roots.contains(h) && self.doc.nodes.contains_key(h))
+            .or_else(|| self.doc.node(first).parent)
+            .filter(|t| !roots.contains(t));
+        let Some(t) = target.map(|t| self.doc.node(t).aabb()) else { return };
+        let red = SNAP;
+        let v = self.view;
+        painter.rect_stroke(v.rect_to_screen(t), 0.0, Stroke::new(1.0, red), StrokeKind::Middle);
+        let mut lines: Vec<(Pos2, Pos2)> = vec![];
+        let (cx, cy) = (s.center().x, s.center().y);
+        if t.contains_rect(s) {
+            lines.push((pos2(t.min.x, cy), pos2(s.min.x, cy)));
+            lines.push((pos2(s.max.x, cy), pos2(t.max.x, cy)));
+            lines.push((pos2(cx, t.min.y), pos2(cx, s.min.y)));
+            lines.push((pos2(cx, s.max.y), pos2(cx, t.max.y)));
+        } else {
+            let y = if s.max.y > t.min.y && s.min.y < t.max.y { (s.min.y.max(t.min.y) + s.max.y.min(t.max.y)) / 2.0 } else { cy };
+            let x = if s.max.x > t.min.x && s.min.x < t.max.x { (s.min.x.max(t.min.x) + s.max.x.min(t.max.x)) / 2.0 } else { cx };
+            if s.max.x <= t.min.x {
+                lines.push((pos2(s.max.x, y), pos2(t.min.x, y)));
+            } else if t.max.x <= s.min.x {
+                lines.push((pos2(t.max.x, y), pos2(s.min.x, y)));
+            }
+            if s.max.y <= t.min.y {
+                lines.push((pos2(x, s.max.y), pos2(x, t.min.y)));
+            } else if t.max.y <= s.min.y {
+                lines.push((pos2(x, t.max.y), pos2(x, s.min.y)));
+            }
+        }
+        for (a, b) in lines {
+            let d = a.distance(b);
+            if d < 0.01 {
+                continue;
+            }
+            let (sa, sb) = (v.to_screen(a), v.to_screen(b));
+            painter.line_segment([sa, sb], Stroke::new(1.0, red));
+            let g = painter.layout_no_wrap(num(d), FontId::proportional(11.0), Color32::WHITE);
+            let pill = Rect::from_center_size(sa.lerp(sb, 0.5), g.size() + vec2(8.0, 4.0));
+            painter.rect_filled(pill, 2.0, red);
+            painter.galley(pill.min + vec2(4.0, 2.0), g, Color32::WHITE);
+        }
+    }
+
+    /// Shift+R: top and left rulers with the selection's span highlighted.
+    fn draw_rulers(&self, painter: &Painter, rect: Rect) {
+        const T: f32 = 20.0;
+        let bg = Color32::from_gray(0xFA);
+        let line = Color32::from_gray(0xD0);
+        let text = Color32::from_gray(0x80);
+        let top = Rect::from_min_max(rect.min, pos2(rect.max.x, rect.min.y + T));
+        let left = Rect::from_min_max(rect.min, pos2(rect.min.x + T, rect.max.y));
+        painter.rect_filled(top, 0.0, bg);
+        painter.rect_filled(left, 0.0, bg);
+        // Pick a tick spacing that leaves ~60px between labels.
+        let step = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0]
+            .into_iter()
+            .find(|s| s * self.view.zoom >= 60.0)
+            .unwrap_or(10000.0);
+        if let Some(b) = self.sel.first().map(|_| self.doc.bounds(&self.sel_roots())).filter(|b| b.is_finite()) {
+            let sb = self.view.rect_to_screen(b);
+            painter.rect_filled(Rect::from_min_max(pos2(sb.min.x, top.min.y), pos2(sb.max.x, top.max.y)), 0.0, BLUE.gamma_multiply(0.15));
+            painter.rect_filled(Rect::from_min_max(pos2(left.min.x, sb.min.y), pos2(left.max.x, sb.max.y)), 0.0, BLUE.gamma_multiply(0.15));
+        }
+        let (a, b) = (self.view.to_world(rect.min), self.view.to_world(rect.max));
+        let mut x = (a.x / step).floor() * step;
+        while x <= b.x {
+            let sx = self.view.to_screen(pos2(x, 0.0)).x;
+            if sx > left.max.x {
+                painter.line_segment([pos2(sx, top.max.y - 6.0), pos2(sx, top.max.y)], Stroke::new(1.0, line));
+                painter.text(pos2(sx + 3.0, top.min.y + 3.0), egui::Align2::LEFT_TOP, num(x), FontId::proportional(9.0), text);
+            }
+            x += step;
+        }
+        let mut y = (a.y / step).floor() * step;
+        while y <= b.y {
+            let sy = self.view.to_screen(pos2(0.0, y)).y;
+            if sy > top.max.y {
+                painter.line_segment([pos2(left.max.x - 6.0, sy), pos2(left.max.x, sy)], Stroke::new(1.0, line));
+                painter.text(pos2(left.min.x + 3.0, sy + 2.0), egui::Align2::LEFT_TOP, num(y), FontId::proportional(9.0), text);
+            }
+            y += step;
+        }
+        painter.line_segment([top.left_bottom(), top.right_bottom()], Stroke::new(1.0, line));
+        painter.line_segment([left.right_top(), left.right_bottom()], Stroke::new(1.0, line));
     }
 
     fn set_cursor(&self, ui: &Ui, ptr: Option<Pos2>, panning: bool) {

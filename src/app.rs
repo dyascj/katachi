@@ -95,6 +95,12 @@ pub struct App {
     pub vector_edit: Option<crate::vector_edit::VectorEdit>,
     pub vector_grabbed: Option<crate::vector_edit::Grab>,
     pub vector_start: Pos2,
+    /// Cmd+\ hides the side panels.
+    pub ui_hidden: bool,
+    pub rulers: bool,
+    /// Properties copied with Cmd+Alt+C.
+    pub style_clip: Option<Node>,
+    pub layer_search: Option<String>,
     undo: Vec<Document>,
     redo: Vec<Document>,
     in_gesture: bool,
@@ -138,6 +144,10 @@ impl App {
             vector_edit: None,
             vector_grabbed: None,
             vector_start: Pos2::ZERO,
+            ui_hidden: false,
+            rulers: false,
+            style_clip: None,
+            layer_search: None,
             undo: vec![],
             redo: vec![],
             in_gesture: false,
@@ -275,6 +285,92 @@ impl App {
                 *n = Node { id: n.id, parent: n.parent, children: n.children.clone(), name, ..Node::new(Kind::Frame, r) };
             }
             self.sel = vec![g];
+        }
+    }
+
+    pub fn flip_selection(&mut self, horizontal: bool) {
+        let roots = self.sel_roots();
+        if roots.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        let c = self.doc.bounds(&roots).center();
+        for id in roots {
+            self.doc.flip(id, horizontal, if horizontal { c.x } else { c.y });
+        }
+        self.doc.reflow();
+    }
+
+    pub fn distribute_selection(&mut self, horizontal: bool) {
+        let roots = self.sel_roots();
+        if roots.len() < 3 {
+            return;
+        }
+        self.checkpoint();
+        self.doc.distribute(&roots, horizontal);
+        self.doc.reflow();
+    }
+
+    /// Ctrl+Alt+T: line the selection up along its dominant direction with even gaps.
+    pub fn tidy_up(&mut self) {
+        let roots = self.sel_roots();
+        if roots.len() < 2 {
+            return;
+        }
+        let b = self.doc.bounds(&roots);
+        let horizontal = b.width() >= b.height();
+        self.checkpoint();
+        let mut items: Vec<(NodeId, Rect)> = roots.iter().map(|&i| (i, self.doc.node(i).aabb())).collect();
+        items.sort_by(|a, c| if horizontal { a.1.min.x.total_cmp(&c.1.min.x) } else { a.1.min.y.total_cmp(&c.1.min.y) });
+        // Average existing gap, at least zero.
+        let gaps: Vec<f32> = items.windows(2).map(|w| if horizontal { w[1].1.min.x - w[0].1.max.x } else { w[1].1.min.y - w[0].1.max.y }).collect();
+        let gap = (gaps.iter().sum::<f32>() / gaps.len() as f32).max(0.0).round();
+        let mut cursor = if horizontal { b.min.x } else { b.min.y };
+        for (id, r) in items {
+            let d = if horizontal { vec2(cursor - r.min.x, b.min.y - r.min.y) } else { vec2(b.min.x - r.min.x, cursor - r.min.y) };
+            self.doc.translate(id, d);
+            cursor += if horizontal { r.width() } else { r.height() } + gap;
+        }
+        self.doc.reflow();
+    }
+
+    /// Tab / Shift+Tab: next or previous sibling of the first selected layer.
+    pub fn select_sibling(&mut self, dir: i32) {
+        let Some(&id) = self.sel.first() else { return };
+        let list = self.doc.children_of(self.page, self.doc.node(id).parent).clone();
+        let Some(i) = list.iter().position(|c| *c == id) else { return };
+        // Layers list is top-first, so "next" walks down the z order.
+        let j = (i as i32 - dir).rem_euclid(list.len() as i32) as usize;
+        self.sel = vec![list[j]];
+    }
+
+    /// Cmd+Alt+V: apply copied appearance to the selection.
+    pub fn paste_style(&mut self) {
+        let Some(src) = self.style_clip.clone() else { return };
+        if self.sel.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for id in self.sel.clone() {
+            let n = self.doc.node_mut(id);
+            n.fills = src.fills.clone();
+            n.strokes = src.strokes.clone();
+            n.stroke_width = src.stroke_width;
+            n.shadows = src.shadows.clone();
+            n.opacity = src.opacity;
+            if n.kind == Kind::Rectangle || n.kind.is_frame() {
+                n.radius = src.radius;
+            }
+            if n.kind == Kind::Text && src.kind == Kind::Text {
+                n.font_family = src.font_family.clone();
+                n.font_weight = src.font_weight;
+                n.font_size = src.font_size;
+                n.line_height = src.line_height;
+                n.letter_spacing = src.letter_spacing;
+                n.text_align = src.text_align;
+                n.decoration = src.decoration;
+                n.text_case = src.text_case;
+            }
         }
     }
 
@@ -857,10 +953,48 @@ impl App {
             return;
         }
         let step = if m.shift { 10.0 } else { 1.0 };
+        // Ctrl+Alt arrangement shortcuts (Figma on macOS).
+        if m.ctrl && m.alt && !m.mac_cmd {
+            match key {
+                Key::H => return self.distribute_selection(true),
+                Key::V => return self.distribute_selection(false),
+                Key::T => return self.tidy_up(),
+                _ => {}
+            }
+        }
         match (cmd, m.shift, m.alt, key) {
             (true, false, _, Key::Z) => self.undo(),
             (true, true, _, Key::Z) | (true, false, _, Key::Y) => self.redo(),
             (true, false, false, Key::D) => self.duplicate_selection(),
+            (true, false, true, Key::C) => self.style_clip = self.sel.first().map(|&id| self.doc.node(id).clone()),
+            (true, false, true, Key::V) => self.paste_style(),
+            (true, false, false, Key::R) => {
+                if let Some(&id) = self.sel.first() {
+                    self.left_tab_assets = false;
+                    self.renaming = Some((id, self.doc.node(id).name.clone()));
+                }
+            }
+            (true, false, false, Key::Backslash) => self.ui_hidden = !self.ui_hidden,
+            (false, true, false, Key::R) => self.rulers = !self.rulers,
+            (false, false, true, Key::L) => {
+                for n in self.doc.nodes.values_mut() {
+                    n.expanded = false;
+                }
+            }
+            (false, true, false, Key::H) => self.flip_selection(true),
+            (false, true, false, Key::V) => self.flip_selection(false),
+            (false, shift, false, Key::Tab) => {
+                // Tab cycles layers in Figma; stop egui from moving widget focus instead.
+                ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+                self.select_sibling(if shift { -1 } else { 1 });
+            }
+            (false, true, false, Key::Enter) => {
+                let parents: Vec<NodeId> = self.sel.iter().filter_map(|&s| self.doc.node(s).parent).collect();
+                if !parents.is_empty() {
+                    self.sel = parents;
+                    self.sel.dedup();
+                }
+            }
             (true, false, false, Key::A) => self.select_all(),
             (true, false, true, Key::G) => self.group_selection(true),
             (true, false, true, Key::K) => self.create_component(),
@@ -962,8 +1096,10 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.shortcuts(&ctx);
-        self.left_panel(ui);
-        self.right_panel(ui);
+        if !self.ui_hidden {
+            self.left_panel(ui);
+            self.right_panel(ui);
+        }
         self.canvas_panel(ui);
         self.close_guard(&ctx);
         self.debug_screenshot(&ctx);

@@ -454,6 +454,19 @@ fn shots() {
     st.zoom_to(&egui::Context::default(), None, false);
     h.run_steps(4);
     save(&mut h, "10-boolean-vector-edit");
+    // Alt measurements against the hovered layer, with rulers.
+    let st = h.state_mut();
+    st.vector_edit = None;
+    st.rulers = true;
+    let find = |st: &App, name: &str| *st.doc.nodes.keys().find(|i| st.doc.node(**i).name == name).unwrap();
+    let (avatar, hero) = (find(st, "Avatar"), find(st, "Hero"));
+    st.sel = vec![avatar];
+    let target = h.state().view.to_screen(h.state().doc.node(hero).rect.center());
+    h.input_mut().modifiers = Modifiers::ALT;
+    h.event(Event::PointerMoved(target));
+    h.input_mut().modifiers = Modifiers::ALT;
+    h.run_steps(2);
+    save(&mut h, "11-measure-rulers");
 }
 
 #[test]
@@ -673,4 +686,41 @@ fn boolean_shortcuts_and_live_updates() {
     let p = s(&h, 90., 90.);
     click(&mut h, p, Modifiers::NONE);
     assert_eq!(h.state().sel, vec![g]);
+}
+
+#[test]
+fn arrangement_and_navigation_shortcuts() {
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (10.0, 10.0));
+    let b = draw(&mut h, Key::O, (20.0, 0.0), (30.0, 10.0));
+    let c = draw(&mut h, Key::R, (100.0, 0.0), (110.0, 10.0));
+    h.state_mut().sel = vec![a, b, c];
+    key(&mut h, Modifiers { alt: true, ctrl: true, ..Default::default() }, Key::H);
+    assert_eq!(rect(&h, b).min.x, 50.0, "distributed");
+    // Tab walks siblings; Shift+Enter selects the parent.
+    h.state_mut().sel = vec![c];
+    key(&mut h, Modifiers::NONE, Key::Tab);
+    assert_eq!(h.state().sel, vec![b]);
+    // Copy/paste properties.
+    h.state_mut().doc.node_mut(a).fills[0].color = crate::doc::Rgba::rgb(9, 9, 9);
+    h.state_mut().doc.node_mut(a).opacity = 0.5;
+    h.state_mut().sel = vec![a];
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::C);
+    h.state_mut().sel = vec![c];
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::V);
+    assert_eq!(h.state().doc.node(c).fills[0].color, crate::doc::Rgba::rgb(9, 9, 9));
+    assert_eq!(h.state().doc.node(c).opacity, 0.5);
+    // Flip a group mirrors its children within the selection bounds.
+    h.state_mut().sel = vec![a, c];
+    key(&mut h, Modifiers::COMMAND, Key::G);
+    key(&mut h, Modifiers::SHIFT, Key::H);
+    assert_eq!(rect(&h, a).min.x, 100.0);
+    assert_eq!(rect(&h, c).min.x, 0.0);
+    h.state_mut().sel = vec![a];
+    key(&mut h, Modifiers::SHIFT, Key::Enter);
+    assert_eq!(h.state().doc.node(h.state().sel[0]).kind, Kind::Group);
+    // Cmd+\ hides the panels; the canvas grows to the window.
+    key(&mut h, Modifiers::COMMAND, Key::Backslash);
+    assert!(h.state().ui_hidden);
+    assert_eq!(h.state().canvas_rect.unwrap().width(), 1440.0);
 }

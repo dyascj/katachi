@@ -169,9 +169,12 @@ fn add_children(doc: &mut Document, g: &usvg::Group, page: usize, parent: Option
     }
 }
 
+/// An imported frame plus raster images (node, encoded bytes) awaiting image fills.
+pub type Imported = (NodeId, Vec<(NodeId, Vec<u8>)>);
+
 /// Place an SVG as a frame (like Figma) with its top-left at `at`. Returns the frame and
 /// any embedded raster images the caller should store and assign as image fills.
-pub fn import(doc: &mut Document, data: &[u8], name: &str, page: usize, parent: Option<NodeId>, at: Pos2) -> Result<(NodeId, Vec<(NodeId, Vec<u8>)>), String> {
+pub fn import(doc: &mut Document, data: &[u8], name: &str, page: usize, parent: Option<NodeId>, at: Pos2) -> Result<Imported, String> {
     let tree = usvg::Tree::from_data(data, &options()).map_err(|e| e.to_string())?;
     let size = tree.size();
     let mut frame = Node::new(Kind::Frame, Rect::from_min_size(Pos2::ZERO, vec2(size.width(), size.height())));

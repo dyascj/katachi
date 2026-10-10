@@ -1060,6 +1060,60 @@ impl Document {
         Some(g)
     }
 
+    /// Mirror a subtree across a vertical (`horizontal = true`) or horizontal line at `axis`.
+    pub fn flip(&mut self, id: NodeId, horizontal: bool, axis: f32) {
+        for n in std::iter::once(id).chain(self.descendants(id)) {
+            let node = self.node_mut(n);
+            let r = node.rect;
+            node.rect = if horizontal {
+                Rect::from_min_size(pos2(2.0 * axis - r.max.x, r.min.y), r.size())
+            } else {
+                Rect::from_min_size(pos2(r.min.x, 2.0 * axis - r.max.y), r.size())
+            };
+            node.rotation = normalize_deg(-node.rotation);
+            let (w, h) = (r.width(), r.height());
+            for pt in node.paths.iter_mut().flat_map(|sp| sp.points.iter_mut()) {
+                if horizontal {
+                    pt.p.x = w - pt.p.x;
+                    pt.h_in.x = -pt.h_in.x;
+                    pt.h_out.x = -pt.h_out.x;
+                } else {
+                    pt.p.y = h - pt.p.y;
+                    pt.h_in.y = -pt.h_in.y;
+                    pt.h_out.y = -pt.h_out.y;
+                }
+            }
+            for p in node.fills.iter_mut().chain(node.strokes.iter_mut()) {
+                if horizontal {
+                    (p.from.x, p.to.x) = (1.0 - p.from.x, 1.0 - p.to.x);
+                } else {
+                    (p.from.y, p.to.y) = (1.0 - p.from.y, 1.0 - p.to.y);
+                }
+            }
+        }
+    }
+
+    /// Even out the gaps between layers along one axis, keeping the outermost two in place.
+    pub fn distribute(&mut self, ids: &[NodeId], horizontal: bool) {
+        if ids.len() < 3 {
+            return;
+        }
+        let key = |r: Rect| if horizontal { r.min.x } else { r.min.y };
+        let size = |r: Rect| if horizontal { r.width() } else { r.height() };
+        let mut items: Vec<(NodeId, Rect)> = ids.iter().map(|&i| (i, self.nodes[&i].aabb())).collect();
+        items.sort_by(|a, b| key(a.1).total_cmp(&key(b.1)));
+        let start = key(items[0].1);
+        let end = items.iter().map(|(_, r)| key(*r) + size(*r)).fold(f32::MIN, f32::max);
+        let total: f32 = items.iter().map(|(_, r)| size(*r)).sum();
+        let gap = (end - start - total) / (items.len() - 1) as f32;
+        let mut cursor = start;
+        for (id, r) in items {
+            let d = (cursor - key(r)).round();
+            self.translate(id, if horizontal { vec2(d, 0.0) } else { vec2(0.0, d) });
+            cursor += size(r) + gap;
+        }
+    }
+
     /// Wrap layers in a live boolean group; it takes the bottom layer's paint, like Figma.
     pub fn boolean(&mut self, ids: &[NodeId], op: BoolOp) -> Option<NodeId> {
         let g = self.group(ids)?;
@@ -1643,6 +1697,24 @@ mod tests {
         assert_eq!(d.hit(0, pos2(50., 50.), 0.), None, "even-odd hole");
         d.node_mut(v).even_odd = false;
         assert_eq!(d.hit(0, pos2(50., 50.), 0.), Some(v), "same winding fills");
+    }
+
+    #[test]
+    fn flip_and_distribute() {
+        let mut d = Document::default();
+        let pts = [PathPoint { p: pos2(0., 0.), ..Default::default() }, PathPoint { p: pos2(10., 5.), h_in: vec2(-2., 0.), ..Default::default() }];
+        let v = d.insert(0, None, None, Node::vector(&pts, false));
+        d.flip(v, true, 5.0);
+        let n = d.node(v);
+        assert_eq!(n.rect, r(0., 0., 10., 5.));
+        assert_eq!(n.paths[0].points[0].p, pos2(10., 0.));
+        assert_eq!(n.paths[0].points[1].h_in, vec2(2., 0.));
+        let a = d.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 0., 10., 10.)));
+        let b = d.insert(0, None, None, Node::new(Kind::Rectangle, r(15., 0., 10., 10.)));
+        let c = d.insert(0, None, None, Node::new(Kind::Rectangle, r(90., 0., 10., 10.)));
+        d.distribute(&[c, a, b], true);
+        assert_eq!(d.node(b).rect.min.x, 45.0);
+        assert_eq!(d.node(c).rect.min.x, 90.0);
     }
 
     #[test]

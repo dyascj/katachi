@@ -432,7 +432,17 @@ impl App {
             }
             self.pages_list(ui);
             ui.separator();
-            ui.label(RichText::new("Layers").strong());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Layers").strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button(if self.layer_search.is_some() { "Done" } else { "Search" }).clicked() {
+                        self.layer_search = if self.layer_search.is_some() { None } else { Some(String::new()) };
+                    }
+                });
+            });
+            if let Some(q) = &mut self.layer_search {
+                ui.add(egui::TextEdit::singleline(q).hint_text("Find layers").desired_width(f32::INFINITY));
+            }
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.layers(ui));
         });
     }
@@ -595,6 +605,22 @@ impl App {
     }
 
     fn layer_rows(&self) -> Vec<(NodeId, usize)> {
+        // Searching shows every matching layer flat, at its depth.
+        if let Some(q) = self.layer_search.as_ref().filter(|q| !q.is_empty()) {
+            let q = q.to_lowercase();
+            let mut out = vec![];
+            fn walk(app: &App, list: &[NodeId], depth: usize, q: &str, out: &mut Vec<(NodeId, usize)>) {
+                for &id in list.iter().rev() {
+                    let n = app.doc.node(id);
+                    if n.name.to_lowercase().contains(q) {
+                        out.push((id, depth));
+                    }
+                    walk(app, &n.children, depth + 1, q, out);
+                }
+            }
+            walk(self, &self.doc.pages[self.page].children, 0, &q, &mut out);
+            return out.into_iter().map(|(id, _)| (id, 0)).collect();
+        }
         fn walk(app: &App, list: &[NodeId], depth: usize, out: &mut Vec<(NodeId, usize)>) {
             for &id in list.iter().rev() {
                 out.push((id, depth));
@@ -903,9 +929,18 @@ impl App {
     fn position_section(&mut self, ui: &mut Ui, roots: &[NodeId]) {
         heading(ui, "Position");
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
             for a in [Align::Left, Align::HCenter, Align::Right, Align::Top, Align::VCenter, Align::Bottom] {
-                if icon_button(ui, Icon::Align(a), false, 26.0, &format!("Align {a:?}")).clicked() {
+                if icon_button(ui, Icon::Align(a), false, 24.0, &format!("Align {a:?}")).clicked() {
                     self.align(a);
+                }
+            }
+            if roots.len() >= 3 {
+                if icon_button(ui, Icon::GapH, false, 24.0, "Distribute horizontal spacing (⌃⌥H)").clicked() {
+                    self.distribute_selection(true);
+                }
+                if icon_button(ui, Icon::GapV, false, 24.0, "Distribute vertical spacing (⌃⌥V)").clicked() {
+                    self.distribute_selection(false);
                 }
             }
         });
