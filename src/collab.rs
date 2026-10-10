@@ -275,6 +275,8 @@ pub fn connect(addr: &str, ctx: Option<egui::Context>) -> Result<Link, String> {
 /// The app's side of a session.
 pub struct Collab {
     pub link: Link,
+    /// Server-assigned id (also the high bits of this client's node ids).
+    #[allow(dead_code)]
     pub client: u32,
     /// Document as last agreed with the server; local edits are diffs against it.
     pub base: Document,

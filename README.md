@@ -76,6 +76,7 @@ GitHub Actions. Building from source needs Rust 1.92 or newer.
 - Rich text: mixed weights, sizes, colors, and italics within one text layer
 
 **Files**
+- Open Figma `.fig` files (Main menu > Open, or drop one on the canvas): pages, frames, sections, components, component sets, instances, vectors, text, images, effects, auto layout, and constraints
 - `.katachi` files (JSON), atomic saves, crash-recovery autosave, version history, open recent
 - Export presets per layer to PNG, JPG, SVG, and PDF
 
@@ -114,7 +115,7 @@ GitHub Actions. Building from source needs Rust 1.92 or newer.
 ## Roadmap
 
 - Plugins
-- Importing `.fig` files
+- Instance overrides and variables from `.fig` files
 - Lists in text
 
 ## Development
@@ -137,6 +138,7 @@ Code map:
 | `src/prototype.rs` | Present mode, interactions, transitions |
 | `src/codegen.rs` | Dev Mode code generation |
 | `src/collab.rs` | Multiplayer relay, diff sync, presence |
+| `src/kiwi.rs`, `src/fig_import.rs` | Kiwi binary decoder and Figma `.fig` import |
 | `src/text.rs` | Shared text layout and system fonts |
 | `src/boolean.rs`, `src/vector_edit.rs`, `src/svg_import.rs` | Vector features |
 

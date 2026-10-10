@@ -533,7 +533,13 @@ impl App {
             if let Some(q) = &mut self.layer_search {
                 ui.add(egui::TextEdit::singleline(q).hint_text("Find layers").desired_width(f32::INFINITY));
             }
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.layers(ui));
+            // Only the rows in view are built, so huge files stay fast.
+            let rows = self.layer_rows();
+            let row_h = 28.0;
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, row_h, rows.len(), |ui, range| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                self.layers(ui, &rows[range]);
+            });
         });
     }
 
@@ -589,7 +595,7 @@ impl App {
             self.request_new();
             ui.close();
         }
-        if item(ui, "Open…", "⌘O") {
+        if item(ui, "Open… (.katachi or Figma .fig)", "⌘O") {
             self.request_open();
             ui.close();
         }
@@ -758,11 +764,10 @@ impl App {
         out
     }
 
-    fn layers(&mut self, ui: &mut Ui) {
-        let rows = self.layer_rows();
+    fn layers(&mut self, ui: &mut Ui, rows: &[(NodeId, usize)]) {
         let mut rects: Vec<(NodeId, Rect)> = vec![];
         let shift = ui.input(|i| i.modifiers.shift || i.modifiers.command);
-        for (id, depth) in rows {
+        for &(id, depth) in rows {
             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click_and_drag());
             rects.push((id, rect));
             let n = self.doc.node(id).clone();

@@ -334,6 +334,9 @@ pub struct Textures {
     used: HashSet<u64>,
     images: HashMap<String, Option<(TextureHandle, Vec2)>>,
     tiles: HashMap<String, Option<TextureHandle>>,
+    /// Per-layer rasters with the node snapshots they were made from.
+    node_rasters: HashMap<(NodeId, u8), NodeRaster>,
+    last_key: u64,
 }
 
 const GRAD_RES: usize = 256;
@@ -344,6 +347,7 @@ impl Textures {
         let used = std::mem::take(&mut self.used);
         self.gradients.retain(|k, _| used.contains(k));
         self.rasters.retain(|k, _| used.contains(k));
+        self.node_rasters.retain(|_, e| used.contains(&e.key));
     }
 
     fn gradient(&mut self, ctx: &egui::Context, p: &Paint) -> TextureId {
@@ -370,13 +374,30 @@ impl Textures {
             .id()
     }
 
-    /// SVG rendered by resvg at `scale` (snapped to half-octaves so zooming doesn't re-render every frame).
+    /// A layer's raster from an earlier frame, if nothing it depends on changed since.
+    fn cached_raster(&mut self, id: NodeId, kind: u8, deps: &[&Node], scale: f32) -> Option<(TextureId, Rect)> {
+        let e = self.node_rasters.get(&(id, kind))?;
+        let same = e.scale == scale && e.deps.len() == deps.len() && e.deps.iter().zip(deps).all(|(a, b)| a == *b);
+        if !same {
+            return None;
+        }
+        self.used.insert(e.key);
+        Some((e.tex, e.region))
+    }
+
+    fn store_raster(&mut self, id: NodeId, kind: u8, deps: &[&Node], scale: f32, tex: TextureId, region: Rect) {
+        // Keep the texture alive under the key `raster`/`backdrop` filed it under.
+        let key = self.last_key;
+        self.node_rasters.insert((id, kind), NodeRaster { deps: deps.iter().map(|n| (*n).clone()).collect(), scale, tex, region, key });
+    }
+
+    /// SVG rendered by resvg at `scale` (already bucketed with `bucket`).
     fn raster(&mut self, ctx: &egui::Context, svg: &str, scale: f32) -> Option<TextureId> {
-        let scale = 2f32.powf((scale.max(0.01).log2() * 2.0).ceil() / 2.0);
         let mut h = DefaultHasher::new();
         (svg, scale.to_bits()).hash(&mut h);
         let key = h.finish();
         self.used.insert(key);
+        self.last_key = key;
         if let Some(t) = self.rasters.get(&key) {
             return Some(t.id());
         }
@@ -390,11 +411,11 @@ impl Textures {
 
     /// Blurred backdrop masked to a layer's shape (see `export::backdrop_parts`).
     fn backdrop(&mut self, ctx: &egui::Context, (content, mask, _, blur): (String, String, Rect, f32), scale: f32) -> Option<TextureId> {
-        let scale = 2f32.powf((scale.max(0.01).log2() * 2.0).ceil() / 2.0);
         let mut h = DefaultHasher::new();
         (&content, &mask, blur.to_bits(), scale.to_bits()).hash(&mut h);
         let key = h.finish();
         self.used.insert(key);
+        self.last_key = key;
         if let Some(t) = self.rasters.get(&key) {
             return Some(t.id());
         }
@@ -443,6 +464,20 @@ impl Textures {
         });
         entry.as_ref().map(|t| t.id())
     }
+}
+
+struct NodeRaster {
+    deps: Vec<Node>,
+    scale: f32,
+    tex: TextureId,
+    region: Rect,
+    /// The texture's key in `rasters`, for eviction.
+    key: u64,
+}
+
+/// Raster scales snap to half-octaves so zooming doesn't re-render every frame.
+fn bucket(scale: f32) -> f32 {
+    2f32.powf((scale.max(0.01).log2() * 2.0).ceil() / 2.0)
 }
 
 /// Everything a draw pass needs besides the painter.
@@ -527,16 +562,60 @@ fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
     }
     let v = sc.view;
     let screen = v.rect_to_screen(n.aabb());
+    // Off-screen containers skip their whole subtree.
+    // ponytail: unclipped frames whose children overflow far past them can pop in late; track subtree bounds if seen
+    if !n.children.is_empty() && !painter.clip_rect().intersects(screen.expand(screen.width().max(screen.height()) * 0.25 + 64.0)) {
+        return;
+    }
+    // Level of detail: layers smaller than a pixel aren't drawn at all.
+    if screen.width() < 0.5 && screen.height() < 0.5 {
+        return;
+    }
     let a = alpha * n.opacity;
-    let reach = n.stroke_width.max(n.shadows.iter().map(|s| s.blur + s.spread + s.offset.length()).fold(0.0, f32::max));
-    let ppp = painter.ctx().pixels_per_point();
-    if n.shadows.iter().any(|s| s.visible && s.kind == EffectKind::BackgroundBlur)
-        && let Some(parts) = crate::export::backdrop_parts(sc.doc, id) {
-            let region = parts.2;
-            if let Some(t) = sc.tex.backdrop(painter.ctx(), parts, v.zoom * ppp) {
-                painter.image(t, v.rect_to_screen(region), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+    // Tiny text is drawn as a faint bar per line ("greeking"), like Figma when zoomed out.
+    if n.kind == Kind::Text && n.font_size * v.zoom < 4.0 {
+        if let Some(c) = n.first_fill() {
+            let lines = (n.rect.height() / crate::text::line_pitch(n)).round().max(1.0) as usize;
+            let pitch = screen.height() / lines as f32;
+            for i in 0..lines.min(64) {
+                let y = screen.min.y + pitch * (i as f32 + 0.25);
+                let bar = Rect::from_min_size(pos2(screen.min.x, y), vec2(screen.width(), (pitch * 0.5).max(0.5)));
+                painter.rect_filled(bar, 0.0, c.to32().gamma_multiply(a * 0.35));
             }
         }
+        return;
+    }
+    let reach = n.stroke_width.max(n.shadows.iter().map(|s| s.blur + s.spread + s.offset.length()).fold(0.0, f32::max));
+    let ppp = painter.ctx().pixels_per_point();
+    let on_screen = painter.clip_rect().intersects(screen.expand(reach * v.zoom + 2.0));
+    if on_screen && n.shadows.iter().any(|s| s.visible && s.kind == EffectKind::BackgroundBlur) {
+        // What shows through depends on the layers overlapping this one on its page.
+        let area = n.aabb().expand(64.0);
+        let page = sc.doc.page_of(id);
+        let mut deps: Vec<&Node> = vec![n];
+        let mut stack: Vec<NodeId> = sc.doc.pages[page].children.clone();
+        while let Some(d) = stack.pop() {
+            let dn = sc.doc.node(d);
+            if d != id && dn.aabb().intersects(area) {
+                deps.push(dn);
+                stack.extend(dn.children.iter().copied());
+            }
+        }
+        let scale = bucket(v.zoom * ppp);
+        let tex = match sc.tex.cached_raster(id, 1, &deps, scale) {
+            Some(t) => Some(t),
+            None => crate::export::backdrop_parts(sc.doc, id).and_then(|parts| {
+                let region = parts.2;
+                sc.tex.backdrop(painter.ctx(), parts, scale).map(|t| {
+                    sc.tex.store_raster(id, 1, &deps, scale, t, region);
+                    (t, region)
+                })
+            }),
+        };
+        if let Some((t, region)) = tex {
+            painter.image(t, v.rect_to_screen(region), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+        }
+    }
     if n.is_mask {
         // Masks only shape what's above them.
         return;
@@ -544,10 +623,25 @@ fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
     let needs_compositing = n.children.iter().any(|c| sc.doc.node(*c).is_mask)
         || (n.parent.is_none() && sc.doc.descendants(id).iter().any(|d| sc.doc.node(*d).blend != crate::doc::BlendMode::Normal));
     if Some(id) != sc.hide && (needs_compositing || n.shadows.iter().any(|s| s.visible && matches!(s.kind, EffectKind::InnerShadow | EffectKind::LayerBlur))) {
+        if !on_screen {
+            return;
+        }
         // egui can't blur on the GPU: draw this layer (and its children) through resvg, exactly like export.
-        let svg = crate::export::to_svg(sc.doc, &[id]);
-        let region = crate::export::export_bounds(sc.doc, &[id]);
-        if let Some(t) = sc.tex.raster(painter.ctx(), &svg, v.zoom * ppp) {
+        // The SVG is only rebuilt when the subtree's content or the zoom bucket changes.
+        let deps: Vec<&Node> = std::iter::once(id).chain(sc.doc.descendants(id)).map(|d| sc.doc.node(d)).collect();
+        let scale = bucket(v.zoom * ppp);
+        let tex = match sc.tex.cached_raster(id, 0, &deps, scale) {
+            Some(t) => Some(t),
+            None => {
+                let svg = crate::export::to_svg(sc.doc, &[id]);
+                let region = crate::export::export_bounds(sc.doc, &[id]);
+                sc.tex.raster(painter.ctx(), &svg, scale).map(|t| {
+                    sc.tex.store_raster(id, 0, &deps, scale, t, region);
+                    (t, region)
+                })
+            }
+        };
+        if let Some((t, region)) = tex {
             let tint = Color32::WHITE.gamma_multiply(alpha);
             painter.image(t, v.rect_to_screen(region), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), tint);
         }

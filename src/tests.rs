@@ -1215,3 +1215,27 @@ fn multiplayer_host_join_edit_and_undo_only_mine() {
     assert!(!a.state().doc.nodes.contains_key(&ra) && !b.state().doc.nodes.contains_key(&ra));
     assert!(a.state().doc.nodes.contains_key(&rb) && b.state().doc.nodes.contains_key(&rb), "undo leaves others' work");
 }
+
+/// `KATACHI_PERF_FILE=x.katachi cargo test --release perf_file -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn perf_file() {
+    let Some(f) = std::env::var_os("KATACHI_PERF_FILE") else { return };
+    let t = std::time::Instant::now();
+    let mut h = Harness::builder().with_size(vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).build_eframe(move |cc| {
+        crate::setup_style(&cc.egui_ctx);
+        App::new(Some(std::path::PathBuf::from(&f)))
+    });
+    eprintln!("open: {:?}, nodes {}", t.elapsed(), h.state().doc.nodes.len());
+    let pages: Vec<usize> = std::env::var("KATACHI_PERF_PAGES").ok().map(|p| p.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_else(|| (0..h.state().doc.pages.len().min(12)).collect());
+    for page in pages {
+        h.state_mut().select_page(page);
+        h.run_steps(2);
+        let t = std::time::Instant::now();
+        h.run_steps(10);
+        eprintln!("page {page} '{}': frame {:?}", h.state().doc.pages[page].name, t.elapsed() / 10);
+    }
+    let t = std::time::Instant::now();
+    h.state_mut().doc.reflow();
+    eprintln!("reflow {:?}", t.elapsed());
+}

@@ -12,12 +12,15 @@ egui = { version = "0.35.0", features = ["serde"] }
 i_overlay = "9.0.1"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 lyon = "1.0.19"
+miniz_oxide = "0.9.1"
 resvg = "0.48.1"
 rfd = "0.17.2"
+ruzstd = "0.9.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 svg2pdf = "0.13.0"
 tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+zip = { version = "9.0.1", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 egui_kittest = { version = "0.35.0", features = ["eframe", "wgpu"] }
@@ -25,6 +28,8 @@ egui_kittest = { version = "0.35.0", features = ["eframe", "wgpu"] }
 # Keep build caches small: line tables for our code, no debug info for dependencies.
 [profile.dev]
 debug = "line-tables-only"
+# The disk this builds on is tight; incremental caches grow by gigabytes.
+incremental = false
 
 [profile.dev.package."*"]
 debug = false

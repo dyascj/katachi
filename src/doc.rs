@@ -1210,6 +1210,43 @@ pub struct Document {
     pub collections: Vec<Collection>,
     #[serde(default)]
     pub variables: Vec<Variable>,
+    #[serde(skip)]
+    pub cache: SyncCache,
+}
+
+/// Remembers which instances are already in sync, so editing a big file doesn't re-sync
+/// thousands of instances. Shared between clones (undo snapshots, drag bases); entries are
+/// validated by comparing component content, so a stale entry just causes a re-sync.
+#[derive(Clone, Default)]
+pub struct SyncCache(std::sync::Arc<std::sync::Mutex<SyncState>>);
+
+#[derive(Default)]
+pub struct SyncState {
+    /// Component -> (revision, subtree as last seen).
+    comps: HashMap<NodeId, (u64, Vec<Node>)>,
+    /// Instance -> what it was last synced against.
+    insts: HashMap<NodeId, InstKey>,
+    next_rev: u64,
+}
+
+#[derive(Clone, PartialEq)]
+struct InstKey {
+    comp: NodeId,
+    rev: u64,
+    size: (u32, u32),
+    props: Vec<(String, PropValue)>,
+}
+
+impl PartialEq for SyncCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for SyncCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SyncCache")
+    }
 }
 
 mod images_b64 {
@@ -1251,6 +1288,7 @@ impl Default for Document {
             comments: vec![],
             collections: vec![],
             variables: vec![],
+            cache: SyncCache::default(),
         }
     }
 }
@@ -1705,6 +1743,45 @@ impl Document {
         self.apply_instance_props(inst);
     }
 
+    /// A component's revision: bumps whenever its subtree's content changes.
+    fn comp_rev(&self, comp: NodeId, revs: &mut HashMap<NodeId, u64>) -> u64 {
+        if let Some(r) = revs.get(&comp) {
+            return *r;
+        }
+        let ids: Vec<NodeId> = std::iter::once(comp).chain(self.descendants(comp)).collect();
+        let cache = self.cache.0.clone();
+        let mut st = cache.lock().unwrap();
+        let same = st.comps.get(&comp).is_some_and(|(_, snap)| snap.len() == ids.len() && snap.iter().zip(&ids).all(|(a, id)| *a == self.nodes[id]));
+        let rev = if same {
+            st.comps[&comp].0
+        } else {
+            st.next_rev += 1;
+            let rev = st.next_rev;
+            st.comps.insert(comp, (rev, ids.iter().map(|id| self.nodes[id].clone()).collect()));
+            rev
+        };
+        revs.insert(comp, rev);
+        rev
+    }
+
+    fn inst_key(&self, inst: NodeId, revs: &mut HashMap<NodeId, u64>) -> Option<InstKey> {
+        let n = &self.nodes[&inst];
+        let comp = n.component.filter(|c| self.nodes.contains_key(c))?;
+        let (size, props) = ((n.rect.width().to_bits(), n.rect.height().to_bits()), n.prop_values.clone());
+        Some(InstKey { comp, rev: self.comp_rev(comp, revs), size, props })
+    }
+
+    fn instance_stale(&self, inst: NodeId, revs: &mut HashMap<NodeId, u64>) -> bool {
+        let Some(key) = self.inst_key(inst, revs) else { return false };
+        self.cache.0.lock().unwrap().insts.get(&inst) != Some(&key)
+    }
+
+    fn mark_synced(&self, inst: NodeId, revs: &mut HashMap<NodeId, u64>) {
+        if let Some(key) = self.inst_key(inst, revs) {
+            self.cache.0.lock().unwrap().insts.insert(inst, key);
+        }
+    }
+
     /// Property definitions for a component: its own, or its component set's.
     pub fn props_of(&self, comp: NodeId) -> Vec<CompProp> {
         let c = &self.nodes[&comp];
@@ -1844,11 +1921,12 @@ impl Document {
         self.apply_styles();
         self.apply_variables();
         let instances: Vec<NodeId> = self.nodes.values().filter(|n| n.kind == Kind::Instance).map(|n| n.id).collect();
-        // ponytail: syncs every instance on every edit; track dirty components when files get large
         for _ in 0..2 {
+            let mut revs: HashMap<NodeId, u64> = HashMap::new();
             for &i in &instances {
-                if self.nodes.contains_key(&i) {
+                if self.nodes.contains_key(&i) && self.instance_stale(i, &mut revs) {
                     self.sync_instance(i);
+                    self.mark_synced(i, &mut revs);
                 }
             }
         }

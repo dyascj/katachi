@@ -71,14 +71,14 @@ pub fn weight_name(w: u16) -> &'static str {
 struct Registry {
     /// Usable now.
     ready: HashMap<(String, u16), FontFamily>,
-    /// Handed to egui this frame; usable from the next.
-    pending: HashSet<(String, u16)>,
+    /// Handed to egui on this pass; usable from a later one.
+    pending: HashMap<(String, u16), u64>,
     missing: HashSet<(String, u16)>,
 }
 
-fn registry() -> &'static Mutex<Registry> {
-    static R: OnceLock<Mutex<Registry>> = OnceLock::new();
-    R.get_or_init(Default::default)
+/// Fonts loaded into one egui context (each context has its own font set).
+fn registry(ctx: &egui::Context) -> Arc<Mutex<Registry>> {
+    ctx.data_mut(|d| d.get_temp_mut_or_insert_with(egui::Id::new("katachi-font-registry"), || Arc::new(Mutex::new(Registry::default()))).clone())
 }
 
 /// Make `family`/`weight` available to egui. Call once per frame before drawing text.
@@ -87,14 +87,20 @@ pub fn ensure_font(ctx: &egui::Context, family: &str, weight: u16) {
         return;
     }
     let key = (family.to_string(), weight);
-    let mut r = registry().lock().unwrap();
+    let reg = registry(ctx);
+    let mut r = reg.lock().unwrap();
     if r.ready.contains_key(&key) || r.missing.contains(&key) {
         return;
     }
-    if r.pending.remove(&key) {
-        let name = format!("{family}#{weight}");
-        r.ready.insert(key, FontFamily::Name(name.into()));
-        ctx.request_repaint();
+    let pass = ctx.cumulative_pass_nr();
+    if let Some(&added) = r.pending.get(&key) {
+        // egui binds new fonts at the start of a pass, so only use it on a later one.
+        if pass > added {
+            r.pending.remove(&key);
+            let name = format!("{family}#{weight}");
+            r.ready.insert(key, FontFamily::Name(name.into()));
+            ctx.request_repaint();
+        }
         return;
     }
     let db = system_fonts();
@@ -115,14 +121,14 @@ pub fn ensure_font(ctx: &egui::Context, family: &str, weight: u16) {
             priority: egui::epaint::text::FontPriority::Highest,
         }],
     });
-    r.pending.insert(key);
+    r.pending.insert(key, pass);
     ctx.request_repaint();
 }
 
 /// egui family for a node's font, falling back to Inter until a system font is loaded.
-pub fn font_family(family: &str, weight: u16) -> FontFamily {
+pub fn font_family(ctx: &egui::Context, family: &str, weight: u16) -> FontFamily {
     if family != "Inter"
-        && let Some(f) = registry().lock().unwrap().ready.get(&(family.to_string(), weight)) {
+        && let Some(f) = registry(ctx).lock().unwrap().ready.get(&(family.to_string(), weight)) {
             return f.clone();
         }
     match weight {
@@ -164,7 +170,7 @@ pub fn line_pitch(n: &Node) -> f32 {
 }
 
 /// Layout job for a text node at `zoom`. `text` is the raw (un-cased) string.
-pub fn job(n: &Node, text: &str, zoom: f32, color: Color32) -> LayoutJob {
+pub fn job(ctx: &egui::Context, n: &Node, text: &str, zoom: f32, color: Color32) -> LayoutJob {
     let alpha = color.a() as f32 / 255.0;
     let format = |st: &crate::doc::SpanStyle| {
         let size = st.font_size.unwrap_or(n.font_size) * zoom;
@@ -173,7 +179,7 @@ pub fn job(n: &Node, text: &str, zoom: f32, color: Color32) -> LayoutJob {
         let decoration = st.decoration.unwrap_or(n.decoration);
         let family = st.font_family.as_deref().unwrap_or(&n.font_family);
         TextFormat {
-            font_id: FontId::new(size, font_family(family, st.font_weight.unwrap_or(n.font_weight))),
+            font_id: FontId::new(size, font_family(ctx, family, st.font_weight.unwrap_or(n.font_weight))),
             color: c,
             extra_letter_spacing: n.letter_spacing / 100.0 * size,
             line_height: (n.line_height != LineHeight::Auto).then(|| line_pitch(n) * zoom),
@@ -249,7 +255,7 @@ pub fn draw_offset(n: &Node, rows: usize) -> Vec2 {
 /// Laid-out text for drawing, plus the content size at 100% and the wrapped lines.
 pub fn layout(painter: &egui::Painter, n: &Node, zoom: f32, color: Color32) -> (Arc<Galley>, Vec2, Vec<String>) {
     let text = if n.text.is_empty() { " " } else { n.text.as_str() };
-    let galley = painter.layout_job(job(n, text, zoom, color));
+    let galley = painter.layout_job(job(painter.ctx(), n, text, zoom, color));
     let rows = galley.rows.len();
     // Lines keep a trailing newline where the paragraph ended, so export can track char offsets.
     let lines = galley

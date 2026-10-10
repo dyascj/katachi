@@ -165,6 +165,8 @@ pub struct App {
     pub collab_port: u16,
     /// Pointer in world space this frame (shared as presence).
     pub pointer_world: Option<Pos2>,
+    /// Text layers' last measured inputs, so unchanged text isn't re-laid out every frame.
+    pub text_keys: std::collections::HashMap<NodeId, u64>,
     in_gesture: bool,
     pub path: Option<PathBuf>,
     pub dirty: bool,
@@ -243,6 +245,7 @@ impl App {
             collab_address: String::new(),
             collab_port: 7878,
             pointer_world: None,
+            text_keys: Default::default(),
             in_gesture: false,
             path: None,
             dirty: false,
@@ -258,6 +261,10 @@ impl App {
         app.recoverable = crate::files::orphaned_recoveries(&app.recovery);
         if let Some(p) = path {
             app.open_path(p);
+        }
+        // Debug aid for screenshots: start on a given page.
+        if let Some(pg) = std::env::var("KATACHI_PAGE").ok().and_then(|p| p.parse::<usize>().ok()) {
+            app.page = pg.min(app.doc.pages.len() - 1);
         }
         app
     }
@@ -972,6 +979,9 @@ impl App {
     // ---------- files ----------
 
     pub fn open_path(&mut self, p: PathBuf) {
+        if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("fig")) {
+            return self.import_fig(&p);
+        }
         let parsed = std::fs::read_to_string(&p)
             .map_err(|e| e.to_string())
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).map_err(|e| e.to_string()))
@@ -987,8 +997,23 @@ impl App {
         }
     }
 
+    /// Open a Figma `.fig` as a new, unsaved document (the original is never written to).
+    pub fn import_fig(&mut self, p: &std::path::Path) {
+        let result = std::fs::read(p).map_err(|e| e.to_string()).and_then(|b| crate::fig_import::import(&b));
+        match result {
+            Ok(doc) => {
+                self.reset_to(App::new(None));
+                self.doc = doc;
+                self.dirty = true;
+                let name = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                self.toast(format!("Imported {name}: {} layers. Save to keep it as a .katachi file.", self.doc.nodes.len()));
+            }
+            Err(e) => self.toast(format!("Couldn't import: {e}")),
+        }
+    }
+
     pub fn open_dialog(&mut self) {
-        if let Some(p) = rfd::FileDialog::new().add_filter("Katachi", &["katachi"]).pick_file() {
+        if let Some(p) = rfd::FileDialog::new().add_filter("Katachi or Figma", &["katachi", "fig"]).pick_file() {
             self.open_path(p);
         }
     }

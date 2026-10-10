@@ -46,7 +46,10 @@ impl App {
             && (self.sel != [ve.id] || !self.doc.nodes.contains_key(&ve.id) || self.tool != Tool::Move) {
                 self.vector_edit = None;
             }
+        let prof = std::env::var_os("KATACHI_PROFILE").is_some();
+        let t0 = std::time::Instant::now();
         self.fit_texts(&painter);
+        let t_text = t0.elapsed();
 
         let typing = ui.ctx().egui_wants_keyboard_input();
         let (scroll, zoom, hover_pos, mods, space, mid, primary_pressed, secondary_pressed) = ui.input(|i| {
@@ -70,8 +73,12 @@ impl App {
         }
 
         let mut scene = render::Scene { doc: &self.doc, view: self.view, hide: self.editing_text, tex: &mut self.textures };
+        let t1 = std::time::Instant::now();
         render::draw_page(&painter, &mut scene, self.page);
         self.textures.end_frame();
+        if prof {
+            eprintln!("  fit_texts {t_text:?} draw {:?}", t1.elapsed());
+        }
         self.draw_pixel_grid(&painter, rect);
         self.draw_layout_grids(&painter);
         self.layout_frame_labels(&painter);
@@ -175,6 +182,17 @@ impl App {
             let stem = f.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned());
             let name = stem.unwrap_or_else(|| f.name.clone());
             let w = self.view.to_world(at) + vec2(offset, offset);
+            let is_fig = f.name.to_lowercase().ends_with(".fig") || f.path.as_ref().is_some_and(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("fig")));
+            if is_fig {
+                if let Some(p) = &f.path {
+                    if self.dirty {
+                        self.toast("Save or discard your changes before importing".into());
+                    } else {
+                        self.import_fig(p);
+                    }
+                }
+                return;
+            }
             let is_svg = f.name.to_lowercase().ends_with(".svg") || f.path.as_ref().is_some_and(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg")));
             let id = if is_svg { self.import_svg(&bytes, &name, w, true) } else { self.place_image(bytes, &name, w) };
             placed.extend(id);
@@ -187,14 +205,29 @@ impl App {
 
     /// Text boxes hug their content per their sizing mode; fonts load on demand.
     fn fit_texts(&mut self, painter: &Painter) {
-        let ids: Vec<NodeId> = self.doc.nodes.values().filter(|n| n.kind == Kind::Text).map(|n| n.id).collect();
+        // Only this page's text, and only layers whose text inputs changed since last measured.
+        // ponytail: other pages measure when visited; export of an unvisited page wraps on newlines only
+        let mut ids = vec![];
+        let mut stack: Vec<NodeId> = self.doc.pages[self.page].children.clone();
+        while let Some(id) = stack.pop() {
+            let n = self.doc.node(id);
+            if n.kind == Kind::Text {
+                ids.push(id);
+            }
+            stack.extend(n.children.iter().copied());
+        }
+        let ctx = painter.ctx().clone();
         let mut changed = false;
         for id in ids {
             let n = self.doc.node(id);
-            crate::text::ensure_font(painter.ctx(), &n.font_family, n.font_weight);
+            crate::text::ensure_font(&ctx, &n.font_family, n.font_weight);
             for sp in &n.spans {
                 let fam = sp.style.font_family.as_deref().unwrap_or(&n.font_family);
-                crate::text::ensure_font(painter.ctx(), fam, sp.style.font_weight.unwrap_or(n.font_weight));
+                crate::text::ensure_font(&ctx, fam, sp.style.font_weight.unwrap_or(n.font_weight));
+            }
+            let key = text_key(&ctx, n);
+            if self.text_keys.get(&id) == Some(&key) {
+                continue;
             }
             let (_, size, lines) = crate::text::layout(painter, n, 1.0, Color32::BLACK);
             let n = self.doc.node_mut(id);
@@ -210,6 +243,8 @@ impl App {
                 n.rect = Rect::from_min_size(n.rect.min, want);
                 changed = true;
             }
+            let key = text_key(&ctx, self.doc.node(id));
+            self.text_keys.insert(id, key);
         }
         if changed {
             self.doc.reflow();
@@ -1363,7 +1398,7 @@ impl App {
         };
         let local = n.rect.min + crate::text::draw_offset(&n, galley.rows.len());
         let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
-            let g = ui.painter().layout_job(crate::text::job(&n, buf.as_str(), zoom, color));
+            let g = ui.painter().layout_job(crate::text::job(ui.ctx(), &n, buf.as_str(), zoom, color));
             crate::text::align_rows(g, &n, zoom)
         };
         let out = egui::Area::new(egui::Id::new("canvas-text-edit"))
@@ -1529,6 +1564,23 @@ impl App {
             ui.close();
         }
     }
+}
+
+/// Everything that affects a text layer's measured size, hashed.
+fn text_key(ctx: &egui::Context, n: &Node) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    n.text.hash(&mut h);
+    format!("{:?}", crate::text::font_family(ctx, &n.font_family, n.font_weight)).hash(&mut h);
+    (n.font_size.to_bits(), n.letter_spacing.to_bits(), n.text_sizing as u8, n.text_case as u8).hash(&mut h);
+    format!("{:?}", n.line_height).hash(&mut h);
+    if n.text_sizing != crate::doc::TextSizing::AutoWidth {
+        n.rect.width().to_bits().hash(&mut h);
+    }
+    if !n.spans.is_empty() {
+        format!("{:?}", n.spans).hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Scale-tool property scaling: everything measured in pixels grows with the layer.
