@@ -606,6 +606,10 @@ impl App {
             self.save(true);
             ui.close();
         }
+        if item(ui, "Version history…", "") {
+            self.show_history = true;
+            ui.close();
+        }
         if item(ui, "Place image / SVG…", "⇧⌘K") {
             self.import_dialog();
             ui.close();
@@ -1208,6 +1212,10 @@ impl App {
         if self.sel.iter().all(|&id| self.doc.node(id).kind == Kind::Text) {
             ui.separator();
             self.typography_section(ui, &n);
+        }
+        if roots.len() == 1 && n.kind.is_frame() {
+            ui.separator();
+            self.layout_guides(ui, n.id);
         }
         if matches!(n.kind, Kind::Polygon | Kind::Star) {
             let (mut count, mut ratio) = (n.point_count as f32, n.inner_ratio * 100.0);
@@ -2140,6 +2148,82 @@ impl App {
                     t.fills = paints.clone();
                 }
             }
+        }
+    }
+
+    fn layout_guides(&mut self, ui: &mut Ui, id: NodeId) {
+        use crate::doc::{GridAlign, GridKind, LayoutGrid};
+        let mut grids = self.doc.node(id).grids.clone();
+        let before = grids.clone();
+        if section_title(ui, "Layout guide") {
+            grids.push(LayoutGrid::default());
+        }
+        let mut remove = None;
+        for (i, g) in grids.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                let label = match g.kind {
+                    GridKind::Grid => format!("Grid {}px", num(g.size)),
+                    GridKind::Columns => format!("{} columns", g.count),
+                    GridKind::Rows => format!("{} rows", g.count),
+                };
+                let open = ui.add(egui::Button::new(label).frame(false));
+                egui::Popup::menu(&open).id(ui.id().with(("grid", id, i))).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                    ui.set_width(220.0);
+                    ui.horizontal(|ui| {
+                        for k in [GridKind::Grid, GridKind::Columns, GridKind::Rows] {
+                            ui.selectable_value(&mut g.kind, k, format!("{k:?}"));
+                        }
+                    });
+                    egui::Grid::new(ui.id().with(("grid-fields", id, i))).num_columns(2).show(ui, |ui| {
+                        if g.kind == GridKind::Grid {
+                            ui.label("Size");
+                            ui.add(DragValue::new(&mut g.size).range(1.0..=1000.0));
+                            ui.end_row();
+                        } else {
+                            ui.label("Count");
+                            ui.add(DragValue::new(&mut g.count).range(1..=100));
+                            ui.end_row();
+                            ui.label("Type");
+                            egui::ComboBox::from_id_salt(("grid-align", id, i)).selected_text(format!("{:?}", g.align)).show_ui(ui, |ui| {
+                                for a in [GridAlign::Stretch, GridAlign::Min, GridAlign::Center, GridAlign::Max] {
+                                    ui.selectable_value(&mut g.align, a, format!("{a:?}"));
+                                }
+                            });
+                            ui.end_row();
+                            if g.align != GridAlign::Stretch {
+                                ui.label("Width");
+                                ui.add(DragValue::new(&mut g.size).range(1.0..=10000.0));
+                                ui.end_row();
+                            }
+                            ui.label("Gutter");
+                            ui.add(DragValue::new(&mut g.gutter).range(0.0..=1000.0));
+                            ui.end_row();
+                            ui.label(if g.align == GridAlign::Stretch { "Margin" } else { "Offset" });
+                            ui.add(DragValue::new(&mut g.margin).range(-1000.0..=1000.0));
+                            ui.end_row();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        hex_field(ui, ui.id().with(("grid-color", id, i)), &mut g.color, 56.0);
+                        crate::paint_ui::alpha_field(ui, &mut g.color);
+                    });
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, Icon::Minus, false, 22.0, "Remove").clicked() {
+                        remove = Some(i);
+                    }
+                    if icon_button(ui, Icon::Eye(g.visible), false, 22.0, "Show/hide").clicked() {
+                        g.visible = !g.visible;
+                    }
+                });
+            });
+        }
+        if let Some(i) = remove {
+            grids.remove(i);
+        }
+        if grids != before {
+            self.begin_edit();
+            self.doc.node_mut(id).grids = grids;
         }
     }
 

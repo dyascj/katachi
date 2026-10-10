@@ -130,6 +130,8 @@ pub struct App {
     /// Cmd+\ hides the side panels.
     pub ui_hidden: bool,
     pub rulers: bool,
+    pub show_grids: bool,
+    pub show_history: bool,
     /// Properties copied with Cmd+Alt+C.
     pub style_clip: Option<Node>,
     pub layer_search: Option<String>,
@@ -187,6 +189,8 @@ impl App {
             vector_start: Pos2::ZERO,
             ui_hidden: false,
             rulers: false,
+            show_grids: true,
+            show_history: false,
             style_clip: None,
             layer_search: None,
             recovery: crate::files::recovery_dir().join(format!(
@@ -887,8 +891,10 @@ impl App {
                 None => return false,
             },
         };
-        match crate::files::write_atomic(&path, self.document_json().as_bytes()) {
+        let json = self.document_json();
+        match crate::files::write_atomic(&path, json.as_bytes()) {
             Ok(()) => {
+                crate::files::save_version(&path, json.as_bytes());
                 crate::files::add_recent(&path);
                 self.path = Some(path);
                 self.dirty = false;
@@ -990,6 +996,59 @@ impl App {
             let _ = std::fs::remove_file(p);
             self.recoverable.retain(|q| q != p);
         }
+    }
+
+    /// File > Version history: every save of this file, restorable (undoably).
+    fn history_window(&mut self, ctx: &egui::Context) {
+        if !self.show_history {
+            return;
+        }
+        let Some(path) = self.path.clone() else {
+            self.show_history = false;
+            self.toast("Save the file to start its version history".into());
+            return;
+        };
+        let mut open = true;
+        let mut restore = None;
+        egui::Window::new("Version history").open(&mut open).collapsible(false).resizable(false).default_width(300.0).show(ctx, |ui| {
+            let versions = crate::files::versions(&path);
+            if versions.is_empty() {
+                ui.label("No saved versions yet.");
+            }
+            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                for (i, (p, age)) in versions.iter().enumerate() {
+                    let when = match age {
+                        0..=59 => "Just now".to_string(),
+                        60..=3599 => format!("{} min ago", age / 60),
+                        3600..=86399 => format!("{} h ago", age / 3600),
+                        _ => format!("{} days ago", age / 86400),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(if i == 0 { format!("{when} (latest save)") } else { when });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Restore").clicked() {
+                                restore = Some(p.clone());
+                            }
+                        });
+                    });
+                }
+            });
+        });
+        if let Some(p) = restore {
+            let doc = std::fs::read_to_string(&p)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| serde_json::from_value::<Document>(v["document"].clone()).ok());
+            if let Some(doc) = doc {
+                self.checkpoint();
+                self.doc = doc;
+                self.sel.clear();
+                self.page = 0;
+                self.view_ready = false;
+                self.toast("Version restored (undo with ⌘Z)".into());
+            }
+        }
+        self.show_history = open;
     }
 
     fn recovery_prompt(&mut self, ctx: &egui::Context) {
@@ -1171,6 +1230,11 @@ impl App {
             return;
         }
         let step = if m.shift { 10.0 } else { 1.0 };
+        // Ctrl+G: show/hide layout guides.
+        if m.ctrl && !m.mac_cmd && !m.alt && key == Key::G {
+            self.show_grids = !self.show_grids;
+            return;
+        }
         // Ctrl+Cmd+M: use as mask.
         if m.ctrl && m.mac_cmd && key == Key::M {
             return self.toggle_mask();
@@ -1335,6 +1399,7 @@ impl eframe::App for App {
         self.canvas_panel(ui);
         self.close_guard(&ctx);
         self.recovery_prompt(&ctx);
+        self.history_window(&ctx);
         self.autosave(ctx.input(|i| i.time));
         self.debug_screenshot(&ctx);
 

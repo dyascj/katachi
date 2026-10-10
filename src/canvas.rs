@@ -71,6 +71,7 @@ impl App {
         render::draw_page(&painter, &mut scene, self.page);
         self.textures.end_frame();
         self.draw_pixel_grid(&painter, rect);
+        self.draw_layout_grids(&painter);
         self.layout_frame_labels(&painter);
 
         self.accept_drops(ui, hover_pos.filter(|p| rect.contains(*p)).unwrap_or(rect.center()));
@@ -863,9 +864,76 @@ impl App {
             .map(|n| n.aabb())
             .collect();
         if let Some(p) = parent {
-            out.push(self.doc.node(p).aabb());
+            let pn = self.doc.node(p);
+            out.push(pn.aabb());
+            // Column and row edges of the parent's layout guides snap too.
+            if self.show_grids {
+                let r = pn.rect;
+                for g in pn.grids.iter().filter(|g| g.visible) {
+                    match g.kind {
+                        crate::doc::GridKind::Columns => {
+                            for (a, b) in g.bands(r.min.x, r.max.x) {
+                                out.push(Rect::from_min_max(pos2(a, r.min.y), pos2(a, r.max.y)));
+                                out.push(Rect::from_min_max(pos2(b, r.min.y), pos2(b, r.max.y)));
+                            }
+                        }
+                        crate::doc::GridKind::Rows => {
+                            for (a, b) in g.bands(r.min.y, r.max.y) {
+                                out.push(Rect::from_min_max(pos2(r.min.x, a), pos2(r.max.x, a)));
+                                out.push(Rect::from_min_max(pos2(r.min.x, b), pos2(r.max.x, b)));
+                            }
+                        }
+                        crate::doc::GridKind::Grid => {}
+                    }
+                }
+            }
         }
         out
+    }
+
+    /// Layout guides over frames (Ctrl+G toggles), drawn above content like Figma.
+    fn draw_layout_grids(&self, painter: &Painter) {
+        if !self.show_grids {
+            return;
+        }
+        for n in self.doc.nodes.values().filter(|n| !n.grids.is_empty() && n.visible && self.doc.page_of(n.id) == self.page) {
+            let r = n.rect;
+            let clip = painter.with_clip_rect(painter.clip_rect().intersect(self.view.rect_to_screen(r)));
+            for g in n.grids.iter().filter(|g| g.visible) {
+                let c = g.color.to32();
+                match g.kind {
+                    crate::doc::GridKind::Columns => {
+                        for (a, b) in g.bands(r.min.x, r.max.x) {
+                            clip.rect_filled(self.view.rect_to_screen(Rect::from_min_max(pos2(a, r.min.y), pos2(b, r.max.y))), 0.0, c);
+                        }
+                    }
+                    crate::doc::GridKind::Rows => {
+                        for (a, b) in g.bands(r.min.y, r.max.y) {
+                            clip.rect_filled(self.view.rect_to_screen(Rect::from_min_max(pos2(r.min.x, a), pos2(r.max.x, b))), 0.0, c);
+                        }
+                    }
+                    crate::doc::GridKind::Grid => {
+                        let step = g.size.max(1.0);
+                        if step * self.view.zoom < 3.0 {
+                            continue;
+                        }
+                        let stroke = Stroke::new(1.0, c);
+                        let mut x = r.min.x + step;
+                        while x < r.max.x {
+                            let sx = self.view.to_screen(pos2(x, 0.0)).x;
+                            clip.line_segment([pos2(sx, self.view.to_screen(r.min).y), pos2(sx, self.view.to_screen(r.max).y)], stroke);
+                            x += step;
+                        }
+                        let mut y = r.min.y + step;
+                        while y < r.max.y {
+                            let sy = self.view.to_screen(pos2(0.0, y)).y;
+                            clip.line_segment([pos2(self.view.to_screen(r.min).x, sy), pos2(self.view.to_screen(r.max).x, sy)], stroke);
+                            y += step;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Correction that snaps the masked edges of `moving` to nearby sibling edges/centers.

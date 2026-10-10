@@ -592,6 +592,13 @@ fn shots() {
     st.zoom_to(&egui::Context::default(), None, false);
     h.run_steps(4);
     save(&mut h, "18-variants");
+    // Layout guides on the landing frame.
+    let st = h.state_mut();
+    let landing = *st.doc.nodes.keys().find(|i| st.doc.node(**i).name == "Landing").unwrap();
+    st.doc.node_mut(landing).grids = vec![crate::doc::LayoutGrid { kind: crate::doc::GridKind::Columns, count: 4, gutter: 16., margin: 24., ..Default::default() }];
+    st.sel = vec![landing];
+    h.run_steps(3);
+    save(&mut h, "19-layout-grid");
 }
 
 #[test]
@@ -974,4 +981,16 @@ fn prototype_connect_present_and_navigate() {
     assert_eq!(h.state().presenting.as_ref().map(|p| p.frame), Some(a));
     key(&mut h, Modifiers::NONE, Key::Escape);
     assert!(h.state().presenting.is_none());
+}
+
+#[test]
+fn saves_keep_versions() {
+    isolate_data();
+    let file = std::env::temp_dir().join(format!("katachi-versions-{}.katachi", std::process::id()));
+    crate::files::save_version(&file, b"{\"katachi\":1}");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    crate::files::save_version(&file, b"{\"katachi\":2}");
+    let v = crate::files::versions(&file);
+    assert_eq!(v.len(), 2);
+    assert_eq!(std::fs::read_to_string(&v[0].0).unwrap(), "{\"katachi\":2}", "newest first");
 }

@@ -416,6 +416,63 @@ impl Default for ExportSetting {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum GridKind {
+    /// Uniform square grid.
+    #[default]
+    Grid,
+    Columns,
+    Rows,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum GridAlign {
+    #[default]
+    Stretch,
+    Min,
+    Center,
+    Max,
+}
+
+/// A frame's layout guide (Figma's layout grids).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LayoutGrid {
+    pub kind: GridKind,
+    pub count: u32,
+    /// Grid cell size, or track width when not stretching.
+    pub size: f32,
+    pub gutter: f32,
+    /// Margin (stretch) or offset (aligned).
+    pub margin: f32,
+    pub align: GridAlign,
+    pub color: Rgba,
+    pub visible: bool,
+}
+
+impl Default for LayoutGrid {
+    fn default() -> Self {
+        Self { kind: GridKind::Grid, count: 5, size: 10.0, gutter: 20.0, margin: 0.0, align: GridAlign::Stretch, color: Rgba([255, 0, 0, 26]), visible: true }
+    }
+}
+
+impl LayoutGrid {
+    /// Column/row tracks between `lo` and `hi` as (start, end) pairs.
+    pub fn bands(&self, lo: f32, hi: f32) -> Vec<(f32, f32)> {
+        let n = self.count.max(1) as usize;
+        let gutters = self.gutter * (n as f32 - 1.0);
+        let (track, start) = match self.align {
+            GridAlign::Stretch => (((hi - lo) - 2.0 * self.margin - gutters) / n as f32, lo + self.margin),
+            GridAlign::Min => (self.size, lo + self.margin),
+            GridAlign::Max => (self.size, hi - self.margin - (self.size * n as f32 + gutters)),
+            GridAlign::Center => (self.size, (lo + hi) / 2.0 - (self.size * n as f32 + gutters) / 2.0 + self.margin),
+        };
+        (0..n).map(|i| {
+            let a = start + i as f32 * (track + self.gutter);
+            (a, a + track.max(0.0))
+        }).collect()
+    }
+}
+
 /// What sits at the ends of an open path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Marker {
@@ -699,6 +756,7 @@ pub struct Node {
     pub bool_op: BoolOp,
     /// Clips the layers above it in the same parent.
     pub is_mask: bool,
+    pub grids: Vec<LayoutGrid>,
     pub exports: Vec<ExportSetting>,
     pub blend: BlendMode,
     /// Prototype interactions.
@@ -775,6 +833,7 @@ impl Default for Node {
             absolute: false,
             bool_op: BoolOp::Union,
             is_mask: false,
+            grids: vec![],
             exports: vec![],
             blend: BlendMode::Normal,
             reactions: vec![],
@@ -2410,6 +2469,15 @@ mod tests {
         d.reflow();
         assert_eq!(d.node(kids[1]).text, "Pay");
         assert!(!d.node(kids[0]).visible);
+    }
+
+    #[test]
+    fn grid_bands() {
+        let g = LayoutGrid { kind: GridKind::Columns, count: 3, gutter: 10., margin: 20., ..Default::default() };
+        let near = |a: &[(f32, f32)], b: &[(f32, f32)]| a.iter().zip(b).all(|(x, y)| (x.0 - y.0).abs() < 1e-3 && (x.1 - y.1).abs() < 1e-3);
+        assert!(near(&g.bands(0., 340.), &[(20., 113.3333), (123.3333, 216.6667), (226.6667, 320.)]));
+        let c = LayoutGrid { align: GridAlign::Center, size: 50., count: 2, gutter: 10., margin: 0., ..g };
+        assert_eq!(c.bands(0., 200.), vec![(45., 95.), (105., 155.)]);
     }
 
     #[test]
