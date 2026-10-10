@@ -153,4 +153,6 @@ Code map:
 | `src/text.rs` | Shared text layout and system fonts |
 | `src/boolean.rs`, `src/vector_edit.rs`, `src/svg_import.rs` | Vector features |
 
-Inter is bundled under the SIL Open Font License (`assets/fonts/Inter-LICENSE.txt`).
+## License
+
+MIT, see [LICENSE](LICENSE). Inter is bundled under the SIL Open Font License (`assets/fonts/Inter-LICENSE.txt`).
