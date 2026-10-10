@@ -117,6 +117,8 @@ GitHub Actions. Building from source needs Rust 1.92 or newer.
 | Dev Mode, present | Shift D, Alt Cmd Enter |
 | Save, open, place image, export | Cmd S, Cmd O, Shift Cmd K, Shift Cmd E |
 | Find and replace | Cmd F |
+| Copy as PNG, paste to replace, select matching layers | Shift Cmd C, Shift Cmd R, Alt Cmd A |
+| Copy and paste properties | Alt Cmd C, Alt Cmd V |
 | Numbered, bulleted list | Shift Cmd 7, Shift Cmd 8 |
 
 ## Roadmap

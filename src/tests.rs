@@ -1320,3 +1320,35 @@ fn selection_colors_recolor_every_use() {
     assert_eq!(d.node(ids[2]).fills[0].color, Rgba::rgb(0, 255, 0));
     assert_eq!(d.node(ids[1]).fills[0].color, Rgba::rgb(0, 0, 255), "other colors untouched");
 }
+
+#[test]
+fn select_matching_and_paste_to_replace() {
+    use crate::doc::{Paint, Rgba};
+    let mut h = harness();
+    let mut add = |h: &mut Harness<App>, kind, rect, c| {
+        let mut n = Node::new(kind, rect);
+        n.fills = vec![Paint::solid(c)];
+        h.state_mut().doc.insert(0, None, None, n)
+    };
+    let red = Rgba::rgb(255, 0, 0);
+    let a = add(&mut h, Kind::Rectangle, r(0., 0., 20., 20.), red);
+    let b = add(&mut h, Kind::Rectangle, r(40., 0., 30., 30.), red);
+    let c = add(&mut h, Kind::Rectangle, r(80., 0., 20., 20.), Rgba::rgb(0, 0, 255));
+    let e = add(&mut h, Kind::Ellipse, r(0., 100., 10., 10.), red);
+    h.state_mut().sel = vec![a];
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::A);
+    let mut sel = h.state().sel.clone();
+    sel.sort();
+    assert_eq!(sel, vec![a, b], "same type and look, any size");
+    // Copy the ellipse, replace the blue rectangle with it.
+    h.state_mut().sel = vec![e];
+    h.event(Event::Copy);
+    h.step();
+    h.state_mut().sel = vec![c];
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::R);
+    let d = &h.state().doc;
+    assert!(!d.nodes.contains_key(&c));
+    let new = h.state().sel[0];
+    assert_eq!(d.node(new).kind, Kind::Ellipse);
+    assert_eq!(d.node(new).rect.center(), pos2(90., 10.), "centered where the replaced layer was");
+}

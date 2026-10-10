@@ -1498,6 +1498,33 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
             ui.close();
         }
+        ui.add_enabled_ui(has, |ui| {
+            ui.menu_button("Copy/Paste as", |ui| {
+                for (label, short, what) in [("Copy as PNG", "⇧⌘C", "png"), ("Copy as SVG", "", "svg"), ("Copy as CSS", "", "css")] {
+                    if ui.add(egui::Button::new(label).shortcut_text(short)).clicked() {
+                        self.copy_as(&ctx, what);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui.add(egui::Button::new("Copy properties").shortcut_text("⌥⌘C")).clicked() {
+                    self.style_clip = self.sel.first().map(|&id| self.doc.node(id).clone());
+                    ui.close();
+                }
+                if ui.add_enabled(self.style_clip.is_some(), egui::Button::new("Paste properties").shortcut_text("⌥⌘V")).clicked() {
+                    self.paste_style();
+                    ui.close();
+                }
+                if ui.add_enabled(self.clip_frag.is_some(), egui::Button::new("Paste to replace").shortcut_text("⇧⌘R")).clicked() {
+                    self.paste_to_replace();
+                    ui.close();
+                }
+            });
+        });
+        if item(ui, "Select matching layers", "⌥⌘A", has) {
+            self.select_matching();
+            ui.close();
+        }
         if item(ui, "Duplicate", "⌘D", has) {
             self.duplicate_selection();
             ui.close();

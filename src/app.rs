@@ -134,6 +134,8 @@ pub struct App {
     pub rulers: bool,
     pub show_grids: bool,
     pub show_history: bool,
+    /// The last layers copied here, for Paste to replace.
+    pub clip_frag: Option<Vec<Node>>,
     /// Find and replace (Cmd F): (open, query, replacement, focus the field next frame).
     pub find: (bool, String, String, bool),
     /// Plugins > Run script console.
@@ -222,6 +224,7 @@ impl App {
             show_grids: true,
             show_history: false,
             find: (false, String::new(), String::new(), false),
+            clip_frag: None,
             show_console: false,
             console_code: "for (const n of figma.currentPage.selection) {\n  n.rotation += 15;\n}\nfigma.notify(`Rotated ${figma.currentPage.selection.length} layers`);\n".into(),
             show_variables: false,
@@ -766,6 +769,7 @@ impl App {
         if let Ok(json) = serde_json::to_string(&frag) {
             ctx.copy_text(format!("{CLIP_TAG}{json}"));
         }
+        self.clip_frag = Some(frag);
     }
 
     pub fn paste_text(&mut self, text: &str) {
@@ -801,6 +805,77 @@ impl App {
             n.text = text.to_string();
             let id = self.doc.insert(self.page, None, None, n);
             self.sel = vec![id];
+        }
+    }
+
+    /// Shift Cmd R: put the copied layers where each selected layer is, replacing it.
+    pub fn paste_to_replace(&mut self) {
+        let Some(frag) = self.clip_frag.clone() else {
+            self.toast("Copy something first".into());
+            return;
+        };
+        let targets = self.doc.sort_by_z(&self.sel_roots());
+        if targets.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        let mut out = vec![];
+        for t in targets {
+            let (page, parent, index, center) = (self.doc.page_of(t), self.doc.node(t).parent, self.doc.index_in_parent(t), self.doc.node(t).aabb().center());
+            let ids = self.doc.paste(&frag, page, parent, Some(index));
+            let b = self.doc.bounds(&ids);
+            for &id in &ids {
+                self.doc.translate(id, center - b.center());
+            }
+            self.doc.remove(t);
+            out.extend(ids);
+        }
+        self.doc.reflow();
+        self.sel = out;
+    }
+
+    /// Alt Cmd A: every layer on the page that looks like the selected one.
+    pub fn select_matching(&mut self) {
+        let Some(&first) = self.sel.first() else { return };
+        let a = self.doc.node(first).clone();
+        let same = |b: &Node| {
+            b.kind == a.kind
+                && b.fills == a.fills
+                && b.strokes == a.strokes
+                && b.stroke_width == a.stroke_width
+                && b.shadows == a.shadows
+                && b.radius == a.radius
+                && b.component == a.component
+                && (a.kind != Kind::Text || (b.font_family == a.font_family && b.font_size == a.font_size && b.font_weight == a.font_weight))
+        };
+        let page = self.doc.pages[self.page].children.clone();
+        self.sel = page
+            .iter()
+            .flat_map(|&r| std::iter::once(r).chain(self.doc.descendants(r)))
+            .filter(|&id| {
+                let n = self.doc.node(id);
+                n.visible && !n.locked && same(n)
+            })
+            .collect();
+    }
+
+    /// Copy the selection as SVG markup, a PNG image, or CSS.
+    pub fn copy_as(&mut self, ctx: &egui::Context, what: &str) {
+        let roots = self.sel_roots();
+        if roots.is_empty() {
+            return;
+        }
+        match what {
+            "svg" => ctx.copy_text(crate::export::to_svg(&self.doc, &roots)),
+            "css" => ctx.copy_text(roots.iter().map(|&id| crate::codegen::css(&self.doc, id)).collect::<Vec<_>>().join("\n\n")),
+            _ => match crate::export::encode(&self.doc, &crate::export::to_svg(&self.doc, &roots), crate::doc::ExportFormat::Png, 2.0).ok().and_then(|png| image::load_from_memory(&png).ok()) {
+                Some(img) => {
+                    let rgba = img.to_rgba8();
+                    ctx.copy_image(egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw()));
+                    self.toast("Copied as PNG".into());
+                }
+                None => self.toast("Couldn't render the selection".into()),
+            },
         }
     }
 
@@ -1630,6 +1705,9 @@ impl App {
             (true, false, false, Key::D) => self.duplicate_selection(),
             (true, false, true, Key::C) => self.style_clip = self.sel.first().map(|&id| self.doc.node(id).clone()),
             (true, false, true, Key::V) => self.paste_style(),
+            (true, true, false, Key::R) => self.paste_to_replace(),
+            (true, false, true, Key::A) => self.select_matching(),
+            (true, true, false, Key::C) => self.copy_as(ctx, "png"),
             (true, false, false, Key::R) => {
                 if let Some(&id) = self.sel.first() {
                     self.left_tab_assets = false;
