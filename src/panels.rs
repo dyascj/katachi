@@ -682,6 +682,26 @@ impl App {
                 }
             });
         });
+        ui.menu_button("MCP server", |ui| {
+            let port = crate::mcp::port();
+            if self.mcp_listening() {
+                ui.label(format!("Listening on http://127.0.0.1:{port}/mcp"));
+                if ui.button("Copy Claude Code setup command").clicked() {
+                    ui.ctx().copy_text(format!("claude mcp add --transport http katachi http://127.0.0.1:{port}/mcp"));
+                    self.toast("Copied; run it in a terminal".into());
+                    ui.close();
+                }
+                if ui.button("Copy stdio config (Claude Desktop, Cursor)").clicked() {
+                    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "katachi".into());
+                    let cfg = serde_json::json!({ "mcpServers": { "katachi": { "command": exe, "args": ["mcp"] } } });
+                    ui.ctx().copy_text(serde_json::to_string_pretty(&cfg).unwrap_or_default());
+                    self.toast("Copied MCP config".into());
+                    ui.close();
+                }
+            } else {
+                ui.label(format!("Not running: port {port} is in use (another Katachi window?)"));
+            }
+        });
         if item(ui, "Place image / SVG…", "⇧⌘K") {
             self.import_dialog();
             ui.close();

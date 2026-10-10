@@ -10,9 +10,19 @@ use std::collections::HashMap;
 /// `figma` global and node prototype, implemented over plain objects.
 const PRELUDE: &str = r#"
 const __nodes = new Map();
-let __removed = [], __notes = [], __closed = false, __newId = 0, __errors = [], __outbox = [], __ui = null, __storage = {};
+let __removed = [], __notes = [], __closed = false, __newId = 0, __errors = [], __outbox = [], __ui = null, __storage = {}, __result;
 const __handlers = {}, __uiHandlers = [];
-function __reset() { __removed = []; __notes = []; __errors = []; __outbox = []; }
+function __reset() { __removed = []; __notes = []; __errors = []; __outbox = []; __result = undefined; }
+// A returned value as plain JSON: layers become { id, type, name }.
+function __plain(v, depth) {
+  depth = depth || 0;
+  if (v === null || typeof v !== "object" || depth > 20) return typeof v === "function" || typeof v === "symbol" ? undefined : v;
+  if (Object.getPrototypeOf(v) === __NodeProto) return { id: v.id, type: v.type, name: v.name };
+  if (Array.isArray(v)) return v.map(x => __plain(x, depth + 1));
+  const o = {};
+  for (const k of Object.keys(v)) o[k] = __plain(v[k], depth + 1);
+  return o;
+}
 function __safe(f) { try { Promise.resolve(f()).catch(e => __errors.push(String(e) + (e && e.stack ? '\n' + e.stack : ''))); } catch (e) { __errors.push(String(e) + (e && e.stack ? '\n' + e.stack : '')); } }
 function __deliver(json) {
   const msg = JSON.parse(json);
@@ -161,7 +171,7 @@ function __collect() {
   walk(figma.currentPage, null);
   return JSON.stringify({ nodes: out, top: figma.currentPage.children.map(c => c.id), removed: __removed, notes: __notes,
     selection: figma.currentPage.selection.map(n => n.id), closed: __closed, errors: __errors, outbox: __outbox, ui: __ui,
-    storage: JSON.stringify(__storage) });
+    storage: JSON.stringify(__storage), result: __result === undefined ? null : JSON.stringify(__plain(__result)) });
 }
 "#;
 
@@ -271,6 +281,8 @@ pub struct Outcome {
     /// The UI the plugin wants shown, if any.
     pub ui: Option<UiRequest>,
     pub closed: bool,
+    /// What the code returned (JSON), with new layers' ids filled in.
+    pub result: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -311,7 +323,7 @@ impl Session {
         s.eval(PRELUDE)?;
         s.eval(&init)?;
         // Plugins are often async; errors are collected rather than thrown.
-        let out = s.step(doc, page, sel, &format!("__safe(async () => {{\n{code}\n}});"))?;
+        let out = s.step(doc, page, sel, &format!("__safe(async () => {{ __result = await (async () => {{\n{code}\n}})(); }});"))?;
         Ok((s, out))
     }
 
@@ -372,7 +384,18 @@ impl Session {
             height: u.get("height").and_then(|h| h.as_f64()).unwrap_or(200.0) as f32,
             visible: u.get("visible").and_then(|v| v.as_bool()).unwrap_or(true),
         });
+        let result = out["result"].as_str().map(|r| {
+            let mut r = r.to_string();
+            // Longest ids first, so "new:1" doesn't clip "new:12".
+            let mut fresh: Vec<(&String, &NodeId)> = ids.iter().filter(|(k, _)| k.starts_with("new:")).collect();
+            fresh.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
+            for (k, v) in fresh {
+                r = r.replace(&format!("\"{k}\""), &format!("\"{v}\""));
+            }
+            r
+        });
         Ok(Outcome {
+            result,
             notes: strings("notes"),
             selection: out["selection"].as_array().into_iter().flatten().filter_map(|v| ids.get(v.as_str()?).copied()).collect(),
             outbox: strings("outbox"),

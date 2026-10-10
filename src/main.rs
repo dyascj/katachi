@@ -9,6 +9,8 @@ mod export;
 mod fig_import;
 mod files;
 mod kiwi;
+mod mcp;
+mod mcp_tools;
 mod paint_ui;
 mod plugin_view;
 mod plugins;
@@ -28,6 +30,11 @@ use std::sync::Arc;
 fn main() -> eframe::Result {
     // `katachi serve [file] [--port N]`: a headless multiplayer relay that saves to the file.
     let args: Vec<String> = std::env::args().collect();
+    // `katachi mcp`: connect a stdio MCP client to the running app.
+    if args.get(1).is_some_and(|a| a == "mcp") {
+        mcp::stdio_bridge();
+        return Ok(());
+    }
     if args.get(1).is_some_and(|a| a == "serve") {
         serve_headless(&args[2..]);
         return Ok(());

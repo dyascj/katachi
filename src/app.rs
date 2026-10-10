@@ -151,6 +151,9 @@ pub struct App {
     pub show_history: bool,
     /// The plugin that's running with a UI, if any.
     pub plugin: Option<PluginRun>,
+    /// MCP tool calls from agents, once the server is listening.
+    mcp: Option<std::sync::mpsc::Receiver<crate::mcp::Call>>,
+    mcp_tried: bool,
     /// `KATACHI_PLUGIN=path/manifest.json`: run a plugin at startup (development).
     debug_plugin: Option<PathBuf>,
     /// The last layers copied here, for Paste to replace.
@@ -246,6 +249,8 @@ impl App {
             find: (false, String::new(), String::new(), false),
             clip_frag: None,
             plugin: None,
+            mcp: None,
+            mcp_tried: cfg!(test),
             debug_plugin: std::env::var_os("KATACHI_PLUGIN").map(PathBuf::from),
             show_console: false,
             console_code: "for (const n of figma.currentPage.selection) {\n  n.rotation += 15;\n}\nfigma.notify(`Rotated ${figma.currentPage.selection.length} layers`);\n".into(),
@@ -1136,6 +1141,10 @@ impl App {
                 None => return false,
             },
         };
+        self.save_to(path)
+    }
+
+    pub fn save_to(&mut self, path: PathBuf) -> bool {
         let json = self.document_json();
         match crate::files::write_atomic(&path, json.as_bytes()) {
             Ok(()) => {
@@ -1317,15 +1326,20 @@ impl App {
         }
     }
 
+    /// Make the changes since `before` one undo step (if there were any).
+    pub fn keep_changes(&mut self, before: Document) {
+        if self.doc.nodes != before.nodes || self.doc.pages != before.pages || self.doc.styles != before.styles || self.doc.variables != before.variables || self.doc.collections != before.collections {
+            let after = std::mem::replace(&mut self.doc, before);
+            self.checkpoint();
+            self.doc = after;
+        }
+    }
+
     /// Keep a plugin step's changes as one undo step, or roll them back on error.
     fn plugin_apply(&mut self, name: &str, before: Document, res: Result<crate::plugins::Outcome, String>) -> Option<crate::plugins::Outcome> {
         match res {
             Ok(out) => {
-                if self.doc.nodes != before.nodes || self.doc.pages != before.pages {
-                    let after = std::mem::replace(&mut self.doc, before);
-                    self.checkpoint();
-                    self.doc = after;
-                }
+                self.keep_changes(before);
                 self.sel = out.selection.clone();
                 if let Some(n) = out.notes.last() {
                     self.toast(n.clone());
@@ -1344,6 +1358,24 @@ impl App {
                 None
             }
         }
+    }
+
+    /// Start the MCP server on the first frame, then answer tool calls between frames.
+    fn mcp_frame(&mut self, ctx: &egui::Context) {
+        if !self.mcp_tried {
+            self.mcp_tried = true;
+            self.mcp = crate::mcp::start(ctx.clone());
+        }
+        let calls: Vec<crate::mcp::Call> = self.mcp.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
+        for c in calls {
+            let result = self.mcp_tool(ctx, &c.name, &c.args);
+            let _ = c.reply.send(result);
+            ctx.request_repaint();
+        }
+    }
+
+    pub fn mcp_listening(&self) -> bool {
+        self.mcp.is_some()
     }
 
     /// A running plugin with a UI: pass messages both ways, report selection changes, draw its panel.
@@ -1741,7 +1773,6 @@ impl App {
         Some(id)
     }
 
-    /// Cmd+E: merge the selection into one vector with exact outlines.
     /// Alt Cmd O: strokes become filled vectors. Layers that also have fills become a group of both.
     pub fn outline_stroke_selection(&mut self) {
         let targets: Vec<NodeId> = self
@@ -1787,6 +1818,7 @@ impl App {
         self.sel = out;
     }
 
+    /// Cmd+E: merge the selection into one vector with exact outlines.
     pub fn flatten_selection(&mut self) {
         let roots = self.sel_roots();
         if roots.is_empty() || roots.iter().all(|&id| self.doc.node(id).kind == Kind::Vector && roots.len() == 1) {
@@ -2057,6 +2089,7 @@ impl eframe::App for App {
         self.console_window(&ctx);
         self.find_window(&ctx);
         self.plugin_frame(&ctx, frame);
+        self.mcp_frame(&ctx);
         self.variables_window(&ctx);
         self.autosave(ctx.input(|i| i.time));
         self.debug_screenshot(&ctx);
