@@ -72,7 +72,7 @@ impl App {
             self.view.pan += scroll;
         }
 
-        let mut scene = render::Scene { doc: &self.doc, view: self.view, hide: self.editing_text, tex: &mut self.textures };
+        let mut scene = render::Scene { doc: &self.doc, view: self.view, hide: self.editing_text, outline: self.outline_mode, tex: &mut self.textures };
         let t1 = std::time::Instant::now();
         render::draw_page(&painter, &mut scene, self.page);
         self.textures.end_frame();
@@ -1579,6 +1579,10 @@ impl App {
         let masked = self.sel.first().is_some_and(|&s| self.doc.node(s).is_mask);
         if item(ui, if masked { "Remove mask" } else { "Use as mask" }, "⌃⌘M", has) {
             self.toggle_mask();
+            ui.close();
+        }
+        if item(ui, "Outline stroke", "⌥⌘O", has) {
+            self.outline_stroke_selection();
             ui.close();
         }
         if item(ui, "Flatten", "⌘E", has) {

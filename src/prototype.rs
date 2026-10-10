@@ -245,24 +245,24 @@ impl App {
                 match tr.kind {
                     TransitionKind::SmartAnimate => {
                         let d = smart_frame(&self.doc, from, to, e);
-                        render::draw_subtree(&painter, &mut Scene { doc: &d, view, hide: None, tex: &mut self.textures }, to, 1.0);
+                        render::draw_subtree(&painter, &mut Scene { doc: &d, view, hide: None, outline: false, tex: &mut self.textures }, to, 1.0);
                     }
                     TransitionKind::Dissolve => {
-                        render::draw_subtree(&painter, &mut Scene { doc: &self.doc, view: fv, hide: None, tex: &mut self.textures }, from, 1.0);
-                        render::draw_subtree(&painter, &mut Scene { doc: &self.doc, view, hide: None, tex: &mut self.textures }, to, e);
+                        render::draw_subtree(&painter, &mut Scene { doc: &self.doc, view: fv, hide: None, outline: false, tex: &mut self.textures }, from, 1.0);
+                        render::draw_subtree(&painter, &mut Scene { doc: &self.doc, view, hide: None, outline: false, tex: &mut self.textures }, to, e);
                     }
                     TransitionKind::MoveIn | TransitionKind::SlideIn => {
-                        render::draw_subtree(&painter, &mut Scene { doc: &self.doc, view: fv, hide: None, tex: &mut self.textures }, from, 1.0);
+                        render::draw_subtree(&painter, &mut Scene { doc: &self.doc, view: fv, hide: None, outline: false, tex: &mut self.textures }, from, 1.0);
                         let k = if tr.kind == TransitionKind::SlideIn { 0.3 } else { 1.0 };
                         let a = if tr.kind == TransitionKind::SlideIn { e } else { 1.0 };
                         let v = shift(view, dir * k * (1.0 - e));
-                        render::draw_subtree(&painter, &mut Scene { doc: &self.doc, view: v, hide: None, tex: &mut self.textures }, to, a);
+                        render::draw_subtree(&painter, &mut Scene { doc: &self.doc, view: v, hide: None, outline: false, tex: &mut self.textures }, to, a);
                     }
                     TransitionKind::Push => {
                         let fv2 = shift(fv, -dir * e);
-                        render::draw_subtree(&painter, &mut Scene { doc: &self.doc, view: fv2, hide: None, tex: &mut self.textures }, from, 1.0);
+                        render::draw_subtree(&painter, &mut Scene { doc: &self.doc, view: fv2, hide: None, outline: false, tex: &mut self.textures }, from, 1.0);
                         let v = shift(view, dir * (1.0 - e));
-                        render::draw_subtree(&painter, &mut Scene { doc: &self.doc, view: v, hide: None, tex: &mut self.textures }, to, 1.0);
+                        render::draw_subtree(&painter, &mut Scene { doc: &self.doc, view: v, hide: None, outline: false, tex: &mut self.textures }, to, 1.0);
                     }
                     TransitionKind::Instant => {}
                 }
@@ -275,7 +275,7 @@ impl App {
                 return;
             }
             None => {
-                render::draw_subtree(&painter, &mut Scene { doc: &self.doc, view, hide: None, tex: &mut self.textures }, frame, 1.0);
+                render::draw_subtree(&painter, &mut Scene { doc: &self.doc, view, hide: None, outline: false, tex: &mut self.textures }, frame, 1.0);
             }
         }
         // Overlays sit centered over the frame with a dim backdrop.
@@ -289,7 +289,7 @@ impl App {
             let size = self.doc.node(o).rect.size() * view.zoom;
             let at = fr.center() - size / 2.0;
             let ov = View { zoom: view.zoom, pan: at.to_vec2() - self.doc.node(o).rect.min.to_vec2() * view.zoom };
-            render::draw_subtree(&painter, &mut Scene { doc: &self.doc, view: ov, hide: None, tex: &mut self.textures }, o, 1.0);
+            render::draw_subtree(&painter, &mut Scene { doc: &self.doc, view: ov, hide: None, outline: false, tex: &mut self.textures }, o, 1.0);
             overlay_views.push((o, ov));
         }
         self.textures.end_frame();

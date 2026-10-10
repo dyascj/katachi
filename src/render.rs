@@ -485,6 +485,8 @@ pub struct Scene<'a> {
     pub doc: &'a Document,
     pub view: View,
     pub hide: Option<NodeId>,
+    /// Outline mode (Cmd Y): every layer as a hairline, no fills or effects.
+    pub outline: bool,
     pub tex: &'a mut Textures,
 }
 
@@ -569,6 +571,23 @@ fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
     }
     // Level of detail: layers smaller than a pixel aren't drawn at all.
     if screen.width() < 0.5 && screen.height() < 0.5 {
+        return;
+    }
+    if sc.outline {
+        let gray = Color32::from_gray(0x40);
+        if n.kind == Kind::Text {
+            if sc.hide != Some(id) {
+                let (galley, _, _) = crate::text::layout(painter, n, v.zoom, gray);
+                let local = n.rect.min + crate::text::draw_offset(n, galley.rows.len());
+                let pos = v.to_screen(crate::doc::rotate(local, n.rect.center(), n.rotation));
+                painter.add(egui::epaint::TextShape::new(pos, galley, gray).with_angle(-n.rotation.to_radians()));
+            }
+        } else if !matches!(n.kind, Kind::Group | Kind::Boolean) {
+            painter.add(stroke_mesh(&node_path(n, &v, 0.0), 1.0, gray));
+        }
+        for &c in &n.children {
+            draw_node(painter, sc, c, alpha);
+        }
         return;
     }
     let a = alpha * n.opacity;

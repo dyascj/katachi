@@ -708,6 +708,10 @@ impl App {
             self.zoom_to(&ctx, None, true);
             ui.close();
         }
+        if item(ui, if self.outline_mode { "Show fills" } else { "Outline mode" }, "⌘Y") {
+            self.outline_mode = !self.outline_mode;
+            ui.close();
+        }
     }
 
     fn pages_list(&mut self, ui: &mut Ui) {

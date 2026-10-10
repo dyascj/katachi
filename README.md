@@ -51,7 +51,7 @@ GitHub Actions. Building from source needs Rust 1.92 or newer.
 **Vectors**
 - Multi-contour paths with even-odd or non-zero fill, vector edit mode for anchors and handles
 - Live boolean groups: union, subtract, intersect, exclude
-- Flatten (Cmd E), SVG import by paste, drag-and-drop, or File > Place
+- Flatten (Cmd E), outline stroke (Alt Cmd O), SVG import by paste, drag-and-drop, or File > Place
 
 **Paint and effects**
 - Solid, linear, and radial gradient fills, and images (fill, fit, stretch, tile)
@@ -113,7 +113,7 @@ GitHub Actions. Building from source needs Rust 1.92 or newer.
 | Show or hide, lock | Shift Cmd H, Shift Cmd L |
 | Next and previous layer, select parent | Tab, Shift Tab, Shift Enter |
 | Zoom to fit, 100%, selection | Shift 1, Shift 0, Shift 2 |
-| Rulers, layout guides, hide UI | Shift R, Ctrl G, Cmd \ |
+| Rulers, layout guides, hide UI, outline mode | Shift R, Ctrl G, Cmd \, Cmd Y |
 | Dev Mode, present | Shift D, Alt Cmd Enter |
 | Save, open, place image, export | Cmd S, Cmd O, Shift Cmd K, Shift Cmd E |
 | Find and replace | Cmd F |

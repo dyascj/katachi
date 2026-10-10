@@ -132,6 +132,7 @@ pub struct App {
     /// Cmd+\ hides the side panels.
     pub ui_hidden: bool,
     pub rulers: bool,
+    pub outline_mode: bool,
     pub show_grids: bool,
     pub show_history: bool,
     /// The last layers copied here, for Paste to replace.
@@ -221,6 +222,7 @@ impl App {
             vector_start: Pos2::ZERO,
             ui_hidden: false,
             rulers: false,
+            outline_mode: false,
             show_grids: true,
             show_history: false,
             find: (false, String::new(), String::new(), false),
@@ -1598,6 +1600,51 @@ impl App {
     }
 
     /// Cmd+E: merge the selection into one vector with exact outlines.
+    /// Alt Cmd O: strokes become filled vectors. Layers that also have fills become a group of both.
+    pub fn outline_stroke_selection(&mut self) {
+        let targets: Vec<NodeId> = self
+            .sel_roots()
+            .into_iter()
+            .filter(|&id| {
+                let n = self.doc.node(id);
+                n.kind != Kind::Text && n.stroke_width > 0.0 && n.strokes.iter().any(|s| s.visible)
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        let mut out = vec![];
+        for id in targets {
+            let n = self.doc.node(id).clone();
+            let paths = crate::boolean::stroke_outline(&n);
+            if paths.is_empty() {
+                continue;
+            }
+            let mut v = Node::vector_paths(paths);
+            v.name = n.name.clone();
+            v.fills = n.strokes.iter().filter(|s| s.visible).cloned().collect();
+            v.strokes.clear();
+            v.stroke_width = 0.0;
+            v.opacity = n.opacity;
+            v.even_odd = false;
+            let (page, parent, index) = (self.doc.page_of(id), n.parent, self.doc.index_in_parent(id));
+            let vid = self.doc.insert(page, parent, Some(index + 1), v);
+            if n.fills.iter().any(|f| f.visible) {
+                self.doc.node_mut(id).strokes.clear();
+                if let Some(g) = self.doc.group(&[id, vid]) {
+                    self.doc.node_mut(g).name = n.name.clone();
+                    out.push(g);
+                }
+            } else {
+                self.doc.remove(id);
+                out.push(vid);
+            }
+        }
+        self.doc.reflow();
+        self.sel = out;
+    }
+
     pub fn flatten_selection(&mut self) {
         let roots = self.sel_roots();
         if roots.is_empty() || roots.iter().all(|&id| self.doc.node(id).kind == Kind::Vector && roots.len() == 1) {
@@ -1701,11 +1748,13 @@ impl App {
         }
         match (cmd, m.shift, m.alt, key) {
             (true, false, _, Key::Z) => self.undo(),
-            (true, true, _, Key::Z) | (true, false, _, Key::Y) => self.redo(),
+            (true, true, _, Key::Z) => self.redo(),
             (true, false, false, Key::D) => self.duplicate_selection(),
             (true, false, true, Key::C) => self.style_clip = self.sel.first().map(|&id| self.doc.node(id).clone()),
             (true, false, true, Key::V) => self.paste_style(),
             (true, true, false, Key::R) => self.paste_to_replace(),
+            (true, false, false, Key::Y) => self.outline_mode = !self.outline_mode,
+            (true, false, true, Key::O) => self.outline_stroke_selection(),
             (true, false, true, Key::A) => self.select_matching(),
             (true, true, false, Key::C) => self.copy_as(ctx, "png"),
             (true, false, false, Key::R) => {

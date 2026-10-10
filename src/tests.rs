@@ -1325,7 +1325,7 @@ fn selection_colors_recolor_every_use() {
 fn select_matching_and_paste_to_replace() {
     use crate::doc::{Paint, Rgba};
     let mut h = harness();
-    let mut add = |h: &mut Harness<App>, kind, rect, c| {
+    let add = |h: &mut Harness<App>, kind, rect, c| {
         let mut n = Node::new(kind, rect);
         n.fills = vec![Paint::solid(c)];
         h.state_mut().doc.insert(0, None, None, n)

@@ -95,6 +95,58 @@ pub fn result(doc: &Document, id: NodeId) -> Vec<SubPath> {
         .collect()
 }
 
+/// A layer's stroke as filled outlines in world space (Outline stroke), honoring alignment, caps, and joins.
+pub fn stroke_outline(n: &Node) -> Vec<SubPath> {
+    use i_overlay::mesh::float::stroke::offset::StrokeOffset;
+    use i_overlay::mesh::float::style::{LineCap, LineJoin, StrokeStyle};
+    use lyon::path::Event;
+    if n.stroke_width <= 0.0 {
+        return vec![];
+    }
+    let mut contours: Vec<(Vec<[f64; 2]>, bool)> = vec![];
+    let mut cur: Vec<[f64; 2]> = vec![];
+    for ev in node_path(n, &IDENTITY, 0.0).iter().flattened(0.1) {
+        match ev {
+            Event::Begin { at } => cur = vec![[at.x as f64, at.y as f64]],
+            Event::Line { to, .. } => cur.push([to.x as f64, to.y as f64]),
+            Event::End { close, .. } => {
+                if cur.len() >= 2 {
+                    contours.push((std::mem::take(&mut cur), close));
+                }
+            }
+            _ => {}
+        }
+    }
+    // Inside and outside strokes are centered strokes twice as wide, clipped to (or cut from) the shape.
+    let align = if n.kind == Kind::Vector && contours.iter().any(|c| !c.1) { crate::doc::StrokeAlign::Center } else { n.stroke_align };
+    let w = n.stroke_width as f64 * if align == crate::doc::StrokeAlign::Center { 1.0 } else { 2.0 };
+    let cap = match n.cap {
+        crate::doc::Cap::None => LineCap::Butt,
+        crate::doc::Cap::Round => LineCap::Round(0.1),
+        crate::doc::Cap::Square => LineCap::Square,
+    };
+    let join = match n.join {
+        crate::doc::Join::Miter => LineJoin::Miter(0.1),
+        crate::doc::Join::Round => LineJoin::Round(0.1),
+        crate::doc::Join::Bevel => LineJoin::Bevel,
+    };
+    let style = StrokeStyle::new(w).line_join(join).start_cap(cap.clone()).end_cap(cap);
+    let mut acc: Contours = vec![];
+    for (c, closed) in &contours {
+        let shapes: Contours = c.stroke(style.clone(), *closed).into_iter().flatten().collect();
+        acc = union(&acc, &shapes);
+    }
+    let fill: Contours = contours.iter().filter(|c| c.1).map(|c| c.0.clone()).collect();
+    let acc = match align {
+        crate::doc::StrokeAlign::Inside => op(&acc, &fill, OverlayRule::Intersect),
+        crate::doc::StrokeAlign::Outside => op(&acc, &fill, OverlayRule::Difference),
+        crate::doc::StrokeAlign::Center => acc,
+    };
+    acc.into_iter()
+        .map(|c| SubPath { points: c.into_iter().map(|[x, y]| PathPoint { p: pos2(x as f32, y as f32), ..Default::default() }).collect(), closed: true })
+        .collect()
+}
+
 /// A stand-in vector carrying the boolean's paint, for drawing, hit testing, and export.
 pub fn as_vector(doc: &Document, id: NodeId) -> Option<Node> {
     let n = doc.node(id);
@@ -127,6 +179,17 @@ mod tests {
 
     fn sq(d: &mut Document, parent: Option<NodeId>, x: f32, y: f32, w: f32) -> NodeId {
         d.insert(0, parent, None, Node::new(Kind::Rectangle, Rect::from_min_size(pos2(x, y), vec2(w, w))))
+    }
+
+    #[test]
+    fn outline_stroke_follows_alignment() {
+        let mut n = Node::new(Kind::Rectangle, Rect::from_min_size(pos2(0., 0.), vec2(10., 10.)));
+        n.stroke_width = 2.0;
+        n.stroke_align = crate::doc::StrokeAlign::Inside;
+        // A 10x10 square minus the 6x6 hole left by a 2px inside stroke.
+        assert!((area(&stroke_outline(&n)).abs() - (100.0 - 36.0)).abs() < 0.5);
+        n.stroke_align = crate::doc::StrokeAlign::Outside;
+        assert!((area(&stroke_outline(&n)).abs() - (196.0 - 100.0)).abs() < 1.0, "{}", area(&stroke_outline(&n)));
     }
 
     fn area(paths: &[SubPath]) -> f32 {
