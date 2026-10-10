@@ -1059,3 +1059,63 @@ fn comments_pin_post_and_follow_their_frame() {
     h.state_mut().doc.translate(f, vec2(100., 0.));
     assert_eq!(h.state().doc.comment_pos(&c), pos2(150., 50.), "pin moves with its frame");
 }
+
+/// `cargo test --release perf -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn perf_large_document() {
+    let mut h = Harness::builder().with_size(vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).wgpu().build_eframe(|cc| {
+        crate::setup_style(&cc.egui_ctx);
+        App::new(None)
+    });
+    let st = h.state_mut();
+    for f in 0..50 {
+        let (fx, fy) = ((f % 10) as f32 * 600.0, (f / 10) as f32 * 600.0);
+        let frame = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(fx, fy, 560., 560.)));
+        for i in 0..100 {
+            let (x, y) = (fx + (i % 10) as f32 * 55.0, fy + (i / 10) as f32 * 55.0);
+            st.doc.insert(0, Some(frame), None, Node::new(Kind::Rectangle, r(x, y, 50., 50.)));
+        }
+        for i in 0..10 {
+            let mut t = Node::new(Kind::Text, r(fx + 5., fy + i as f32 * 50. + 5., 10., 10.));
+            t.text = format!("Label {f}-{i}");
+            st.doc.insert(0, Some(frame), None, t);
+        }
+    }
+    st.doc.reflow();
+    h.run_steps(3);
+    let t = std::time::Instant::now();
+    h.run_steps(30);
+    let idle = t.elapsed() / 30;
+    // Drag a frame around: every frame restores the base doc, moves, and reflows.
+    let p = h.state().view.to_screen(pos2(10., 10.));
+    let t = std::time::Instant::now();
+    drag(&mut h, p, p + vec2(200., 100.), Modifiers::NONE);
+    let drag_time = t.elapsed() / 10;
+    let t = std::time::Instant::now();
+    h.state_mut().doc.reflow();
+    let reflow = t.elapsed();
+    eprintln!("nodes={} idle frame={idle:?} drag frame≈{drag_time:?} reflow={reflow:?}", h.state().doc.nodes.len());
+}
+
+/// Render SVGs in $KATACHI_RENDER_DIR to PNGs with the app's own resvg pipeline.
+#[test]
+#[ignore]
+fn render_svgs() {
+    let Some(dir) = std::env::var_os("KATACHI_RENDER_DIR") else { return };
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.extension().is_some_and(|x| x == "svg") {
+            let svg = std::fs::read_to_string(&p).unwrap();
+            let scale: f32 = std::env::var("KATACHI_RENDER_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(0.35);
+            let (px, size) = crate::export::rasterize(&svg, scale).unwrap();
+            let img = image::RgbaImage::from_fn(size[0] as u32, size[1] as u32, |x, y| {
+                let i = (y as usize * size[0] + x as usize) * 4;
+                let a = px[i + 3] as u32;
+                let un = |c: u8| if a == 0 { 0 } else { ((c as u32 * 255) / a).min(255) as u8 };
+                image::Rgba([un(px[i]), un(px[i + 1]), un(px[i + 2]), px[i + 3]])
+            });
+            img.save(p.with_extension("png")).unwrap();
+        }
+    }
+}

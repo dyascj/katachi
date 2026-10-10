@@ -1,0 +1,6 @@
+<svg width="1600" height="560" viewBox="0 0 1600 560" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#26232F"/><stop offset="1" stop-color="#0D0C11"/></linearGradient></defs>
+<rect width="1600" height="560" rx="32" fill="#F6F5F2"/>
+<g transform="translate(150 100) scale(0.35)"><rect x="100" y="100" width="824" height="824" rx="186" fill="url(#bg)"/><rect x="318.0" y="288.0" width="108.0" height="460.0" rx="54.0" fill="#FFFFFF"/><circle cx="628.0" cy="386.0" r="114.0" fill="#8E72FF"/><path d="M483.6 549.6 Q468.0 534.0 468.0 556.0 L468.0 726.0 Q468.0 748.0 490.0 748.0 L660.0 748.0 Q682.0 748.0 666.4 732.4 Z" fill="#FF5A3C"/></g>
+<text x="560" y="300" font-family="Inter" font-weight="700" font-size="150" fill="#16151B" letter-spacing="-4">Katachi</text>
+<text x="566" y="380" font-family="Inter" font-weight="400" font-size="44" fill="#6B6A73">A Figma-style design tool, written in Rust</text>
+</svg>
