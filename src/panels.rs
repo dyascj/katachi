@@ -49,6 +49,8 @@ pub enum Icon {
     Play,
     Styles,
     Detach,
+    Comment,
+    Close,
 }
 
 const SUBTLE: Color32 = Color32::from_rgb(0xF5, 0xF5, 0xF5);
@@ -56,7 +58,7 @@ const SEL_BG: Color32 = Color32::from_rgb(0xE5, 0xF4, 0xFF);
 const CHILD_BG: Color32 = Color32::from_rgb(0xF2, 0xF9, 0xFF);
 
 /// Toolbar groups as in Figma UI3: (tool, icon, "Name  shortcut").
-pub const TOOL_GROUPS: [&[(Tool, Icon, &str)]; 5] = [
+pub const TOOL_GROUPS: [&[(Tool, Icon, &str)]; 6] = [
     &[(Tool::Move, Icon::Move, "Move  V"), (Tool::Hand, Icon::Hand, "Hand tool  H"), (Tool::Scale, Icon::Scale, "Scale  K")],
     &[(Tool::Frame, Icon::Frame, "Frame  F"), (Tool::Section, Icon::Section, "Section  ⇧S"), (Tool::Slice, Icon::Slice, "Slice  S")],
     &[
@@ -69,6 +71,7 @@ pub const TOOL_GROUPS: [&[(Tool, Icon, &str)]; 5] = [
     ],
     &[(Tool::Pen, Icon::Pen, "Pen  P"), (Tool::Pencil, Icon::Pencil, "Pencil  ⇧P")],
     &[(Tool::Text, Icon::Text, "Text  T")],
+    &[(Tool::Comment, Icon::Comment, "Comment  C")],
 ];
 
 /// Drag payload: a main component dragged from the Assets tab.
@@ -287,6 +290,14 @@ pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
             p.line_segment([at(-1., 1.), at(6., -6.)], s);
             p.line_segment([at(6., -6.), at(2., -6.)], s);
             p.line_segment([at(6., -6.), at(6., -2.)], s);
+        }
+        Icon::Close => {
+            p.line_segment([at(-4., -4.), at(4., 4.)], s);
+            p.line_segment([at(4., -4.), at(-4., 4.)], s);
+        }
+        Icon::Comment => {
+            let r = Rect::from_center_size(c, vec2(12., 11.));
+            p.rect_stroke(r, egui::CornerRadius { nw: 6, ne: 6, se: 6, sw: 0 }, s, StrokeKind::Middle);
         }
         Icon::Styles => {
             for (dx, dy) in [(-3., -3.), (3., -3.), (-3., 3.), (3., 3.)] {
@@ -934,6 +945,10 @@ impl App {
                 ui.spacing_mut().item_spacing.y = 6.0;
                 if self.dev_mode {
                     self.dev_panel(ui);
+                    return;
+                }
+                if self.tool == Tool::Comment {
+                    self.comments_panel(ui);
                     return;
                 }
                 if self.prototype_tab {

@@ -335,6 +335,19 @@ impl Bindable {
     }
 }
 
+/// A comment thread pinned on the canvas, optionally anchored to a frame so it moves with it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Comment {
+    pub id: u64,
+    pub page: usize,
+    /// World position, or offset from the anchor's top-left when anchored.
+    pub at: Pos2,
+    pub anchor: Option<NodeId>,
+    /// (author, text, unix seconds); the first entry opens the thread.
+    pub messages: Vec<(String, String, u64)>,
+    pub resolved: bool,
+}
+
 pub type StyleId = u64;
 
 /// Typography captured by a text style.
@@ -1093,6 +1106,8 @@ pub struct Document {
     #[serde(default)]
     pub styles: Vec<Style>,
     #[serde(default)]
+    pub comments: Vec<Comment>,
+    #[serde(default)]
     pub collections: Vec<Collection>,
     #[serde(default)]
     pub variables: Vec<Variable>,
@@ -1134,6 +1149,7 @@ impl Default for Document {
             next_id: 1,
             images: HashMap::new(),
             styles: vec![],
+            comments: vec![],
             collections: vec![],
             variables: vec![],
         }
@@ -1331,6 +1347,14 @@ impl Document {
                     self.set_rect(c, nr);
                 }
             }
+        }
+    }
+
+    /// Where a comment pin sits in world space.
+    pub fn comment_pos(&self, c: &Comment) -> Pos2 {
+        match c.anchor.and_then(|a| self.nodes.get(&a)) {
+            Some(n) => n.rect.min + c.at.to_vec2(),
+            None => c.at,
         }
     }
 

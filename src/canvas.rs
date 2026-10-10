@@ -147,6 +147,8 @@ impl App {
         if self.rulers {
             self.draw_rulers(&painter, rect);
         }
+        self.comment_hits = self.draw_comment_pins(&painter);
+        self.comment_popups(ui.ctx());
         self.set_cursor(ui, ptr, panning);
         self.toolbar(ui.ctx(), rect);
         self.draw_toast(&painter, rect);
@@ -296,6 +298,18 @@ impl App {
 
     fn on_press(&mut self, s: Pos2, w: Pos2, mods: egui::Modifiers) {
         let tool = self.tool;
+        // Clicking a comment pin opens its thread (whenever pins are showing).
+        if self.comments_visible() {
+            if let Some((cid, _)) = self.comment_hits.iter().find(|(_, r)| r.contains(s)) {
+                self.open_comment = Some(*cid);
+                self.draft_comment = None;
+                return;
+            }
+            if tool == Tool::Comment {
+                self.start_comment(w);
+                return;
+            }
+        }
         if tool == Tool::Move && self.vector_edit.is_some() && self.vector_press(s, mods.shift) {
             self.press = Some(Press { world: w, target: None, handle: None, toggle_off: false });
             return;
@@ -1272,6 +1286,7 @@ impl App {
                     _ => CursorIcon::Default,
                 },
                 Tool::Text => CursorIcon::Text,
+                Tool::Comment => CursorIcon::Cell,
                 Tool::Hand => CursorIcon::Grab,
                 _ => CursorIcon::Crosshair,
             }

@@ -626,6 +626,25 @@ fn shots() {
     st.sel = vec![card];
     h.run_steps(3);
     save(&mut h, "21-dev-mode");
+    // Comments: two threads, one open.
+    let st = h.state_mut();
+    st.dev_mode = false;
+    let landing = *st.doc.nodes.keys().find(|i| st.doc.node(**i).name == "Landing").unwrap();
+    for (i, (at, text)) in [(pos2(400., 20.), "Can we try a warmer gradient here?"), (pos2(120., 260.), "Love the type pairing")].into_iter().enumerate() {
+        st.doc.comments.push(crate::doc::Comment {
+            id: 9000 + i as u64,
+            page: 0,
+            at,
+            anchor: Some(landing),
+            messages: vec![("Charles".into(), text.into(), 0), ("Luna".into(), "Agreed, trying #FF7A59 → #9747FF".into(), 0)][..if i == 0 { 2 } else { 1 }].to_vec(),
+            resolved: false,
+        });
+    }
+    st.set_tool(Tool::Comment);
+    st.open_comment = Some(9000);
+    st.sel.clear();
+    h.run_steps(4);
+    save(&mut h, "22-comments");
 }
 
 #[test]
@@ -1020,4 +1039,23 @@ fn saves_keep_versions() {
     let v = crate::files::versions(&file);
     assert_eq!(v.len(), 2);
     assert_eq!(std::fs::read_to_string(&v[0].0).unwrap(), "{\"katachi\":2}", "newest first");
+}
+
+#[test]
+fn comments_pin_post_and_follow_their_frame() {
+    let mut h = harness();
+    let f = draw(&mut h, Key::F, (0.0, 0.0), (200.0, 200.0));
+    key(&mut h, Modifiers::NONE, Key::C);
+    let p = s(&h, 50., 50.);
+    click(&mut h, p, Modifiers::NONE);
+    assert!(h.state().draft_comment.is_some());
+    h.event(Event::Text("Looks great".into()));
+    h.run_steps(2);
+    key(&mut h, Modifiers::COMMAND, Key::Enter);
+    let c = h.state().doc.comments.first().cloned().expect("posted");
+    assert_eq!(c.anchor, Some(f));
+    assert_eq!(c.messages[0].1, "Looks great");
+    assert_eq!(h.state().doc.comment_pos(&c), pos2(50., 50.));
+    h.state_mut().doc.translate(f, vec2(100., 0.));
+    assert_eq!(h.state().doc.comment_pos(&c), pos2(150., 50.), "pin moves with its frame");
 }

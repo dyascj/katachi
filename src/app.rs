@@ -23,6 +23,8 @@ pub enum Tool {
     Pen,
     Pencil,
     Text,
+    /// C: drop comment pins.
+    Comment,
 }
 
 impl Tool {
@@ -118,7 +120,7 @@ pub struct App {
     pub zoom_target: Option<NodeId>,
     pub left_tab_assets: bool,
     /// Last tool used in each toolbar group (move, frame, shape, pen, text).
-    pub tool_groups: [Tool; 5],
+    pub tool_groups: [Tool; 6],
     pub presenting: Option<crate::prototype::Presentation>,
     /// Right panel shows the Prototype tab instead of Design.
     pub prototype_tab: bool,
@@ -136,6 +138,12 @@ pub struct App {
     /// Dev Mode: inspect and code instead of design controls.
     pub dev_mode: bool,
     pub code_lang: crate::codegen::Lang,
+    pub show_comments: bool,
+    pub show_resolved: bool,
+    pub draft_comment: Option<(crate::doc::Comment, String)>,
+    pub open_comment: Option<u64>,
+    pub comment_reply: String,
+    pub comment_hits: Vec<(u64, Rect)>,
     pub var_collection: Option<u64>,
     /// Properties copied with Cmd+Alt+C.
     pub style_clip: Option<Node>,
@@ -185,7 +193,7 @@ impl App {
             pending_frame: None,
             zoom_target: None,
             left_tab_assets: false,
-            tool_groups: [Tool::Move, Tool::Frame, Tool::Rectangle, Tool::Pen, Tool::Text],
+            tool_groups: [Tool::Move, Tool::Frame, Tool::Rectangle, Tool::Pen, Tool::Text, Tool::Comment],
             presenting: None,
             prototype_tab: false,
             connecting: None,
@@ -199,6 +207,12 @@ impl App {
             show_variables: false,
             dev_mode: false,
             code_lang: crate::codegen::Lang::Css,
+            show_comments: false,
+            show_resolved: false,
+            draft_comment: None,
+            open_comment: None,
+            comment_reply: String::new(),
+            comment_hits: vec![],
             var_collection: None,
             style_clip: None,
             layer_search: None,
@@ -1367,6 +1381,8 @@ impl App {
             (false, false, false, Key::L) => self.set_tool(Tool::Line),
             (false, false, false, Key::P) => self.set_tool(Tool::Pen),
             (false, false, false, Key::T) => self.set_tool(Tool::Text),
+            (false, false, false, Key::C) => self.set_tool(Tool::Comment),
+            (false, true, false, Key::C) => self.show_comments = !self.show_comments,
             _ => {}
         }
     }
