@@ -741,6 +741,49 @@ pub fn import(data: &[u8]) -> Result<Document, String> {
 mod tests {
     use super::*;
 
+    fn kv(j: serde_json::Value) -> Value {
+        match j {
+            serde_json::Value::Bool(b) => Value::Bool(b),
+            serde_json::Value::Number(n) => n.as_u64().map_or(Value::Float(n.as_f64().unwrap_or(0.0) as f32), Value::UInt),
+            serde_json::Value::String(s) => Value::Str(s),
+            serde_json::Value::Array(a) => Value::Array(a.into_iter().map(kv).collect()),
+            serde_json::Value::Object(m) => Value::Object(m.into_iter().map(|(k, v)| (k, kv(v))).collect()),
+            serde_json::Value::Null => Value::Array(vec![]),
+        }
+    }
+
+    #[test]
+    fn instance_overrides_and_props_resolve() {
+        use serde_json::json;
+        let g = |l: u64| json!({ "sessionID": 1, "localID": l });
+        let at = |l: u64, pos: &str| json!({ "guid": g(l), "position": pos });
+        let xf = |x: f32, y: f32| json!({ "m00": 1.0, "m01": 0.0, "m02": x, "m10": 0.0, "m11": 1.0, "m12": y });
+        let msg = json!({ "nodeChanges": [
+            { "guid": g(0), "type": "DOCUMENT" },
+            { "guid": g(1), "type": "CANVAS", "name": "Page", "parentIndex": at(0, "a") },
+            { "guid": g(2), "type": "SYMBOL", "name": "Button", "parentIndex": at(1, "a"), "size": { "x": 100, "y": 40 }, "transform": xf(0., 0.),
+              "componentPropDefs": [{ "id": g(90), "name": "Icon", "type": "BOOL", "initialValue": { "boolValue": true } }] },
+            { "guid": g(3), "type": "TEXT", "name": "Label", "parentIndex": at(2, "a"), "size": { "x": 80, "y": 20 }, "transform": xf(10., 10.),
+              "textData": { "characters": "Button" }, "overrideKey": g(50) },
+            { "guid": g(4), "type": "ELLIPSE", "name": "Icon", "parentIndex": at(2, "b"), "size": { "x": 10, "y": 10 }, "transform": xf(85., 15.),
+              "componentPropRefs": [{ "defID": g(90), "componentPropNodeField": "VISIBLE" }] },
+            { "guid": g(5), "type": "INSTANCE", "name": "Button", "parentIndex": at(1, "b"), "size": { "x": 100, "y": 40 }, "transform": xf(200., 0.),
+              "symbolData": { "symbolID": g(2), "symbolOverrides": [
+                  { "guidPath": { "guids": [g(50)] }, "textData": { "characters": "Submit" } },
+                  { "guidPath": { "guids": [g(2)] }, "opacity": 0.5 },
+              ] },
+              "componentPropAssignments": [{ "defID": g(90), "value": { "boolValue": false } }] },
+        ] });
+        let doc = to_document(&FigFile { message: kv(msg), images: HashMap::new() }).unwrap();
+        let inst = doc.nodes.values().find(|n| n.kind == Kind::Instance).unwrap();
+        assert_eq!(inst.opacity, 0.5, "path naming the main component targets the instance");
+        let kids: Vec<&Node> = inst.children.iter().map(|c| doc.node(*c)).collect();
+        assert_eq!(kids[0].text, "Submit", "override found through the override key");
+        assert!(!kids[1].visible, "boolean property hides the bound layer");
+        let comp = doc.nodes.values().find(|n| n.kind == Kind::Component).unwrap();
+        assert_eq!(doc.node(comp.children[0]).text, "Button", "main component untouched");
+    }
+
     /// Import a real file and report what came through.
     #[test]
     #[ignore]
