@@ -59,7 +59,7 @@ pub fn read(data: &[u8]) -> Result<FigFile, String> {
 
 // ---------- mapping onto Katachi ----------
 
-use crate::doc::{
+use crate::doc::{CompProp, PropTarget, PropValue, 
     AutoLayout, AxisAlign, Cap, Constraint, Decoration, Document, EffectKind, Join, Kind, LayoutMode, LineHeight, Node, NodeId, Page, Paint,
     PaintKind, PathPoint, Rgba, ScaleMode, Shadow, StrokeAlign, SubPath, TextAlign, TextCase, TextSizing, VAlign,
 };
@@ -289,8 +289,174 @@ pub fn to_document(fig: &FigFile) -> Result<Document, String> {
             None => doc.node_mut(inst).kind = Kind::Frame,
         }
     }
+    // Component properties: definitions, the layers bound to them, and instance values.
+    let mut defs: HashMap<Guid, (String, String)> = HashMap::new();
+    for n in changes {
+        for d in n.arr("componentPropDefs") {
+            if let Some(id) = guid(d.get("id")) {
+                defs.insert(id, (d.s("name").unwrap_or("").to_string(), d.s("type").unwrap_or("BOOL").to_string()));
+            }
+        }
+    }
+    let props = Props { defs: &defs, ids: &ids };
+    for (g, &id) in &ids {
+        let v = by_guid[g];
+        let n = doc.node_mut(id);
+        for d in v.arr("componentPropDefs") {
+            let ty = d.s("type").unwrap_or("BOOL");
+            if let Some(default) = props.value(d.get("initialValue"), ty) {
+                n.comp_props.push(CompProp { name: d.s("name").unwrap_or("").to_string(), default });
+            }
+        }
+        n.prop_bind = v.arr("componentPropRefs").iter().filter(|r| r.b("isDeleted") != Some(true)).find_map(|r| {
+            let target = match r.s("componentPropNodeField")? {
+                "TEXT_DATA" => PropTarget::Text,
+                "VISIBLE" => PropTarget::Visible,
+                "OVERRIDDEN_SYMBOL_ID" => PropTarget::Swap,
+                _ => return None,
+            };
+            Some((defs.get(&guid(r.get("defID"))?)?.0.clone(), target))
+        });
+        props.assign(n, v.arr("componentPropAssignments"));
+    }
+    doc.reflow();
+    // Overrides address layers inside instances by a path of main-component layer ids (or override keys).
+    let mut keys: HashMap<Guid, NodeId> = ids.clone();
+    for (g, &id) in &ids {
+        if let Some(k) = guid(by_guid[g].get("overrideKey")) {
+            keys.insert(k, id);
+        }
+    }
+    let mut overrides: Vec<(NodeId, Vec<Guid>, &Value)> = vec![];
+    for (g, &id) in &ids {
+        if doc.nodes.get(&id).is_some_and(|n| n.kind == Kind::Instance) {
+            for o in by_guid[g].get("symbolData").map(|s| s.arr("symbolOverrides")).unwrap_or_default() {
+                let path: Vec<Guid> = o.get("guidPath").map(|p| p.arr("guids").iter().filter_map(|x| guid(Some(x))).collect()).unwrap_or_default();
+                if !path.is_empty() {
+                    overrides.push((id, path, o));
+                }
+            }
+        }
+    }
+    overrides.sort_by_key(|o| o.1.len());
+    // Swaps first, shallowest first, so deeper overrides find the swapped-in layers.
+    let mut depth = 0;
+    for (inst, path, o) in overrides.iter().filter(|o| o.2.get("overriddenSymbolID").is_some() || o.2.get("componentPropAssignments").is_some()) {
+        if path.len() != depth {
+            doc.reflow();
+            depth = path.len();
+        }
+        if let Some(t) = resolve(&doc, *inst, path, &keys) {
+            if let Some(&c) = guid(o.get("overriddenSymbolID")).and_then(|s| ids.get(&s)) {
+                doc.node_mut(t).component = Some(c);
+            }
+            props.assign(doc.node_mut(t), o.arr("componentPropAssignments"));
+        }
+    }
+    doc.reflow();
+    for (inst, path, o) in &overrides {
+        if let Some(t) = resolve(&doc, *inst, path, &keys) {
+            apply_override(doc.node_mut(t), o);
+        }
+    }
     doc.reflow();
     Ok(doc)
+}
+
+struct Props<'a> {
+    defs: &'a HashMap<Guid, (String, String)>,
+    ids: &'a HashMap<Guid, NodeId>,
+}
+
+impl Props<'_> {
+    fn value(&self, v: Option<&Value>, ty: &str) -> Option<PropValue> {
+        match ty {
+            "BOOL" => Some(PropValue::Bool(v.and_then(|v| v.b("boolValue")).unwrap_or(true))),
+            "TEXT" => Some(PropValue::Text(v?.get("textValue")?.s("characters")?.to_string())),
+            "INSTANCE_SWAP" => Some(PropValue::Swap(*self.ids.get(&guid(v?.get("guidValue"))?)?)),
+            _ => None,
+        }
+    }
+
+    /// Instance property values from `componentPropAssignments`.
+    fn assign(&self, n: &mut Node, list: &[Value]) {
+        for a in list {
+            let Some((name, ty)) = guid(a.get("defID")).and_then(|d| self.defs.get(&d)) else { continue };
+            if let Some(val) = self.value(a.get("value"), ty) {
+                n.prop_values.retain(|(k, _)| k != name);
+                n.prop_values.push((name.clone(), val));
+            }
+        }
+    }
+}
+
+/// The layer inside `inst` an override path points at: each step finds the descendant that mirrors that main-component layer.
+fn resolve(doc: &Document, inst: NodeId, path: &[Guid], keys: &HashMap<Guid, NodeId>) -> Option<NodeId> {
+    let mut cur = inst;
+    for g in path {
+        let target = *keys.get(g)?;
+        // A path naming the main component itself means the instance layer.
+        if doc.nodes[&cur].component == Some(target) {
+            continue;
+        }
+        cur = doc.descendants(cur).into_iter().find(|&d| {
+            let mut s = doc.nodes[&d].source;
+            for _ in 0..32 {
+                match s {
+                    Some(x) if x == target => return true,
+                    Some(x) => s = doc.nodes.get(&x).and_then(|n| n.source),
+                    None => return false,
+                }
+            }
+            false
+        })?;
+    }
+    Some(cur)
+}
+
+/// Apply the fields an instance override sets.
+fn apply_override(n: &mut Node, o: &Value) {
+    if let Some(x) = o.s("name") {
+        n.name = x.to_string();
+    }
+    if let Some(b) = o.b("visible") {
+        n.visible = b;
+    }
+    if let Some(x) = o.f("opacity") {
+        n.opacity = x;
+    }
+    if o.get("fillPaints").is_some() {
+        n.fills = paints(o.arr("fillPaints"));
+    }
+    if o.get("strokePaints").is_some() && n.kind != Kind::Text {
+        n.strokes = paints(o.arr("strokePaints"));
+    }
+    if let Some(w) = o.f("strokeWeight") {
+        n.stroke_width = w;
+    }
+    if let Some(r) = o.f("cornerRadius") {
+        n.radius = r;
+        n.corner_radii = None;
+    }
+    let corners = ["rectangleTopLeftCornerRadius", "rectangleTopRightCornerRadius", "rectangleBottomRightCornerRadius", "rectangleBottomLeftCornerRadius"];
+    if corners.iter().any(|k| o.f(k).is_some()) {
+        let cur = n.corner_radii.unwrap_or([n.radius; 4]);
+        let c: [f32; 4] = std::array::from_fn(|i| o.f(corners[i]).unwrap_or(cur[i]));
+        n.corner_radii = if c.iter().all(|x| (x - n.radius).abs() < 0.01) { None } else { Some(c) };
+    }
+    if let Some(p) = o.s("stackPositioning") {
+        n.absolute = p == "ABSOLUTE";
+    }
+    if o.get("effects").is_some() {
+        n.shadows = effects(o);
+    }
+    if n.kind == Kind::Text {
+        text_props(n, o);
+        // Fixed text boxes wrap at their own width, which an override may change.
+        if let Some(sz) = o.get("size") {
+            n.rect = Rect::from_min_size(n.rect.min, vec2(sz.f("x").unwrap_or(n.rect.width()), sz.f("y").unwrap_or(n.rect.height())));
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -407,55 +573,9 @@ fn import_node(
     }
     if n.kind == Kind::Text {
         n.rotation = rotation;
-        let td = v.get("textData");
-        n.text = td.and_then(|t| t.s("characters")).unwrap_or("").to_string();
-        if let Some(f) = v.get("fontName") {
-            n.font_family = f.s("family").unwrap_or("Inter").to_string();
-            n.font_weight = weight_of(f.s("style").unwrap_or("Regular"));
-        }
-        n.font_size = v.f("fontSize").unwrap_or(12.0);
-        if let Some(lh) = v.get("lineHeight") {
-            let val = lh.f("value").unwrap_or(100.0);
-            n.line_height = match lh.s("units") {
-                Some("PIXELS") => LineHeight::Px(val),
-                Some("PERCENT") if (val - 100.0).abs() > 0.01 => LineHeight::Percent(val),
-                Some("RAW") => LineHeight::Percent(val * 100.0),
-                _ => LineHeight::Auto,
-            };
-        }
-        if let Some(ls) = v.get("letterSpacing") {
-            let val = ls.f("value").unwrap_or(0.0);
-            n.letter_spacing = if ls.s("units") == Some("PIXELS") { val / n.font_size.max(1.0) * 100.0 } else { val };
-        }
-        n.text_align = match v.s("textAlignHorizontal") {
-            Some("CENTER") => TextAlign::Center,
-            Some("RIGHT") => TextAlign::Right,
-            Some("JUSTIFIED") => TextAlign::Justify,
-            _ => TextAlign::Left,
-        };
-        n.text_valign = match v.s("textAlignVertical") {
-            Some("CENTER") => VAlign::Middle,
-            Some("BOTTOM") => VAlign::Bottom,
-            _ => VAlign::Top,
-        };
-        n.text_sizing = match v.s("textAutoResize") {
-            Some("WIDTH_AND_HEIGHT") => TextSizing::AutoWidth,
-            Some("HEIGHT") => TextSizing::AutoHeight,
-            _ => TextSizing::Fixed,
-        };
-        n.decoration = match v.s("textDecoration") {
-            Some("UNDERLINE") => Decoration::Underline,
-            Some("STRIKETHROUGH") => Decoration::Strikethrough,
-            _ => Decoration::None,
-        };
-        n.truncate = v.s("textTruncation") == Some("ENDING");
-        n.max_lines = v.u("maxLines").unwrap_or(0) as u32;
-        n.text_case = match v.s("textCase") {
-            Some("UPPER") => TextCase::Upper,
-            Some("LOWER") => TextCase::Lower,
-            Some("TITLE") => TextCase::Title,
-            _ => TextCase::Original,
-        };
+        n.text_sizing = TextSizing::Fixed;
+        n.font_size = 12.0;
+        text_props(&mut n, v);
         n.strokes.clear();
         // Text boxes keep the file's size; the top-left comes from the unrotated box.
         n.rect = Rect::from_center_size(center, size);
@@ -498,6 +618,79 @@ fn import_node(
     }
 }
 
+/// Text properties present on `v` (a node or an instance override).
+fn text_props(n: &mut Node, v: &Value) {
+    if let Some(t) = v.get("textData").and_then(|t| t.s("characters")) {
+        if t != n.text {
+            n.spans.clear();
+        }
+        n.text = t.to_string();
+    }
+    if let Some(f) = v.get("fontName") {
+        n.font_family = f.s("family").unwrap_or("Inter").to_string();
+        n.font_weight = weight_of(f.s("style").unwrap_or("Regular"));
+    }
+    if let Some(sz) = v.f("fontSize") {
+        n.font_size = sz;
+    }
+    if let Some(lh) = v.get("lineHeight") {
+        let val = lh.f("value").unwrap_or(100.0);
+        n.line_height = match lh.s("units") {
+            Some("PIXELS") => LineHeight::Px(val),
+            Some("PERCENT") if (val - 100.0).abs() > 0.01 => LineHeight::Percent(val),
+            Some("RAW") => LineHeight::Percent(val * 100.0),
+            _ => LineHeight::Auto,
+        };
+    }
+    if let Some(ls) = v.get("letterSpacing") {
+        let val = ls.f("value").unwrap_or(0.0);
+        n.letter_spacing = if ls.s("units") == Some("PIXELS") { val / n.font_size.max(1.0) * 100.0 } else { val };
+    }
+    if let Some(a) = v.s("textAlignHorizontal") {
+        n.text_align = match a {
+            "CENTER" => TextAlign::Center,
+            "RIGHT" => TextAlign::Right,
+            "JUSTIFIED" => TextAlign::Justify,
+            _ => TextAlign::Left,
+        };
+    }
+    if let Some(a) = v.s("textAlignVertical") {
+        n.text_valign = match a {
+            "CENTER" => VAlign::Middle,
+            "BOTTOM" => VAlign::Bottom,
+            _ => VAlign::Top,
+        };
+    }
+    if let Some(a) = v.s("textAutoResize") {
+        n.text_sizing = match a {
+            "WIDTH_AND_HEIGHT" => TextSizing::AutoWidth,
+            "HEIGHT" => TextSizing::AutoHeight,
+            _ => TextSizing::Fixed,
+        };
+    }
+    if let Some(d) = v.s("textDecoration") {
+        n.decoration = match d {
+            "UNDERLINE" => Decoration::Underline,
+            "STRIKETHROUGH" => Decoration::Strikethrough,
+            _ => Decoration::None,
+        };
+    }
+    if let Some(t) = v.s("textTruncation") {
+        n.truncate = t == "ENDING";
+    }
+    if let Some(m) = v.u("maxLines") {
+        n.max_lines = m as u32;
+    }
+    if let Some(c) = v.s("textCase") {
+        n.text_case = match c {
+            "UPPER" => TextCase::Upper,
+            "LOWER" => TextCase::Lower,
+            "TITLE" => TextCase::Title,
+            _ => TextCase::Original,
+        };
+    }
+}
+
 /// Properties every layer type shares.
 fn finish_common(n: &mut Node, v: &Value) {
     n.visible = v.b("visible").unwrap_or(true);
@@ -518,7 +711,11 @@ fn finish_common(n: &mut Node, v: &Value) {
         _ => Join::Miter,
     };
     n.dash = v.arr("dashPattern").iter().filter_map(|d| if let Value::Float(f) = d { Some(*f) } else { None }).collect();
-    n.shadows = v
+    n.shadows = effects(v);
+}
+
+fn effects(v: &Value) -> Vec<Shadow> {
+    v
         .arr("effects")
         .iter()
         .filter_map(|e| {
@@ -532,7 +729,7 @@ fn finish_common(n: &mut Node, v: &Value) {
             let off = e.get("offset").map_or(Vec2::ZERO, |o| vec2(o.f("x").unwrap_or(0.0), o.f("y").unwrap_or(0.0)));
             Some(Shadow { kind, color: rgba(e.get("color"), 1.0), offset: off, blur: e.f("radius").unwrap_or(0.0), spread: e.f("spread").unwrap_or(0.0), visible: e.b("visible").unwrap_or(true) })
         })
-        .collect();
+        .collect()
 }
 
 /// Read a `.fig` file into a Katachi document.
