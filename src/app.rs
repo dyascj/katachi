@@ -149,10 +149,10 @@ pub struct App {
     pub outline_mode: bool,
     pub show_grids: bool,
     pub show_history: bool,
-    /// Theme and glass settings, and the blur radius last given to the window.
+    /// Theme and glass settings, and the glass state last given to the window.
     pub appearance: crate::appearance::Appearance,
     pub show_appearance: bool,
-    blur_applied: Option<u8>,
+    glass_applied: Option<(bool, u8)>,
     /// The plugin that's running with a UI, if any.
     pub plugin: Option<PluginRun>,
     /// MCP tool calls from agents, once the server is listening.
@@ -255,7 +255,7 @@ impl App {
             plugin: None,
             appearance: crate::appearance::load(),
             show_appearance: false,
-            blur_applied: None,
+            glass_applied: None,
             mcp: None,
             mcp_tried: cfg!(test),
             debug_plugin: std::env::var_os("KATACHI_PLUGIN").map(PathBuf::from),
@@ -1381,10 +1381,10 @@ impl App {
             }
             self.show_appearance = open;
         }
-        let blur = if self.appearance.glass { self.appearance.blur } else { 0 };
-        if self.blur_applied != Some(blur) {
-            crate::appearance::set_window_blur(frame, blur);
-            self.blur_applied = Some(blur);
+        let want = (self.appearance.glass, self.appearance.blur);
+        if self.glass_applied != Some(want) {
+            crate::appearance::set_window_glass(frame, want.0, want.1);
+            self.glass_applied = Some(want);
         }
     }
 

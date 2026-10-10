@@ -724,6 +724,14 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
     // Paints read the image table, so parse them before borrowing the layer.
     let paints = |k: &str| -> Option<Vec<Paint>> { changed(k).then(|| v[k].as_array().into_iter().flatten().filter_map(|p| paint_from(p, doc)).collect()) };
     let (fills, strokes) = (paints("fills"), paints("strokes"));
+    // Type changes the API allows: createComponentFromNode, and detaching an instance.
+    if changed("type") {
+        match s("type") {
+            "COMPONENT" if doc.node(id).kind.is_frame() || doc.node(id).kind == Kind::Group => doc.node_mut(id).kind = Kind::Component,
+            "FRAME" if doc.node(id).kind == Kind::Instance => doc.detach_instance(id),
+            _ => {}
+        }
+    }
     let n = doc.node_mut(id);
     if let Some(p) = fills {
         n.fills = p;

@@ -75,6 +75,11 @@ fn panel(a: &Appearance, dark: bool) -> Color32 {
 
 /// Install fonts-independent style for both themes and pick the active one.
 pub fn apply(ctx: &Context, a: &Appearance) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(match a.theme {
+        ThemePref::Light => egui::SystemTheme::Light,
+        ThemePref::Dark => egui::SystemTheme::Dark,
+        ThemePref::System => egui::SystemTheme::SystemDefault,
+    }));
     ctx.set_theme(match a.theme {
         ThemePref::Light => egui::ThemePreference::Light,
         ThemePref::Dark => egui::ThemePreference::Dark,
@@ -176,10 +181,12 @@ pub fn page_bg(ctx: &Context, bg: crate::doc::Rgba) -> Color32 {
     if bg == crate::doc::PAGE_BG && is_dark(ctx) { Color32::from_gray(0x1E) } else { bg.with_alpha(255).to32() }
 }
 
-/// macOS: blur the desktop behind the (transparent) window, or stop. Uses the same private
-/// CoreGraphics call macOS's own translucent windows do; elsewhere glass is translucency only.
+/// macOS: with glass, the window is clear and the desktop behind it blurred (the same private
+/// CoreGraphics call macOS's own translucent windows use); without, it's an ordinary opaque
+/// window so the title bar draws normally. Elsewhere glass is translucency only.
 #[cfg(target_os = "macos")]
-pub fn set_window_blur(frame: &eframe::Frame, radius: u8) {
+pub fn set_window_glass(frame: &eframe::Frame, glass: bool, radius: u8) {
+    use objc2::runtime::{AnyClass, AnyObject, Bool};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
@@ -188,19 +195,23 @@ pub fn set_window_blur(frame: &eframe::Frame, radius: u8) {
     }
     let Ok(handle) = frame.window_handle() else { return };
     let RawWindowHandle::AppKit(h) = handle.as_raw() else { return };
+    let Some(color_class) = AnyClass::get(c"NSColor") else { return };
     unsafe {
-        let view = h.ns_view.as_ptr() as *mut objc2::runtime::AnyObject;
-        let window: *mut objc2::runtime::AnyObject = objc2::msg_send![view, window];
+        let view = h.ns_view.as_ptr() as *mut AnyObject;
+        let window: *mut AnyObject = objc2::msg_send![view, window];
         if window.is_null() {
             return;
         }
+        let color: *mut AnyObject = if glass { objc2::msg_send![color_class, clearColor] } else { objc2::msg_send![color_class, windowBackgroundColor] };
+        let _: () = objc2::msg_send![window, setOpaque: Bool::new(!glass)];
+        let _: () = objc2::msg_send![window, setBackgroundColor: color];
         let number: isize = objc2::msg_send![window, windowNumber];
-        CGSSetWindowBackgroundBlurRadius(CGSMainConnectionID(), number as i32, radius as i32);
+        CGSSetWindowBackgroundBlurRadius(CGSMainConnectionID(), number as i32, if glass { radius as i32 } else { 0 });
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn set_window_blur(_frame: &eframe::Frame, _radius: u8) {}
+pub fn set_window_glass(_frame: &eframe::Frame, _glass: bool, _radius: u8) {}
 
 /// The appearance window (Main menu > Appearance).
 pub fn window(ctx: &Context, open: &mut bool, a: &mut Appearance) -> bool {

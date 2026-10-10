@@ -388,5 +388,21 @@ mod tests {
         let out = run(&mut d, 1, &[], "return figma.root.findAll(n => n.type === 'INSTANCE').length").unwrap();
         assert_eq!(out.result.as_deref(), Some("1"));
     }
+
+    #[test]
+    fn svg_layers_become_components() {
+        let mut d = Document::default();
+        let out = run(&mut d, 0, &[], r##"
+            const f = figma.createNodeFromSvg('<svg width="24" height="24" viewBox="0 0 24 24"><path d="M6 6l12 12" stroke="#000" stroke-width="2"/></svg>');
+            const c = figma.createComponentFromNode(f);
+            c.name = "Icon/x";
+            return c;
+        "##).unwrap();
+        let r: serde_json::Value = serde_json::from_str(out.result.as_deref().unwrap()).unwrap();
+        let c = d.node(r["id"].as_str().unwrap().parse().unwrap());
+        assert_eq!((c.kind, c.name.as_str()), (Kind::Component, "Icon/x"));
+        assert_eq!(c.rect.size(), vec2(24., 24.));
+        assert!(!c.children.is_empty());
+    }
 }
 
