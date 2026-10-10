@@ -149,6 +149,8 @@ pub struct App {
     pub outline_mode: bool,
     pub show_grids: bool,
     pub show_history: bool,
+    /// macOS draws no title bar for Katachi; Katachi draws its own (off in tests, on in the promo film).
+    pub own_title_bar: bool,
     /// Theme and glass settings, and the glass state last given to the window.
     pub appearance: crate::appearance::Appearance,
     pub show_appearance: bool,
@@ -253,6 +255,7 @@ impl App {
             find: (false, String::new(), String::new(), false),
             clip_frag: None,
             plugin: None,
+            own_title_bar: cfg!(target_os = "macos") && !cfg!(test),
             appearance: crate::appearance::load(),
             show_appearance: false,
             glass_applied: None,
@@ -1376,7 +1379,7 @@ impl App {
     /// macOS: the title bar strip under the traffic lights, in the panel color (glass when glass is on).
     /// Drag to move the window, double-click to zoom.
     fn title_bar(&mut self, ui: &mut egui::Ui) {
-        if !cfg!(target_os = "macos") || cfg!(test) {
+        if !self.own_title_bar {
             return;
         }
         let ctx = ui.ctx().clone();

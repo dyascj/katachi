@@ -26,6 +26,8 @@ mod variables_ui;
 mod vector_edit;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod promo;
 
 use egui::{FontData, FontDefinitions, FontFamily};
 use std::sync::Arc;
