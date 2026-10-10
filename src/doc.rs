@@ -316,6 +316,69 @@ pub struct Style {
     pub value: StyleValue,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum BlendMode {
+    #[default]
+    Normal,
+    Darken,
+    Multiply,
+    ColorBurn,
+    Lighten,
+    Screen,
+    ColorDodge,
+    Overlay,
+    SoftLight,
+    HardLight,
+    Difference,
+    Exclusion,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
+}
+
+impl BlendMode {
+    pub const ALL: [BlendMode; 16] = [
+        BlendMode::Normal,
+        BlendMode::Darken,
+        BlendMode::Multiply,
+        BlendMode::ColorBurn,
+        BlendMode::Lighten,
+        BlendMode::Screen,
+        BlendMode::ColorDodge,
+        BlendMode::Overlay,
+        BlendMode::SoftLight,
+        BlendMode::HardLight,
+        BlendMode::Difference,
+        BlendMode::Exclusion,
+        BlendMode::Hue,
+        BlendMode::Saturation,
+        BlendMode::Color,
+        BlendMode::Luminosity,
+    ];
+    /// CSS / SVG `mix-blend-mode` keyword.
+    pub fn css(self) -> &'static str {
+        match self {
+            BlendMode::Normal => "normal",
+            BlendMode::Darken => "darken",
+            BlendMode::Multiply => "multiply",
+            BlendMode::ColorBurn => "color-burn",
+            BlendMode::Lighten => "lighten",
+            BlendMode::Screen => "screen",
+            BlendMode::ColorDodge => "color-dodge",
+            BlendMode::Overlay => "overlay",
+            BlendMode::SoftLight => "soft-light",
+            BlendMode::HardLight => "hard-light",
+            BlendMode::Difference => "difference",
+            BlendMode::Exclusion => "exclusion",
+            BlendMode::Hue => "hue",
+            BlendMode::Saturation => "saturation",
+            BlendMode::Color => "color",
+            BlendMode::Luminosity => "luminosity",
+        }
+    }
+}
+
 /// What sits at the ends of an open path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Marker {
@@ -566,6 +629,9 @@ pub struct Node {
     /// Ignores the parent's auto layout.
     pub absolute: bool,
     pub bool_op: BoolOp,
+    /// Clips the layers above it in the same parent.
+    pub is_mask: bool,
+    pub blend: BlendMode,
     /// Prototype interactions.
     pub reactions: Vec<Reaction>,
     /// Linked shared styles.
@@ -639,6 +705,8 @@ impl Default for Node {
             constraints: [Constraint::Min; 2],
             absolute: false,
             bool_op: BoolOp::Union,
+            is_mask: false,
+            blend: BlendMode::Normal,
             reactions: vec![],
             fill_style: None,
             stroke_style: None,
@@ -1761,7 +1829,7 @@ fn merge_from(e: &mut Node, src: &Node) {
         name, visible, opacity, fills, strokes, stroke_width, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, constraints, absolute,
         paths, even_odd, text, font_size, font_weight, font_family, text_sizing, text_align, text_valign, line_height, letter_spacing,
         decoration, text_case, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, fill_style,
-        stroke_style, text_style, effect_style, prop_bind
+        stroke_style, text_style, effect_style, prop_bind, is_mask, blend
     );
     e.synced = Some(Box::new(Node { children: vec![], synced: None, ..src.clone() }));
 }

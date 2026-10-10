@@ -720,6 +720,24 @@ impl App {
         self.sel = vec![id];
     }
 
+    /// Use the selection as a mask (or stop). Several layers get grouped first, bottom one masking.
+    pub fn toggle_mask(&mut self) {
+        let roots = self.sel_roots();
+        let Some(&first) = roots.first() else { return };
+        self.checkpoint();
+        if roots.len() == 1 {
+            let n = self.doc.node_mut(first);
+            n.is_mask = !n.is_mask;
+            return;
+        }
+        if let Some(g) = self.doc.group(&roots) {
+            let bottom = self.doc.node(g).children[0];
+            self.doc.node_mut(bottom).is_mask = true;
+            self.doc.node_mut(g).name = "Mask group".into();
+            self.sel = vec![g];
+        }
+    }
+
     pub fn combine_as_variants(&mut self) {
         let roots = self.sel_roots();
         if roots.len() < 2 || roots.iter().any(|&r| self.doc.node(r).kind != Kind::Component) {
@@ -1123,6 +1141,10 @@ impl App {
             return;
         }
         let step = if m.shift { 10.0 } else { 1.0 };
+        // Ctrl+Cmd+M: use as mask.
+        if m.ctrl && m.mac_cmd && key == Key::M {
+            return self.toggle_mask();
+        }
         // Ctrl+Alt arrangement shortcuts (Figma on macOS).
         if m.ctrl && m.alt && !m.mac_cmd {
             match key {

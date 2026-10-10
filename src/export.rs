@@ -1,6 +1,6 @@
 //! SVG export from the model; PNG export rasterizes that SVG with resvg so both always match.
 
-use crate::doc::{Cap, Decoration, Document, EffectKind, Join, Kind, Node, NodeId, Paint, PaintKind, Rgba, Shadow, StrokeAlign, TextAlign};
+use crate::doc::{BlendMode, Cap, Decoration, Document, EffectKind, Join, Kind, Node, NodeId, Paint, PaintKind, Rgba, Shadow, StrokeAlign, TextAlign};
 use egui::{Pos2, Rect, Vec2};
 use std::fmt::Write;
 
@@ -293,6 +293,10 @@ impl Svg<'_> {
         if !n.visible {
             return;
         }
+        if n.is_mask && n.parent.is_none() {
+            // A mask with nothing to clip shows nothing.
+            return;
+        }
         if n.kind == Kind::Boolean {
             // Export the computed result as one path; operands stay internal.
             if let Some(v) = crate::boolean::as_vector(doc, id) {
@@ -301,6 +305,10 @@ impl Svg<'_> {
             return;
         }
         let o = self.o;
+        let blended = n.blend != BlendMode::Normal;
+        if blended {
+            let _ = write!(self.out, r#"<g style="mix-blend-mode:{}">"#, n.blend.css());
+        }
         let wrap = n.opacity < 1.0;
         if wrap {
             let _ = write!(self.out, r#"<g opacity="{:.3}">"#, n.opacity);
@@ -405,8 +413,34 @@ impl Svg<'_> {
             } else {
                 self.out.push_str("<g>");
             }
+            // A mask layer clips everything above it in this parent (alpha mask, like Figma).
+            let mut masks_open = 0;
             for &c in &n.children {
-                self.node(c);
+                let cn = doc.node(c);
+                if cn.is_mask && cn.visible {
+                    let mid = self.id("mask");
+                    let reg = n.aabb().union(cn.aabb()).translate(-o).expand(shadow_reach(cn) + 1.0);
+                    let body = std::mem::take(&mut self.out);
+                    let mut plain = cn.clone();
+                    plain.is_mask = false;
+                    self.node_like_full(&plain, c);
+                    let mask_body = std::mem::replace(&mut self.out, body);
+                    let _ = write!(
+                        self.defs,
+                        r#"<mask id="{mid}" maskUnits="userSpaceOnUse" x="{}" y="{}" width="{}" height="{}" style="mask-type:alpha">{mask_body}</mask>"#,
+                        reg.min.x,
+                        reg.min.y,
+                        reg.width(),
+                        reg.height()
+                    );
+                    let _ = write!(self.out, r#"<g mask="url(#{mid})">"#);
+                    masks_open += 1;
+                } else {
+                    self.node(c);
+                }
+            }
+            for _ in 0..masks_open {
+                self.out.push_str("</g>");
             }
             self.out.push_str("</g>");
         }
@@ -419,6 +453,20 @@ impl Svg<'_> {
         if wrap {
             self.out.push_str("</g>");
         }
+        if blended {
+            self.out.push_str("</g>");
+        }
+    }
+
+    /// Render a modified copy of a document node (e.g. a mask without its mask flag).
+    fn node_like_full(&mut self, n: &Node, id: NodeId) {
+        let mut d = self.doc.clone();
+        *d.node_mut(id) = n.clone();
+        let mut sub = Svg { doc: &d, o: self.o, out: String::new(), defs: String::new(), next: self.next + 1000 };
+        sub.node(id);
+        self.next = sub.next;
+        self.defs.push_str(&sub.defs);
+        self.out.push_str(&sub.out);
     }
 }
 
@@ -636,6 +684,26 @@ mod tests {
         assert!(svg.contains("A10 10 0 0 1 40 10"), "{svg}");
         assert!(svg.contains(r#"stroke-dasharray="4 2" stroke-linecap="round""#), "{svg}");
         to_png(&d, &[a], 1.0).unwrap();
+    }
+
+    #[test]
+    fn masks_clip_and_blend_modes_export() {
+        let mut d = Document::default();
+        let g = d.insert(0, None, None, Node::new(Kind::Group, Rect::NOTHING));
+        let mut m = Node::new(Kind::Ellipse, Rect::from_min_size(pos2(0., 0.), vec2(40., 40.)));
+        m.is_mask = true;
+        d.insert(0, Some(g), None, m);
+        let mut sq = Node::new(Kind::Rectangle, Rect::from_min_size(pos2(0., 0.), vec2(40., 40.)));
+        sq.fills = vec![Paint::solid(Rgba::rgb(255, 0, 0))];
+        sq.blend = BlendMode::Multiply;
+        d.insert(0, Some(g), None, sq);
+        d.reflow();
+        let svg = to_svg(&d, &[g]);
+        assert!(svg.contains("mask-type:alpha") && svg.contains("mix-blend-mode:multiply"), "{svg}");
+        let png = to_png(&d, &[g], 1.0).unwrap();
+        let img = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert!(img.get_pixel(20, 20).0[3] > 200, "center kept");
+        assert!(img.get_pixel(2, 2).0[3] < 30, "corner masked away");
     }
 
     #[test]

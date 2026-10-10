@@ -500,7 +500,13 @@ fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
                 painter.image(t, v.rect_to_screen(region), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
             }
         }
-    if Some(id) != sc.hide && n.shadows.iter().any(|s| s.visible && matches!(s.kind, EffectKind::InnerShadow | EffectKind::LayerBlur)) {
+    if n.is_mask {
+        // Masks only shape what's above them.
+        return;
+    }
+    let needs_compositing = n.children.iter().any(|c| sc.doc.node(*c).is_mask)
+        || (n.parent.is_none() && sc.doc.descendants(id).iter().any(|d| sc.doc.node(*d).blend != crate::doc::BlendMode::Normal));
+    if Some(id) != sc.hide && (needs_compositing || n.shadows.iter().any(|s| s.visible && matches!(s.kind, EffectKind::InnerShadow | EffectKind::LayerBlur))) {
         // egui can't blur on the GPU: draw this layer (and its children) through resvg, exactly like export.
         let svg = crate::export::to_svg(sc.doc, &[id]);
         let region = crate::export::export_bounds(sc.doc, &[id]);

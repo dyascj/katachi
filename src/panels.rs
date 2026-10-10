@@ -1694,7 +1694,23 @@ impl App {
     }
 
     fn appearance_section(&mut self, ui: &mut Ui, n: &crate::doc::Node) {
-        heading(ui, "Appearance");
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Appearance").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut blend = n.blend;
+                egui::ComboBox::from_id_salt("blend").width(96.0).selected_text(format!("{blend:?}")).show_ui(ui, |ui| {
+                    for b in crate::doc::BlendMode::ALL {
+                        ui.selectable_value(&mut blend, b, format!("{b:?}"));
+                    }
+                });
+                if blend != n.blend {
+                    self.checkpoint();
+                    for &id in &self.sel.clone() {
+                        self.doc.node_mut(id).blend = blend;
+                    }
+                }
+            });
+        });
         let mut op = (n.opacity * 100.0).round();
         let mut r = n.radius;
         let has_radius = n.kind == Kind::Rectangle || n.kind.is_frame();

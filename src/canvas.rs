@@ -1338,6 +1338,11 @@ impl App {
             self.combine_as_variants();
             ui.close();
         }
+        let masked = self.sel.first().is_some_and(|&s| self.doc.node(s).is_mask);
+        if item(ui, if masked { "Remove mask" } else { "Use as mask" }, "⌃⌘M", has) {
+            self.toggle_mask();
+            ui.close();
+        }
         if item(ui, "Flatten", "⌘E", has) {
             self.flatten_selection();
             ui.close();
