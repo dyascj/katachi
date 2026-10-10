@@ -1845,6 +1845,10 @@ impl App {
             self.checkpoint();
             let n = self.doc.node_mut(first);
             n.sizing = sizing;
+            // Filling text wraps at its width, like Figma.
+            if n.kind == Kind::Text && sizing[0] == Sizing::Fill && n.text_sizing == crate::doc::TextSizing::AutoWidth {
+                n.text_sizing = crate::doc::TextSizing::AutoHeight;
+            }
             n.min_size = mins;
             n.max_size = maxs;
             self.doc.reflow();

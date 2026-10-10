@@ -894,6 +894,10 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
             n.sizing[pc] = if s("layoutAlign") == "STRETCH" { Sizing::Fill } else if n.sizing[pc] == Sizing::Fill { Sizing::Fixed } else { n.sizing[pc] };
         }
     }
+    // Text that fills its row's width wraps, so it can't stay auto-width.
+    if n.kind == Kind::Text && n.sizing[0] == Sizing::Fill && n.text_sizing == TextSizing::AutoWidth {
+        n.text_sizing = TextSizing::AutoHeight;
+    }
     for (k, axis) in [("layoutSizingHorizontal", 0), ("layoutSizingVertical", 1)] {
         if changed(k) {
             n.sizing[axis] = match s(k) {

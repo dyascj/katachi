@@ -2168,8 +2168,8 @@ impl Document {
         if l.wrap && h {
             return self.layout_wrap(f, &n, &kids, [pt, pr, pb, pl], &out);
         }
-        // Text is always auto-width, so it can only hug.
-        let fills = |k: &Node, axis: usize| k.sizing[axis] == Sizing::Fill && k.kind != Kind::Text;
+        // Auto-width text can only hug; fixed or auto-height text can fill (and then wraps).
+        let fills = |k: &Node, axis: usize| k.sizing[axis] == Sizing::Fill && (k.kind != Kind::Text || k.text_sizing != TextSizing::AutoWidth);
         let count = kids.len() as f32;
         let gaps = l.gap * (count - 1.0).max(0.0);
         let fixed_main: f32 = kids.iter().map(|c| &self.nodes[c]).filter(|k| !fills(k, ma)).map(|k| main(lsize(k))).sum();
