@@ -406,5 +406,23 @@ mod tests {
         assert_eq!(c.rect.size(), vec2(24., 24.));
         assert!(!c.children.is_empty());
     }
+
+    #[test]
+    fn untouched_hugging_frames_stay_hugging() {
+        let mut d = Document::default();
+        run(&mut d, 0, &[], r#"
+            const b = figma.createFrame(); b.name = "Board"; b.layoutMode = "VERTICAL";
+            b.primaryAxisSizingMode = "AUTO"; b.counterAxisSizingMode = "AUTO";
+            const a = figma.createComponent(); a.name = "State=A"; a.resize(40, 40);
+            const c = figma.createComponent(); c.name = "State=B"; c.resize(40, 40); c.x = 60;
+            const set = figma.combineAsVariants([a, c], b);
+        "#).unwrap();
+        run(&mut d, 0, &[], r#"
+            const set = figma.currentPage.findOne(n => n.type === "COMPONENT_SET");
+            set.resize(200, 120);
+        "#).unwrap();
+        let b = d.nodes.values().find(|n| n.name == "Board").unwrap();
+        assert_eq!(b.sizing, [crate::doc::Sizing::Hug; 2], "{:?}", b.rect);
+    }
 }
 

@@ -698,9 +698,19 @@ fn apply_styles_and_variables(doc: &mut Document, out: &Value, refs: &mut Refs) 
     }
 }
 
+/// JSON equality where numbers compare by value (JavaScript writes 140, Rust 140.0).
+fn same(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => (x.as_f64().unwrap_or(0.0) - y.as_f64().unwrap_or(0.0)).abs() < 1e-6,
+        (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(a, b)| same(a, b)),
+        (Value::Object(x), Value::Object(y)) => x.len() == y.len() && x.iter().all(|(k, a)| y.get(k).is_some_and(|b| same(a, b))),
+        _ => a == b,
+    }
+}
+
 /// Write the properties of `v` that differ from `base` (all of them when there's no base).
 fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: bool, refs: &Refs) {
-    let changed = |k: &str| v.get(k).is_some_and(|x| base.get(k) != Some(x));
+    let changed = |k: &str| v.get(k).is_some_and(|x| !base.get(k).is_some_and(|b| same(b, x)));
     let num = |k: &str| f(v, k).map(|x| x as f32);
     let s = |k: &str| v[k].as_str().unwrap_or("");
     let origin = doc.node(id).parent.map_or(Pos2::ZERO, |p| doc.node(p).rect.min);
