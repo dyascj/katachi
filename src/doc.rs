@@ -503,6 +503,28 @@ pub fn stroke_reach(n: &Node) -> (f32, f32) {
     }
 }
 
+/// Individual stroke sides as filled bands (unrotated world rects), honoring stroke alignment.
+/// ponytail: bands are square-cornered; rounded corners with per-side weights are approximate.
+pub fn side_bands(n: &Node, [t, rt, b, l]: [f32; 4]) -> Vec<Rect> {
+    let r = n.rect;
+    let (fi, fo) = match n.stroke_align {
+        StrokeAlign::Inside => (1.0, 0.0),
+        StrokeAlign::Center => (0.5, 0.5),
+        StrokeAlign::Outside => (0.0, 1.0),
+    };
+    let outer = Rect::from_min_max(pos2(r.min.x - l * fo, r.min.y - t * fo), pos2(r.max.x + rt * fo, r.max.y + b * fo));
+    let inner = Rect::from_min_max(pos2(r.min.x + l * fi, r.min.y + t * fi), pos2(r.max.x - rt * fi, r.max.y - b * fi));
+    [
+        Rect::from_min_max(outer.min, pos2(outer.max.x, inner.min.y)),
+        Rect::from_min_max(pos2(inner.max.x, inner.min.y), pos2(outer.max.x, inner.max.y)),
+        Rect::from_min_max(pos2(outer.min.x, inner.max.y), outer.max),
+        Rect::from_min_max(pos2(outer.min.x, inner.min.y), pos2(inner.min.x, inner.max.y)),
+    ]
+    .into_iter()
+    .filter(|b| b.width() > 0.0 && b.height() > 0.0)
+    .collect()
+}
+
 /// A size along `axis` kept within the layer's min and max.
 pub fn clamp_size(n: &Node, axis: usize, v: f32) -> f32 {
     let v = n.min_size[axis].map_or(v, |m| v.max(m));
@@ -995,6 +1017,8 @@ pub struct Node {
     pub layout: AutoLayout,
     /// Horizontal, vertical.
     pub sizing: [Sizing; 2],
+    /// Rectangles and frames: individual stroke weights (top, right, bottom, left).
+    pub stroke_sides: Option<[f32; 4]>,
     /// Min and max width/height for hugging and filling layers.
     pub min_size: [Option<f32>; 2],
     pub max_size: [Option<f32>; 2],
@@ -1089,6 +1113,7 @@ impl Default for Node {
             shadows: vec![],
             layout: AutoLayout::default(),
             sizing: [Sizing::Fixed; 2],
+            stroke_sides: None,
             min_size: [None; 2],
             max_size: [None; 2],
             constraints: [Constraint::Min; 2],
@@ -2468,7 +2493,7 @@ fn merge_from(e: &mut Node, src: &Node) {
         )*};
     }
     take!(
-        name, visible, opacity, fills, strokes, stroke_width, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, min_size, max_size, constraints, absolute,
+        name, visible, opacity, fills, strokes, stroke_width, stroke_sides, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, min_size, max_size, constraints, absolute,
         paths, even_odd, text, font_size, font_weight, font_family, text_sizing, text_align, text_valign, line_height, letter_spacing,
         decoration, text_case, truncate, max_lines, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, fill_style,
         stroke_style, text_style, effect_style, prop_bind, is_mask, blend, bindings, modes, spans, lists
@@ -2729,6 +2754,22 @@ mod tests {
         let mut f = Node::new(Kind::Frame, r(0., 0., 300., 100.));
         f.layout = AutoLayout { mode, gap: 10., padding: [5., 5., 5., 5.], ..Default::default() };
         d.insert(0, None, None, f)
+    }
+
+    #[test]
+    fn individual_stroke_sides_draw_as_bands() {
+        let mut d = Document::default();
+        let mut n = Node::new(Kind::Rectangle, r(0., 0., 100., 50.));
+        n.strokes = vec![Paint::solid(Rgba::rgb(0, 0, 0))];
+        n.stroke_align = StrokeAlign::Inside;
+        n.stroke_sides = Some([0., 0., 4., 0.]);
+        assert_eq!(side_bands(&n, n.stroke_sides.unwrap()), vec![r(0., 46., 100., 4.)], "a bottom border only");
+        n.stroke_align = StrokeAlign::Outside;
+        n.stroke_sides = Some([2., 0., 0., 2.]);
+        assert_eq!(side_bands(&n, n.stroke_sides.unwrap()), vec![r(-2., -2., 102., 2.), r(-2., 0., 2., 50.)]);
+        let id = d.insert(0, None, None, n);
+        let svg = crate::export::to_svg(&d, &[id]);
+        assert_eq!(svg.matches("<rect").count(), 3, "fill plus two bands: {svg}");
     }
 
     #[test]

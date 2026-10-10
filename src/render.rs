@@ -719,6 +719,18 @@ fn draw_content(painter: &Painter, sc: &mut Scene, n: &Node, a: f32) {
             paint_geo(painter, sc, n, fill_geo(&path, n.even_odd), f, a);
         }
     }
+    if let Some(sides) = n.stroke_sides.filter(|_| n.kind == Kind::Rectangle || n.kind.is_frame()) {
+        for band in crate::doc::side_bands(n, sides) {
+            // A band rotated about its own center, moved to where the layer's rotation puts it.
+            let mut b = Node::new(Kind::Rectangle, Rect::from_center_size(crate::doc::rotate(band.center(), n.rect.center(), n.rotation), band.size()));
+            b.rotation = n.rotation;
+            let path = node_path(&b, &v, 0.0);
+            for s in n.strokes.iter().filter(|s| s.visible) {
+                paint_geo(painter, sc, n, fill_geo(&path, false), s, a);
+            }
+        }
+        return;
+    }
     if n.strokes.iter().any(|s| s.visible) && n.stroke_width > 0.0 {
         let w = n.stroke_width * v.zoom;
         let grow = match n.stroke_align {

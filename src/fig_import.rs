@@ -663,6 +663,10 @@ fn import_node(
     n.fills = fills;
     n.strokes = strokes;
     n.stroke_width = v.f("strokeWeight").unwrap_or(1.0);
+    if v.b("borderStrokeWeightsIndependent") == Some(true) {
+        let w = |side: &str| if v.b(&format!("border{side}Hidden")) == Some(true) { 0.0 } else { v.f(&format!("border{side}Weight")).unwrap_or(n.stroke_width) };
+        n.stroke_sides = Some([w("Top"), w("Right"), w("Bottom"), w("Left")]);
+    }
     n.stroke_align = match v.s("strokeAlign") {
         Some("INSIDE") => StrokeAlign::Inside,
         Some("OUTSIDE") => StrokeAlign::Outside,

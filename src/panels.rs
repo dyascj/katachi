@@ -2439,6 +2439,39 @@ impl App {
                             (t.dash, t.cap, t.join) = style.clone();
                         }
                     }
+                    if n.kind == Kind::Rectangle || n.kind.is_frame() {
+                        ui.separator();
+                        ui.label("Sides");
+                        let w = n.stroke_width;
+                        let mut sides = n.stroke_sides;
+                        ui.horizontal_wrapped(|ui| {
+                            for (label, v) in [("All", None), ("Top", Some([w, 0., 0., 0.])), ("Right", Some([0., w, 0., 0.])), ("Bottom", Some([0., 0., w, 0.])), ("Left", Some([0., 0., 0., w])), ("Custom", Some(sides.unwrap_or([w; 4])))] {
+                                let on = match (label, sides) {
+                                    ("Custom", Some(s)) => !s.iter().filter(|x| **x > 0.0).count().eq(&1),
+                                    _ => sides == v,
+                                };
+                                if ui.selectable_label(on, label).clicked() {
+                                    sides = v;
+                                }
+                            }
+                        });
+                        if let Some(s) = &mut sides {
+                            ui.horizontal(|ui| {
+                                for (x, l) in s.iter_mut().zip(["T", "R", "B", "L"]) {
+                                    ui.add(DragValue::new(x).range(0.0..=1000.0).speed(0.1).prefix(l).custom_formatter(|v, _| num(v as f32)));
+                                }
+                            });
+                        }
+                        if sides != n.stroke_sides {
+                            self.begin_edit();
+                            for &id in &self.sel.clone() {
+                                let t = self.doc.node_mut(id);
+                                if t.kind == Kind::Rectangle || t.kind.is_frame() {
+                                    t.stroke_sides = sides;
+                                }
+                            }
+                        }
+                    }
                 });
             });
         }
@@ -2458,6 +2491,9 @@ impl App {
                 if stroke {
                     t.strokes = paints.clone();
                     if stroke_changed {
+                        if width != t.stroke_width && t.stroke_sides.is_some() {
+                            t.stroke_sides = None;
+                        }
                         t.stroke_width = width;
                         if t.kind != Kind::Vector {
                             t.stroke_align = align;

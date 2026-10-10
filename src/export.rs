@@ -441,7 +441,15 @@ impl Svg<'_> {
                         self.out.push_str(&shape(n, o, 0.0, &a));
                     }
                 }
-                if n.stroke_width > 0.0 {
+                if let Some(sides) = n.stroke_sides.filter(|_| n.kind == Kind::Rectangle || n.kind.is_frame()) {
+                    for s in n.strokes.iter().filter(|s| s.visible) {
+                        let attrs = self.paint("fill", s, n);
+                        for b in crate::doc::side_bands(n, sides) {
+                            let b = b.translate(-o);
+                            let _ = write!(self.out, r#"<rect x="{}" y="{}" width="{}" height="{}" {attrs}/>"#, b.min.x, b.min.y, b.width(), b.height());
+                        }
+                    }
+                } else if n.stroke_width > 0.0 {
                     let grow = match (n.kind, n.stroke_align) {
                         (Kind::Vector, _) | (_, StrokeAlign::Center) => 0.0,
                         (_, StrokeAlign::Inside) => -n.stroke_width / 2.0,

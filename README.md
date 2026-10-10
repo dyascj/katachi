@@ -55,7 +55,7 @@ GitHub Actions. Building from source needs Rust 1.92 or newer.
 
 **Paint and effects**
 - Solid, linear, and radial gradient fills, and images (fill, fit, stretch, tile)
-- Strokes with inside / center / outside alignment, dashes, caps, joins, and arrow markers
+- Strokes with inside / center / outside alignment, individual side weights, dashes, caps, joins, and arrow markers
 - Drop shadow, inner shadow, layer blur, background blur, blend modes, masks, independent corner radii
 - Selection colors: every color in a selection, editable in one place
 
