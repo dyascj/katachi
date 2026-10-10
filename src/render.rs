@@ -333,6 +333,7 @@ pub struct Textures {
     rasters: HashMap<u64, TextureHandle>,
     used: HashSet<u64>,
     images: HashMap<String, Option<(TextureHandle, Vec2)>>,
+    tiles: HashMap<String, Option<TextureHandle>>,
 }
 
 const GRAD_RES: usize = 256;
@@ -414,15 +415,33 @@ impl Textures {
         Some(id)
     }
 
+    /// Image texture with a 1px transparent border (so Fit letterboxes cleanly), and its pixel size.
     pub fn image(&mut self, ctx: &egui::Context, doc: &Document, key: &str) -> Option<(TextureId, Vec2)> {
         let entry = self.images.entry(key.to_string()).or_insert_with(|| {
             let bytes = doc.images.get(key)?;
             let img = image::load_from_memory(bytes).ok()?.to_rgba8();
-            let size = [img.width() as usize, img.height() as usize];
-            let color = ColorImage::from_rgba_unmultiplied(size, img.as_raw());
-            Some((ctx.load_texture(format!("image-{key}"), color, TextureOptions::LINEAR), vec2(size[0] as f32, size[1] as f32)))
+            let (w, h) = (img.width() as usize, img.height() as usize);
+            let mut padded = vec![0u8; (w + 2) * (h + 2) * 4];
+            for y in 0..h {
+                let src = &img.as_raw()[y * w * 4..(y + 1) * w * 4];
+                let at = ((y + 1) * (w + 2) + 1) * 4;
+                padded[at..at + w * 4].copy_from_slice(src);
+            }
+            let color = ColorImage::from_rgba_unmultiplied([w + 2, h + 2], &padded);
+            Some((ctx.load_texture(format!("image-{key}"), color, TextureOptions::LINEAR), vec2(w as f32, h as f32)))
         });
         entry.as_ref().map(|(t, s)| (t.id(), *s))
+    }
+
+    /// The same image as a repeating texture, for Tile mode.
+    pub fn image_tile(&mut self, ctx: &egui::Context, doc: &Document, key: &str) -> Option<TextureId> {
+        let entry = self.tiles.entry(key.to_string()).or_insert_with(|| {
+            let img = image::load_from_memory(doc.images.get(key)?).ok()?.to_rgba8();
+            let color = ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+            let opts = TextureOptions { wrap_mode: egui::TextureWrapMode::Repeat, ..TextureOptions::LINEAR };
+            Some(ctx.load_texture(format!("tile-{key}"), color, opts))
+        });
+        entry.as_ref().map(|t| t.id())
     }
 }
 
@@ -448,14 +467,32 @@ fn paint_geo(painter: &Painter, sc: &mut Scene, n: &Node, geo: VertexBuffers<Pos
     let (tex, uv): (TextureId, Box<dyn Fn(Pos2) -> Pos2>) = match p.kind {
         PaintKind::Solid => return void(painter.add(to_mesh(geo, p.color.to32().gamma_multiply(a)))),
         PaintKind::Linear | PaintKind::Radial => (sc.tex.gradient(ctx, p), Box::new(unit)),
-        PaintKind::Image => match sc.tex.image(ctx, sc.doc, &p.image) {
-            Some((id, size)) => {
-                // "Fill" scale mode: cover the layer, centered.
-                let (la, ia) = (n.rect.width() / n.rect.height().max(1e-6), size.x / size.y.max(1e-6));
-                let (su, sv) = if la > ia { (1.0, ia / la) } else { (la / ia, 1.0) };
+        PaintKind::Image if p.scale_mode == crate::doc::ScaleMode::Tile => match (sc.tex.image_tile(ctx, sc.doc, &p.image), sc.tex.image(ctx, sc.doc, &p.image)) {
+            (Some(id), Some((_, size))) => {
+                let tile = size * p.tile_scale.max(0.01);
+                let r = n.rect.size();
                 (id, Box::new(move |s| {
                     let q = unit(s);
-                    pos2(0.5 + (q.x - 0.5) * su, 0.5 + (q.y - 0.5) * sv)
+                    pos2(q.x * r.x / tile.x, q.y * r.y / tile.y)
+                }))
+            }
+            _ => return void(painter.add(to_mesh(geo, crate::doc::SHAPE_GRAY.to32().gamma_multiply(a)))),
+        },
+        PaintKind::Image => match sc.tex.image(ctx, sc.doc, &p.image) {
+            Some((id, size)) => {
+                let (la, ia) = (n.rect.width() / n.rect.height().max(1e-6), size.x / size.y.max(1e-6));
+                // How much of the image's unit square spans the layer, per axis.
+                let (su, sv) = match p.scale_mode {
+                    crate::doc::ScaleMode::Fit => if la > ia { (la / ia, 1.0) } else { (1.0, ia / la) },
+                    crate::doc::ScaleMode::Stretch => (1.0, 1.0),
+                    _ => if la > ia { (1.0, ia / la) } else { (la / ia, 1.0) },
+                };
+                // Skip the 1px transparent border around the texture.
+                let (pw, ph) = (size.x + 2.0, size.y + 2.0);
+                (id, Box::new(move |s| {
+                    let q = unit(s);
+                    let (u, v) = (0.5 + (q.x - 0.5) * su, 0.5 + (q.y - 0.5) * sv);
+                    pos2((1.0 + u * size.x) / pw, (1.0 + v * size.y) / ph)
                 }))
             }
             None => return void(painter.add(to_mesh(geo, crate::doc::SHAPE_GRAY.to32().gamma_multiply(a)))),

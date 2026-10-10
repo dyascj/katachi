@@ -180,14 +180,27 @@ impl Svg<'_> {
                 let mime = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) { "image/png" } else { "image/jpeg" };
                 let data = base64::engine::general_purpose::STANDARD.encode(bytes.as_slice());
                 let id = self.id("image");
-                let _ = write!(
-                    self.defs,
-                    r#"<pattern id="{id}" patternUnits="userSpaceOnUse" x="{x}" y="{y}" width="{w}" height="{h}"><image href="data:{mime};base64,{data}" x="{x}" y="{y}" width="{w}" height="{h}" preserveAspectRatio="xMidYMid slice"/></pattern>"#,
-                    x = r.min.x,
-                    y = r.min.y,
-                    w = r.width(),
-                    h = r.height()
-                );
+                use crate::doc::ScaleMode;
+                let (x, y, w, h) = (r.min.x, r.min.y, r.width(), r.height());
+                let href = format!("data:{mime};base64,{data}");
+                if p.scale_mode == ScaleMode::Tile {
+                    let dims = image::ImageReader::new(std::io::Cursor::new(bytes.as_slice())).with_guessed_format().ok().and_then(|r| r.into_dimensions().ok());
+                    let (iw, ih) = dims.map_or((w, h), |(a, b)| (a as f32 * p.tile_scale, b as f32 * p.tile_scale));
+                    let _ = write!(
+                        self.defs,
+                        r#"<pattern id="{id}" patternUnits="userSpaceOnUse" x="{x}" y="{y}" width="{iw}" height="{ih}"><image href="{href}" x="0" y="0" width="{iw}" height="{ih}" preserveAspectRatio="none"/></pattern>"#
+                    );
+                } else {
+                    let aspect = match p.scale_mode {
+                        ScaleMode::Fit => "xMidYMid meet",
+                        ScaleMode::Stretch => "none",
+                        _ => "xMidYMid slice",
+                    };
+                    let _ = write!(
+                        self.defs,
+                        r#"<pattern id="{id}" patternUnits="userSpaceOnUse" x="{x}" y="{y}" width="{w}" height="{h}"><image href="{href}" x="{x}" y="{y}" width="{w}" height="{h}" preserveAspectRatio="{aspect}"/></pattern>"#
+                    );
+                }
                 format!(r#"{name}="url(#{id})" {name}-opacity="{:.3}""#, p.alpha())
             }
         }
@@ -738,6 +751,36 @@ mod tests {
         let img = image::load_from_memory(&png).unwrap().to_rgba8();
         assert!(img.get_pixel(20, 20).0[3] > 200, "center kept");
         assert!(img.get_pixel(2, 2).0[3] < 30, "corner masked away");
+    }
+
+    #[test]
+    fn image_fit_letterboxes_and_tile_repeats() {
+        use crate::doc::ScaleMode;
+        let mut d = Document::default();
+        let mut buf = std::io::Cursor::new(vec![]);
+        image::RgbaImage::from_fn(2, 1, |x, _| if x == 0 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) })
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        d.images.insert("img".into(), std::sync::Arc::new(buf.into_inner()));
+        let layer = |d: &mut Document, mode: ScaleMode, x: f32| {
+            let mut p = Paint::solid(Rgba::WHITE);
+            p.convert(PaintKind::Image);
+            p.image = "img".into();
+            p.scale_mode = mode;
+            p.tile_scale = 10.0;
+            let mut n = Node::new(Kind::Rectangle, Rect::from_min_size(pos2(x, 0.), vec2(40., 40.)));
+            n.fills = vec![p];
+            d.insert(0, None, None, n)
+        };
+        let fit = layer(&mut d, ScaleMode::Fit, 0.);
+        let img = image::load_from_memory(&to_png(&d, &[fit], 1.0).unwrap()).unwrap().to_rgba8();
+        assert!(img.get_pixel(20, 3).0[3] < 30, "letterbox band above the 2:1 image");
+        assert!(img.get_pixel(5, 20).0[0] > 200, "image in the middle");
+        let tile = layer(&mut d, ScaleMode::Tile, 100.);
+        let img = image::load_from_memory(&to_png(&d, &[tile], 1.0).unwrap()).unwrap().to_rgba8();
+        // 2x1 image at 10x is 20x10 per tile: red then blue, repeating.
+        assert!(img.get_pixel(5, 5).0[0] > 200 && img.get_pixel(15, 5).0[2] > 200, "first tile");
+        assert!(img.get_pixel(25, 15).0[0] > 200, "repeats");
     }
 
     #[test]

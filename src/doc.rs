@@ -503,6 +503,18 @@ pub enum PaintKind {
     Image,
 }
 
+/// How an image fills its layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ScaleMode {
+    /// Cover, cropping overflow.
+    #[default]
+    Fill,
+    /// Contain, letterboxed.
+    Fit,
+    Stretch,
+    Tile,
+}
+
 /// A fill or stroke paint. For gradients and images, `color`'s alpha is the paint opacity.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Paint {
@@ -521,11 +533,30 @@ pub struct Paint {
     /// Key into `Document::images`.
     #[serde(default)]
     pub image: String,
+    #[serde(default)]
+    pub scale_mode: ScaleMode,
+    /// Tile size relative to the image's pixels.
+    #[serde(default = "one")]
+    pub tile_scale: f32,
+}
+
+fn one() -> f32 {
+    1.0
 }
 
 impl Paint {
     pub fn solid(color: Rgba) -> Self {
-        Self { color, visible: true, kind: PaintKind::Solid, stops: vec![], from: Pos2::ZERO, to: Pos2::ZERO, image: String::new() }
+        Self {
+            color,
+            visible: true,
+            kind: PaintKind::Solid,
+            stops: vec![],
+            from: Pos2::ZERO,
+            to: Pos2::ZERO,
+            image: String::new(),
+            scale_mode: ScaleMode::Fill,
+            tile_scale: 1.0,
+        }
     }
 
     /// Switch kind, seeding Figma's defaults from the current color.

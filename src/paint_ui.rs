@@ -216,6 +216,22 @@ fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEve
             if paint.image.is_empty() {
                 ui.label("No image selected");
             }
+            ui.horizontal(|ui| {
+                use crate::doc::ScaleMode;
+                for m in [ScaleMode::Fill, ScaleMode::Fit, ScaleMode::Stretch, ScaleMode::Tile] {
+                    if ui.selectable_label(paint.scale_mode == m, format!("{m:?}")).clicked() && paint.scale_mode != m {
+                        paint.scale_mode = m;
+                        ev = Some(PaintEvent::Changed);
+                    }
+                }
+            });
+            if paint.scale_mode == crate::doc::ScaleMode::Tile {
+                let mut pct = paint.tile_scale * 100.0;
+                if ui.add(DragValue::new(&mut pct).range(1.0..=1000.0).suffix("%").prefix("Scale ")).changed() {
+                    paint.tile_scale = pct / 100.0;
+                    ev = Some(PaintEvent::Changed);
+                }
+            }
         }
     }
     ev
