@@ -264,6 +264,77 @@ pub fn variant_pairs(name: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+pub type VarId = u64;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum VarValue {
+    Color(Rgba),
+    Number(f32),
+    Text(String),
+    Bool(bool),
+    /// Points at another variable.
+    Alias(VarId),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Variable {
+    pub id: VarId,
+    pub name: String,
+    pub collection: u64,
+    /// One value per mode of the collection.
+    pub values: Vec<VarValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Collection {
+    pub id: u64,
+    pub name: String,
+    pub modes: Vec<String>,
+}
+
+/// Layer properties a variable can drive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Bindable {
+    Fill,
+    Stroke,
+    Opacity,
+    Radius,
+    Width,
+    Height,
+    Gap,
+    Padding,
+    StrokeWidth,
+    FontSize,
+    Text,
+    Visible,
+}
+
+impl Bindable {
+    pub const ALL: [Bindable; 12] = [
+        Bindable::Fill,
+        Bindable::Stroke,
+        Bindable::Opacity,
+        Bindable::Radius,
+        Bindable::Width,
+        Bindable::Height,
+        Bindable::Gap,
+        Bindable::Padding,
+        Bindable::StrokeWidth,
+        Bindable::FontSize,
+        Bindable::Text,
+        Bindable::Visible,
+    ];
+    /// Whether a value of this kind fits the property.
+    pub fn accepts(self, v: &VarValue) -> bool {
+        match self {
+            Bindable::Fill | Bindable::Stroke => matches!(v, VarValue::Color(_)),
+            Bindable::Text => matches!(v, VarValue::Text(_)),
+            Bindable::Visible => matches!(v, VarValue::Bool(_)),
+            _ => matches!(v, VarValue::Number(_)),
+        }
+    }
+}
+
 pub type StyleId = u64;
 
 /// Typography captured by a text style.
@@ -761,6 +832,10 @@ pub struct Node {
     pub blend: BlendMode,
     /// Prototype interactions.
     pub reactions: Vec<Reaction>,
+    /// Properties driven by variables.
+    pub bindings: Vec<(Bindable, VarId)>,
+    /// Explicit variable modes set on this layer: (collection, mode index); children inherit.
+    pub modes: Vec<(u64, usize)>,
     /// Linked shared styles.
     pub fill_style: Option<StyleId>,
     pub stroke_style: Option<StyleId>,
@@ -837,6 +912,8 @@ impl Default for Node {
             exports: vec![],
             blend: BlendMode::Normal,
             reactions: vec![],
+            bindings: vec![],
+            modes: vec![],
             fill_style: None,
             stroke_style: None,
             text_style: None,
@@ -1015,6 +1092,10 @@ pub struct Document {
     pub images: HashMap<String, std::sync::Arc<Vec<u8>>>,
     #[serde(default)]
     pub styles: Vec<Style>,
+    #[serde(default)]
+    pub collections: Vec<Collection>,
+    #[serde(default)]
+    pub variables: Vec<Variable>,
 }
 
 mod images_b64 {
@@ -1053,6 +1134,8 @@ impl Default for Document {
             next_id: 1,
             images: HashMap::new(),
             styles: vec![],
+            collections: vec![],
+            variables: vec![],
         }
     }
 }
@@ -1246,6 +1329,82 @@ impl Document {
                     self.translate(c, nr.min - cr.min);
                 } else {
                     self.set_rect(c, nr);
+                }
+            }
+        }
+    }
+
+    pub fn variable(&self, id: VarId) -> Option<&Variable> {
+        self.variables.iter().find(|v| v.id == id)
+    }
+
+    pub fn add_collection(&mut self, name: String) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.collections.push(Collection { id, name, modes: vec!["Mode 1".into()] });
+        id
+    }
+
+    pub fn add_variable(&mut self, collection: u64, name: String, value: VarValue) -> VarId {
+        let id = self.next_id;
+        self.next_id += 1;
+        let modes = self.collections.iter().find(|c| c.id == collection).map_or(1, |c| c.modes.len());
+        self.variables.push(Variable { id, name, collection, values: vec![value; modes] });
+        id
+    }
+
+    /// The mode index a layer sees for a collection: nearest explicit choice up the tree, else the first.
+    pub fn mode_for(&self, id: NodeId, collection: u64) -> usize {
+        std::iter::once(id)
+            .chain(self.ancestors(id))
+            .find_map(|a| self.nodes[&a].modes.iter().find(|(c, _)| *c == collection).map(|(_, m)| *m))
+            .unwrap_or(0)
+    }
+
+    /// A variable's concrete value as seen from `node`, following aliases.
+    pub fn resolve(&self, var: VarId, node: NodeId) -> Option<VarValue> {
+        let mut cur = var;
+        for _ in 0..8 {
+            let v = self.variable(cur)?;
+            let mode = self.mode_for(node, v.collection).min(v.values.len().saturating_sub(1));
+            match v.values.get(mode)? {
+                VarValue::Alias(next) => cur = *next,
+                other => return Some(other.clone()),
+            }
+        }
+        None
+    }
+
+    /// Push variable values into bound properties.
+    pub fn apply_variables(&mut self) {
+        if self.variables.is_empty() {
+            return;
+        }
+        let bound: Vec<NodeId> = self.nodes.values().filter(|n| !n.bindings.is_empty()).map(|n| n.id).collect();
+        for id in bound {
+            for (prop, var) in self.nodes[&id].bindings.clone() {
+                let Some(val) = self.resolve(var, id) else { continue };
+                let n = self.node_mut(id);
+                match (prop, val) {
+                    (Bindable::Fill, VarValue::Color(c)) => match n.fills.last_mut() {
+                        Some(p) if p.kind == PaintKind::Solid => p.color = c,
+                        _ => n.fills = vec![Paint::solid(c)],
+                    },
+                    (Bindable::Stroke, VarValue::Color(c)) => match n.strokes.last_mut() {
+                        Some(p) if p.kind == PaintKind::Solid => p.color = c,
+                        _ => n.strokes = vec![Paint::solid(c)],
+                    },
+                    (Bindable::Opacity, VarValue::Number(v)) => n.opacity = (v / 100.0).clamp(0.0, 1.0),
+                    (Bindable::Radius, VarValue::Number(v)) => n.radius = v.max(0.0),
+                    (Bindable::Width, VarValue::Number(v)) => n.rect = Rect::from_min_size(n.rect.min, vec2(v.max(0.0), n.rect.height())),
+                    (Bindable::Height, VarValue::Number(v)) => n.rect = Rect::from_min_size(n.rect.min, vec2(n.rect.width(), v.max(0.0))),
+                    (Bindable::Gap, VarValue::Number(v)) => n.layout.gap = v,
+                    (Bindable::Padding, VarValue::Number(v)) => n.layout.padding = [v; 4],
+                    (Bindable::StrokeWidth, VarValue::Number(v)) => n.stroke_width = v.max(0.0),
+                    (Bindable::FontSize, VarValue::Number(v)) => n.font_size = v.max(1.0),
+                    (Bindable::Text, VarValue::Text(t)) => n.text = t,
+                    (Bindable::Visible, VarValue::Bool(b)) => n.visible = b,
+                    _ => {}
                 }
             }
         }
@@ -1560,6 +1719,7 @@ impl Document {
     /// Re-derive everything computed from children: group bounds and auto layout.
     pub fn reflow(&mut self) {
         self.apply_styles();
+        self.apply_variables();
         let instances: Vec<NodeId> = self.nodes.values().filter(|n| n.kind == Kind::Instance).map(|n| n.id).collect();
         // ponytail: syncs every instance on every edit; track dirty components when files get large
         for _ in 0..2 {
@@ -1569,6 +1729,8 @@ impl Document {
                 }
             }
         }
+        // Instances copied their bindings; resolve them too, before layout uses sizes and gaps.
+        self.apply_variables();
         self.reflow_layout();
     }
 
@@ -1958,7 +2120,7 @@ fn merge_from(e: &mut Node, src: &Node) {
         name, visible, opacity, fills, strokes, stroke_width, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, constraints, absolute,
         paths, even_odd, text, font_size, font_weight, font_family, text_sizing, text_align, text_valign, line_height, letter_spacing,
         decoration, text_case, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, fill_style,
-        stroke_style, text_style, effect_style, prop_bind, is_mask, blend
+        stroke_style, text_style, effect_style, prop_bind, is_mask, blend, bindings, modes
     );
     e.synced = Some(Box::new(Node { children: vec![], synced: None, ..src.clone() }));
 }
@@ -2478,6 +2640,32 @@ mod tests {
         assert!(near(&g.bands(0., 340.), &[(20., 113.3333), (123.3333, 216.6667), (226.6667, 320.)]));
         let c = LayoutGrid { align: GridAlign::Center, size: 50., count: 2, gutter: 10., margin: 0., ..g };
         assert_eq!(c.bands(0., 200.), vec![(45., 95.), (105., 155.)]);
+    }
+
+    #[test]
+    fn variables_resolve_by_mode_and_alias() {
+        let mut d = Document::default();
+        let c = d.add_collection("Theme".into());
+        d.collections[0].modes = vec!["Light".into(), "Dark".into()];
+        let base = d.add_variable(c, "gray/900".into(), VarValue::Color(Rgba::rgb(20, 20, 20)));
+        let bg = d.add_variable(c, "bg".into(), VarValue::Color(Rgba::WHITE));
+        d.variables[1].values[1] = VarValue::Alias(base);
+        let space = d.add_variable(c, "space/md".into(), VarValue::Number(12.0));
+        let f = d.insert(0, None, None, Node::new(Kind::Frame, r(0., 0., 100., 100.)));
+        let child = d.insert(0, Some(f), None, Node::new(Kind::Rectangle, r(10., 10., 20., 20.)));
+        d.node_mut(child).bindings = vec![(Bindable::Fill, bg), (Bindable::Radius, space)];
+        d.reflow();
+        assert_eq!(d.node(child).fills[0].color, Rgba::WHITE, "light by default");
+        assert_eq!(d.node(child).radius, 12.0);
+        // Switching the frame to Dark flows down to the child, through the alias.
+        d.node_mut(f).modes = vec![(c, 1)];
+        d.reflow();
+        assert_eq!(d.node(child).fills[0].color, Rgba::rgb(20, 20, 20));
+        // Editing the variable (Dark value, since the frame is Dark) updates bound layers.
+        d.variables[2].values[1] = VarValue::Number(4.0);
+        d.reflow();
+        assert_eq!(d.node(child).radius, 4.0);
+        assert!(Bindable::Radius.accepts(&VarValue::Number(1.0)) && !Bindable::Fill.accepts(&VarValue::Number(1.0)));
     }
 
     #[test]

@@ -132,6 +132,8 @@ pub struct App {
     pub rulers: bool,
     pub show_grids: bool,
     pub show_history: bool,
+    pub show_variables: bool,
+    pub var_collection: Option<u64>,
     /// Properties copied with Cmd+Alt+C.
     pub style_clip: Option<Node>,
     pub layer_search: Option<String>,
@@ -191,6 +193,8 @@ impl App {
             rulers: false,
             show_grids: true,
             show_history: false,
+            show_variables: false,
+            var_collection: None,
             style_clip: None,
             layer_search: None,
             recovery: crate::files::recovery_dir().join(format!(
@@ -1400,6 +1404,7 @@ impl eframe::App for App {
         self.close_guard(&ctx);
         self.recovery_prompt(&ctx);
         self.history_window(&ctx);
+        self.variables_window(&ctx);
         self.autosave(ctx.input(|i| i.time));
         self.debug_screenshot(&ctx);
 

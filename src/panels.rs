@@ -606,6 +606,10 @@ impl App {
             self.save(true);
             ui.close();
         }
+        if item(ui, "Local variables…", "") {
+            self.show_variables = true;
+            ui.close();
+        }
         if item(ui, "Version history…", "") {
             self.show_history = true;
             ui.close();
@@ -1111,6 +1115,10 @@ impl App {
             }
         });
         self.local_styles(ui);
+        ui.separator();
+        if ui.add_sized([ui.available_width(), 24.0], egui::Button::new("Local variables")).clicked() {
+            self.show_variables = true;
+        }
     }
 
     /// With nothing selected, list the file's styles like Figma's "Local styles".
@@ -1245,6 +1253,9 @@ impl App {
         }
         ui.separator();
         self.effects_section(ui);
+        if roots.len() == 1 {
+            self.variables_section(ui, roots[0]);
+        }
     }
 
     fn component_section(&mut self, ui: &mut Ui, id: NodeId) {

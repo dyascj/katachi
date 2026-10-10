@@ -599,6 +599,25 @@ fn shots() {
     st.sel = vec![landing];
     h.run_steps(3);
     save(&mut h, "19-layout-grid");
+    // Variables: a Light/Dark theme bound to the landing frame's fill and the hero radius.
+    use crate::doc::{Bindable, VarValue};
+    let st = h.state_mut();
+    st.doc.node_mut(landing).grids.clear();
+    let c = st.doc.add_collection("Theme".into());
+    st.doc.collections.last_mut().unwrap().modes = vec!["Light".into(), "Dark".into()];
+    let surface = st.doc.add_variable(c, "color/surface".into(), VarValue::Color(Rgba::WHITE));
+    st.doc.variables.last_mut().unwrap().values[1] = VarValue::Color(Rgba::rgb(24, 24, 27));
+    let radius = st.doc.add_variable(c, "radius/lg".into(), VarValue::Number(12.));
+    st.doc.variables.last_mut().unwrap().values[1] = VarValue::Number(24.);
+    st.doc.node_mut(landing).bindings = vec![(Bindable::Fill, surface)];
+    let hero = *st.doc.nodes.keys().find(|i| st.doc.node(**i).name == "Hero").unwrap();
+    st.doc.node_mut(hero).bindings = vec![(Bindable::Radius, radius)];
+    st.doc.node_mut(landing).modes = vec![(c, 1)];
+    st.doc.reflow();
+    st.sel = vec![landing];
+    st.show_variables = true;
+    h.run_steps(4);
+    save(&mut h, "20-variables");
 }
 
 #[test]

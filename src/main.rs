@@ -10,6 +10,7 @@ mod prototype;
 mod render;
 mod svg_import;
 mod text;
+mod variables_ui;
 mod vector_edit;
 #[cfg(test)]
 mod tests;
