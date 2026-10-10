@@ -212,6 +212,11 @@ pub fn job(ctx: &egui::Context, n: &Node, text: &str, zoom: f32, color: Color32)
         TextSizing::AutoWidth => f32::INFINITY,
         _ => (n.rect.width() * zoom).max(1.0),
     };
+    if n.truncate {
+        let fit = if n.text_sizing == TextSizing::Fixed { (n.rect.height() / line_pitch(n)).floor().max(1.0) as usize } else { usize::MAX };
+        job.wrap.max_rows = if n.max_lines > 0 { fit.min(n.max_lines as usize) } else { fit };
+        job.wrap.overflow_character = Some('…');
+    }
     job
 }
 

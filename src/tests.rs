@@ -809,6 +809,27 @@ fn text_wraps_aligns_and_spaces_lines() {
     assert_eq!(rect(&h, t2), r(200., 0., 100., 80.), "fixed boxes keep their size");
 }
 
+#[test]
+fn truncated_text_stops_at_max_lines_with_ellipsis() {
+    use crate::doc::{LineHeight, TextSizing};
+    let mut h = harness();
+    let mut n = Node::new(Kind::Text, r(0., 0., 60., 10.));
+    n.text = "alpha beta gamma delta epsilon zeta".into();
+    n.font_size = 12.0;
+    n.text_sizing = TextSizing::AutoHeight;
+    n.line_height = LineHeight::Px(20.0);
+    n.truncate = true;
+    n.max_lines = 2;
+    let id = h.state_mut().doc.insert(0, None, None, n);
+    h.run_steps(3);
+    let t = h.state().doc.node(id).clone();
+    assert_eq!(t.lines.len(), 2, "{:?}", t.lines);
+    assert!(t.lines[1].ends_with('…'), "{:?}", t.lines);
+    assert_eq!(t.rect.height(), 40.0);
+    let css = crate::codegen::css(&h.state().doc, id);
+    assert!(css.contains("-webkit-line-clamp: 2"), "{css}");
+}
+
 fn double_click(h: &mut Harness<App>, p: Pos2) {
     h.run_steps(30);
     move_to(h, p, Modifiers::NONE);

@@ -977,6 +977,10 @@ pub struct Node {
     pub letter_spacing: f32,
     pub decoration: Decoration,
     pub text_case: TextCase,
+    /// End overflowing text with an ellipsis.
+    pub truncate: bool,
+    /// With truncation on: lines before the ellipsis (0 = as many as fit).
+    pub max_lines: u32,
     /// Styled character ranges (rich text).
     pub spans: Vec<TextSpan>,
     /// Wrapped lines from the last layout, used by export.
@@ -1048,6 +1052,8 @@ impl Default for Node {
             letter_spacing: 0.0,
             decoration: Decoration::None,
             text_case: TextCase::Original,
+            truncate: false,
+            max_lines: 0,
             spans: vec![],
             lines: vec![],
             expanded: true,
@@ -2320,7 +2326,7 @@ fn merge_from(e: &mut Node, src: &Node) {
     take!(
         name, visible, opacity, fills, strokes, stroke_width, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, constraints, absolute,
         paths, even_odd, text, font_size, font_weight, font_family, text_sizing, text_align, text_valign, line_height, letter_spacing,
-        decoration, text_case, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, fill_style,
+        decoration, text_case, truncate, max_lines, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, fill_style,
         stroke_style, text_style, effect_style, prop_bind, is_mask, blend, bindings, modes, spans
     );
     e.synced = Some(Box::new(Node { children: vec![], synced: None, ..src.clone() }));

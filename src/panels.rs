@@ -2094,6 +2094,12 @@ impl App {
                     t.decoration = if on { Decoration::None } else { d };
                 }
             }
+            ui.add_space(6.0);
+            ui.checkbox(&mut t.truncate, "Truncate");
+            if t.truncate {
+                ui.add(egui::DragValue::new(&mut t.max_lines).range(0..=999).custom_formatter(|v, _| if v == 0.0 { "Auto".into() } else { format!("{v} lines") }))
+                    .on_hover_text("Max lines (Auto fits the box)");
+            }
         });
         let changed = t.font_family != n.font_family
             || t.font_weight != n.font_weight
@@ -2104,7 +2110,9 @@ impl App {
             || t.text_valign != n.text_valign
             || t.text_sizing != n.text_sizing
             || t.decoration != n.decoration
-            || t.text_case != n.text_case;
+            || t.text_case != n.text_case
+            || t.truncate != n.truncate
+            || t.max_lines != n.max_lines;
         // With characters selected in the editor, changes style just that range (rich text).
         if changed && self.text_selection(ui.ctx()).is_some() {
             let patch = crate::doc::SpanStyle {
@@ -2135,6 +2143,8 @@ impl App {
                 d.text_sizing = t.text_sizing;
                 d.decoration = t.decoration;
                 d.text_case = t.text_case;
+                d.truncate = t.truncate;
+                d.max_lines = t.max_lines;
             }
         }
     }

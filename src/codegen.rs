@@ -113,6 +113,17 @@ pub fn css(doc: &Document, id: NodeId) -> String {
             Decoration::Strikethrough => decl("text-decoration", "line-through".into()),
             Decoration::None => {}
         }
+        if n.truncate {
+            decl("overflow", "hidden".into());
+            decl("text-overflow", "ellipsis".into());
+            if n.max_lines > 1 {
+                decl("display", "-webkit-box".into());
+                decl("-webkit-box-orient", "vertical".into());
+                decl("-webkit-line-clamp", n.max_lines.to_string());
+            } else {
+                decl("white-space", "nowrap".into());
+            }
+        }
     } else {
         let fills: Vec<String> = n.fills.iter().rev().filter(|f| f.visible).map(css_paint).collect();
         match fills.as_slice() {

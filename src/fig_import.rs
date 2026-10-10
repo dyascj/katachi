@@ -448,6 +448,8 @@ fn import_node(
             Some("STRIKETHROUGH") => Decoration::Strikethrough,
             _ => Decoration::None,
         };
+        n.truncate = v.s("textTruncation") == Some("ENDING");
+        n.max_lines = v.u("maxLines").unwrap_or(0) as u32;
         n.text_case = match v.s("textCase") {
             Some("UPPER") => TextCase::Upper,
             Some("LOWER") => TextCase::Lower,
