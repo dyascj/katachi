@@ -315,6 +315,79 @@ fn prop_json(v: &PropValue) -> (&'static str, Value) {
     }
 }
 
+// ---------- prototyping ----------
+
+fn reaction_json(r: &Reaction) -> Value {
+    let trigger = match r.trigger {
+        Trigger::OnClick => json!({ "type": "ON_CLICK" }),
+        Trigger::OnHover => json!({ "type": "ON_HOVER" }),
+        Trigger::WhilePressed => json!({ "type": "ON_PRESS" }),
+        Trigger::AfterDelay(ms) => json!({ "type": "AFTER_TIMEOUT", "timeout": ms as f32 / 1000.0 }),
+    };
+    let t = r.transition;
+    let transition = match t.kind {
+        TransitionKind::Instant => Value::Null,
+        k => json!({
+            "type": match k { TransitionKind::Dissolve => "DISSOLVE", TransitionKind::SmartAnimate => "SMART_ANIMATE", TransitionKind::MoveIn => "MOVE_IN", TransitionKind::Push => "PUSH", _ => "SLIDE_IN" },
+            "direction": match t.direction { Direction::Left => "LEFT", Direction::Right => "RIGHT", Direction::Up => "TOP", Direction::Down => "BOTTOM" },
+            "duration": t.duration, "easing": { "type": "EASE_OUT" },
+        }),
+    };
+    let action = match &r.action {
+        Action::None => Value::Null,
+        Action::Navigate(id) => json!({ "type": "NODE", "destinationId": id.to_string(), "navigation": "NAVIGATE", "transition": transition }),
+        Action::OpenOverlay(id) => json!({ "type": "NODE", "destinationId": id.to_string(), "navigation": "OVERLAY", "transition": transition }),
+        Action::Back => json!({ "type": "BACK" }),
+        Action::CloseOverlay => json!({ "type": "CLOSE" }),
+        Action::OpenUrl(u) => json!({ "type": "URL", "url": u }),
+    };
+    json!({ "trigger": trigger, "actions": if action.is_null() { vec![] } else { vec![action] } })
+}
+
+fn reaction_from(v: &Value, refs: &Refs) -> Option<Reaction> {
+    let trigger = match v["trigger"]["type"].as_str()? {
+        "ON_HOVER" | "MOUSE_ENTER" => Trigger::OnHover,
+        "ON_PRESS" | "MOUSE_DOWN" => Trigger::WhilePressed,
+        "AFTER_TIMEOUT" => Trigger::AfterDelay((f(&v["trigger"], "timeout").unwrap_or(0.8) * 1000.0) as u32),
+        _ => Trigger::OnClick,
+    };
+    // Figma allows several actions per trigger; Katachi plays the first.
+    let a = v["actions"].as_array().and_then(|a| a.first()).or(v.get("action"))?;
+    let t = &a["transition"];
+    let transition = if t.is_object() {
+        Transition {
+            kind: match t["type"].as_str() {
+                Some("DISSOLVE") => TransitionKind::Dissolve,
+                Some("SMART_ANIMATE") => TransitionKind::SmartAnimate,
+                Some("MOVE_IN") | Some("MOVE_OUT") => TransitionKind::MoveIn,
+                Some("PUSH") => TransitionKind::Push,
+                Some("SLIDE_IN") | Some("SLIDE_OUT") => TransitionKind::SlideIn,
+                _ => TransitionKind::Instant,
+            },
+            direction: match t["direction"].as_str() {
+                Some("RIGHT") => Direction::Right,
+                Some("TOP") => Direction::Up,
+                Some("BOTTOM") => Direction::Down,
+                _ => Direction::Left,
+            },
+            duration: f(t, "duration").unwrap_or(0.3) as f32,
+        }
+    } else {
+        Transition::default()
+    };
+    let action = match a["type"].as_str()? {
+        "NODE" => {
+            let dest = refs.node(a["destinationId"].as_str()?)?;
+            if a["navigation"].as_str() == Some("OVERLAY") { Action::OpenOverlay(dest) } else { Action::Navigate(dest) }
+        }
+        "BACK" => Action::Back,
+        "CLOSE" => Action::CloseOverlay,
+        "URL" => Action::OpenUrl(a["url"].as_str()?.to_string()),
+        _ => return None,
+    };
+    Some(Reaction { trigger, action, transition })
+}
+
 // ---------- layers ----------
 
 /// One layer as the plugin API sees it (without children).
@@ -378,6 +451,7 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
         }
     }
     v["boundVariables"] = Value::Object(bv);
+    v["reactions"] = json!(n.reactions.iter().map(reaction_json).collect::<Vec<_>>());
     v["explicitVariableModes"] = Value::Object(n.modes.iter().map(|(c, m)| (format!("VariableCollectionId:{c}"), json!(format!("{c}:{m}")))).collect());
     if !n.prop_bind.is_empty() {
         let refs: serde_json::Map<String, Value> = n
@@ -548,7 +622,8 @@ pub fn snapshot(doc: &Document, page: usize, sel: &[NodeId], all_pages: bool) ->
     json!({
         "pages": doc.pages.iter().enumerate().map(|(i, p)| {
             let loaded = all_pages || i == page;
-            json!({ "name": p.name, "loaded": loaded, "children": if loaded { p.children.iter().map(|&c| tree(doc, c)).collect::<Vec<_>>() } else { vec![] } })
+            json!({ "name": p.name, "loaded": loaded, "children": if loaded { p.children.iter().map(|&c| tree(doc, c)).collect::<Vec<_>>() } else { vec![] },
+                "flowStartingPoints": p.flows.iter().filter(|f| doc.nodes.contains_key(f)).map(|f| json!({ "nodeId": f.to_string(), "name": doc.node(*f).name })).collect::<Vec<_>>() })
         }).collect::<Vec<_>>(),
         "current": page,
         "selection": sel.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
@@ -1076,6 +1151,9 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
             }
         }
     }
+    if changed("reactions") {
+        n.reactions = v["reactions"].as_array().into_iter().flatten().filter_map(|r| reaction_from(r, refs)).collect();
+    }
     if changed("explicitVariableModes") {
         n.modes = v["explicitVariableModes"].as_object().into_iter().flatten().filter_map(|(_, m)| refs.mode(m.as_str()?)).collect();
     }
@@ -1234,6 +1312,12 @@ pub fn apply(doc: &mut Document, out: &Value) -> HashMap<String, NodeId> {
         apply_props(doc, id, v, &base, moved.contains(&id), &refs);
     }
     lap("  properties", &mut t);
+    // Prototype starting points per page.
+    for (p, &page) in out_pages.iter().zip(&page_of) {
+        if let Some(flows) = p["flowStartingPoints"].as_array() {
+            doc.pages[page].flows = flows.iter().filter_map(|f| refs.node(f["nodeId"].as_str()?)).filter(|id| doc.nodes.contains_key(id)).collect();
+        }
+    }
     // Instances: point at their main components, sync, then take the script's overrides.
     for v in &nodes {
         let Some(jid) = v["id"].as_str() else { continue };

@@ -529,6 +529,33 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod prototype_tests {
+    use super::*;
+
+    #[test]
+    fn reactions_and_flows_through_the_api() {
+        let mut d = Document::default();
+        let out = run(&mut d, 0, &[], r#"
+            const a = figma.createFrame(); a.name = "Login";
+            const b = figma.createFrame(); b.name = "Dashboard"; b.x = 200;
+            const btn = figma.createRectangle(); a.appendChild(btn);
+            await btn.setReactionsAsync([{ trigger: { type: "ON_CLICK" }, actions: [{ type: "NODE", destinationId: b.id, navigation: "NAVIGATE", transition: { type: "DISSOLVE", duration: 0.2, easing: { type: "EASE_OUT" } } }] }]);
+            b.reactions = [{ trigger: { type: "AFTER_TIMEOUT", timeout: 1.5 }, actions: [{ type: "BACK" }] }];
+            figma.currentPage.flowStartingPoints = [{ nodeId: a.id, name: "Sign in" }];
+            return { a, b, btn };
+        "#).unwrap();
+        let r: serde_json::Value = serde_json::from_str(out.result.as_deref().unwrap()).unwrap();
+        let id = |k: &str| r[k]["id"].as_str().unwrap().parse::<NodeId>().unwrap();
+        let rx = &d.node(id("btn")).reactions[0];
+        assert_eq!(rx.action, crate::doc::Action::Navigate(id("b")));
+        assert_eq!(rx.transition.kind, crate::doc::TransitionKind::Dissolve);
+        assert_eq!(d.node(id("b")).reactions[0].trigger, crate::doc::Trigger::AfterDelay(1500));
+        assert_eq!(d.pages[0].flows, vec![id("a")]);
+        let back = run(&mut d, 0, &[], "return figma.currentPage.findOne(n => n.type === 'RECTANGLE').reactions[0].actions[0].navigation").unwrap();
+        assert_eq!(back.result.as_deref(), Some("\"NAVIGATE\""));
+    }
+}
 
 /// `KATACHI_DOC=file.katachi KATACHI_JS=script.js cargo test --release plugin_bench -- --ignored --nocapture`
 #[cfg(test)]

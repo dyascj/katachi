@@ -104,6 +104,7 @@ const __NodeProto = {
   setStrokeStyleIdAsync(id) { this.strokeStyleId = id; return Promise.resolve(); },
   setTextStyleIdAsync(id) { this.textStyleId = id; return Promise.resolve(); },
   setEffectStyleIdAsync(id) { this.effectStyleId = id; return Promise.resolve(); },
+  setReactionsAsync(r) { this.reactions = __copy(r); return Promise.resolve(); },
   setBoundVariable(field, v) {
     this.boundVariables = this.boundVariables || {};
     if (v) this.boundVariables[field] = { type: "VARIABLE_ALIAS", id: typeof v === "string" ? v : v.id };
@@ -397,7 +398,7 @@ const figma = {
 };
 
 function __page(name, id, loaded) {
-  const p = Object.setPrototypeOf({ type: "PAGE", id, name, children: [], __loaded: loaded }, __NodeProto);
+  const p = Object.setPrototypeOf({ type: "PAGE", id, name, children: [], __loaded: loaded, flowStartingPoints: [] }, __NodeProto);
   let sel = [];
   Object.defineProperty(p, "selection", { get() { return sel; }, set(v) { sel = [...v]; }, configurable: true, enumerable: false });
   return p;
@@ -419,6 +420,7 @@ function __load(snap) {
   const root = Object.setPrototypeOf({ type: "DOCUMENT", id: "0:0", name: "Document", children: [] }, __NodeProto);
   root.children = snap.pages.map((pg, i) => {
     const p = __page(pg.name, "page:" + i, pg.loaded);
+    p.flowStartingPoints = pg.flowStartingPoints || [];
     p.parent = root;
     p.children = pg.children.map(c => link(c, p));
     return p;
@@ -444,7 +446,7 @@ function __collect() {
   figma.root.children.forEach((p, i) => walk(p, null, i));
   return JSON.stringify({
     nodes: out, removed: __removed, notes: __notes,
-    pages: figma.root.children.map(p => ({ id: p.id, name: p.name, loaded: p.__loaded !== false, top: p.children.map(c => c.id) })),
+    pages: figma.root.children.map(p => ({ id: p.id, name: p.name, loaded: p.__loaded !== false, top: p.children.map(c => c.id), flowStartingPoints: p.flowStartingPoints })),
     current: Math.max(0, figma.root.children.indexOf(__currentPage)),
     selection: __currentPage.selection.map(n => n.id), closed: __closed, errors: __errors, outbox: __outbox, ui: __ui,
     storage: JSON.stringify(__storage), result: __result === undefined ? null : JSON.stringify(__plain(__result)),
