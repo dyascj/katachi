@@ -108,6 +108,8 @@ fn handle(m: &Value, tx: &Sender<Call>, ctx: &egui::Context) -> Option<Value> {
             if tx.send(Call { name, args, reply }).is_err() {
                 return Some(error(id, -32603, "Katachi is closing"));
             }
+            // macOS App Nap would let a backgrounded window sleep through the call.
+            let _awake = Awake::new();
             ctx.request_repaint();
             match wait.recv_timeout(Duration::from_secs(600)) {
                 Ok(result) => ok(result),
@@ -117,6 +119,45 @@ fn handle(m: &Value, tx: &Sender<Call>, ctx: &egui::Context) -> Option<Value> {
         }
         other => error(id, -32601, &format!("unknown method {other}")),
     })
+}
+
+/// Keeps macOS from napping the app while a tool call runs (NSProcessInfo activity).
+struct Awake(#[cfg(target_os = "macos")] *mut objc2::runtime::AnyObject);
+
+impl Awake {
+    fn new() -> Self {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            use objc2::runtime::{AnyClass, AnyObject};
+            let Some(pi) = AnyClass::get(c"NSProcessInfo") else { return Self(std::ptr::null_mut()) };
+            let Some(ns_string) = AnyClass::get(c"NSString") else { return Self(std::ptr::null_mut()) };
+            let info: *mut AnyObject = objc2::msg_send![pi, processInfo];
+            let reason: *mut AnyObject = objc2::msg_send![ns_string, stringWithUTF8String: c"MCP tool call".as_ptr()];
+            // NSActivityUserInitiatedAllowingIdleSystemSleep
+            let activity: *mut AnyObject = objc2::msg_send![info, beginActivityWithOptions: 0x00FF_FFFFu64, reason: reason];
+            let _: *mut AnyObject = objc2::msg_send![activity, retain];
+            Self(activity)
+        }
+        #[cfg(not(target_os = "macos"))]
+        Self()
+    }
+}
+
+impl Drop for Awake {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            use objc2::runtime::{AnyClass, AnyObject};
+            if self.0.is_null() {
+                return;
+            }
+            if let Some(pi) = AnyClass::get(c"NSProcessInfo") {
+                let info: *mut AnyObject = objc2::msg_send![pi, processInfo];
+                let _: () = objc2::msg_send![info, endActivity: self.0];
+            }
+            let _: () = objc2::msg_send![self.0, release];
+        }
+    }
 }
 
 const INSTRUCTIONS: &str = "Katachi is a Figma-compatible design tool. Read the open document with get_metadata, \
