@@ -221,30 +221,42 @@ fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEve
     ev
 }
 
-/// A drop shadow row: visibility, name (opens settings), remove. Returns (changed, remove).
+/// An effect row: name (opens settings), visibility, remove. Returns (changed, remove).
 pub fn shadow_row(ui: &mut Ui, id: egui::Id, s: &mut Shadow) -> (bool, bool) {
+    use crate::doc::EffectKind;
     let (mut changed, mut remove) = (false, false);
     ui.horizontal(|ui| {
-        let open = ui.add(egui::Button::new("Drop shadow").frame(false));
+        let open = ui.add(egui::Button::new(s.kind.label()).frame(false));
         Popup::menu(&open).id(id.with("popup")).close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-            ui.set_width(220.0);
+            ui.set_width(230.0);
+            egui::ComboBox::from_id_salt(id.with("kind")).selected_text(s.kind.label()).show_ui(ui, |ui| {
+                for k in [EffectKind::DropShadow, EffectKind::InnerShadow, EffectKind::LayerBlur, EffectKind::BackgroundBlur] {
+                    changed |= ui.selectable_value(&mut s.kind, k, k.label()).changed();
+                }
+            });
             egui::Grid::new(id.with("grid")).num_columns(4).show(ui, |ui| {
                 let mut field = |ui: &mut Ui, label: &str, v: &mut f32, min: f32| {
                     ui.label(label);
                     changed |= ui.add(DragValue::new(v).speed(0.5).range(min..=1000.0).custom_formatter(|v, _| num(v as f32))).changed();
                 };
-                field(ui, "X", &mut s.offset.x, -1000.0);
-                field(ui, "Y", &mut s.offset.y, -1000.0);
-                ui.end_row();
-                field(ui, "Blur", &mut s.blur, 0.0);
-                field(ui, "Spread", &mut s.spread, -1000.0);
+                if s.kind.is_shadow() {
+                    field(ui, "X", &mut s.offset.x, -1000.0);
+                    field(ui, "Y", &mut s.offset.y, -1000.0);
+                    ui.end_row();
+                    field(ui, "Blur", &mut s.blur, 0.0);
+                    field(ui, "Spread", &mut s.spread, -1000.0);
+                } else {
+                    field(ui, "Blur", &mut s.blur, 0.0);
+                }
                 ui.end_row();
             });
-            ui.horizontal(|ui| {
-                changed |= hex_field(ui, id.with("hex"), &mut s.color, 56.0);
-                changed |= alpha_field(ui, &mut s.color);
-            });
-            changed |= rgb_picker(ui, &mut s.color);
+            if s.kind.is_shadow() {
+                ui.horizontal(|ui| {
+                    changed |= hex_field(ui, id.with("hex"), &mut s.color, 56.0);
+                    changed |= alpha_field(ui, &mut s.color);
+                });
+                changed |= rgb_picker(ui, &mut s.color);
+            }
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             remove = icon_button(ui, Icon::Minus, false, 22.0, "Remove").clicked();

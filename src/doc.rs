@@ -156,6 +156,22 @@ pub enum TextCase {
     Title,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Cap {
+    #[default]
+    None,
+    Round,
+    Square,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Join {
+    #[default]
+    Miter,
+    Round,
+    Bevel,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StrokeAlign {
     Inside,
@@ -298,8 +314,34 @@ impl Paint {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum EffectKind {
+    #[default]
+    DropShadow,
+    InnerShadow,
+    LayerBlur,
+    BackgroundBlur,
+}
+
+impl EffectKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            EffectKind::DropShadow => "Drop shadow",
+            EffectKind::InnerShadow => "Inner shadow",
+            EffectKind::LayerBlur => "Layer blur",
+            EffectKind::BackgroundBlur => "Background blur",
+        }
+    }
+    pub fn is_shadow(self) -> bool {
+        matches!(self, EffectKind::DropShadow | EffectKind::InnerShadow)
+    }
+}
+
+/// A layer effect. Blurs use only `blur`; shadows use everything.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Shadow {
+    #[serde(default)]
+    pub kind: EffectKind,
     pub color: Rgba,
     pub offset: Vec2,
     pub blur: f32,
@@ -310,7 +352,7 @@ pub struct Shadow {
 impl Default for Shadow {
     /// Figma's default drop shadow.
     fn default() -> Self {
-        Self { color: Rgba([0, 0, 0, 64]), offset: vec2(0.0, 4.0), blur: 4.0, spread: 0.0, visible: true }
+        Self { kind: EffectKind::DropShadow, color: Rgba([0, 0, 0, 64]), offset: vec2(0.0, 4.0), blur: 4.0, spread: 0.0, visible: true }
     }
 }
 
@@ -333,6 +375,12 @@ pub struct Node {
     pub stroke_width: f32,
     pub stroke_align: StrokeAlign,
     pub radius: f32,
+    /// Independent corners: top-left, top-right, bottom-right, bottom-left.
+    pub corner_radii: Option<[f32; 4]>,
+    /// Dash pattern (dash, gap, ...); empty = solid.
+    pub dash: Vec<f32>,
+    pub cap: Cap,
+    pub join: Join,
     pub clip: bool,
     pub shadows: Vec<Shadow>,
     pub layout: AutoLayout,
@@ -387,6 +435,10 @@ impl Default for Node {
             stroke_width: 1.0,
             stroke_align: StrokeAlign::Inside,
             radius: 0.0,
+            corner_radii: None,
+            dash: vec![],
+            cap: Cap::None,
+            join: Join::Miter,
             clip: false,
             shadows: vec![],
             layout: AutoLayout::default(),
@@ -484,6 +536,11 @@ impl Node {
             }
         }
         self.rect = r;
+    }
+
+    /// Corner radii (tl, tr, br, bl), uniform unless set independently.
+    pub fn radii(&self) -> [f32; 4] {
+        self.corner_radii.unwrap_or([self.radius; 4])
     }
 
     /// World corners (top-left, top-right, bottom-right, bottom-left), rotation applied.
@@ -1278,7 +1335,7 @@ fn merge_from(e: &mut Node, src: &Node) {
         )*};
     }
     take!(
-        name, visible, opacity, fills, strokes, stroke_width, stroke_align, radius, clip, shadows, layout, sizing, constraints, absolute,
+        name, visible, opacity, fills, strokes, stroke_width, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, constraints, absolute,
         paths, even_odd, text, font_size, font_weight, font_family, text_sizing, text_align, text_valign, line_height, letter_spacing,
         decoration, text_case, rotation, component
     );

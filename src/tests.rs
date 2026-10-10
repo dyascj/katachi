@@ -376,7 +376,7 @@ fn shots() {
     h.run_steps(3);
     save(&mut h, "4-rotated");
     // Paints and effects: gradient hero, shadowed card, radial avatar, image tile.
-    use crate::doc::{Paint, PaintKind, Rgba, Shadow};
+    use crate::doc::{Paint, PaintKind, Rgba};
     let st = h.state_mut();
     st.undo();
     let ids: Vec<NodeId> = st.doc.nodes.keys().copied().collect();
@@ -467,6 +467,28 @@ fn shots() {
     h.input_mut().modifiers = Modifiers::ALT;
     h.run_steps(2);
     save(&mut h, "11-measure-rulers");
+    // Effects: inner shadow, layer blur, frosted glass, dashes, independent corners.
+    use crate::doc::{EffectKind, Shadow};
+    h.input_mut().modifiers = Modifiers::NONE;
+    let st = h.state_mut();
+    st.rulers = false;
+    let find = |st: &App, name: &str| *st.doc.nodes.keys().find(|i| st.doc.node(**i).name == name).unwrap();
+    let (hero, avatar, landing) = (find(st, "Hero"), find(st, "Avatar"), find(st, "Landing"));
+    st.doc.node_mut(hero).shadows = vec![Shadow { kind: EffectKind::InnerShadow, offset: vec2(0., 6.), blur: 12., color: Rgba([0, 0, 0, 120]), ..Default::default() }];
+    st.doc.node_mut(avatar).shadows = vec![Shadow { kind: EffectKind::LayerBlur, blur: 6., ..Default::default() }];
+    let lr = st.doc.node(landing).rect;
+    let mut glass = Node::new(Kind::Rectangle, r(lr.min.x + 220., lr.min.y + 40., 200., 110.));
+    glass.fills = vec![crate::doc::Paint::solid(Rgba([255, 255, 255, 70]))];
+    glass.shadows = vec![Shadow { kind: EffectKind::BackgroundBlur, blur: 16., ..Default::default() }];
+    glass.corner_radii = Some([24., 4., 24., 4.]);
+    glass.strokes = vec![crate::doc::Paint::solid(Rgba::WHITE)];
+    glass.stroke_width = 2.;
+    glass.dash = vec![8., 4.];
+    glass.cap = crate::doc::Cap::Round;
+    let g = st.doc.insert(0, Some(landing), None, glass);
+    st.sel = vec![g];
+    h.run_steps(4);
+    save(&mut h, "12-effects");
 }
 
 #[test]
@@ -723,4 +745,17 @@ fn arrangement_and_navigation_shortcuts() {
     key(&mut h, Modifiers::COMMAND, Key::Backslash);
     assert!(h.state().ui_hidden);
     assert_eq!(h.state().canvas_rect.unwrap().width(), 1440.0);
+}
+
+#[test]
+fn blur_spreads_and_preserves_energy() {
+    let (w, h) = (21, 1);
+    let mut px = vec![0u8; w * h * 4];
+    for c in 0..4 {
+        px[10 * 4 + c] = 210;
+    }
+    crate::render::blur_rgba(&mut px, w, h, 2.0);
+    let alpha: Vec<u8> = px.chunks(4).map(|p| p[3]).collect();
+    assert!(alpha[10] < 210 && alpha[10] > 0 && alpha[8] > 0, "{alpha:?}");
+    assert!(alpha[10] >= alpha[8] && alpha[8] >= alpha[5], "peaked: {alpha:?}");
 }

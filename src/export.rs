@@ -1,6 +1,6 @@
 //! SVG export from the model; PNG export rasterizes that SVG with resvg so both always match.
 
-use crate::doc::{Decoration, Document, Kind, Node, NodeId, Paint, PaintKind, Rgba, Shadow, StrokeAlign, TextAlign};
+use crate::doc::{Cap, Decoration, Document, EffectKind, Join, Kind, Node, NodeId, Paint, PaintKind, Rgba, Shadow, StrokeAlign, TextAlign};
 use egui::{Pos2, Rect, Vec2};
 use std::fmt::Write;
 
@@ -38,15 +38,33 @@ fn shape(n: &Node, o: Vec2, grow: f32, attrs: &str) -> String {
             if n.even_odd { r#" fill-rule="evenodd""# } else { "" }
         ),
         _ => {
-            let rad = (n.radius + grow).clamp(0.0, r.width().min(r.height()).max(0.0) / 2.0);
-            format!(
-                r#"<rect x="{}" y="{}" width="{}" height="{}"{} {attrs}/>"#,
-                r.min.x,
-                r.min.y,
-                r.width().max(0.0),
-                r.height().max(0.0),
-                if rad > 0.0 { format!(r#" rx="{rad}""#) } else { String::new() }
-            )
+            let lim = r.width().min(r.height()).max(0.0) / 2.0;
+            let [tl, tr, br, bl] = n.radii().map(|x| (x + grow).clamp(0.0, lim));
+            if tl == tr && tr == br && br == bl {
+                format!(
+                    r#"<rect x="{}" y="{}" width="{}" height="{}"{} {attrs}/>"#,
+                    r.min.x,
+                    r.min.y,
+                    r.width().max(0.0),
+                    r.height().max(0.0),
+                    if tl > 0.0 { format!(r#" rx="{tl}""#) } else { String::new() }
+                )
+            } else {
+                // Independent corners need a path with an arc per corner.
+                let (x0, y0, x1, y1) = (r.min.x, r.min.y, r.max.x, r.max.y);
+                format!(
+                    r#"<path d="M{} {y0}H{}A{tr} {tr} 0 0 1 {x1} {}V{}A{br} {br} 0 0 1 {} {y1}H{}A{bl} {bl} 0 0 1 {x0} {}V{}A{tl} {tl} 0 0 1 {} {y0}Z" {attrs}/>"#,
+                    x0 + tl,
+                    x1 - tr,
+                    y0 + tr,
+                    y1 - br,
+                    x1 - br,
+                    x0 + bl,
+                    y1 - bl,
+                    y0 + tl,
+                    x0 + tl
+                )
+            }
         }
     }
 }
@@ -77,11 +95,30 @@ pub fn path_data(n: &Node, o: Vec2) -> String {
     d
 }
 
+/// Dash, cap, and join attributes beyond SVG's defaults.
+fn stroke_style(n: &Node) -> String {
+    let mut s = String::new();
+    if n.dash.iter().any(|d| *d > 0.0) {
+        let _ = write!(s, r#" stroke-dasharray="{}""#, n.dash.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(" "));
+    }
+    match n.cap {
+        Cap::Round => s.push_str(r#" stroke-linecap="round""#),
+        Cap::Square => s.push_str(r#" stroke-linecap="square""#),
+        Cap::None => {}
+    }
+    match n.join {
+        Join::Round => s.push_str(r#" stroke-linejoin="round""#),
+        Join::Bevel => s.push_str(r#" stroke-linejoin="bevel""#),
+        Join::Miter => {}
+    }
+    s
+}
+
 /// How far shadows reach past a layer's bounds.
 fn shadow_reach(n: &Node) -> f32 {
     n.shadows
         .iter()
-        .filter(|s| s.visible)
+        .filter(|s| s.visible && s.kind != EffectKind::BackgroundBlur)
         .map(|s| s.blur * 2.0 + s.spread.max(0.0) + s.offset.x.abs().max(s.offset.y.abs()))
         .fold(0.0, f32::max)
 }
@@ -168,13 +205,13 @@ impl Svg<'_> {
         }
     }
 
-    /// Opens a drop-shadow filter group if the layer has shadows. Returns whether it did.
+    /// Opens a filter group for the layer's own drop and inner shadows. Returns whether it did.
     fn open_shadows(&mut self, n: &Node) -> bool {
-        let shadows: Vec<Shadow> = n.shadows.iter().filter(|s| s.visible).copied().collect();
-        if shadows.is_empty() {
+        let fx: Vec<Shadow> = n.shadows.iter().filter(|s| s.visible && s.kind.is_shadow()).copied().collect();
+        if fx.is_empty() {
             return false;
         }
-        let id = self.id("shadow");
+        let id = self.id("effects");
         let reg = n.aabb().translate(-self.o).expand(shadow_reach(n));
         let _ = write!(
             self.defs,
@@ -184,25 +221,56 @@ impl Svg<'_> {
             reg.width(),
             reg.height()
         );
-        for (i, s) in shadows.iter().enumerate() {
+        for (i, s) in fx.iter().enumerate() {
             let (c, a) = color_parts(s.color);
-            let _ = write!(self.defs, r#"<feFlood flood-color="{c}" flood-opacity="{a:.3}"/><feComposite in2="SourceAlpha" operator="in""#);
-            if s.spread > 0.0 {
-                let _ = write!(self.defs, r#"/><feMorphology operator="dilate" radius="{}""#, s.spread);
+            if s.kind == EffectKind::DropShadow {
+                let _ = write!(self.defs, r#"<feFlood flood-color="{c}" flood-opacity="{a:.3}"/><feComposite in2="SourceAlpha" operator="in""#);
+                if s.spread > 0.0 {
+                    let _ = write!(self.defs, r#"/><feMorphology operator="dilate" radius="{}""#, s.spread);
+                }
+                let _ = write!(self.defs, r#"/><feGaussianBlur stdDeviation="{}"/><feOffset dx="{}" dy="{}" result="e{i}"/>"#, s.blur / 2.0, s.offset.x, s.offset.y);
+            } else {
+                // Inner shadow: the shape's inverse, shifted and blurred, kept only inside the shape.
+                let _ = write!(
+                    self.defs,
+                    r#"<feComponentTransfer in="SourceAlpha"><feFuncA type="table" tableValues="1 0"/></feComponentTransfer><feOffset dx="{}" dy="{}"/><feGaussianBlur stdDeviation="{}" result="inv{i}"/><feFlood flood-color="{c}" flood-opacity="{a:.3}"/><feComposite in2="inv{i}" operator="in"/><feComposite in2="SourceAlpha" operator="in" result="e{i}"/>"#,
+                    s.offset.x,
+                    s.offset.y,
+                    s.blur / 2.0
+                );
             }
-            let _ = write!(
-                self.defs,
-                r#"/><feGaussianBlur stdDeviation="{}"/><feOffset dx="{}" dy="{}" result="s{i}"/>"#,
-                s.blur / 2.0,
-                s.offset.x,
-                s.offset.y
-            );
         }
         self.defs.push_str("<feMerge>");
-        for i in 0..shadows.len() {
-            let _ = write!(self.defs, r#"<feMergeNode in="s{i}"/>"#);
+        for (i, s) in fx.iter().enumerate() {
+            if s.kind == EffectKind::DropShadow {
+                let _ = write!(self.defs, r#"<feMergeNode in="e{i}"/>"#);
+            }
         }
-        self.defs.push_str(r#"<feMergeNode in="SourceGraphic"/></feMerge></filter>"#);
+        self.defs.push_str(r#"<feMergeNode in="SourceGraphic"/>"#);
+        for (i, s) in fx.iter().enumerate() {
+            if s.kind == EffectKind::InnerShadow {
+                let _ = write!(self.defs, r#"<feMergeNode in="e{i}"/>"#);
+            }
+        }
+        self.defs.push_str("</feMerge></filter>");
+        let _ = write!(self.out, r#"<g filter="url(#{id})">"#);
+        true
+    }
+
+    /// Opens a layer-blur group around the whole layer (children included).
+    fn open_blur(&mut self, n: &Node) -> bool {
+        let Some(b) = n.shadows.iter().find(|s| s.visible && s.kind == EffectKind::LayerBlur) else { return false };
+        let id = self.id("blur");
+        let reg = n.aabb().translate(-self.o).expand(b.blur * 2.0);
+        let _ = write!(
+            self.defs,
+            r#"<filter id="{id}" filterUnits="userSpaceOnUse" x="{}" y="{}" width="{}" height="{}"><feGaussianBlur stdDeviation="{}"/></filter>"#,
+            reg.min.x,
+            reg.min.y,
+            reg.width(),
+            reg.height(),
+            b.blur / 2.0
+        );
         let _ = write!(self.out, r#"<g filter="url(#{id})">"#);
         true
     }
@@ -231,6 +299,7 @@ impl Svg<'_> {
         } else {
             String::new()
         };
+        let blurred = self.open_blur(n);
         // Groups cast their children's shadow; everything else shadows its own shape.
         let group_shadow = n.kind == Kind::Group && self.open_shadows(n);
         let own_shadow = n.kind != Kind::Group && self.open_shadows(n);
@@ -291,7 +360,7 @@ impl Svg<'_> {
                         (_, StrokeAlign::Outside) => n.stroke_width / 2.0,
                     };
                     for s in n.strokes.iter().filter(|s| s.visible) {
-                        let attrs = format!(r#"fill="none" {} stroke-width="{}""#, self.paint("stroke", s, n), n.stroke_width);
+                        let attrs = format!(r#"fill="none" {} stroke-width="{}"{}"#, self.paint("stroke", s, n), n.stroke_width, stroke_style(n));
                         self.out.push_str(&shape(n, o, grow, &attrs));
                     }
                 }
@@ -319,6 +388,9 @@ impl Svg<'_> {
         if group_shadow {
             self.out.push_str("</g>");
         }
+        if blurred {
+            self.out.push_str("</g>");
+        }
         if wrap {
             self.out.push_str("</g>");
         }
@@ -331,7 +403,11 @@ pub fn export_bounds(doc: &Document, ids: &[NodeId]) -> Rect {
         let n = doc.node(*id);
         let mut b = n.aabb();
         for s in n.shadows.iter().filter(|s| s.visible) {
-            b = b.union(n.aabb().translate(s.offset).expand(s.blur + s.spread));
+            match s.kind {
+                EffectKind::DropShadow => b = b.union(n.aabb().translate(s.offset).expand(s.blur + s.spread)),
+                EffectKind::LayerBlur => b = b.union(n.aabb().expand(s.blur)),
+                _ => {}
+            }
         }
         r.union(b)
     });
@@ -351,6 +427,65 @@ pub fn to_svg(doc: &Document, ids: &[NodeId]) -> String {
         if svg.defs.is_empty() { String::new() } else { format!("<defs>{}</defs>", svg.defs) },
         svg.out
     )
+}
+
+/// What's beneath a background-blurred layer (canvas only; SVG can't express backdrop blur):
+/// an unblurred backdrop and a mask of the layer's shape, both over `region` (padded by the
+/// blur so edges blur against real content), plus the blur radius.
+pub fn backdrop_parts(doc: &Document, id: NodeId) -> Option<(String, String, Rect, f32)> {
+    let n = doc.node(id);
+    let blur = n.shadows.iter().find(|s| s.visible && s.kind == EffectKind::BackgroundBlur)?.blur;
+    let page = doc.page_of(id);
+    // Everything painted before this layer: at each level of its ancestry, drop the
+    // layer (or ancestor's later siblings) and whatever sits above it.
+    let mut tmp = doc.clone();
+    let mut cur = id;
+    let mut first = true;
+    loop {
+        let parent = tmp.node(cur).parent;
+        let list = tmp.children_of(page, parent).clone();
+        let i = list.iter().position(|c| *c == cur).unwrap_or(0);
+        for &later in &list[if first { i } else { i + 1 }..] {
+            tmp.remove(later);
+        }
+        first = false;
+        match parent {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    let region = n.aabb().expand(blur);
+    let mut svg = Svg { doc: &tmp, o: region.min.to_vec2(), out: String::new(), defs: String::new(), next: 0 };
+    let bg = doc.pages[page].background;
+    let _ = write!(svg.out, r##"<rect x="0" y="0" width="{}" height="{}" fill="#{}"/>"##, region.width(), region.height(), bg.hex());
+    for r in tmp.pages[page].children.clone() {
+        svg.node(r);
+    }
+    let (w, h) = (region.width().max(1.0), region.height().max(1.0));
+    let head = format!(r#"<svg width="{w}" height="{h}" viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg">"#);
+    let content = format!("{head}<defs>{}</defs>{}</svg>", svg.defs, svg.out);
+    let turn = if n.rotation != 0.0 {
+        let c = n.rect.center() - svg.o;
+        format!(r#"transform="rotate({} {} {})""#, -n.rotation, c.x, c.y)
+    } else {
+        String::new()
+    };
+    let mask = format!(r##"{head}{}</svg>"##, shape(n, svg.o, 0.0, &format!(r##"fill="#FFFFFF" {turn}"##)));
+    Some((content, mask, region, blur))
+}
+
+/// Rasterize SVG text at `scale` (premultiplied RGBA pixels and size).
+pub fn rasterize(svg: &str, scale: f32) -> Option<(Vec<u8>, [usize; 2])> {
+    let mut opt = resvg::usvg::Options::default();
+    for f in FONTS {
+        opt.fontdb_mut().load_font_data(f.to_vec());
+    }
+    let tree = resvg::usvg::Tree::from_str(svg, &opt).ok()?;
+    let size = tree.size();
+    let (w, h) = ((size.width() * scale).ceil() as u32, (size.height() * scale).ceil() as u32);
+    let mut pix = resvg::tiny_skia::Pixmap::new(w.clamp(1, 4096), h.clamp(1, 4096))?;
+    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pix.as_mut());
+    Some((pix.data().to_vec(), [pix.width() as usize, pix.height() as usize]))
 }
 
 pub fn to_png(doc: &Document, ids: &[NodeId], scale: f32) -> Result<Vec<u8>, String> {
@@ -442,6 +577,21 @@ mod tests {
         let img = image::load_from_memory(&png).unwrap().to_rgba8();
         assert!(img.get_pixel(5, 20).0[0] > 200, "left half red");
         assert!(img.get_pixel(35, 20).0[2] > 200, "right half blue");
+    }
+
+    #[test]
+    fn corners_and_dashes_export() {
+        let mut d = Document::default();
+        let mut n = Node::new(Kind::Rectangle, Rect::from_min_size(pos2(0., 0.), vec2(40., 20.)));
+        n.corner_radii = Some([0., 10., 0., 4.]);
+        n.strokes = vec![Paint::solid(Rgba::BLACK)];
+        n.dash = vec![4., 2.];
+        n.cap = Cap::Round;
+        let a = d.insert(0, None, None, n);
+        let svg = to_svg(&d, &[a]);
+        assert!(svg.contains("A10 10 0 0 1 40 10"), "{svg}");
+        assert!(svg.contains(r#"stroke-dasharray="4 2" stroke-linecap="round""#), "{svg}");
+        to_png(&d, &[a], 1.0).unwrap();
     }
 
     #[test]

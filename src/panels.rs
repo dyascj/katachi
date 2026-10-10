@@ -1170,6 +1170,7 @@ impl App {
         let mut op = (n.opacity * 100.0).round();
         let mut r = n.radius;
         let has_radius = n.kind == Kind::Rectangle || n.kind.is_frame();
+        let mut corners = n.corner_radii;
         ui.horizontal(|ui| {
             if num_field(ui, &mut op, "@opacity", 0.0, half(ui)) {
                 self.begin_edit();
@@ -1177,15 +1178,42 @@ impl App {
                     self.doc.node_mut(id).opacity = op.min(100.0) / 100.0;
                 }
             }
-            if has_radius && num_field(ui, &mut r, "@radius", 0.0, half(ui)) {
-                self.begin_edit();
-                for &id in &self.sel {
-                    if self.doc.node(id).kind == Kind::Rectangle || self.doc.node(id).kind.is_frame() {
-                        self.doc.node_mut(id).radius = r;
+            if has_radius {
+                if corners.is_none() && num_field(ui, &mut r, "@radius", 0.0, half(ui) - 28.0) {
+                    self.begin_edit();
+                    for &id in &self.sel {
+                        if self.doc.node(id).kind == Kind::Rectangle || self.doc.node(id).kind.is_frame() {
+                            self.doc.node_mut(id).radius = r;
+                        }
                     }
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, Icon::Radius, corners.is_some(), 22.0, "Independent corners").clicked() {
+                        self.checkpoint();
+                        corners = if corners.is_some() { None } else { Some([n.radius; 4]) };
+                        for &id in &self.sel {
+                            self.doc.node_mut(id).corner_radii = corners;
+                        }
+                    }
+                });
             }
         });
+        if let (true, Some(mut c)) = (has_radius, corners) {
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let w = (ui.max_rect().width() - 12.0) / 4.0 - 1.0;
+                for v in c.iter_mut() {
+                    changed |= num_field(ui, v, "", 0.0, w);
+                }
+            });
+            if changed {
+                self.begin_edit();
+                for &id in &self.sel {
+                    self.doc.node_mut(id).corner_radii = Some(c);
+                }
+            }
+        }
     }
 
     fn typography_section(&mut self, ui: &mut Ui, n: &crate::doc::Node) {
@@ -1373,12 +1401,50 @@ impl App {
                     .add(DragValue::new(&mut width).range(0.0..=1000.0).speed(0.1).prefix("Weight  ").custom_formatter(|v, _| num(v as f32)))
                     .changed();
                 if n.kind != Kind::Vector {
-                    egui::ComboBox::from_id_salt("stroke-align").width(80.0).selected_text(format!("{align:?}")).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("stroke-align").width(70.0).selected_text(format!("{align:?}")).show_ui(ui, |ui| {
                         for a in [StrokeAlign::Inside, StrokeAlign::Center, StrokeAlign::Outside] {
                             stroke_changed |= ui.selectable_value(&mut align, a, format!("{a:?}")).changed();
                         }
                     });
                 }
+                // Dashes, caps, and joins live in a settings popover, like Figma.
+                let more = icon_button(ui, Icon::Menu, false, 22.0, "Advanced stroke");
+                egui::Popup::menu(&more).id(ui.id().with("stroke-more")).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                    ui.set_width(200.0);
+                    let mut style = (n.dash.clone(), n.cap, n.join);
+                    let dash_id = ui.id().with(("dash", n.id));
+                    let shown = style.0.iter().map(|d| num(*d)).collect::<Vec<_>>().join(", ");
+                    let mut buf: String = ui.data(|d| d.get_temp(dash_id)).unwrap_or(shown);
+                    ui.label("Dashes");
+                    let r = ui.add(egui::TextEdit::singleline(&mut buf).id(dash_id).hint_text("e.g. 4, 2"));
+                    if r.has_focus() {
+                        ui.data_mut(|d| d.insert_temp(dash_id, buf.clone()));
+                    } else {
+                        ui.data_mut(|d| d.remove::<String>(dash_id));
+                    }
+                    if r.lost_focus() {
+                        style.0 = buf.split([',', ' ']).filter_map(|t| t.trim().parse::<f32>().ok()).filter(|v| *v >= 0.0).collect();
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Caps");
+                        for c in [crate::doc::Cap::None, crate::doc::Cap::Round, crate::doc::Cap::Square] {
+                            ui.selectable_value(&mut style.1, c, format!("{c:?}"));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Join");
+                        for j in [crate::doc::Join::Miter, crate::doc::Join::Round, crate::doc::Join::Bevel] {
+                            ui.selectable_value(&mut style.2, j, format!("{j:?}"));
+                        }
+                    });
+                    if style != (n.dash.clone(), n.cap, n.join) {
+                        self.begin_edit();
+                        for &id in &self.sel.clone() {
+                            let t = self.doc.node_mut(id);
+                            (t.dash, t.cap, t.join) = style.clone();
+                        }
+                    }
+                });
             });
         }
         if changed || stroke_changed {

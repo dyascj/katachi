@@ -1,6 +1,6 @@
 //! Canvas rendering: every node becomes a lyon path in screen space, tessellated into egui meshes.
 
-use crate::doc::{Document, Kind, Node, NodeId, Paint, PaintKind, StrokeAlign};
+use crate::doc::{Cap, Document, EffectKind, Join, Kind, Node, NodeId, Paint, PaintKind, StrokeAlign};
 use egui::{ColorImage, TextureHandle, TextureId, TextureOptions};
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -10,7 +10,7 @@ use lyon::math::{Angle, Box2D, Transform, point, vector};
 use lyon::path::builder::BorderRadii;
 use lyon::path::{Path, Winding};
 use lyon::tessellation::{
-    BuffersBuilder, FillOptions, FillTessellator, FillVertex, LineJoin, StrokeOptions, StrokeTessellator,
+    BuffersBuilder, FillOptions, FillTessellator, FillVertex, LineCap, LineJoin, StrokeOptions, StrokeTessellator,
     StrokeVertex, VertexBuffers,
 };
 
@@ -83,9 +83,11 @@ pub fn node_path(n: &Node, v: &View, grow: f32) -> Path {
             }
         }
         _ => {
-            let rad = (n.radius * v.zoom + grow).clamp(0.0, r.width().min(r.height()) / 2.0);
+            let lim = r.width().min(r.height()) / 2.0;
+            let [tl, tr, br, bl] = n.radii().map(|x| (x * v.zoom + grow).clamp(0.0, lim));
             let bx = Box2D::new(point(r.min.x, r.min.y), point(r.max.x, r.max.y));
-            b.add_rounded_rectangle(&bx, &BorderRadii::new(rad), Winding::Positive);
+            let radii = BorderRadii { top_left: tl, top_right: tr, bottom_right: br, bottom_left: bl };
+            b.add_rounded_rectangle(&bx, &radii, Winding::Positive);
         }
     }
     let path = b.build();
@@ -120,10 +122,24 @@ fn fill_geo(path: &Path, even_odd: bool) -> VertexBuffers<Pos2, u32> {
 }
 
 fn stroke_geo(path: &Path, width: f32) -> VertexBuffers<Pos2, u32> {
+    stroke_geo_styled(path, width, Cap::None, Join::Miter)
+}
+
+fn stroke_geo_styled(path: &Path, width: f32, cap: Cap, join: Join) -> VertexBuffers<Pos2, u32> {
+    let cap = match cap {
+        Cap::None => LineCap::Butt,
+        Cap::Round => LineCap::Round,
+        Cap::Square => LineCap::Square,
+    };
+    let join = match join {
+        Join::Miter => LineJoin::Miter,
+        Join::Round => LineJoin::Round,
+        Join::Bevel => LineJoin::Bevel,
+    };
     let mut geo = VertexBuffers::new();
     let _ = StrokeTessellator::new().tessellate_path(
         path,
-        &StrokeOptions::tolerance(0.15).with_line_width(width).with_line_join(LineJoin::Miter),
+        &StrokeOptions::tolerance(0.15).with_line_width(width).with_line_join(join).with_line_cap(cap),
         &mut BuffersBuilder::new(&mut geo, |v: StrokeVertex| pos2(v.position().x, v.position().y)),
     );
     geo
@@ -137,10 +153,112 @@ pub fn stroke_mesh(path: &Path, width: f32, color: Color32) -> Mesh {
     to_mesh(stroke_geo(path, width), color)
 }
 
+/// Approximate a Gaussian blur (std dev `sigma` px) with three box blurs per axis.
+pub fn blur_rgba(px: &mut [u8], w: usize, h: usize, sigma: f32) {
+    if sigma < 0.5 || w == 0 || h == 0 {
+        return;
+    }
+    let r = (((12.0 * sigma * sigma / 3.0) + 1.0).sqrt() / 2.0).floor().max(1.0) as usize;
+    let mut buf = vec![0u8; px.len()];
+    let pass = |src: &[u8], dst: &mut [u8], len: usize, lines: usize, at: &dyn Fn(usize, usize) -> usize| {
+        let win = (2 * r + 1) as u32;
+        for l in 0..lines {
+            let mut acc = [0u32; 4];
+            let px_at = |i: isize| at(l, i.clamp(0, len as isize - 1) as usize) * 4;
+            for i in -(r as isize)..=(r as isize) {
+                let o = px_at(i);
+                for c in 0..4 {
+                    acc[c] += src[o + c] as u32;
+                }
+            }
+            for i in 0..len {
+                let o = at(l, i) * 4;
+                for c in 0..4 {
+                    dst[o + c] = (acc[c] / win) as u8;
+                }
+                let (add, sub) = (px_at(i as isize + r as isize + 1), px_at(i as isize - r as isize));
+                for c in 0..4 {
+                    acc[c] = acc[c] + src[add + c] as u32 - src[sub + c] as u32;
+                }
+            }
+        }
+    };
+    for _ in 0..3 {
+        pass(px, &mut buf, w, h, &|y, x| y * w + x);
+        pass(&buf, px, h, w, &|x, y| y * w + x);
+    }
+}
+
+/// Cut a path into dashes following `pattern` (on, off, on, off, ...), in screen units.
+pub fn dashed(path: &Path, pattern: &[f32]) -> Path {
+    use lyon::path::Event;
+    use lyon::path::iterator::PathIterator;
+    let pattern: Vec<f32> = if pattern.len() % 2 == 1 { pattern.iter().chain(pattern).copied().collect() } else { pattern.to_vec() };
+    let total: f32 = pattern.iter().sum();
+    let mut b = Path::builder();
+    if total <= 0.0 {
+        return path.clone();
+    }
+    let (mut idx, mut left, mut on, mut open) = (0usize, pattern[0], true, false);
+    for ev in path.iter().flattened(0.15) {
+        match ev {
+            Event::Begin { at } => {
+                (idx, left, on) = (0, pattern[0], true);
+                b.begin(at);
+                open = true;
+            }
+            Event::Line { from, to } | Event::End { last: from, first: to, close: true } => {
+                let mut a = from;
+                let mut seg = (to - from).length();
+                while seg > 0.0 {
+                    let step = seg.min(left);
+                    let p = a + (to - a).normalize() * step;
+                    if on {
+                        if !open {
+                            b.begin(a);
+                            open = true;
+                        }
+                        b.line_to(p);
+                    }
+                    seg -= step;
+                    left -= step;
+                    a = p;
+                    if left <= 1e-4 {
+                        if on && open {
+                            b.end(false);
+                            open = false;
+                        }
+                        idx = (idx + 1) % pattern.len();
+                        left = pattern[idx];
+                        on = idx % 2 == 0;
+                    }
+                }
+                if matches!(ev, Event::End { .. }) && open {
+                    b.end(false);
+                    open = false;
+                }
+            }
+            Event::End { .. } => {
+                if open {
+                    b.end(false);
+                    open = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    if open {
+        b.end(false);
+    }
+    b.build()
+}
+
 /// GPU textures for gradients and image fills, rebuilt only when a paint changes.
 #[derive(Default)]
 pub struct Textures {
     gradients: HashMap<u64, TextureHandle>,
+    /// Layers drawn through resvg (blurs, inner shadows), keyed by SVG content and scale.
+    rasters: HashMap<u64, TextureHandle>,
     used: HashSet<u64>,
     images: HashMap<String, Option<(TextureHandle, Vec2)>>,
 }
@@ -152,6 +270,7 @@ impl Textures {
     pub fn end_frame(&mut self) {
         let used = std::mem::take(&mut self.used);
         self.gradients.retain(|k, _| used.contains(k));
+        self.rasters.retain(|k, _| used.contains(k));
     }
 
     fn gradient(&mut self, ctx: &egui::Context, p: &Paint) -> TextureId {
@@ -176,6 +295,51 @@ impl Textures {
                 ctx.load_texture(format!("gradient-{key}"), img, TextureOptions::LINEAR)
             })
             .id()
+    }
+
+    /// SVG rendered by resvg at `scale` (snapped to half-octaves so zooming doesn't re-render every frame).
+    fn raster(&mut self, ctx: &egui::Context, svg: &str, scale: f32) -> Option<TextureId> {
+        let scale = 2f32.powf((scale.max(0.01).log2() * 2.0).ceil() / 2.0);
+        let mut h = DefaultHasher::new();
+        (svg, scale.to_bits()).hash(&mut h);
+        let key = h.finish();
+        self.used.insert(key);
+        if let Some(t) = self.rasters.get(&key) {
+            return Some(t.id());
+        }
+        let (px, size) = crate::export::rasterize(svg, scale)?;
+        let img = ColorImage::from_rgba_premultiplied(size, &px);
+        let t = ctx.load_texture(format!("raster-{key}"), img, TextureOptions::LINEAR);
+        let id = t.id();
+        self.rasters.insert(key, t);
+        Some(id)
+    }
+
+    /// Blurred backdrop masked to a layer's shape (see `export::backdrop_parts`).
+    fn backdrop(&mut self, ctx: &egui::Context, (content, mask, _, blur): (String, String, Rect, f32), scale: f32) -> Option<TextureId> {
+        let scale = 2f32.powf((scale.max(0.01).log2() * 2.0).ceil() / 2.0);
+        let mut h = DefaultHasher::new();
+        (&content, &mask, blur.to_bits(), scale.to_bits()).hash(&mut h);
+        let key = h.finish();
+        self.used.insert(key);
+        if let Some(t) = self.rasters.get(&key) {
+            return Some(t.id());
+        }
+        let (mut px, size) = crate::export::rasterize(&content, scale)?;
+        let (m, msize) = crate::export::rasterize(&mask, scale)?;
+        if msize != size {
+            return None;
+        }
+        blur_rgba(&mut px, size[0], size[1], blur / 2.0 * scale);
+        for (p, a) in px.chunks_exact_mut(4).zip(m.chunks_exact(4).map(|c| c[3] as u32)) {
+            for c in p.iter_mut() {
+                *c = (*c as u32 * a / 255) as u8;
+            }
+        }
+        let t = ctx.load_texture(format!("backdrop-{key}"), ColorImage::from_rgba_premultiplied(size, &px), TextureOptions::LINEAR);
+        let id = t.id();
+        self.rasters.insert(key, t);
+        Some(id)
     }
 
     pub fn image(&mut self, ctx: &egui::Context, doc: &Document, key: &str) -> Option<(TextureId, Vec2)> {
@@ -251,6 +415,24 @@ fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
     let screen = v.rect_to_screen(n.aabb());
     let a = alpha * n.opacity;
     let reach = n.stroke_width.max(n.shadows.iter().map(|s| s.blur + s.spread + s.offset.length()).fold(0.0, f32::max));
+    let ppp = painter.ctx().pixels_per_point();
+    if n.shadows.iter().any(|s| s.visible && s.kind == EffectKind::BackgroundBlur)
+        && let Some(parts) = crate::export::backdrop_parts(sc.doc, id) {
+            let region = parts.2;
+            if let Some(t) = sc.tex.backdrop(painter.ctx(), parts, v.zoom * ppp) {
+                painter.image(t, v.rect_to_screen(region), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+            }
+        }
+    if Some(id) != sc.hide && n.shadows.iter().any(|s| s.visible && matches!(s.kind, EffectKind::InnerShadow | EffectKind::LayerBlur)) {
+        // egui can't blur on the GPU: draw this layer (and its children) through resvg, exactly like export.
+        let svg = crate::export::to_svg(sc.doc, &[id]);
+        let region = crate::export::export_bounds(sc.doc, &[id]);
+        if let Some(t) = sc.tex.raster(painter.ctx(), &svg, v.zoom * ppp) {
+            let tint = Color32::WHITE.gamma_multiply(alpha);
+            painter.image(t, v.rect_to_screen(region), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), tint);
+        }
+        return;
+    }
     if n.kind == Kind::Boolean {
         // Operands aren't drawn themselves; the result carries the paint.
         if let Some(r) = crate::boolean::as_vector(sc.doc, id) {
@@ -277,14 +459,15 @@ fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
 }
 
 fn draw_shadows(painter: &Painter, n: &Node, v: &View, a: f32) {
-    for s in n.shadows.iter().filter(|s| s.visible) {
+    for s in n.shadows.iter().filter(|s| s.visible && s.kind == EffectKind::DropShadow) {
         let z = v.zoom;
         let color = s.color.to32().gamma_multiply(a);
         let rect_like = (n.kind == Kind::Rectangle || n.kind.is_frame()) && n.rotation == 0.0;
         if rect_like {
             let r = v.rect_to_screen(n.rect).translate(s.offset * z).expand(s.spread * z);
-            let rad = ((n.radius + s.spread).max(0.0) * z).min(255.0) as u8;
-            painter.add(egui::epaint::RectShape::filled(r, egui::CornerRadius::same(rad), color).with_blur_width(s.blur * z));
+            let [tl, tr, br, bl] = n.radii().map(|x| ((x + s.spread).max(0.0) * z).min(255.0) as u8);
+            let cr = egui::CornerRadius { nw: tl, ne: tr, se: br, sw: bl };
+            painter.add(egui::epaint::RectShape::filled(r, cr, color).with_blur_width(s.blur * z));
         } else if n.kind != Kind::Group && n.kind != Kind::Text {
             // ponytail: stacked offsets approximate the blur for non-rect shapes; exact in export
             let shifted = View { pan: v.pan + s.offset * z, zoom: z };
@@ -325,8 +508,9 @@ fn draw_content(painter: &Painter, sc: &mut Scene, n: &Node, a: f32) {
             StrokeAlign::Outside => w / 2.0,
         };
         let spath = if grow == 0.0 || n.kind == Kind::Vector { path } else { node_path(n, &v, grow) };
+        let spath = if n.dash.iter().any(|d| *d > 0.0) { dashed(&spath, &n.dash.iter().map(|d| d * v.zoom).collect::<Vec<_>>()) } else { spath };
         for s in n.strokes.iter().filter(|s| s.visible) {
-            paint_geo(painter, sc, n, stroke_geo(&spath, w), s, a);
+            paint_geo(painter, sc, n, stroke_geo_styled(&spath, w, n.cap, n.join), s, a);
         }
     }
 }
