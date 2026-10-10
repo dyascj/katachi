@@ -361,7 +361,8 @@ impl Svg<'_> {
                     };
                     let mut attrs = format!(
                         r#"font-family="{}" font-size="{}" font-weight="{}" text-anchor="{anchor}" {fill}"#,
-                        esc(&n.font_family),
+                        // Missing fonts fall back to Inter, as on the canvas.
+                        esc(&format!("{}, Inter, sans-serif", n.font_family)),
                         n.font_size,
                         n.font_weight
                     );
@@ -420,7 +421,7 @@ impl Svg<'_> {
                                     let _ = write!(style, r#" font-size="{sz}""#);
                                 }
                                 if let Some(f) = &st.font_family {
-                                    let _ = write!(style, r#" font-family="{}""#, esc(f));
+                                    let _ = write!(style, r#" font-family="{}""#, esc(&format!("{f}, Inter, sans-serif")));
                                 }
                                 if let Some(c) = st.color {
                                     let (c, a) = color_parts(c);

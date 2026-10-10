@@ -352,6 +352,9 @@ mod tests {
         assert_eq!(card.layout.gap, 12.0);
         let title = d.node(card.children[0]);
         assert_eq!(title.font_size, 28.0, "text style applied");
+        let tid = card.children[0];
+        run(&mut d, 0, &[], &format!("figma.getNodeById('{tid}').fontSize = 40;")).unwrap();
+        assert_eq!((d.node(tid).font_size, d.node(tid).text_style), (40.0, None), "a manual size detaches the style");
         // Instances: property values and overrides on synced layers.
         let inst = d.node(id("inst"));
         assert_eq!((inst.kind, inst.component), (Kind::Instance, Some(id("btn"))));

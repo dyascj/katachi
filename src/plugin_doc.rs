@@ -1044,6 +1044,10 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
     if changed("fills") && !changed("fillStyleId") {
         n.fill_style = None;
     }
+    // Setting a typography value by hand detaches the text style, as in Figma.
+    if ["fontSize", "fontName", "lineHeight", "letterSpacing", "textCase", "textDecoration"].iter().any(|k| changed(k)) && !changed("textStyleId") {
+        n.text_style = None;
+    }
     if changed("strokes") && !changed("strokeStyleId") {
         n.stroke_style = None;
     }
