@@ -414,6 +414,20 @@ fn shots() {
     st.add_auto_layout();
     h.run_steps(3);
     save(&mut h, "6-auto-layout");
+    // Components: the card becomes a main component with an instance beside it.
+    let st = h.state_mut();
+    st.sel = vec![card];
+    st.create_component();
+    let insts = st.duplicate_or_instance(&[card]);
+    st.doc.translate(insts[0], vec2(280., 0.));
+    st.doc.reflow();
+    st.sel = insts;
+    st.zoom_to(&egui::Context::default(), None, false);
+    h.run_steps(3);
+    save(&mut h, "7-component");
+    h.state_mut().left_tab_assets = true;
+    h.run_steps(3);
+    save(&mut h, "8-assets");
 }
 
 #[test]
@@ -486,4 +500,33 @@ fn shift_a_wraps_in_auto_layout_and_drag_reorders() {
     key(&mut h, Modifiers::SHIFT | Modifiers::ALT, Key::A);
     assert_eq!(h.state().doc.node(f).layout.mode, LayoutMode::None);
     assert_eq!(rect(&h, a).min.x, 100.0);
+}
+
+#[test]
+fn components_instances_via_shortcuts() {
+    let mut h = harness();
+    let rect_id = draw(&mut h, Key::R, (0.0, 0.0), (80.0, 40.0));
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::K);
+    let comp = h.state().sel[0];
+    assert_eq!(h.state().doc.node(comp).kind, Kind::Component);
+    assert_eq!(h.state().doc.node(comp).children, vec![rect_id]);
+    // Alt-drag the main component: makes an instance.
+    let (a, b) = (s(&h, 40., 20.), s(&h, 240., 20.));
+    drag(&mut h, a, b, Modifiers::ALT);
+    let inst = h.state().sel[0];
+    assert_eq!(h.state().doc.node(inst).kind, Kind::Instance);
+    assert_eq!(rect(&h, inst), r(200., 0., 80., 40.));
+    // Edit the main's child fill through the model; the instance follows.
+    h.state_mut().doc.node_mut(rect_id).fills[0].color = crate::doc::Rgba::rgb(1, 2, 3);
+    h.state_mut().doc.reflow();
+    let kid = h.state().doc.node(inst).children[0];
+    assert_eq!(h.state().doc.node(kid).fills[0].color, crate::doc::Rgba::rgb(1, 2, 3));
+    // Clicking inside an instance selects the instance; Cmd+Alt+B detaches it.
+    let p = s(&h, -300., 300.);
+    click(&mut h, p, Modifiers::NONE);
+    let p = s(&h, 240., 20.);
+    click(&mut h, p, Modifiers::NONE);
+    assert_eq!(h.state().sel, vec![inst]);
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::B);
+    assert_eq!(h.state().doc.node(inst).kind, Kind::Frame);
 }

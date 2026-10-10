@@ -9,6 +9,10 @@ pub type NodeId = u64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Kind {
     Frame,
+    /// A main component: a frame other layers can instantiate.
+    Component,
+    /// A live copy of a component.
+    Instance,
     Group,
     Rectangle,
     Ellipse,
@@ -20,6 +24,8 @@ impl Kind {
     pub fn label(self) -> &'static str {
         match self {
             Kind::Frame => "Frame",
+            Kind::Component => "Component",
+            Kind::Instance => "Instance",
             Kind::Group => "Group",
             Kind::Rectangle => "Rectangle",
             Kind::Ellipse => "Ellipse",
@@ -28,7 +34,11 @@ impl Kind {
         }
     }
     pub fn is_container(self) -> bool {
-        matches!(self, Kind::Frame | Kind::Group)
+        self.is_frame() || self == Kind::Group
+    }
+    /// Frames, components, and instances all behave as frames.
+    pub fn is_frame(self) -> bool {
+        matches!(self, Kind::Frame | Kind::Component | Kind::Instance)
     }
 }
 
@@ -261,6 +271,12 @@ pub struct Node {
     pub constraints: [Constraint; 2],
     /// Ignores the parent's auto layout.
     pub absolute: bool,
+    /// Instances: the main component they copy.
+    pub component: Option<NodeId>,
+    /// Inside an instance (and the instance itself): the component layer this mirrors.
+    pub source: Option<NodeId>,
+    /// The source's values as last copied; a property that differs from this is an override.
+    pub synced: Option<Box<Node>>,
     pub points: Vec<PathPoint>,
     pub closed: bool,
     pub text: String,
@@ -293,6 +309,9 @@ impl Default for Node {
             sizing: [Sizing::Fixed; 2],
             constraints: [Constraint::Min; 2],
             absolute: false,
+            component: None,
+            source: None,
+            synced: None,
             points: vec![],
             closed: false,
             text: String::new(),
@@ -310,7 +329,7 @@ impl Node {
     pub fn new(kind: Kind, rect: Rect) -> Self {
         let mut n = Node { kind, rect, ..Default::default() };
         match kind {
-            Kind::Frame => {
+            Kind::Frame | Kind::Component | Kind::Instance => {
                 n.fills = vec![Paint::solid(Rgba::WHITE)];
                 n.clip = true;
             }
@@ -606,7 +625,7 @@ impl Document {
                 let cr = self.nodes[&c].rect;
                 self.set_rect(c, Rect::from_two_pos(map(cr.min), map(cr.max)));
             }
-        } else if kind == Kind::Frame && mode == LayoutMode::None && constraints {
+        } else if kind.is_frame() && mode == LayoutMode::None && constraints {
             for c in kids {
                 let (cr, [ch, cv]) = (self.nodes[&c].rect, self.nodes[&c].constraints);
                 let axis = |k: Constraint, lo: f32, hi: f32, olo: f32, ohi: f32, nlo: f32, nhi: f32| -> (f32, f32) {
@@ -636,13 +655,152 @@ impl Document {
         }
     }
 
+    /// Create an instance of `comp` with its top-left at `at`.
+    pub fn instantiate(&mut self, comp: NodeId, page: usize, parent: Option<NodeId>, index: Option<usize>, at: Pos2) -> NodeId {
+        let c = self.nodes[&comp].clone();
+        let mut n = Node { children: vec![], name: c.name.clone(), ..c.clone() };
+        n.kind = Kind::Instance;
+        n.component = Some(comp);
+        n.source = Some(comp);
+        n.synced = Some(Box::new(Node { children: vec![], ..c }));
+        n.rect = Rect::from_min_size(at, n.rect.size());
+        let id = self.insert(page, parent, index, n);
+        self.sync_instance(id);
+        self.reflow();
+        id
+    }
+
+    /// Turn an instance back into a plain frame; nested instances stay instances.
+    pub fn detach_instance(&mut self, inst: NodeId) {
+        let n = self.node_mut(inst);
+        n.kind = Kind::Frame;
+        n.component = None;
+        n.source = None;
+        n.synced = None;
+        for d in self.descendants(inst) {
+            if self.ancestors(d).iter().take_while(|a| **a != inst).any(|a| self.nodes[a].kind == Kind::Instance) {
+                continue;
+            }
+            let n = self.node_mut(d);
+            n.source = None;
+            n.synced = None;
+        }
+    }
+
+    /// Drop all overrides on an instance.
+    pub fn reset_instance(&mut self, inst: NodeId) {
+        for id in std::iter::once(inst).chain(self.descendants(inst)) {
+            if let Some(src) = self.nodes[&id].source.and_then(|s| self.nodes.get(&s)).cloned() {
+                let n = self.node_mut(id);
+                let keep = n.rect;
+                *n = Node { id: n.id, parent: n.parent, children: n.children.clone(), kind: n.kind, component: n.component, source: n.source, synced: None, ..src };
+                n.rect = keep;
+                n.synced = Some(Box::new(Node { children: vec![], ..n.clone() }));
+            }
+        }
+        if let Some(c) = self.nodes[&inst].component.and_then(|c| self.nodes.get(&c)) {
+            let size = c.rect.size();
+            let n = self.node_mut(inst);
+            n.rect = Rect::from_min_size(n.rect.min, size);
+        }
+        self.sync_instance(inst);
+        self.reflow();
+    }
+
+    /// Bring an instance in line with its main component, keeping overrides.
+    pub fn sync_instance(&mut self, inst: NodeId) {
+        let Some(comp) = self.nodes[&inst].component.filter(|c| self.nodes.contains_key(c)) else { return };
+        if comp == inst || self.is_ancestor(inst, comp) {
+            return;
+        }
+        let page = self.page_of(inst);
+        let c = self.nodes[&comp].clone();
+        // Instance layers by the component layer they mirror.
+        let mut by_source: HashMap<NodeId, NodeId> = HashMap::new();
+        for d in self.descendants(inst) {
+            if let Some(s) = self.nodes[&d].source {
+                by_source.entry(s).or_insert(d);
+            }
+        }
+        // Root: merge appearance, keep placement; size follows the main unless resized.
+        let target_size = {
+            let n = &self.nodes[&inst];
+            let snap = n.synced.as_deref();
+            if snap.is_none_or(|s| s.rect.size() == n.rect.size()) { c.rect.size() } else { n.rect.size() }
+        };
+        let actual = Rect::from_min_size(self.nodes[&inst].rect.min, target_size);
+        merge_from(self.node_mut(inst), &c);
+        self.node_mut(inst).rect = Rect::from_min_size(actual.min, c.rect.size());
+        let offset = actual.min - c.rect.min;
+        // Children, in component order.
+        let mut keep = std::collections::HashSet::new();
+        let mut order: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for cid in self.descendants(comp) {
+            let src = self.nodes[&cid].clone();
+            let parent = if src.parent == Some(comp) { inst } else { by_source[&src.parent.unwrap()] };
+            let id = match by_source.get(&cid) {
+                Some(&e) => {
+                    merge_from(self.node_mut(e), &src);
+                    if self.nodes[&e].parent != Some(parent) {
+                        self.reparent(e, page, Some(parent), None);
+                    }
+                    e
+                }
+                None => {
+                    let mut n = Node { children: vec![], ..src.clone() };
+                    n.source = Some(cid);
+                    n.synced = Some(Box::new(Node { children: vec![], ..src.clone() }));
+                    // Nested instances keep pointing at their own component.
+                    let id = self.insert(page, Some(parent), None, n);
+                    by_source.insert(cid, id);
+                    id
+                }
+            };
+            let text = self.nodes[&id].kind == Kind::Text;
+            let n = self.node_mut(id);
+            n.rect = if text {
+                Rect::from_min_size(src.rect.min + offset, n.rect.size())
+            } else {
+                Rect::from_min_size(src.rect.min + offset, src.rect.size())
+            };
+            keep.insert(id);
+            order.entry(parent).or_default().push(id);
+        }
+        for d in self.descendants(inst) {
+            if !keep.contains(&d) && self.nodes.get(&d).is_some_and(|n| n.source.is_some()) {
+                self.remove(d);
+            }
+        }
+        for (parent, kids) in order {
+            let extra: Vec<NodeId> = self.nodes[&parent].children.iter().copied().filter(|k| !kids.contains(k)).collect();
+            self.node_mut(parent).children = kids.into_iter().chain(extra).collect();
+        }
+        // Resized instances re-apply constraints from the component's size.
+        if actual.size() != c.rect.size() {
+            self.set_rect(inst, actual);
+        }
+    }
+
     /// Re-derive everything computed from children: group bounds and auto layout.
     pub fn reflow(&mut self) {
+        let instances: Vec<NodeId> = self.nodes.values().filter(|n| n.kind == Kind::Instance).map(|n| n.id).collect();
+        // ponytail: syncs every instance on every edit; track dirty components when files get large
+        for _ in 0..2 {
+            for &i in &instances {
+                if self.nodes.contains_key(&i) {
+                    self.sync_instance(i);
+                }
+            }
+        }
+        self.reflow_layout();
+    }
+
+    fn reflow_layout(&mut self) {
         self.fit_groups_only();
         let mut frames: Vec<(usize, NodeId)> = self
             .nodes
             .values()
-            .filter(|n| n.kind == Kind::Frame && n.layout.mode != LayoutMode::None)
+            .filter(|n| n.kind.is_frame() && n.layout.mode != LayoutMode::None)
             .map(|n| (self.ancestors(n.id).len(), n.id))
             .collect();
         if frames.is_empty() {
@@ -873,7 +1031,7 @@ impl Document {
             if !n.visible || n.locked {
                 continue;
             }
-            if n.kind == Kind::Frame && n.clip && !n.rect.expand(tol).contains(n.to_local(p)) {
+            if n.kind.is_frame() && n.clip && !n.rect.expand(tol).contains(n.to_local(p)) {
                 continue;
             }
             if let Some(h) = self.hit_in(&n.children, p, tol) {
@@ -890,7 +1048,7 @@ impl Document {
         let p = n.to_local(p);
         match n.kind {
             Kind::Group => false,
-            Kind::Frame | Kind::Rectangle | Kind::Text => n.rect.expand(tol).contains(p),
+            Kind::Frame | Kind::Component | Kind::Instance | Kind::Rectangle | Kind::Text => n.rect.expand(tol).contains(p),
             Kind::Ellipse => {
                 let c = n.rect.center();
                 let r = n.rect.size() / 2.0 + Vec2::splat(tol);
@@ -913,6 +1071,21 @@ impl Document {
     pub fn bounds(&self, ids: &[NodeId]) -> Rect {
         ids.iter().fold(Rect::NOTHING, |r, id| r.union(self.nodes[id].aabb()))
     }
+}
+
+/// Copy each property from `src` unless the instance layer overrode it
+/// (its value no longer matches what was last copied).
+fn merge_from(e: &mut Node, src: &Node) {
+    let snap = e.synced.take().map(|b| *b).unwrap_or_else(|| src.clone());
+    macro_rules! take {
+        ($($f:ident),*) => {$(
+            if e.$f == snap.$f {
+                e.$f = src.$f.clone();
+            }
+        )*};
+    }
+    take!(name, visible, opacity, fills, strokes, stroke_width, stroke_align, radius, clip, shadows, layout, sizing, constraints, absolute, points, closed, text, font_size, font_weight, rotation, component);
+    e.synced = Some(Box::new(Node { children: vec![], synced: None, ..src.clone() }));
 }
 
 /// Rotate `p` around `c` by `deg` counter-clockwise on screen (y points down).
@@ -1194,6 +1367,72 @@ mod tests {
         assert_eq!(d.node(scale).rect, r(-30., 20., 40., 40.));
         d.set_rect_with(f, r(0., 0., 100., 100.), false);
         assert_eq!(d.node(left).rect, r(-40., 10., 20., 20.), "Cmd-resize ignores constraints");
+    }
+
+    #[test]
+    fn instances_follow_main_and_keep_overrides() {
+        let mut d = Document::default();
+        let mut comp = Node::new(Kind::Component, r(0., 0., 100., 50.));
+        comp.name = "Button".into();
+        let c = d.insert(0, None, None, comp);
+        let mut label = Node::new(Kind::Text, r(10., 10., 30., 15.));
+        label.text = "OK".into();
+        let t = d.insert(0, Some(c), None, label);
+        let bg = d.insert(0, Some(c), Some(0), Node::new(Kind::Rectangle, r(0., 0., 100., 50.)));
+        let i = d.instantiate(c, 0, None, None, pos2(200., 0.));
+        let inst = d.node(i).clone();
+        assert_eq!((inst.kind, inst.name.as_str(), inst.rect), (Kind::Instance, "Button", r(200., 0., 100., 50.)));
+        assert_eq!(inst.children.len(), 2);
+        let (ibg, it) = (inst.children[0], inst.children[1]);
+        assert_eq!(d.node(it).text, "OK");
+        assert_eq!(d.node(it).rect.min, pos2(210., 10.));
+        assert_eq!(d.node(ibg).source, Some(bg));
+
+        // Override the label text, then change the main: fill propagates, text override sticks.
+        d.node_mut(it).text = "Cancel".into();
+        d.node_mut(bg).fills = vec![Paint::solid(Rgba::rgb(255, 0, 0))];
+        d.node_mut(t).text = "Okay".into();
+        d.node_mut(t).font_size = 20.0;
+        d.reflow();
+        assert_eq!(d.node(ibg).fills[0].color, Rgba::rgb(255, 0, 0));
+        assert_eq!(d.node(it).text, "Cancel", "override kept");
+        assert_eq!(d.node(it).font_size, 20.0, "non-overridden prop updates");
+
+        // Structure changes flow through; reset drops overrides.
+        let dot = d.insert(0, Some(c), None, Node::new(Kind::Ellipse, r(80., 5., 10., 10.)));
+        d.reflow();
+        assert_eq!(d.node(i).children.len(), 3);
+        assert_eq!(d.node(*d.node(i).children.last().unwrap()).rect.min, pos2(280., 5.));
+        d.remove(dot);
+        d.reflow();
+        assert_eq!(d.node(i).children.len(), 2);
+        d.reset_instance(i);
+        assert_eq!(d.node(it).text, "Okay");
+
+        // Moving the main doesn't move instances; detaching cuts the link.
+        d.translate(c, vec2(-50., 0.));
+        d.reflow();
+        assert_eq!(d.node(i).rect.min, pos2(200., 0.));
+        d.detach_instance(i);
+        d.node_mut(t).text = "Later".into();
+        d.reflow();
+        assert_eq!(d.node(i).kind, Kind::Frame);
+        assert_eq!(d.node(it).text, "Okay");
+    }
+
+    #[test]
+    fn resized_instance_applies_constraints() {
+        let mut d = Document::default();
+        let c = d.insert(0, None, None, Node::new(Kind::Component, r(0., 0., 100., 50.)));
+        let mut pin = Node::new(Kind::Rectangle, r(80., 0., 20., 20.));
+        pin.constraints = [Constraint::Max, Constraint::Min];
+        d.insert(0, Some(c), None, pin);
+        let i = d.instantiate(c, 0, None, None, pos2(0., 100.));
+        d.set_rect(i, r(0., 100., 200., 50.));
+        d.reflow();
+        let kid = d.node(i).children[0];
+        assert_eq!(d.node(kid).rect, r(180., 100., 20., 20.), "pinned right");
+        assert_eq!(d.node(i).rect.width(), 200.0, "size override kept");
     }
 
     #[test]

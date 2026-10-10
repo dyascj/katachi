@@ -36,11 +36,16 @@ pub enum Icon {
     GapH,
     GapV,
     Rotate,
+    Component,
+    Instance,
 }
 
 const SUBTLE: Color32 = Color32::from_rgb(0xF5, 0xF5, 0xF5);
 const SEL_BG: Color32 = Color32::from_rgb(0xE5, 0xF4, 0xFF);
 const CHILD_BG: Color32 = Color32::from_rgb(0xF2, 0xF9, 0xFF);
+
+/// Drag payload: a main component dragged from the Assets tab.
+pub struct AssetDrag(pub NodeId);
 
 pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
     let s = Stroke::new(1.2, color);
@@ -209,6 +214,18 @@ pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
             p.line_segment([end, end + vec2(3.0, 0.5)], s);
             p.line_segment([end, end + vec2(0.5, 3.0)], s);
         }
+        Icon::Component => {
+            // Four small diamonds.
+            for (dx, dy) in [(0., -3.5), (3.5, 0.), (0., 3.5), (-3.5, 0.)] {
+                let m = at(dx, dy);
+                let d = 2.3;
+                p.add(Shape::convex_polygon(vec![m + vec2(0., -d), m + vec2(d, 0.), m + vec2(0., d), m + vec2(-d, 0.)], color, Stroke::NONE));
+            }
+        }
+        Icon::Instance => {
+            let d = 5.5;
+            p.add(Shape::closed_line(vec![at(0., -d), at(d, 0.), at(0., d), at(-d, 0.)], s));
+        }
         Icon::Menu => {
             for y in [-4., 0., 4.] {
                 p.line_segment([at(-6., y), at(6., y)], s);
@@ -241,6 +258,8 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, selected: bool, size: f32, tip: &str
 fn kind_icon(k: Kind) -> Icon {
     match k {
         Kind::Frame => Icon::Frame,
+        Kind::Component => Icon::Component,
+        Kind::Instance => Icon::Instance,
         Kind::Group => Icon::Group,
         Kind::Rectangle => Icon::Rect,
         Kind::Ellipse => Icon::Ellipse,
@@ -391,11 +410,64 @@ impl App {
                 let name = self.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned());
                 ui.label(RichText::new(name.unwrap_or_else(|| "Untitled".into())).strong());
             });
+            ui.horizontal(|ui| {
+                for (assets, label) in [(false, "File"), (true, "Assets")] {
+                    let text = RichText::new(label);
+                    let text = if self.left_tab_assets == assets { text.strong() } else { text.color(Color32::from_gray(0x80)) };
+                    if ui.add(egui::Button::new(text).frame(false)).clicked() {
+                        self.left_tab_assets = assets;
+                    }
+                }
+            });
             ui.separator();
+            if self.left_tab_assets {
+                self.assets(ui);
+                return;
+            }
             self.pages_list(ui);
             ui.separator();
             ui.label(RichText::new("Layers").strong());
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.layers(ui));
+        });
+    }
+
+    /// Assets tab: every main component in the file. Drag one onto the canvas to place an instance.
+    fn assets(&mut self, ui: &mut Ui) {
+        let search_id = ui.id().with("asset-search");
+        let mut q: String = ui.data(|d| d.get_temp(search_id)).unwrap_or_default();
+        ui.add(egui::TextEdit::singleline(&mut q).hint_text("Search assets").desired_width(f32::INFINITY));
+        ui.data_mut(|d| d.insert_temp(search_id, q.clone()));
+        ui.add_space(4.0);
+        ui.label(RichText::new("Local components").strong());
+        let mut comps: Vec<(usize, NodeId, String)> = self
+            .doc
+            .nodes
+            .values()
+            .filter(|n| n.kind == Kind::Component && n.name.to_lowercase().contains(&q.to_lowercase()))
+            .map(|n| (self.doc.page_of(n.id), n.id, n.name.clone()))
+            .collect();
+        comps.sort_by(|a, b| (a.0, &a.2).cmp(&(b.0, &b.2)));
+        if comps.is_empty() {
+            ui.label(RichText::new("Create components with ⌥⌘K to reuse them here.").color(Color32::from_gray(0x80)));
+        }
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for (page, id, name) in comps {
+                let r = ui.dnd_drag_source(ui.id().with(("asset", id)), AssetDrag(id), |ui| {
+                    ui.horizontal(|ui| {
+                        let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                        paint_icon(ui.painter(), rect, Icon::Component, crate::canvas::PURPLE);
+                        ui.label(&name);
+                        ui.label(RichText::new(&self.doc.pages[page].name).color(Color32::from_gray(0x99)).small());
+                    });
+                });
+                if r.response.double_clicked() {
+                    let at = self.view_center_world();
+                    self.checkpoint();
+                    let size = self.doc.node(id).rect.size();
+                    let i = self.doc.instantiate(id, self.page, None, None, (at - size / 2.0).round());
+                    self.sel = vec![i];
+                }
+            }
         });
     }
 
@@ -545,8 +617,13 @@ impl App {
             } else if resp.hovered() || self.hover == Some(id) {
                 p.rect_stroke(rect.shrink(0.5), 0.0, Stroke::new(1.0, BLUE), StrokeKind::Inside);
             }
-            let dim = if n.visible { 0x1E } else { 0xB3 };
-            let fg = Color32::from_gray(dim);
+            let comp = self.accent(id) == crate::canvas::PURPLE;
+            let fg = match (comp, n.visible) {
+                (true, true) => crate::canvas::PURPLE,
+                (true, false) => crate::canvas::PURPLE.gamma_multiply(0.45),
+                (false, true) => Color32::from_gray(0x1E),
+                (false, false) => Color32::from_gray(0xB3),
+            };
             let x = rect.min.x + 6.0 + depth as f32 * 16.0;
             let chev = Rect::from_center_size(pos2(x + 6.0, rect.center().y), vec2(12.0, 12.0));
             if !n.children.is_empty() {
@@ -570,7 +647,7 @@ impl App {
                     }
                 }
             } else {
-                let strong = n.parent.is_none() && n.kind == Kind::Frame;
+                let strong = (n.parent.is_none() && n.kind.is_frame()) || n.kind == Kind::Component;
                 let font = if strong { FontId::new(12.0, egui::FontFamily::Name("Inter SemiBold".into())) } else { FontId::proportional(12.0) };
                 p.text(name_pos, egui::Align2::LEFT_CENTER, &n.name, font, fg);
             }
@@ -722,6 +799,7 @@ impl App {
         let roots = self.sel_roots();
         let first = self.sel[0];
         let n = self.doc.node(first).clone();
+        self.component_section(ui, first);
         self.position_section(ui, &roots);
         ui.separator();
         self.layout_section(ui, &roots);
@@ -744,12 +822,56 @@ impl App {
         self.effects_section(ui);
     }
 
+    fn component_section(&mut self, ui: &mut Ui, id: NodeId) {
+        let n = self.doc.node(id).clone();
+        let inst = self.owning_instance(id);
+        if n.kind != Kind::Component && inst.is_none() {
+            return;
+        }
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+            let icon = if n.kind == Kind::Component { Icon::Component } else { Icon::Instance };
+            paint_icon(ui.painter(), rect, icon, crate::canvas::PURPLE);
+            let title = match (n.kind, inst) {
+                (Kind::Component, _) => n.name.clone(),
+                (_, Some(i)) => {
+                    let main = self.doc.node(i).component.and_then(|c| self.doc.nodes.get(&c)).map_or("Missing component".into(), |c| c.name.clone());
+                    format!("Instance of {main}")
+                }
+                _ => String::new(),
+            };
+            ui.label(RichText::new(title).strong().color(crate::canvas::PURPLE));
+        });
+        if let Some(i) = inst {
+            ui.horizontal(|ui| {
+                if ui.button("Go to main").clicked() {
+                    self.go_to_main(i);
+                }
+                if ui.button("Reset").clicked() {
+                    self.checkpoint();
+                    self.doc.reset_instance(i);
+                }
+                if ui.button("Detach").clicked() {
+                    self.checkpoint();
+                    self.doc.detach_instance(i);
+                }
+            });
+        } else if ui.button("Create instance").clicked() {
+            self.checkpoint();
+            self.sel = self.duplicate_or_instance(&[id]);
+            if let Some(&i) = self.sel.first() {
+                self.doc.translate(i, vec2(n.rect.width() + 40.0, 0.0));
+            }
+        }
+        ui.separator();
+    }
+
     /// Origin that X/Y are reported against: the nearest frame, like Figma.
     fn frame_origin(&self, id: NodeId) -> egui::Vec2 {
         self.doc
             .ancestors(id)
             .into_iter()
-            .find(|a| self.doc.node(*a).kind == Kind::Frame)
+            .find(|a| self.doc.node(*a).kind.is_frame())
             .map(|f| self.doc.node(f).rect.min.to_vec2())
             .unwrap_or_default()
     }
@@ -801,7 +923,7 @@ impl App {
     fn layout_section(&mut self, ui: &mut Ui, roots: &[NodeId]) {
         let first = roots[0];
         let n = self.doc.node(first).clone();
-        let is_frame = roots.len() == 1 && n.kind == Kind::Frame;
+        let is_frame = roots.len() == 1 && n.kind.is_frame();
         let al = is_frame && n.layout.mode != LayoutMode::None;
         ui.horizontal(|ui| {
             ui.label(RichText::new(if is_frame { "Auto layout" } else { "Layout" }).strong());
@@ -885,12 +1007,12 @@ impl App {
                 self.doc.reflow();
             }
         }
-        if n.kind == Kind::Frame {
+        if n.kind.is_frame() {
             let mut clip = n.clip;
             if ui.checkbox(&mut clip, "Clip content").changed() {
                 self.checkpoint();
                 for &id in &self.sel.clone() {
-                    if self.doc.node(id).kind == Kind::Frame {
+                    if self.doc.node(id).kind.is_frame() {
                         self.doc.node_mut(id).clip = clip;
                     }
                 }
@@ -951,7 +1073,7 @@ impl App {
         let n = self.doc.node(id).clone();
         let Some(p) = n.parent else { return };
         let pn = self.doc.node(p);
-        if pn.kind != Kind::Frame || (pn.layout.mode != LayoutMode::None && !n.absolute) {
+        if !pn.kind.is_frame() || (pn.layout.mode != LayoutMode::None && !n.absolute) {
             return;
         }
         ui.separator();
@@ -988,7 +1110,7 @@ impl App {
         heading(ui, "Appearance");
         let mut op = (n.opacity * 100.0).round();
         let mut r = n.radius;
-        let has_radius = matches!(n.kind, Kind::Rectangle | Kind::Frame);
+        let has_radius = n.kind == Kind::Rectangle || n.kind.is_frame();
         ui.horizontal(|ui| {
             if num_field(ui, &mut op, "@opacity", 0.0, half(ui)) {
                 self.begin_edit();
@@ -999,7 +1121,7 @@ impl App {
             if has_radius && num_field(ui, &mut r, "@radius", 0.0, half(ui)) {
                 self.begin_edit();
                 for &id in &self.sel {
-                    if matches!(self.doc.node(id).kind, Kind::Rectangle | Kind::Frame) {
+                    if self.doc.node(id).kind == Kind::Rectangle || self.doc.node(id).kind.is_frame() {
                         self.doc.node_mut(id).radius = r;
                     }
                 }

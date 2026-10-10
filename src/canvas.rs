@@ -9,6 +9,7 @@ use egui::{
 };
 
 pub const BLUE: Color32 = Color32::from_rgb(0x0D, 0x99, 0xFF);
+pub const PURPLE: Color32 = Color32::from_rgb(0x97, 0x47, 0xFF);
 const SNAP: Color32 = Color32::from_rgb(0xF2, 0x48, 0x22);
 
 pub fn num(v: f32) -> String {
@@ -35,6 +36,9 @@ impl App {
             } else {
                 View::fit(self.doc.bounds(&kids), rect, 1.0)
             };
+        }
+        if let Some(t) = self.zoom_target.take().filter(|t| self.doc.nodes.contains_key(t)) {
+            self.view = View::fit(self.doc.node(t).aabb(), rect, 1.0);
         }
         self.fit_texts(&painter);
 
@@ -115,6 +119,17 @@ impl App {
             && let Some(w) = world {
                 self.on_double_click(w);
             }
+        if let (Some(drop), Some(p)) = (resp.dnd_release_payload::<crate::panels::AssetDrag>(), hover_pos) {
+            // Instance dropped from the Assets tab, centered under the pointer.
+            if self.doc.nodes.contains_key(&drop.0) {
+                self.checkpoint();
+                let w = self.view.to_world(p);
+                let size = self.doc.node(drop.0).rect.size();
+                let parent = self.frame_at(w, &[]);
+                let i = self.doc.instantiate(drop.0, self.page, parent, None, (w - size / 2.0).round());
+                self.sel = vec![i];
+            }
+        }
         resp.context_menu(|ui| self.context_menu(ui));
 
         self.text_editor(ui, &painter);
@@ -186,15 +201,26 @@ impl App {
         self.frame_labels.clear();
         for &id in &self.doc.pages[self.page].children {
             let n = self.doc.node(id);
-            if n.kind != Kind::Frame || !n.visible {
+            if !n.kind.is_frame() || !n.visible {
                 continue;
             }
             let active = self.sel.contains(&id) || self.hover == Some(id);
-            let color = if active { BLUE } else { Color32::from_gray(0x80) };
+            let comp = matches!(n.kind, Kind::Component | Kind::Instance);
+            let color = match (comp, active) {
+                (true, _) => PURPLE,
+                (false, true) => BLUE,
+                _ => Color32::from_gray(0x80),
+            };
             let galley = painter.layout_no_wrap(n.name.clone(), FontId::proportional(11.0), color);
             let r = self.view.rect_to_screen(n.aabb());
-            let pos = pos2(r.min.x, r.min.y - galley.size().y - 4.0);
-            self.frame_labels.push((id, Rect::from_min_size(pos, galley.size())));
+            let indent = if comp { 14.0 } else { 0.0 };
+            let pos = pos2(r.min.x + indent, r.min.y - galley.size().y - 4.0);
+            if comp {
+                let icon = if n.kind == Kind::Component { crate::panels::Icon::Component } else { crate::panels::Icon::Instance };
+                let ir = Rect::from_center_size(pos2(r.min.x + 5.0, pos.y + galley.size().y / 2.0), vec2(12.0, 12.0));
+                crate::panels::paint_icon(painter, ir, icon, PURPLE);
+            }
+            self.frame_labels.push((id, Rect::from_min_max(pos2(r.min.x, pos.y), pos + galley.size())));
             painter.galley(pos, galley, color);
         }
     }
@@ -262,7 +288,7 @@ impl App {
                 if let Some(t) = target {
                     let n = self.doc.node(t);
                     // An unselected top-level frame with content: click selects it, drag marquees.
-                    defer = n.kind == Kind::Frame
+                    defer = n.kind.is_frame()
                         && n.parent.is_none()
                         && !n.children.is_empty()
                         && !self.sel.contains(&t)
@@ -274,7 +300,10 @@ impl App {
                             self.sel.push(t);
                         }
                     } else if !self.sel.contains(&t) && !defer {
-                        self.sel = vec![t];
+                        // Pressing inside a selected parent drags the parent; a plain click selects the child.
+                        if !self.sel.iter().any(|&p| self.doc.is_ancestor(p, t)) {
+                            self.sel = vec![t];
+                        }
                     }
                 } else if handle.is_none() && !mods.shift {
                     self.sel.clear();
@@ -326,7 +355,8 @@ impl App {
                 } else if press.target.is_some() && !self.sel.is_empty() {
                     self.checkpoint();
                     if mods.alt {
-                        self.sel = self.doc.duplicate(&self.sel_roots());
+                        let roots = self.sel_roots();
+                        self.sel = self.duplicate_or_instance(&roots);
                     }
                     Some(Drag::Move { base: self.doc.clone(), start })
                 } else {
@@ -349,7 +379,7 @@ impl App {
                         n
                     }
                 };
-                if node.kind == Kind::Frame && parent.is_some() {
+                if node.kind.is_frame() && parent.is_some() {
                     node.clip = true;
                 }
                 let id = self.doc.insert(self.page, parent, None, node);
@@ -546,7 +576,7 @@ impl App {
             }
             Some(Drag::Create { id, .. }) => {
                 let n = self.doc.node(id).clone();
-                if n.kind == Kind::Frame {
+                if n.kind.is_frame() {
                     // A new frame drawn around sibling layers adopts them.
                     let (r, parent) = (n.rect, n.parent);
                     let kids: Vec<NodeId> = self
@@ -683,7 +713,7 @@ impl App {
             if !usable(n) {
                 continue;
             }
-            if n.kind == Kind::Frame && !n.children.is_empty() && !r.contains_rect(n.aabb()) {
+            if n.kind.is_frame() && !n.children.is_empty() && !r.contains_rect(n.aabb()) {
                 out.extend(n.children.iter().copied().filter(|c| {
                     let c = self.doc.node(*c);
                     usable(c) && r.intersects(c.aabb())
@@ -760,15 +790,24 @@ impl App {
 
     // ---------- overlays ----------
 
+    /// Purple for components, instances, and anything inside them; blue otherwise.
+    pub fn accent(&self, id: NodeId) -> Color32 {
+        let comp = std::iter::once(id)
+            .chain(self.doc.ancestors(id))
+            .any(|a| matches!(self.doc.node(a).kind, Kind::Component | Kind::Instance));
+        if comp { PURPLE } else { BLUE }
+    }
+
     fn outline(&self, painter: &Painter, id: NodeId, width: f32) {
         let n = self.doc.node(id);
+        let accent = self.accent(id);
         match n.kind {
             Kind::Vector | Kind::Ellipse => {
-                painter.add(render::stroke_mesh(&render::node_path(n, &self.view, 0.0), width, BLUE));
+                painter.add(render::stroke_mesh(&render::node_path(n, &self.view, 0.0), width, accent));
             }
             _ => {
                 let pts = n.corners().map(|p| self.view.to_screen(p)).to_vec();
-                painter.add(egui::Shape::closed_line(pts, Stroke::new(width, BLUE)));
+                painter.add(egui::Shape::closed_line(pts, Stroke::new(width, accent)));
             }
         }
     }
@@ -787,12 +826,13 @@ impl App {
             let (fr, rot) = self.sel_frame().unwrap_or((Rect::NOTHING, 0.0));
             let corners = [fr.left_top(), fr.right_top(), fr.right_bottom(), fr.left_bottom()]
                 .map(|p| self.view.to_screen(rotate(p, fr.center(), rot)));
-            painter.add(egui::Shape::closed_line(corners.to_vec(), Stroke::new(1.0, BLUE)));
+            let accent = self.accent(roots[0]);
+            painter.add(egui::Shape::closed_line(corners.to_vec(), Stroke::new(1.0, accent)));
             if self.editing_text.is_none() && self.tool == Tool::Move {
                 for c in corners {
                     let h = Rect::from_center_size(c, vec2(7.0, 7.0));
                     painter.rect_filled(h, 1.0, Color32::WHITE);
-                    painter.rect_stroke(h, 1.0, Stroke::new(1.0, BLUE), StrokeKind::Middle);
+                    painter.rect_stroke(h, 1.0, Stroke::new(1.0, accent), StrokeKind::Middle);
                 }
             }
             let b = self.view.rect_to_screen(self.doc.bounds(&roots));
@@ -802,7 +842,7 @@ impl App {
             };
             let g = painter.layout_no_wrap(label, FontId::proportional(11.0), Color32::WHITE);
             let pill = Rect::from_center_size(b.center_bottom() + vec2(0.0, 8.0 + g.size().y / 2.0 + 2.0), g.size() + vec2(8.0, 4.0));
-            painter.rect_filled(pill, 2.0, BLUE);
+            painter.rect_filled(pill, 2.0, accent);
             painter.galley(pill.min + vec2(4.0, 2.0), g, Color32::WHITE);
         }
         for g in &self.guides {
@@ -973,6 +1013,29 @@ impl App {
         if item(ui, "Ungroup", "⇧⌘G", container) {
             self.ungroup_selection();
             ui.close();
+        }
+        ui.separator();
+        let one = (self.sel.len() == 1).then(|| self.sel[0]);
+        let kind = one.map(|id| self.doc.node(id).kind);
+        if kind != Some(Kind::Component) && item(ui, "Create component", "⌥⌘K", has) {
+            self.create_component();
+            ui.close();
+        }
+        if let Some(inst) = one.and_then(|id| self.owning_instance(id)) {
+            if item(ui, "Go to main component", "", true) {
+                self.go_to_main(inst);
+                ui.close();
+            }
+            if item(ui, "Reset instance", "", true) {
+                self.checkpoint();
+                self.doc.reset_instance(inst);
+                ui.close();
+            }
+            if item(ui, "Detach instance", "⌥⌘B", true) {
+                self.checkpoint();
+                self.doc.detach_instance(inst);
+                ui.close();
+            }
         }
         ui.separator();
         if item(ui, "Show/Hide", "⇧⌘H", has) {

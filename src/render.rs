@@ -266,7 +266,7 @@ fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
     if n.children.is_empty() {
         return;
     }
-    let child_painter = if n.kind == Kind::Frame && n.clip {
+    let child_painter = if n.kind.is_frame() && n.clip {
         painter.with_clip_rect(painter.clip_rect().intersect(screen))
     } else {
         painter.clone()
@@ -280,7 +280,7 @@ fn draw_shadows(painter: &Painter, n: &Node, v: &View, a: f32) {
     for s in n.shadows.iter().filter(|s| s.visible) {
         let z = v.zoom;
         let color = s.color.to32().gamma_multiply(a);
-        let rect_like = matches!(n.kind, Kind::Rectangle | Kind::Frame) && n.rotation == 0.0;
+        let rect_like = (n.kind == Kind::Rectangle || n.kind.is_frame()) && n.rotation == 0.0;
         if rect_like {
             let r = v.rect_to_screen(n.rect).translate(s.offset * z).expand(s.spread * z);
             let rad = ((n.radius + s.spread).max(0.0) * z).min(255.0) as u8;

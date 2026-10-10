@@ -248,7 +248,7 @@ impl Svg<'_> {
             self.out.push_str("</g>");
         }
         if !n.children.is_empty() {
-            if n.kind == Kind::Frame && n.clip {
+            if n.kind.is_frame() && n.clip {
                 let cid = self.id("clip");
                 let _ = write!(self.defs, r#"<clipPath id="{cid}">{}</clipPath>"#, shape(n, o, 0.0, turn.trim()));
                 let _ = write!(self.out, r#"<g clip-path="url(#{cid})">"#);

@@ -88,6 +88,9 @@ pub struct App {
     pub textures: crate::render::Textures,
     /// Top-level frame pressed on its empty area: selected on click, marquee on drag.
     pub pending_frame: Option<NodeId>,
+    /// Zoom to this layer on the next frame (after page switches settle).
+    pub zoom_target: Option<NodeId>,
+    pub left_tab_assets: bool,
     undo: Vec<Document>,
     redo: Vec<Document>,
     in_gesture: bool,
@@ -126,6 +129,8 @@ impl App {
             canvas_rect: None,
             textures: Default::default(),
             pending_frame: None,
+            zoom_target: None,
+            left_tab_assets: false,
             undo: vec![],
             redo: vec![],
             in_gesture: false,
@@ -218,7 +223,8 @@ impl App {
         chain.push(hit);
         for (i, &cur) in chain.iter().enumerate() {
             let n = self.doc.node(cur);
-            let top_frame = n.kind == Kind::Frame && n.parent.is_none();
+            // Top-level frames are click-through; instances act like groups.
+            let top_frame = matches!(n.kind, Kind::Frame | Kind::Component) && n.parent.is_none();
             let entered = self.sel.iter().any(|&s| s != cur && self.doc.is_ancestor(cur, s));
             if i + 1 == chain.len() || !(top_frame || entered) {
                 return cur;
@@ -272,7 +278,7 @@ impl App {
         }
         let frames_only = roots.iter().all(|&id| {
             let n = self.doc.node(id);
-            n.kind == Kind::Frame && n.layout.mode == LayoutMode::None
+            n.kind.is_frame() && n.layout.mode == LayoutMode::None
         });
         if !frames_only {
             self.group_selection(true);
@@ -428,11 +434,24 @@ impl App {
             self.checkpoint();
             // Paste into a selected frame, otherwise next to the original.
             let parent = match self.sel.as_slice() {
-                [one] if self.doc.node(*one).kind == Kind::Frame => Some(*one),
+                [one] if self.doc.node(*one).kind.is_frame() => Some(*one),
                 [one, ..] => self.doc.node(*one).parent,
                 [] => None,
             };
-            self.sel = self.doc.paste(&frag, self.page, parent, None);
+            // Pasting a main component that still exists makes an instance of it.
+            let in_frag: std::collections::HashSet<NodeId> = frag.iter().map(|n| n.id).collect();
+            let mut out = vec![];
+            for root in frag.iter().filter(|n| !n.parent.is_some_and(|p| in_frag.contains(&p))) {
+                let live = self.doc.nodes.get(&root.id).is_some_and(|n| n.kind == Kind::Component);
+                if root.kind == Kind::Component && live {
+                    out.push(self.doc.instantiate(root.id, self.page, parent, None, root.rect.min));
+                } else {
+                    let sub: Vec<Node> = frag.iter().filter(|n| n.id == root.id || self.frag_descends(&frag, n.id, root.id)).cloned().collect();
+                    out.extend(self.doc.paste(&sub, self.page, parent, None));
+                }
+            }
+            self.doc.reflow();
+            self.sel = out;
         } else if !text.trim().is_empty() {
             // Plain text becomes a text layer, like Figma.
             self.checkpoint();
@@ -449,7 +468,88 @@ impl App {
             return;
         }
         self.checkpoint();
-        self.sel = self.doc.duplicate(&roots);
+        self.sel = self.duplicate_or_instance(&roots);
+    }
+
+    /// Duplicate layers; main components produce instances instead, as in Figma.
+    pub fn duplicate_or_instance(&mut self, roots: &[NodeId]) -> Vec<NodeId> {
+        let mut out = vec![];
+        for id in self.doc.sort_by_z(roots) {
+            let n = self.doc.node(id);
+            if n.kind == Kind::Component {
+                let (page, parent, at) = (self.doc.page_of(id), n.parent, n.rect.min);
+                let index = self.doc.index_in_parent(id) + 1;
+                out.push(self.doc.instantiate(id, page, parent, Some(index), at));
+            } else {
+                out.extend(self.doc.duplicate(&[id]));
+            }
+        }
+        out
+    }
+
+    /// Cmd+Alt+K: frames become components; anything else is wrapped in a new one.
+    pub fn create_component(&mut self) {
+        let roots = self.sel_roots();
+        if roots.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        let id = match roots.as_slice() {
+            [one] if self.doc.node(*one).kind == Kind::Frame => *one,
+            _ => {
+                self.group_selection(true);
+                let id = self.sel[0];
+                self.doc.node_mut(id).fills.clear();
+                id
+            }
+        };
+        let name = self.doc.auto_name("Component");
+        let n = self.doc.node_mut(id);
+        n.kind = Kind::Component;
+        if n.name.starts_with("Frame ") {
+            n.name = name;
+        }
+        self.sel = vec![id];
+    }
+
+    pub fn detach_selection(&mut self) {
+        let insts: Vec<NodeId> = self.sel.iter().copied().filter(|&id| self.doc.node(id).kind == Kind::Instance).collect();
+        if insts.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for i in insts {
+            self.doc.detach_instance(i);
+        }
+    }
+
+    /// The instance a layer belongs to (itself or nearest instance ancestor).
+    pub fn owning_instance(&self, id: NodeId) -> Option<NodeId> {
+        std::iter::once(id).chain(self.doc.ancestors(id)).find(|a| self.doc.node(*a).kind == Kind::Instance)
+    }
+
+    pub fn go_to_main(&mut self, inst: NodeId) {
+        let Some(c) = self.doc.node(inst).component.filter(|c| self.doc.nodes.contains_key(c)) else {
+            self.toast("Main component is missing".into());
+            return;
+        };
+        let page = self.doc.page_of(c);
+        if page != self.page {
+            self.select_page(page);
+        }
+        self.sel = vec![c];
+        self.zoom_target = Some(c);
+    }
+
+    fn frag_descends(&self, frag: &[Node], id: NodeId, root: NodeId) -> bool {
+        let mut cur = frag.iter().find(|n| n.id == id).and_then(|n| n.parent);
+        while let Some(p) = cur {
+            if p == root {
+                return true;
+            }
+            cur = frag.iter().find(|n| n.id == p).and_then(|n| n.parent);
+        }
+        false
     }
 
     pub fn view_center_world(&self) -> Pos2 {
@@ -486,7 +586,7 @@ impl App {
                 if ex.contains(&id) || !n.visible || n.locked {
                     continue;
                 }
-                if n.kind == Kind::Frame && n.rect.contains(n.to_local(p)) {
+                if n.kind.is_frame() && n.rect.contains(n.to_local(p)) {
                     return walk(app, &n.children, p, ex).or(Some(id));
                 }
                 if n.kind == Kind::Group
@@ -636,6 +736,8 @@ impl App {
             (true, false, false, Key::D) => self.duplicate_selection(),
             (true, false, false, Key::A) => self.select_all(),
             (true, false, true, Key::G) => self.group_selection(true),
+            (true, false, true, Key::K) => self.create_component(),
+            (true, false, true, Key::B) => self.detach_selection(),
             (true, false, false, Key::G) => self.group_selection(false),
             (true, true, false, Key::G) => self.ungroup_selection(),
             (true, true, false, Key::H) => self.toggle_visible(),
