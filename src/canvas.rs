@@ -180,15 +180,23 @@ impl App {
         }
     }
 
-    /// Auto-width text: the box always hugs its content.
+    /// Text boxes hug their content per their sizing mode; fonts load on demand.
     fn fit_texts(&mut self, painter: &Painter) {
         let ids: Vec<NodeId> = self.doc.nodes.values().filter(|n| n.kind == Kind::Text).map(|n| n.id).collect();
         let mut changed = false;
         for id in ids {
-            let size = render::measure_text(painter, self.doc.node(id));
+            let n = self.doc.node(id);
+            crate::text::ensure_font(painter.ctx(), &n.font_family, n.font_weight);
+            let (_, size, lines) = crate::text::layout(painter, n, 1.0, Color32::BLACK);
             let n = self.doc.node_mut(id);
-            if (n.rect.size() - size).length() > 0.01 {
-                n.rect = Rect::from_min_size(n.rect.min, size);
+            n.lines = lines;
+            let want = match n.text_sizing {
+                crate::doc::TextSizing::AutoWidth => size,
+                crate::doc::TextSizing::AutoHeight => vec2(n.rect.width(), size.y),
+                crate::doc::TextSizing::Fixed => n.rect.size(),
+            };
+            if (n.rect.size() - want).length() > 0.01 {
+                n.rect = Rect::from_min_size(n.rect.min, want);
                 changed = true;
             }
         }
@@ -364,7 +372,7 @@ impl App {
                     Some(Drag::Marquee { start, base_sel })
                 }
             }
-            Tool::Frame | Tool::Rectangle | Tool::Ellipse | Tool::Line => {
+            Tool::Frame | Tool::Rectangle | Tool::Ellipse | Tool::Line | Tool::Text => {
                 self.checkpoint();
                 let start = self.snap_point(start.round(), &[]);
                 let parent = self.frame_at(start, &[]);
@@ -373,6 +381,11 @@ impl App {
                     Tool::Frame => Node::new(Kind::Frame, rect),
                     Tool::Rectangle => Node::new(Kind::Rectangle, rect),
                     Tool::Ellipse => Node::new(Kind::Ellipse, rect),
+                    Tool::Text => {
+                        let mut n = Node::new(Kind::Text, rect);
+                        n.text_sizing = crate::doc::TextSizing::Fixed;
+                        n
+                    }
                     _ => {
                         let mut n = Node::vector(&[PathPoint { p: start, ..Default::default() }; 2], false);
                         n.name = self.doc.auto_name("Line");
@@ -500,6 +513,15 @@ impl App {
                     if hy != 0 {
                         n.sizing[1] = Sizing::Fixed;
                     }
+                    // Text: dragging width wraps (auto height); dragging height fixes the box.
+                    if n.kind == Kind::Text {
+                        use crate::doc::TextSizing;
+                        if hy != 0 {
+                            n.text_sizing = TextSizing::Fixed;
+                        } else if hx != 0 && n.text_sizing == TextSizing::AutoWidth {
+                            n.text_sizing = TextSizing::AutoHeight;
+                        }
+                    }
                     self.doc.set_rect_with(id, Rect::from_two_pos(map(r.min), map(r.max)), !mods.command);
                 }
                 self.doc.reflow();
@@ -589,6 +611,10 @@ impl App {
                     for c in kids {
                         self.doc.reparent(c, self.page, Some(id), None);
                     }
+                }
+                if n.kind == Kind::Text {
+                    self.editing_text = Some(id);
+                    self.focus_text = true;
                 }
                 if n.kind != Kind::Vector && (n.rect.width() < 1.0 || n.rect.height() < 1.0) {
                     let r = Rect::from_min_size(n.rect.min, n.rect.size().max(Vec2::splat(1.0)));
@@ -931,18 +957,26 @@ impl App {
             self.editing_text = None;
             return;
         };
-        let font = FontId::new(n.font_size * self.view.zoom, render::font_family(n.font_weight));
         let color = n.first_fill().map_or(Color32::BLACK, |c| c.to32());
+        let zoom = self.view.zoom;
         let mut text = n.text.clone();
-        let width = render::measure_text(painter, &n).x * self.view.zoom + n.font_size * self.view.zoom;
+        let (galley, size, _) = crate::text::layout(painter, &n, zoom, color);
+        let width = match n.text_sizing {
+            crate::doc::TextSizing::AutoWidth => size.x * zoom + n.font_size * zoom,
+            _ => n.rect.width() * zoom,
+        };
+        let local = n.rect.min + crate::text::draw_offset(&n, galley.rows.len());
+        let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
+            let g = ui.painter().layout_job(crate::text::job(&n, buf.as_str(), zoom, color));
+            crate::text::align_rows(g, &n, zoom)
+        };
         let out = egui::Area::new(egui::Id::new("canvas-text-edit"))
-            .fixed_pos(self.view.to_screen(n.rect.min))
+            .fixed_pos(self.view.to_screen(local))
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
                 ui.add(
                     egui::TextEdit::multiline(&mut text)
-                        .font(font)
-                        .text_color(color)
+                        .layouter(&mut layouter)
                         .frame(egui::Frame::NONE)
                         .margin(egui::Margin::ZERO)
                         .desired_width(width)

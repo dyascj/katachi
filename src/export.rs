@@ -1,6 +1,6 @@
 //! SVG export from the model; PNG export rasterizes that SVG with resvg so both always match.
 
-use crate::doc::{Document, Kind, Node, NodeId, Paint, PaintKind, Rgba, Shadow, StrokeAlign};
+use crate::doc::{Decoration, Document, Kind, Node, NodeId, Paint, PaintKind, Rgba, Shadow, StrokeAlign, TextAlign};
 use egui::{Pos2, Rect, Vec2};
 use std::fmt::Write;
 
@@ -11,9 +11,6 @@ pub const FONTS: [&[u8]; 4] = [
     include_bytes!("../assets/fonts/Inter-Bold.ttf"),
 ];
 
-/// Inter's ascender / line height in ems (hhea), matching egui's layout of the same font.
-const ASCENT: f32 = 0.96875;
-const LINE: f32 = 1.2109375;
 
 /// `#RRGGBB` plus opacity (1.0 = opaque).
 fn color_parts(c: Rgba) -> (String, f32) {
@@ -209,14 +206,36 @@ impl Svg<'_> {
                 if let Some(f) = n.fills.iter().rev().find(|f| f.visible) {
                     let r = n.rect.translate(-o);
                     let fill = self.paint("fill", f, n);
-                    let _ = write!(
-                        self.out,
-                        r#"<text font-family="Inter" font-size="{}" font-weight="{}" {fill} xml:space="preserve">"#,
-                        n.font_size, n.font_weight
+                    let (anchor, x) = match n.text_align {
+                        TextAlign::Center => ("middle", r.center().x),
+                        TextAlign::Right => ("end", r.max.x),
+                        _ => ("start", r.min.x),
+                    };
+                    let mut attrs = format!(
+                        r#"font-family="{}" font-size="{}" font-weight="{}" text-anchor="{anchor}" {fill}"#,
+                        esc(&n.font_family),
+                        n.font_size,
+                        n.font_weight
                     );
-                    for (i, line) in n.text.split('\n').enumerate() {
-                        let y = r.min.y + n.font_size * (ASCENT + LINE * i as f32);
-                        let _ = write!(self.out, r#"<tspan x="{}" y="{}">{}</tspan>"#, r.min.x, y, esc(line));
+                    if n.letter_spacing != 0.0 {
+                        let _ = write!(attrs, r#" letter-spacing="{}""#, n.letter_spacing / 100.0 * n.font_size);
+                    }
+                    match n.decoration {
+                        Decoration::Underline => attrs.push_str(r#" text-decoration="underline""#),
+                        Decoration::Strikethrough => attrs.push_str(r#" text-decoration="line-through""#),
+                        Decoration::None => {}
+                    }
+                    let lines: Vec<String> = if n.lines.is_empty() {
+                        crate::text::apply_case(&n.text, n.text_case).split('\n').map(str::to_string).collect()
+                    } else {
+                        n.lines.iter().map(|l| l.trim_end_matches('\n').to_string()).collect()
+                    };
+                    let top = r.min.y + crate::text::draw_offset(n, lines.len()).y;
+                    let pitch = crate::text::line_pitch(n);
+                    let _ = write!(self.out, r#"<text {attrs} xml:space="preserve">"#);
+                    for (i, line) in lines.iter().enumerate() {
+                        let y = top + n.font_size * crate::text::ASCENT + pitch * i as f32;
+                        let _ = write!(self.out, r#"<tspan x="{x}" y="{y}">{}</tspan>"#, esc(line));
                     }
                     self.out.push_str("</text>");
                 }
@@ -300,6 +319,11 @@ pub fn to_svg(doc: &Document, ids: &[NodeId]) -> String {
 pub fn to_png(doc: &Document, ids: &[NodeId], scale: f32) -> Result<Vec<u8>, String> {
     let svg = to_svg(doc, ids);
     let mut opt = resvg::usvg::Options::default();
+    // System fonts only when a layer uses one; Inter is always bundled.
+    let needs_system = doc.nodes.values().any(|n| n.kind == Kind::Text && n.font_family != "Inter");
+    if needs_system {
+        opt.fontdb = std::sync::Arc::new(crate::text::system_fonts().clone());
+    }
     for f in FONTS {
         opt.fontdb_mut().load_font_data(f.to_vec());
     }

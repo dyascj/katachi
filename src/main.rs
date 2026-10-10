@@ -5,6 +5,7 @@ mod export;
 mod paint_ui;
 mod panels;
 mod render;
+mod text;
 #[cfg(test)]
 mod tests;
 

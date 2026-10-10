@@ -5,7 +5,7 @@ use egui::{ColorImage, TextureHandle, TextureId, TextureOptions};
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use egui::epaint::{Mesh, Vertex, WHITE_UV};
-use egui::{Color32, FontFamily, FontId, Painter, Pos2, Rect, Vec2, pos2, vec2};
+use egui::{Color32, Painter, Pos2, Rect, Vec2, pos2, vec2};
 use lyon::math::{Angle, Box2D, Transform, point, vector};
 use lyon::path::builder::BorderRadii;
 use lyon::path::{Path, Winding};
@@ -45,15 +45,6 @@ impl View {
         let pad = screen.shrink(48.0);
         let zoom = (pad.width() / r.width()).min(pad.height() / r.height()).clamp(0.02, max_zoom);
         View { zoom, pan: screen.center().to_vec2() - r.center().to_vec2() * zoom }
-    }
-}
-
-pub fn font_family(weight: u16) -> FontFamily {
-    match weight {
-        0..=449 => FontFamily::Proportional,
-        450..=549 => FontFamily::Name("Inter Medium".into()),
-        550..=649 => FontFamily::Name("Inter SemiBold".into()),
-        _ => FontFamily::Name("Inter Bold".into()),
     }
 }
 
@@ -303,13 +294,10 @@ fn draw_content(painter: &Painter, sc: &mut Scene, n: &Node, a: f32) {
         return;
     }
     if n.kind == Kind::Text {
-        if let Some(c) = n.first_fill().map(|c| c.to32()) {
-            let galley = painter.layout_no_wrap(
-                n.text.clone(),
-                FontId::new(n.font_size * v.zoom, font_family(n.font_weight)),
-                c.gamma_multiply(a),
-            );
-            let pos = v.to_screen(crate::doc::rotate(n.rect.min, n.rect.center(), n.rotation));
+        if let Some(c) = n.first_fill().map(|c| c.to32().gamma_multiply(a)) {
+            let (galley, _, _) = crate::text::layout(painter, n, v.zoom, c);
+            let local = n.rect.min + crate::text::draw_offset(n, galley.rows.len());
+            let pos = v.to_screen(crate::doc::rotate(local, n.rect.center(), n.rotation));
             painter.add(egui::epaint::TextShape::new(pos, galley, c).with_angle(-n.rotation.to_radians()));
         }
         return;
@@ -334,10 +322,3 @@ fn draw_content(painter: &Painter, sc: &mut Scene, n: &Node, a: f32) {
     }
 }
 
-/// Size of a text node's content at 100% zoom.
-pub fn measure_text(painter: &Painter, n: &Node) -> Vec2 {
-    let text = if n.text.is_empty() { " ".to_string() } else { n.text.clone() };
-    painter
-        .layout_no_wrap(text, FontId::new(n.font_size, font_family(n.font_weight)), Color32::BLACK)
-        .size()
-}

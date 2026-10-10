@@ -768,6 +768,8 @@ impl App {
             ui.separator();
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.set_max_width(ui.available_width());
+                // Never let a long label widen the panel.
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                 ui.spacing_mut().item_spacing.y = 6.0;
                 if self.sel.is_empty() {
                     self.page_props(ui);
@@ -1130,24 +1132,146 @@ impl App {
     }
 
     fn typography_section(&mut self, ui: &mut Ui, n: &crate::doc::Node) {
+        use crate::doc::{Decoration, LineHeight, TextAlign, TextCase, TextSizing, VAlign};
+        use crate::text::{families, weight_name, weights_for};
         heading(ui, "Typography");
-        ui.add_enabled(false, egui::Button::new("Inter").min_size(vec2(ui.available_width(), 22.0)));
-        let (mut size, mut weight) = (n.font_size, n.font_weight);
-        let mut changed = false;
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("weight").width(half(ui) - 12.0).selected_text(weight_name(weight)).show_ui(ui, |ui| {
-                for w in [400, 500, 600, 700] {
-                    changed |= ui.selectable_value(&mut weight, w, weight_name(w)).changed();
+        let mut t = n.clone();
+        // Font family picker with search.
+        let fam_id = ui.id().with("font-search");
+        let resp = ui.add_sized([ui.available_width(), 24.0], egui::Button::new(&t.font_family));
+        egui::Popup::menu(&resp).id(fam_id.with("popup")).show(|ui| {
+            ui.set_width(220.0);
+            let mut q: String = ui.data(|d| d.get_temp(fam_id)).unwrap_or_default();
+            ui.add(egui::TextEdit::singleline(&mut q).hint_text("Search fonts").desired_width(f32::INFINITY));
+            ui.data_mut(|d| d.insert_temp(fam_id, q.clone()));
+            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                let ql = q.to_lowercase();
+                for f in families().iter().filter(|f| f.to_lowercase().contains(&ql)).take(400) {
+                    if ui.selectable_label(*f == t.font_family, f).clicked() {
+                        t.font_family = f.clone();
+                        let ws = weights_for(f);
+                        if !ws.contains(&t.font_weight) {
+                            t.font_weight = *ws.iter().min_by_key(|w| (**w as i32 - 400).abs()).unwrap_or(&400);
+                        }
+                        ui.close();
+                    }
                 }
             });
-            changed |= num_field(ui, &mut size, "", 1.0, half(ui));
         });
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("weight").width(half(ui) - 12.0).selected_text(weight_name(t.font_weight)).show_ui(ui, |ui| {
+                for w in weights_for(&t.font_family) {
+                    ui.selectable_value(&mut t.font_weight, w, weight_name(w));
+                }
+            });
+            num_field(ui, &mut t.font_size, "", 1.0, half(ui));
+        });
+        // Line height: "Auto", px, or "%" typed into the field.
+        ui.horizontal(|ui| {
+            let lh_id = ui.id().with(("lh", n.id));
+            let shown = match t.line_height {
+                LineHeight::Auto => "Auto".to_string(),
+                LineHeight::Px(v) => num(v),
+                LineHeight::Percent(p) => format!("{}%", num(p)),
+            };
+            let mut buf: String = ui.data(|d| d.get_temp(lh_id)).unwrap_or(shown);
+            let r = ui.add_sized([half(ui), 22.0], egui::TextEdit::singleline(&mut buf).id(lh_id).hint_text("Line height"));
+            if r.has_focus() {
+                ui.data_mut(|d| d.insert_temp(lh_id, buf.clone()));
+            } else {
+                ui.data_mut(|d| d.remove::<String>(lh_id));
+            }
+            if r.lost_focus() {
+                let v = buf.trim();
+                t.line_height = if v.eq_ignore_ascii_case("auto") || v.is_empty() {
+                    LineHeight::Auto
+                } else if let Some(p) = v.strip_suffix('%').and_then(|p| p.trim().parse().ok()) {
+                    LineHeight::Percent(p)
+                } else if let Ok(px) = v.parse() {
+                    LineHeight::Px(px)
+                } else {
+                    t.line_height
+                };
+            }
+            r.on_hover_text("Line height: Auto, pixels, or percent");
+            let mut ls = t.letter_spacing;
+            if ui.add_sized([half(ui), 22.0], DragValue::new(&mut ls).speed(0.1).suffix("%").prefix("|A|  ").custom_formatter(|v, _| num(v as f32))).changed() {
+                t.letter_spacing = ls;
+            }
+        });
+        // Alignment and resizing.
+        ui.horizontal(|ui| {
+            for (a, icon) in [(TextAlign::Left, Icon::Align(Align::Left)), (TextAlign::Center, Icon::Align(Align::HCenter)), (TextAlign::Right, Icon::Align(Align::Right))] {
+                if icon_button(ui, icon, t.text_align == a, 24.0, &format!("Align {a:?}")).clicked() {
+                    t.text_align = a;
+                }
+            }
+            ui.add_space(6.0);
+            for (v, icon) in [(VAlign::Top, Icon::Align(Align::Top)), (VAlign::Middle, Icon::Align(Align::VCenter)), (VAlign::Bottom, Icon::Align(Align::Bottom))] {
+                if icon_button(ui, icon, t.text_valign == v, 24.0, &format!("Align {v:?}")).clicked() {
+                    t.text_valign = v;
+                    if t.text_sizing != TextSizing::Fixed {
+                        t.text_sizing = TextSizing::Fixed;
+                    }
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            let sizing = match t.text_sizing {
+                TextSizing::AutoWidth => "Auto width",
+                TextSizing::AutoHeight => "Auto height",
+                TextSizing::Fixed => "Fixed size",
+            };
+            egui::ComboBox::from_id_salt("text-sizing").width(half(ui) - 12.0).selected_text(sizing).show_ui(ui, |ui| {
+                ui.selectable_value(&mut t.text_sizing, TextSizing::AutoWidth, "Auto width");
+                ui.selectable_value(&mut t.text_sizing, TextSizing::AutoHeight, "Auto height");
+                ui.selectable_value(&mut t.text_sizing, TextSizing::Fixed, "Fixed size");
+            });
+            let case = match t.text_case {
+                TextCase::Original => "Aa  As typed",
+                TextCase::Upper => "AA  Upper",
+                TextCase::Lower => "aa  Lower",
+                TextCase::Title => "Aa  Title",
+            };
+            egui::ComboBox::from_id_salt("text-case").width(half(ui) - 12.0).selected_text(case).show_ui(ui, |ui| {
+                ui.selectable_value(&mut t.text_case, TextCase::Original, "As typed");
+                ui.selectable_value(&mut t.text_case, TextCase::Upper, "UPPER CASE");
+                ui.selectable_value(&mut t.text_case, TextCase::Lower, "lower case");
+                ui.selectable_value(&mut t.text_case, TextCase::Title, "Title Case");
+            });
+        });
+        ui.horizontal(|ui| {
+            for (d, label) in [(Decoration::Underline, RichText::new(" U ").underline()), (Decoration::Strikethrough, RichText::new(" S ").strikethrough())] {
+                let on = t.decoration == d;
+                if ui.selectable_label(on, label).on_hover_text(format!("{d:?}")).clicked() {
+                    t.decoration = if on { Decoration::None } else { d };
+                }
+            }
+        });
+        let changed = t.font_family != n.font_family
+            || t.font_weight != n.font_weight
+            || t.font_size != n.font_size
+            || t.line_height != n.line_height
+            || t.letter_spacing != n.letter_spacing
+            || t.text_align != n.text_align
+            || t.text_valign != n.text_valign
+            || t.text_sizing != n.text_sizing
+            || t.decoration != n.decoration
+            || t.text_case != n.text_case;
         if changed {
             self.begin_edit();
-            for &id in &self.sel {
-                let t = self.doc.node_mut(id);
-                t.font_size = size;
-                t.font_weight = weight;
+            for &id in &self.sel.clone() {
+                let d = self.doc.node_mut(id);
+                d.font_family = t.font_family.clone();
+                d.font_weight = t.font_weight;
+                d.font_size = t.font_size;
+                d.line_height = t.line_height;
+                d.letter_spacing = t.letter_spacing;
+                d.text_align = t.text_align;
+                d.text_valign = t.text_valign;
+                d.text_sizing = t.text_sizing;
+                d.decoration = t.decoration;
+                d.text_case = t.text_case;
             }
         }
     }
@@ -1317,11 +1441,3 @@ impl App {
     }
 }
 
-fn weight_name(w: u16) -> &'static str {
-    match w {
-        500 => "Medium",
-        600 => "Semi Bold",
-        700 => "Bold",
-        _ => "Regular",
-    }
-}

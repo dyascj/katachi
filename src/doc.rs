@@ -93,6 +93,57 @@ pub struct AutoLayout {
     pub cross: AxisAlign,
 }
 
+/// How a text box sizes itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TextSizing {
+    #[default]
+    AutoWidth,
+    AutoHeight,
+    Fixed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TextAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+    Justify,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum VAlign {
+    #[default]
+    Top,
+    Middle,
+    Bottom,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize)]
+pub enum LineHeight {
+    #[default]
+    Auto,
+    Px(f32),
+    Percent(f32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Decoration {
+    #[default]
+    None,
+    Underline,
+    Strikethrough,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TextCase {
+    #[default]
+    Original,
+    Upper,
+    Lower,
+    Title,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StrokeAlign {
     Inside,
@@ -282,6 +333,18 @@ pub struct Node {
     pub text: String,
     pub font_size: f32,
     pub font_weight: u16,
+    pub font_family: String,
+    pub text_sizing: TextSizing,
+    pub text_align: TextAlign,
+    pub text_valign: VAlign,
+    pub line_height: LineHeight,
+    /// Percent of the font size.
+    pub letter_spacing: f32,
+    pub decoration: Decoration,
+    pub text_case: TextCase,
+    /// Wrapped lines from the last layout, used by export.
+    #[serde(skip)]
+    pub lines: Vec<String>,
     pub expanded: bool,
 }
 
@@ -317,6 +380,15 @@ impl Default for Node {
             text: String::new(),
             font_size: 12.0,
             font_weight: 400,
+            font_family: "Inter".into(),
+            text_sizing: TextSizing::AutoWidth,
+            text_align: TextAlign::Left,
+            text_valign: VAlign::Top,
+            line_height: LineHeight::Auto,
+            letter_spacing: 0.0,
+            decoration: Decoration::None,
+            text_case: TextCase::Original,
+            lines: vec![],
             expanded: true,
         }
     }
@@ -1084,7 +1156,11 @@ fn merge_from(e: &mut Node, src: &Node) {
             }
         )*};
     }
-    take!(name, visible, opacity, fills, strokes, stroke_width, stroke_align, radius, clip, shadows, layout, sizing, constraints, absolute, points, closed, text, font_size, font_weight, rotation, component);
+    take!(
+        name, visible, opacity, fills, strokes, stroke_width, stroke_align, radius, clip, shadows, layout, sizing, constraints, absolute,
+        points, closed, text, font_size, font_weight, font_family, text_sizing, text_align, text_valign, line_height, letter_spacing,
+        decoration, text_case, rotation, component
+    );
     e.synced = Some(Box::new(Node { children: vec![], synced: None, ..src.clone() }));
 }
 

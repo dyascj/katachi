@@ -428,6 +428,15 @@ fn shots() {
     h.state_mut().left_tab_assets = true;
     h.run_steps(3);
     save(&mut h, "8-assets");
+    // Typography: the title in a system font, selected.
+    let st = h.state_mut();
+    st.left_tab_assets = false;
+    let title = *st.doc.nodes.keys().find(|i| st.doc.node(**i).name == "Title").unwrap();
+    st.doc.node_mut(title).font_family = "Georgia".into();
+    st.doc.node_mut(title).letter_spacing = -2.0;
+    st.sel = vec![title];
+    h.run_steps(5);
+    save(&mut h, "9-typography");
 }
 
 #[test]
@@ -529,4 +538,35 @@ fn components_instances_via_shortcuts() {
     assert_eq!(h.state().sel, vec![inst]);
     key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::B);
     assert_eq!(h.state().doc.node(inst).kind, Kind::Frame);
+}
+
+#[test]
+fn text_wraps_aligns_and_spaces_lines() {
+    use crate::doc::{LineHeight, TextAlign, TextSizing};
+    let mut h = harness();
+    let mut n = Node::new(Kind::Text, r(0., 0., 60., 10.));
+    n.text = "alpha beta gamma delta".into();
+    n.font_size = 12.0;
+    n.text_sizing = TextSizing::AutoHeight;
+    n.line_height = LineHeight::Px(20.0);
+    n.text_align = TextAlign::Center;
+    let id = h.state_mut().doc.insert(0, None, None, n);
+    h.run_steps(3);
+    let t = h.state().doc.node(id).clone();
+    assert_eq!(t.rect.width(), 60.0, "auto height keeps width");
+    assert!(t.lines.len() >= 3, "wrapped into lines: {:?}", t.lines);
+    assert_eq!(t.rect.height(), 20.0 * t.lines.len() as f32, "line height drives box height");
+    let svg = crate::export::to_svg(&h.state().doc, &[id]);
+    assert!(svg.contains(r#"text-anchor="middle""#) && svg.contains(r#"x="30""#), "{svg}");
+    // Dragging the text tool makes a fixed box and starts editing.
+    key(&mut h, Modifiers::NONE, Key::T);
+    let (a, b) = (s(&h, 200., 0.), s(&h, 300., 80.));
+    drag(&mut h, a, b, Modifiers::NONE);
+    let t2 = h.state().sel[0];
+    assert_eq!(h.state().doc.node(t2).text_sizing, TextSizing::Fixed);
+    assert_eq!(rect(&h, t2), r(200., 0., 100., 80.));
+    assert_eq!(h.state().editing_text, Some(t2));
+    h.event(Event::Text("Hi".into()));
+    h.run_steps(2);
+    assert_eq!(rect(&h, t2), r(200., 0., 100., 80.), "fixed boxes keep their size");
 }
