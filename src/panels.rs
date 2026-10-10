@@ -1690,24 +1690,39 @@ impl App {
             } else {
                 // A layer inside a component: bind one of its properties.
                 let props = self.doc.props_of(o);
-                let target = match n.kind {
-                    Kind::Text => PropTarget::Text,
-                    Kind::Instance => PropTarget::Swap,
-                    _ => PropTarget::Visible,
-                };
-                let fits = |p: &CompProp| matches!((&p.default, target), (PropValue::Bool(_), PropTarget::Visible) | (PropValue::Text(_), PropTarget::Text) | (PropValue::Swap(_), PropTarget::Swap) | (PropValue::Bool(_), _));
+                // One row per thing a property can drive here: visibility always, plus text or the swap.
+                let mut targets = vec![PropTarget::Visible];
+                match n.kind {
+                    Kind::Text => targets.insert(0, PropTarget::Text),
+                    Kind::Instance => targets.push(PropTarget::Swap),
+                    _ => {}
+                }
+                let fits = |p: &CompProp, t: PropTarget| matches!((&p.default, t), (PropValue::Bool(_), PropTarget::Visible) | (PropValue::Text(_), PropTarget::Text) | (PropValue::Swap(_), PropTarget::Swap));
                 let mut bind = n.prop_bind.clone();
-                ui.horizontal(|ui| {
-                    ui.label("Property");
-                    let shown = bind.as_ref().map_or("None".to_string(), |(nm, _)| nm.clone());
-                    egui::ComboBox::from_id_salt(("bind", id)).selected_text(shown).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut bind, None, "None");
-                        for p in props.iter().filter(|p| fits(p)) {
-                            let t = if matches!(p.default, PropValue::Bool(_)) { PropTarget::Visible } else { target };
-                            ui.selectable_value(&mut bind, Some((p.name.clone(), t)), &p.name);
-                        }
+                for t in targets {
+                    let label = match t {
+                        PropTarget::Text => "Text",
+                        PropTarget::Visible => "Visible",
+                        PropTarget::Swap => "Swap",
+                    };
+                    let mut cur: Option<String> = bind.iter().find(|(_, bt)| *bt == t).map(|(nm, _)| nm.clone());
+                    let before = cur.clone();
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        egui::ComboBox::from_id_salt(("bind", id, label)).selected_text(cur.clone().unwrap_or_else(|| "None".into())).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut cur, None, "None");
+                            for p in props.iter().filter(|p| fits(p, t)) {
+                                ui.selectable_value(&mut cur, Some(p.name.clone()), &p.name);
+                            }
+                        });
                     });
-                });
+                    if cur != before {
+                        bind.retain(|(_, bt)| *bt != t);
+                        if let Some(nm) = cur {
+                            bind.push((nm, t));
+                        }
+                    }
+                }
                 if bind != n.prop_bind {
                     self.checkpoint();
                     self.doc.node_mut(id).prop_bind = bind;

@@ -321,7 +321,7 @@ pub fn to_document(fig: &FigFile) -> Result<Document, String> {
                 n.comp_props.push(CompProp { name: d.s("name").unwrap_or("").to_string(), default });
             }
         }
-        n.prop_bind = v.arr("componentPropRefs").iter().filter(|r| r.b("isDeleted") != Some(true)).find_map(|r| {
+        n.prop_bind = v.arr("componentPropRefs").iter().filter(|r| r.b("isDeleted") != Some(true)).filter_map(|r| {
             let target = match r.s("componentPropNodeField")? {
                 "TEXT_DATA" => PropTarget::Text,
                 "VISIBLE" => PropTarget::Visible,
@@ -329,7 +329,7 @@ pub fn to_document(fig: &FigFile) -> Result<Document, String> {
                 _ => return None,
             };
             Some((defs.get(&guid(r.get("defID"))?)?.0.clone(), target))
-        });
+        }).collect();
         props.assign(n, v.arr("componentPropAssignments"));
     }
     doc.reflow();

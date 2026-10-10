@@ -263,6 +263,20 @@ pub enum PropTarget {
     Swap,
 }
 
+/// Property bindings were one optional pair in older files; now a layer can have several.
+fn one_or_many_binds<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<(String, PropTarget)>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Binds {
+        One(Option<(String, PropTarget)>),
+        Many(Vec<(String, PropTarget)>),
+    }
+    Ok(match Binds::deserialize(d)? {
+        Binds::One(o) => o.into_iter().collect(),
+        Binds::Many(v) => v,
+    })
+}
+
 /// Parse "Size=Large, State=Hover" into ordered pairs.
 pub fn variant_pairs(name: &str) -> Vec<(String, String)> {
     name.split(',')
@@ -1124,7 +1138,8 @@ pub struct Node {
     /// Components and sets: property definitions.
     pub comp_props: Vec<CompProp>,
     /// A layer inside a component bound to a property.
-    pub prop_bind: Option<(String, PropTarget)>,
+    #[serde(deserialize_with = "one_or_many_binds")]
+    pub prop_bind: Vec<(String, PropTarget)>,
     /// Instances: chosen property values (missing = the default).
     pub prop_values: Vec<(String, PropValue)>,
     /// Instances: the main component they copy.
@@ -1212,7 +1227,7 @@ impl Default for Node {
             text_style: None,
             effect_style: None,
             comp_props: vec![],
-            prop_bind: None,
+            prop_bind: vec![],
             prop_values: vec![],
             component: None,
             source: None,
@@ -1856,27 +1871,50 @@ impl Document {
         if comp == inst || self.is_ancestor(inst, comp) {
             return;
         }
+        // An instance nested inside another instance is a copy its outer instance keeps in step;
+        // it only syncs from its own component once swapped to a different one.
+        let outer = self.nodes[&inst].source.filter(|s| *s != comp).and_then(|s| self.nodes.get(&s)).filter(|s| s.kind == Kind::Instance).map(|s| s.component);
+        if outer == Some(Some(comp)) {
+            self.apply_instance_props(inst);
+            return;
+        }
+        let nested = outer.is_some();
         let page = self.page_of(inst);
         let mut c = self.nodes[&comp].clone();
         // Instances of a variant are named after the component set, as in Figma.
         if let Some(set) = c.parent.map(|p| &self.nodes[&p]).filter(|p| p.kind == Kind::ComponentSet) {
             c.name = set.name.clone();
         }
+        // Nested instances that were swapped own their subtree; leave it to their own sync.
+        let swapped: std::collections::HashSet<NodeId> = self
+            .descendants(inst)
+            .into_iter()
+            .filter(|&d| {
+                let n = &self.nodes[&d];
+                n.kind == Kind::Instance && n.source.and_then(|s| self.nodes.get(&s)).is_some_and(|s| s.kind == Kind::Instance && s.component != n.component)
+            })
+            .collect();
+        let under_swapped = |doc: &Document, d: NodeId| doc.ancestors(d).iter().take_while(|a| **a != inst).any(|a| swapped.contains(a));
         // Instance layers by the component layer they mirror.
         let mut by_source: HashMap<NodeId, NodeId> = HashMap::new();
         for d in self.descendants(inst) {
-            if let Some(s) = self.nodes[&d].source {
+            if let Some(s) = self.nodes[&d].source
+                && !under_swapped(self, d)
+            {
                 by_source.entry(s).or_insert(d);
             }
         }
         // Root: merge appearance, keep placement; size follows the main unless resized.
+        // A swapped nested instance keeps its own place, size, and visibility (its outer instance sets them).
         let target_size = {
             let n = &self.nodes[&inst];
             let snap = n.synced.as_deref();
-            if snap.is_none_or(|s| s.rect.size() == n.rect.size()) { c.rect.size() } else { n.rect.size() }
+            if !nested && snap.is_none_or(|s| s.rect.size() == n.rect.size()) { c.rect.size() } else { n.rect.size() }
         };
         let actual = Rect::from_min_size(self.nodes[&inst].rect.min, target_size);
-        merge_from(self.node_mut(inst), &c);
+        if !nested {
+            merge_from(self.node_mut(inst), &c);
+        }
         self.node_mut(inst).rect = Rect::from_min_size(actual.min, c.rect.size());
         let offset = actual.min - c.rect.min;
         // Children, in component order.
@@ -1884,7 +1922,15 @@ impl Document {
         let mut order: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
         for cid in self.descendants(comp) {
             let src = self.nodes[&cid].clone();
-            let parent = if src.parent == Some(comp) { inst } else { by_source[&src.parent.unwrap()] };
+            let parent = if src.parent == Some(comp) {
+                inst
+            } else {
+                // Layers inside a swapped nested instance belong to it.
+                match src.parent.and_then(|p| by_source.get(&p)).copied() {
+                    Some(p) if !swapped.contains(&p) => p,
+                    _ => continue,
+                }
+            };
             let id = match by_source.get(&cid) {
                 Some(&e) => {
                     merge_from(self.node_mut(e), &src);
@@ -1914,7 +1960,7 @@ impl Document {
             order.entry(parent).or_default().push(id);
         }
         for d in self.descendants(inst) {
-            if !keep.contains(&d) && self.nodes.get(&d).is_some_and(|n| n.source.is_some()) {
+            if !keep.contains(&d) && self.nodes.get(&d).is_some_and(|n| n.source.is_some()) && !under_swapped(self, d) {
                 self.remove(d);
             }
         }
@@ -1986,14 +2032,17 @@ impl Document {
         }
         let values = self.nodes[&inst].prop_values.clone();
         let value = |name: &str| values.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone()).or_else(|| props.iter().find(|p| p.name == name).map(|p| p.default.clone()));
-        for d in self.descendants(inst) {
-            let Some((name, target)) = self.nodes[&d].prop_bind.clone() else { continue };
-            let n = self.node_mut(d);
-            match (target, value(&name)) {
-                (PropTarget::Visible, Some(PropValue::Bool(b))) => n.visible = b,
-                (PropTarget::Text, Some(PropValue::Text(t))) => n.text = t,
-                (PropTarget::Swap, Some(PropValue::Swap(c))) => n.component = Some(c),
-                _ => {}
+        // Only this instance's own layers: ones inside a nested instance follow that instance's properties.
+        let own: Vec<NodeId> = self.descendants(inst).into_iter().filter(|&d| !self.ancestors(d).iter().take_while(|a| **a != inst).any(|a| self.nodes[a].kind == Kind::Instance)).collect();
+        for d in own {
+            for (name, target) in self.nodes[&d].prop_bind.clone() {
+                let n = self.node_mut(d);
+                match (target, value(&name)) {
+                    (PropTarget::Visible, Some(PropValue::Bool(b))) => n.visible = b,
+                    (PropTarget::Text, Some(PropValue::Text(t))) => n.text = t,
+                    (PropTarget::Swap, Some(PropValue::Swap(c))) => n.component = Some(c),
+                    _ => {}
+                }
             }
         }
     }
@@ -2854,6 +2903,16 @@ mod tests {
     }
 
     #[test]
+    fn older_files_with_one_property_binding_still_load() {
+        let old: Node = serde_json::from_str(r#"{"prop_bind":["Label","Text"]}"#).unwrap();
+        assert_eq!(old.prop_bind, vec![("Label".to_string(), PropTarget::Text)]);
+        let none: Node = serde_json::from_str(r#"{"prop_bind":null}"#).unwrap();
+        assert!(none.prop_bind.is_empty());
+        let many: Node = serde_json::from_str(r#"{"prop_bind":[["Show","Visible"],["Icon","Swap"]]}"#).unwrap();
+        assert_eq!(many.prop_bind.len(), 2);
+    }
+
+    #[test]
     fn component_sets_grow_to_hold_their_variants() {
         let mut d = Document::default();
         let set = d.insert(0, None, None, Node::new(Kind::ComponentSet, r(0., 0., 100., 100.)));
@@ -3179,9 +3238,9 @@ mod tests {
         ];
         for c in [a, b] {
             let lbl = d.node(c).children[1];
-            d.node_mut(lbl).prop_bind = Some(("Label".into(), PropTarget::Text));
+            d.node_mut(lbl).prop_bind = vec![("Label".into(), PropTarget::Text)];
             let bg = d.node(c).children[0];
-            d.node_mut(bg).prop_bind = Some(("Show label".into(), PropTarget::Visible));
+            d.node_mut(bg).prop_bind = vec![("Show label".into(), PropTarget::Visible)];
         }
         let j = d.instantiate(a, 0, None, None, pos2(0., 300.));
         let kids = d.node(j).children.clone();

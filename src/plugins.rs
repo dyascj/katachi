@@ -332,7 +332,7 @@ mod tests {
         assert_eq!((btn.layout.mode, btn.layout.padding, btn.layout.gap, btn.sizing), (LayoutMode::Horizontal, [8., 16., 8., 16.], 8., [Sizing::Hug, Sizing::Hug]));
         assert_eq!(btn.fills[0].color, Rgba::rgb(0x8E, 0x72, 0xFF), "paint style applied");
         assert_eq!(btn.comp_props[0].name, "Label");
-        assert_eq!(d.node(btn.children[0]).prop_bind, Some(("Label".to_string(), PropTarget::Text)));
+        assert_eq!(d.node(btn.children[0]).prop_bind, vec![("Label".to_string(), PropTarget::Text)]);
         // Variable bindings resolve in the frame's explicit mode.
         let card = d.node(id("card"));
         assert!(card.bindings.contains(&(Bindable::Gap, bg.id + 1)) || card.bindings.iter().any(|(b, _)| *b == Bindable::Gap));
@@ -423,6 +423,45 @@ mod tests {
         "#).unwrap();
         let b = d.nodes.values().find(|n| n.name == "Board").unwrap();
         assert_eq!(b.sizing, [crate::doc::Sizing::Hug; 2], "{:?}", b.rect);
+    }
+
+    #[test]
+    fn nested_instances_keep_overrides_and_swap_cleanly() {
+        let mut d = Document::default();
+        let out = run(&mut d, 0, &[], r#"
+            const a = figma.createComponent(); a.name = "Icon/a"; a.resize(24, 24);
+            const ra = figma.createRectangle(); ra.name = "A shape"; a.appendChild(ra); ra.resize(24, 24);
+            ra.constraints = { horizontal: "SCALE", vertical: "SCALE" };
+            const b = figma.createComponent(); b.name = "Icon/b"; b.resize(24, 24); b.x = 50;
+            const eb = figma.createEllipse(); eb.name = "B shape"; b.appendChild(eb); eb.resize(24, 24);
+            eb.constraints = { horizontal: "SCALE", vertical: "SCALE" };
+            const btn = figma.createComponent(); btn.name = "Button"; btn.x = 100; btn.resize(80, 30);
+            const ic = a.createInstance(); btn.appendChild(ic); ic.resize(16, 16); ic.name = "Icon"; ic.visible = false;
+            btn.addComponentProperty("Show icon", "BOOLEAN", false);
+            btn.addComponentProperty("Icon", "INSTANCE_SWAP", a.id);
+            ic.componentPropertyReferences = { visible: "Show icon", mainComponent: "Icon" };
+            const plain = btn.createInstance(); plain.y = 100;
+            const swapped = btn.createInstance(); swapped.y = 200;
+            swapped.setProperties({ "Show icon": true, Icon: b.id });
+            return { plain, swapped, b };
+        "#).unwrap();
+        let r: serde_json::Value = serde_json::from_str(out.result.as_deref().unwrap()).unwrap();
+        let id = |k: &str| r[k]["id"].as_str().unwrap().parse::<NodeId>().unwrap();
+        let icon_of = |d: &Document, i: NodeId| d.node(d.node(i).children[0]).clone();
+        let plain = icon_of(&d, id("plain"));
+        assert!(!plain.visible, "Show icon defaults off in instances");
+        assert_eq!(plain.rect.size(), vec2(16., 16.));
+        let sw = icon_of(&d, id("swapped"));
+        assert!(sw.visible);
+        assert_eq!(sw.component, Some(id("b")));
+        assert_eq!(sw.rect.size(), vec2(16., 16.), "a swap keeps the instance's size");
+        assert_eq!(d.node(sw.children[0]).name, "B shape");
+        assert_eq!(d.node(sw.children[0]).rect.size(), vec2(16., 16.), "swapped layers scale to fit");
+        let count = d.nodes.len();
+        d.reflow();
+        d.reflow();
+        assert_eq!(d.nodes.len(), count, "no layers churn between reflows");
+        assert_eq!(icon_of(&d, id("swapped")).component, Some(id("b")));
     }
 }
 

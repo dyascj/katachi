@@ -379,13 +379,20 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
     }
     v["boundVariables"] = Value::Object(bv);
     v["explicitVariableModes"] = Value::Object(n.modes.iter().map(|(c, m)| (format!("VariableCollectionId:{c}"), json!(format!("{c}:{m}")))).collect());
-    if let Some((name, t)) = &n.prop_bind {
-        let field = match t {
-            PropTarget::Text => "characters",
-            PropTarget::Visible => "visible",
-            PropTarget::Swap => "mainComponent",
-        };
-        v["componentPropertyReferences"] = json!({ field: name });
+    if !n.prop_bind.is_empty() {
+        let refs: serde_json::Map<String, Value> = n
+            .prop_bind
+            .iter()
+            .map(|(name, t)| {
+                let field = match t {
+                    PropTarget::Text => "characters",
+                    PropTarget::Visible => "visible",
+                    PropTarget::Swap => "mainComponent",
+                };
+                (field.to_string(), json!(name))
+            })
+            .collect();
+        v["componentPropertyReferences"] = Value::Object(refs);
     }
     if n.kind.is_frame() {
         let l = n.layout;
@@ -1089,13 +1096,10 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
     if changed("componentPropertyReferences") {
         let r = &v["componentPropertyReferences"];
         let plain = |s: &str| s.split('#').next().unwrap_or(s).to_string();
-        n.prop_bind = if let Some(p) = r["characters"].as_str() {
-            Some((plain(p), PropTarget::Text))
-        } else if let Some(p) = r["visible"].as_str() {
-            Some((plain(p), PropTarget::Visible))
-        } else {
-            r["mainComponent"].as_str().map(|p| (plain(p), PropTarget::Swap))
-        };
+        n.prop_bind = [("characters", PropTarget::Text), ("visible", PropTarget::Visible), ("mainComponent", PropTarget::Swap)]
+            .into_iter()
+            .filter_map(|(k, t)| r[k].as_str().map(|p| (plain(p), t)))
+            .collect();
     }
 }
 
