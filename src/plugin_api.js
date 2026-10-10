@@ -396,7 +396,19 @@ const figma = {
   base64Encode() { throw new Error("base64Encode isn't supported"); },
 };
 
-function __load(page) {
+function __page(name, id, loaded) {
+  const p = Object.setPrototypeOf({ type: "PAGE", id, name, children: [], __loaded: loaded }, __NodeProto);
+  let sel = [];
+  Object.defineProperty(p, "selection", { get() { return sel; }, set(v) { sel = [...v]; }, configurable: true, enumerable: false });
+  return p;
+}
+let __currentPage = null;
+Object.defineProperty(figma, "currentPage", { get() { return __currentPage; }, set(p) { __currentPage = p; }, configurable: true });
+figma.setCurrentPageAsync = (p) => { __currentPage = p; return Promise.resolve(); };
+figma.loadAllPagesAsync = () => Promise.resolve();
+figma.createPage = () => { const p = __page("Page " + (figma.root.children.length + 1), "page:" + __newid(), true); figma.root.children.push(p); p.parent = figma.root; return p; };
+
+function __load(snap) {
   __nodes.clear();
   const link = (raw, parent) => {
     const n = __link(raw);
@@ -404,32 +416,37 @@ function __load(page) {
     if (raw.children) n.children = raw.children.map(c => link(c, n));
     return n;
   };
-  const p = { type: "PAGE", id: "page", name: page.name, children: [] };
-  Object.setPrototypeOf(p, __NodeProto);
-  p.children = page.children.map(c => link(c, p));
-  let sel = page.selection.map(id => __nodes.get(id)).filter(Boolean);
-  Object.defineProperty(p, "selection", { get() { return sel; }, set(v) { sel = [...v]; }, configurable: true });
-  figma.currentPage = p;
-  figma.root = { type: "DOCUMENT", name: "Document", children: [p] };
-  __styles = page.styles.map(s => Object.setPrototypeOf(s, __StyleProto));
-  __collections = page.collections.map(c => Object.setPrototypeOf(c, __CollectionProto));
-  __variables = page.variables.map(v => Object.setPrototypeOf(v, __VariableProto));
-  __fonts = page.fonts || __fonts;
+  const root = Object.setPrototypeOf({ type: "DOCUMENT", id: "0:0", name: "Document", children: [] }, __NodeProto);
+  root.children = snap.pages.map((pg, i) => {
+    const p = __page(pg.name, "page:" + i, pg.loaded);
+    p.parent = root;
+    p.children = pg.children.map(c => link(c, p));
+    return p;
+  });
+  figma.root = root;
+  __currentPage = root.children[snap.current];
+  __currentPage.selection = snap.selection.map(id => __nodes.get(id)).filter(Boolean);
+  __styles = snap.styles.map(s => Object.setPrototypeOf(s, __StyleProto));
+  __collections = snap.collections.map(c => Object.setPrototypeOf(c, __CollectionProto));
+  __variables = snap.variables.map(v => Object.setPrototypeOf(v, __VariableProto));
+  __fonts = snap.fonts || __fonts;
 }
 
 function __collect() {
   const out = [];
-  const walk = (n, parentId) => {
+  const walk = (n, parentId, page) => {
     for (const c of n.children || []) {
       const { parent, children, ...rest } = c;
-      out.push(Object.assign(rest, { parentId, childIds: children ? children.map(k => k.id) : null }));
-      walk(c, c.id);
+      out.push(Object.assign(rest, { parentId, page, childIds: children ? children.map(k => k.id) : null }));
+      walk(c, c.id, page);
     }
   };
-  walk(figma.currentPage, null);
+  figma.root.children.forEach((p, i) => walk(p, null, i));
   return JSON.stringify({
-    nodes: out, top: figma.currentPage.children.map(c => c.id), removed: __removed, notes: __notes,
-    selection: figma.currentPage.selection.map(n => n.id), closed: __closed, errors: __errors, outbox: __outbox, ui: __ui,
+    nodes: out, removed: __removed, notes: __notes,
+    pages: figma.root.children.map(p => ({ id: p.id, name: p.name, loaded: p.__loaded !== false, top: p.children.map(c => c.id) })),
+    current: Math.max(0, figma.root.children.indexOf(__currentPage)),
+    selection: __currentPage.selection.map(n => n.id), closed: __closed, errors: __errors, outbox: __outbox, ui: __ui,
     storage: JSON.stringify(__storage), result: __result === undefined ? null : JSON.stringify(__plain(__result)),
     styles: __styles, collections: __collections.map(c => ({ id: c.id, name: c.name, modes: c.modes })), variables: __variables,
     removedStyles: __removedStyles, removedVariables: __removedVariables, removedCollections: __removedCollections,

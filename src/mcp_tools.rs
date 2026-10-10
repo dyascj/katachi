@@ -208,6 +208,9 @@ impl App {
                     }
                 };
                 self.keep_changes(before);
+                if out.page != self.page {
+                    self.select_page(out.page);
+                }
                 self.sel = out.selection.clone();
                 self.fit_all_texts(ctx);
                 let mut msg = String::new();

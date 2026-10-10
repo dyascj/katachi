@@ -1341,6 +1341,9 @@ impl App {
         match res {
             Ok(out) => {
                 self.keep_changes(before);
+                if out.page != self.page {
+                    self.select_page(out.page);
+                }
                 self.sel = out.selection.clone();
                 if let Some(n) = out.notes.last() {
                     self.toast(n.clone());

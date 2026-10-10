@@ -528,8 +528,8 @@ fn var_value_json(v: &VarValue) -> Value {
     }
 }
 
-/// The current page, styles, and variables as Figma-shaped JSON.
-pub fn snapshot(doc: &Document, page: usize, sel: &[NodeId]) -> Value {
+/// Pages (the current one, or all of them), styles, and variables as Figma-shaped JSON.
+pub fn snapshot(doc: &Document, page: usize, sel: &[NodeId], all_pages: bool) -> Value {
     fn tree(doc: &Document, id: NodeId) -> Value {
         let mut v = node_json(doc, id);
         let n = doc.node(id);
@@ -538,10 +538,12 @@ pub fn snapshot(doc: &Document, page: usize, sel: &[NodeId]) -> Value {
         }
         v
     }
-    let p = &doc.pages[page];
     json!({
-        "name": p.name,
-        "children": p.children.iter().map(|&c| tree(doc, c)).collect::<Vec<_>>(),
+        "pages": doc.pages.iter().enumerate().map(|(i, p)| {
+            let loaded = all_pages || i == page;
+            json!({ "name": p.name, "loaded": loaded, "children": if loaded { p.children.iter().map(|&c| tree(doc, c)).collect::<Vec<_>>() } else { vec![] } })
+        }).collect::<Vec<_>>(),
+        "current": page,
         "selection": sel.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         "styles": doc.styles.iter().map(style_json).collect::<Vec<_>>(),
         "collections": doc.collections.iter().map(|c| json!({
@@ -1070,9 +1072,25 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
 }
 
 /// Apply a plugin run's collected changes. Returns plugin ids -> Katachi ids.
-pub fn apply(doc: &mut Document, page: usize, out: &Value) -> HashMap<String, NodeId> {
+pub fn apply(doc: &mut Document, out: &Value) -> HashMap<String, NodeId> {
     let mut refs = Refs::default();
     apply_styles_and_variables(doc, out, &mut refs);
+    // Pages: existing ones keep their index ("page:i"); new ones are added at the end.
+    let out_pages = out["pages"].as_array().cloned().unwrap_or_default();
+    let mut page_of: Vec<usize> = vec![];
+    for p in &out_pages {
+        let name = p["name"].as_str().unwrap_or("Page").to_string();
+        let i = match p["id"].as_str().and_then(|s| s.strip_prefix("page:")).and_then(|s| s.parse::<usize>().ok()).filter(|i| *i < doc.pages.len()) {
+            Some(i) => i,
+            None => {
+                doc.pages.push(Page { name: name.clone(), children: vec![], background: PAGE_BG, flows: vec![] });
+                doc.pages.len() - 1
+            }
+        };
+        doc.pages[i].name = name;
+        page_of.push(i);
+    }
+    let page_for = |v: &Value| v["page"].as_u64().and_then(|i| page_of.get(i as usize).copied()).unwrap_or(0);
     let nodes = out["nodes"].as_array().cloned().unwrap_or_default();
     let by_id: HashMap<&str, &Value> = nodes.iter().filter_map(|v| Some((v["id"].as_str()?, v))).collect();
     // Bases: how each existing layer looked before this run.
@@ -1096,6 +1114,7 @@ pub fn apply(doc: &mut Document, page: usize, out: &Value) -> HashMap<String, No
         }
         let ty = v["type"].as_str().unwrap_or("RECTANGLE");
         let name = v["name"].as_str().unwrap_or("").to_string();
+        let page = page_for(v);
         let id = if let Some(svg) = v["__svg"].as_str() {
             match crate::svg_import::import(doc, svg.as_bytes(), &name, page, None, Pos2::ZERO) {
                 Ok((f, images)) => {
@@ -1133,16 +1152,20 @@ pub fn apply(doc: &mut Document, page: usize, out: &Value) -> HashMap<String, No
         refs.nodes.insert(jid.clone(), id);
         fresh.push(jid);
     }
-    // Structure: page order, then each container's children.
-    let top: Vec<NodeId> = out["top"].as_array().into_iter().flatten().filter_map(|v| refs.nodes.get(v.as_str()?).copied()).collect();
+    // Structure: each loaded page's order, then each container's children.
     // Layers that change parent take the script's x/y relative to the new one, as in Figma.
     let mut moved: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
-    for (i, &id) in top.iter().enumerate() {
-        if doc.node(id).parent.is_some() || doc.index_in_parent(id) != i {
-            if doc.node(id).parent.is_some() {
-                moved.insert(id);
+    for (p, &page) in out_pages.iter().zip(&page_of) {
+        let top: Vec<NodeId> = p["top"].as_array().into_iter().flatten().filter_map(|v| refs.nodes.get(v.as_str()?).copied()).collect();
+        let loaded = p["loaded"].as_bool().unwrap_or(true);
+        for (i, &id) in top.iter().enumerate() {
+            let here = doc.node(id).parent.is_none() && doc.page_of(id) == page;
+            if !here || (loaded && doc.index_in_parent(id) != i) {
+                if doc.node(id).parent.is_some() {
+                    moved.insert(id);
+                }
+                doc.reparent(id, page, None, Some(if loaded { i } else { doc.pages[page].children.len() }));
             }
-            doc.reparent(id, page, None, Some(i));
         }
     }
     for v in &nodes {
@@ -1157,6 +1180,7 @@ pub fn apply(doc: &mut Document, page: usize, out: &Value) -> HashMap<String, No
                 if doc.node(c).parent != Some(id) {
                     moved.insert(c);
                 }
+                let page = doc.page_of(id);
                 doc.reparent(c, page, Some(id), Some(i));
             }
         }

@@ -16,6 +16,8 @@ pub struct Outcome {
     /// The UI the plugin wants shown, if any.
     pub ui: Option<UiRequest>,
     pub closed: bool,
+    /// The page the plugin left current.
+    pub page: usize,
     /// What the code returned (JSON), with new layers' ids filled in.
     pub result: Option<String>,
 }
@@ -34,6 +36,7 @@ pub struct Session {
     ctx: rquickjs::Context,
     pub name: String,
     storage: Option<(std::path::PathBuf, String)>,
+    all_pages: bool,
 }
 
 impl Session {
@@ -49,7 +52,9 @@ impl Session {
             let saved = std::fs::read_to_string(&path).unwrap_or_else(|_| "{}".into());
             (path, saved)
         });
-        let mut s = Session { rt, ctx, name: name.to_string(), storage };
+        // Other pages load only for small documents or plugins that ask for them (like Figma's dynamic pages).
+        let all_pages = doc.nodes.len() < 20_000 || code.contains("loadAllPagesAsync") || code.contains("figma.root");
+        let mut s = Session { rt, ctx, name: name.to_string(), storage, all_pages };
         let init = format!(
             "globalThis.__html__ = {}; __storage = {};",
             serde_json::to_string(html.unwrap_or("")).unwrap_or_default(),
@@ -87,7 +92,7 @@ impl Session {
 
     /// Load the page into JS, run `js`, settle promises, and apply the changes.
     fn step(&mut self, doc: &mut Document, page: usize, sel: &[NodeId], js: &str) -> Result<Outcome, String> {
-        let snap = crate::plugin_doc::snapshot(doc, page, sel).to_string();
+        let snap = crate::plugin_doc::snapshot(doc, page, sel, self.all_pages).to_string();
         self.eval(&format!("__reset(); __load({snap});"))?;
         self.eval(js)?;
         for _ in 0..100_000 {
@@ -111,7 +116,7 @@ impl Session {
             let _ = crate::files::write_atomic(path, now.as_bytes());
             *saved = now.to_string();
         }
-        let ids = crate::plugin_doc::apply(doc, page, &out);
+        let ids = crate::plugin_doc::apply(doc, &out);
         let strings = |k: &str| out[k].as_array().map(|a| a.iter().filter_map(|n| n.as_str().map(String::from)).collect()).unwrap_or_default();
         let ui = out["ui"].as_object().map(|u| UiRequest {
             html: u.get("html").and_then(|h| h.as_str()).unwrap_or("").to_string(),
@@ -130,6 +135,7 @@ impl Session {
             r
         });
         Ok(Outcome {
+            page: out["current"].as_u64().map_or(page, |p| p as usize).min(doc.pages.len().saturating_sub(1)),
             result,
             notes: strings("notes"),
             selection: out["selection"].as_array().into_iter().flatten().filter_map(|v| ids.get(v.as_str()?).copied()).collect(),
@@ -355,4 +361,32 @@ mod tests {
         "#).unwrap();
         assert_eq!(out.result.as_deref(), Some(r#"["bg/surface",28,"Button","HORIZONTAL","AUTO"]"#));
     }
+
+    #[test]
+    fn pages_hold_components_used_elsewhere() {
+        let mut d = Document::default();
+        let out = run(&mut d, 0, &[], r#"
+            const home = figma.currentPage;
+            home.name = "Screens";
+            const comps = figma.createPage();
+            comps.name = "Components";
+            await figma.setCurrentPageAsync(comps);
+            const c = figma.createComponent(); c.name = "Btn";
+            await figma.setCurrentPageAsync(home);
+            const i = c.createInstance(); i.x = 50;
+            figma.currentPage = comps;
+            return { pages: figma.root.children.map(p => p.name), c, i };
+        "#).unwrap();
+        let names: Vec<&str> = d.pages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["Screens", "Components"]);
+        let r: serde_json::Value = serde_json::from_str(out.result.as_deref().unwrap()).unwrap();
+        let id = |k: &str| r[k]["id"].as_str().unwrap().parse::<NodeId>().unwrap();
+        assert_eq!((d.page_of(id("c")), d.page_of(id("i"))), (1, 0));
+        assert_eq!(d.node(id("i")).component, Some(id("c")));
+        assert_eq!(out.page, 1, "the script left Components current");
+        // The next run sees both pages.
+        let out = run(&mut d, 1, &[], "return figma.root.findAll(n => n.type === 'INSTANCE').length").unwrap();
+        assert_eq!(out.result.as_deref(), Some("1"));
+    }
 }
+
