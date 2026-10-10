@@ -205,10 +205,27 @@ impl App {
 
     /// Text boxes hug their content per their sizing mode; fonts load on demand.
     fn fit_texts(&mut self, painter: &Painter) {
-        // Only this page's text, and only layers whose text inputs changed since last measured.
-        // ponytail: other pages measure when visited; export of an unvisited page wraps on newlines only
+        self.fit_texts_on(painter, self.page);
+    }
+
+    /// Measure text on every page (and settle the layouts that depend on it), e.g. before export
+    /// or after an agent edits: the canvas only measures the page on screen.
+    pub fn fit_all_texts(&mut self, ctx: &egui::Context) {
+        let painter = Painter::new(ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+        for page in 0..self.doc.pages.len() {
+            // Auto-height text inside filling layouts settles over a couple of rounds.
+            for _ in 0..3 {
+                if !self.fit_texts_on(&painter, page) {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Measure `page`'s text layers whose inputs changed since last time. Returns whether any resized.
+    fn fit_texts_on(&mut self, painter: &Painter, page: usize) -> bool {
         let mut ids = vec![];
-        let mut stack: Vec<NodeId> = self.doc.pages[self.page].children.clone();
+        let mut stack: Vec<NodeId> = self.doc.pages[page].children.clone();
         while let Some(id) = stack.pop() {
             let n = self.doc.node(id);
             if n.kind == Kind::Text {
@@ -249,6 +266,7 @@ impl App {
         if changed {
             self.doc.reflow();
         }
+        changed
     }
 
     fn layout_frame_labels(&mut self, painter: &Painter) {

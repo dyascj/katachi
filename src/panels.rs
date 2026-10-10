@@ -707,7 +707,7 @@ impl App {
             ui.close();
         }
         if item(ui, "Export…", "⇧⌘E") {
-            self.export();
+            self.export(&ui.ctx().clone());
             ui.close();
         }
         ui.separator();
@@ -2760,7 +2760,7 @@ impl App {
             many => format!("Export {} layers", many.len()),
         };
         if ui.add_sized([ui.available_width(), 26.0], egui::Button::new(label)).clicked() {
-            self.export();
+            self.export(&ui.ctx().clone());
         }
     }
 

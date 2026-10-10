@@ -1163,7 +1163,8 @@ impl App {
     }
 
     /// Export the selection (or page) with each layer's presets, or the panel's default.
-    pub fn export(&mut self) {
+    pub fn export(&mut self, ctx: &egui::Context) {
+        self.fit_all_texts(ctx);
         use crate::doc::{ExportFormat, ExportSetting};
         let ids = if self.sel.is_empty() { self.doc.pages[self.page].children.clone() } else { self.sel_roots() };
         if ids.is_empty() {
@@ -1878,7 +1879,7 @@ impl App {
             (true, true, Key::S) => return void(self.save(true)),
             (true, false, Key::O) => return self.request_open(),
             (true, false, Key::N) => return self.request_new(),
-            (true, true, Key::E) => return self.export(),
+            (true, true, Key::E) => return self.export(ctx),
             (true, false, Key::F) => {
                 self.find.0 = true;
                 self.find.3 = true;

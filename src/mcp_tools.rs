@@ -131,6 +131,7 @@ impl App {
                 if ids.is_empty() {
                     return Err("nothing to show: the page is empty".into());
                 }
+                self.fit_all_texts(ctx);
                 let b = self.doc.bounds(&ids);
                 // Keep images a reasonable size for a model to look at.
                 let want = args["scale"].as_f64().unwrap_or(1.0) as f32;
@@ -208,6 +209,7 @@ impl App {
                 };
                 self.keep_changes(before);
                 self.sel = out.selection.clone();
+                self.fit_all_texts(ctx);
                 let mut msg = String::new();
                 if let Some(r) = &out.result {
                     msg.push_str(r);
@@ -323,6 +325,9 @@ mod tests {
     fn agents_build_and_read_back_through_tools() {
         let mut app = App::new(None);
         let ctx = egui::Context::default();
+        // Fonts load on the first pass.
+        ctx.begin_pass(Default::default());
+        let _ = ctx.end_pass();
         let made = app.mcp_tool(&ctx, "execute_code", &json!({ "code": r#"
             const card = figma.createFrame();
             card.name = "Card <1>";
@@ -340,6 +345,7 @@ mod tests {
         let xml = meta["content"][0]["text"].as_str().unwrap();
         assert!(xml.contains(r#"<frame id="1" name="Card &lt;1&gt;" x="0" y="0" width="200" height="100">"#), "{xml}");
         assert!(xml.contains(r#"x="10" y="12""#) && xml.contains(">Hi</text>"), "{xml}");
+        assert!(!xml.contains(r#"y="12" width="0""#), "text is measured right away: {xml}");
         let shot = app.mcp_tool(&ctx, "get_screenshot", &json!({}));
         assert_eq!(shot["content"][0]["mimeType"], "image/png");
         // One undo step per call; errors come back as tool errors.
