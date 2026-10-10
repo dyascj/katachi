@@ -1950,12 +1950,21 @@ impl Document {
                 }
             };
             let text = self.nodes[&id].kind == Kind::Text;
-            let n = self.node_mut(id);
-            n.rect = if text {
-                Rect::from_min_size(src.rect.min + offset, n.rect.size())
+            if swapped.contains(&id) {
+                // A swapped nested instance owns its layers: move and size it as a whole.
+                let (cur, target) = (self.nodes[&id].rect, Rect::from_min_size(src.rect.min + offset, src.rect.size()));
+                self.translate(id, target.min - cur.min);
+                if target.size() != cur.size() {
+                    self.set_rect(id, target);
+                }
             } else {
-                Rect::from_min_size(src.rect.min + offset, src.rect.size())
-            };
+                let n = self.node_mut(id);
+                n.rect = if text {
+                    Rect::from_min_size(src.rect.min + offset, n.rect.size())
+                } else {
+                    Rect::from_min_size(src.rect.min + offset, src.rect.size())
+                };
+            }
             keep.insert(id);
             order.entry(parent).or_default().push(id);
         }

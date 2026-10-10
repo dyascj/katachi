@@ -457,6 +457,14 @@ mod tests {
         assert_eq!(sw.rect.size(), vec2(16., 16.), "a swap keeps the instance's size");
         assert_eq!(d.node(sw.children[0]).name, "B shape");
         assert_eq!(d.node(sw.children[0]).rect.size(), vec2(16., 16.), "swapped layers scale to fit");
+        // Moving the outer instance carries the swapped icon's layers along.
+        let before = d.node(sw.children[0]).rect.min - sw.rect.min;
+        d.translate(id("swapped"), vec2(37., 11.));
+        let btn = d.nodes.values().find(|n| n.name == "Button" && n.kind == Kind::Component).unwrap().id;
+        d.node_mut(btn).fills.clear();
+        d.reflow();
+        let sw = icon_of(&d, id("swapped"));
+        assert_eq!(d.node(sw.children[0]).rect.min - sw.rect.min, before, "swapped layers stay inside their instance");
         let count = d.nodes.len();
         d.reflow();
         d.reflow();
