@@ -30,6 +30,14 @@ pub struct UiRequest {
     pub visible: bool,
 }
 
+/// `KATACHI_PROFILE=1`: time each phase of a plugin run on stderr.
+pub fn lap(label: &str, t: &mut std::time::Instant) {
+    if std::env::var_os("KATACHI_PROFILE").is_some() {
+        eprintln!("  {label}: {:?}", t.elapsed());
+    }
+    *t = std::time::Instant::now();
+}
+
 /// A running plugin: its JS runtime stays alive between events.
 pub struct Session {
     rt: rquickjs::Runtime,
@@ -92,7 +100,9 @@ impl Session {
 
     /// Load the page into JS, run `js`, settle promises, and apply the changes.
     fn step(&mut self, doc: &mut Document, page: usize, sel: &[NodeId], js: &str) -> Result<Outcome, String> {
+        let mut t = std::time::Instant::now();
         let snap = crate::plugin_doc::snapshot(doc, page, sel, self.all_pages).to_string();
+        lap("snapshot", &mut t);
         self.eval(&format!("__reset(); __load({snap});"))?;
         self.eval(js)?;
         for _ in 0..100_000 {
@@ -116,7 +126,9 @@ impl Session {
             let _ = crate::files::write_atomic(path, now.as_bytes());
             *saved = now.to_string();
         }
+        lap("run + collect", &mut t);
         let ids = crate::plugin_doc::apply(doc, &out);
+        lap("apply", &mut t);
         let strings = |k: &str| out[k].as_array().map(|a| a.iter().filter_map(|n| n.as_str().map(String::from)).collect()).unwrap_or_default();
         let ui = out["ui"].as_object().map(|u| UiRequest {
             html: u.get("html").and_then(|h| h.as_str()).unwrap_or("").to_string(),
@@ -514,3 +526,19 @@ mod tests {
     }
 }
 
+
+/// `KATACHI_DOC=file.katachi KATACHI_JS=script.js cargo test --release plugin_bench -- --ignored --nocapture`
+#[cfg(test)]
+#[test]
+#[ignore]
+fn plugin_bench() {
+    let (Some(doc), Some(js)) = (std::env::var_os("KATACHI_DOC"), std::env::var_os("KATACHI_JS")) else { return };
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(doc).unwrap()).unwrap();
+    let mut d: Document = serde_json::from_value(v["document"].clone()).unwrap();
+    let t = std::time::Instant::now();
+    d.reflow();
+    eprintln!("load reflow: {:?} ({} nodes)", t.elapsed(), d.nodes.len());
+    let t = std::time::Instant::now();
+    let r = run(&mut d, 0, &[], &std::fs::read_to_string(js).unwrap());
+    eprintln!("run: {:?} -> {:?} ({} nodes)", t.elapsed(), r.map(|o| o.result), d.nodes.len());
+}

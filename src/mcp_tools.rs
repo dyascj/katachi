@@ -131,7 +131,9 @@ impl App {
                 if ids.is_empty() {
                     return Err("nothing to show: the page is empty".into());
                 }
+                let mut t = std::time::Instant::now();
                 self.fit_all_texts(ctx);
+                crate::plugins::lap("fit texts", &mut t);
                 let b = self.doc.bounds(&ids);
                 // Keep images a reasonable size for a model to look at.
                 let want = args["scale"].as_f64().unwrap_or(1.0) as f32;

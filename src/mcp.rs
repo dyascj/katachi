@@ -109,8 +109,9 @@ fn handle(m: &Value, tx: &Sender<Call>, ctx: &egui::Context) -> Option<Value> {
                 return Some(error(id, -32603, "Katachi is closing"));
             }
             ctx.request_repaint();
-            match wait.recv_timeout(Duration::from_secs(120)) {
+            match wait.recv_timeout(Duration::from_secs(600)) {
                 Ok(result) => ok(result),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => error(id, -32603, "Katachi stopped while running the tool"),
                 Err(_) => error(id, -32603, "Katachi didn't answer in time (is the window open?)"),
             }
         }

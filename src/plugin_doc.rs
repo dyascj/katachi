@@ -1105,6 +1105,8 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
 
 /// Apply a plugin run's collected changes. Returns plugin ids -> Katachi ids.
 pub fn apply(doc: &mut Document, out: &Value) -> HashMap<String, NodeId> {
+    let lap = crate::plugins::lap;
+    let mut t = std::time::Instant::now();
     let mut refs = Refs::default();
     apply_styles_and_variables(doc, out, &mut refs);
     // Pages: existing ones keep their index ("page:i"); new ones are added at the end.
@@ -1184,6 +1186,7 @@ pub fn apply(doc: &mut Document, out: &Value) -> HashMap<String, NodeId> {
         refs.nodes.insert(jid.clone(), id);
         fresh.push(jid);
     }
+    lap("  create", &mut t);
     // Structure: each loaded page's order, then each container's children.
     // Layers that change parent take the script's x/y relative to the new one, as in Figma.
     let mut moved: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
@@ -1217,6 +1220,7 @@ pub fn apply(doc: &mut Document, out: &Value) -> HashMap<String, NodeId> {
             }
         }
     }
+    lap("  structure", &mut t);
     // Properties, parents before children so relative positions resolve.
     let mut order: Vec<&Value> = nodes.iter().filter(|v| !provisional(v)).collect();
     order.sort_by_key(|v| v["id"].as_str().and_then(|s| refs.nodes.get(s)).map_or(0, |&i| doc.ancestors(i).len()));
@@ -1225,11 +1229,13 @@ pub fn apply(doc: &mut Document, out: &Value) -> HashMap<String, NodeId> {
         let base = bases.get(&id).cloned().unwrap_or(Value::Null);
         apply_props(doc, id, v, &base, moved.contains(&id), &refs);
     }
+    lap("  properties", &mut t);
     // Instances: point at their main components, sync, then take the script's overrides.
     for v in &nodes {
         let Some(jid) = v["id"].as_str() else { continue };
         let Some(&inst) = refs.nodes.get(jid) else { continue };
-        if v["type"] != "INSTANCE" {
+        // A layer inside an instance can be rebuilt by a later sync in this same run.
+        if v["type"] != "INSTANCE" || !doc.nodes.contains_key(&inst) {
             continue;
         }
         let comp = v["mainComponentId"].as_str().and_then(|c| refs.node(c)).filter(|c| doc.nodes.get(c).is_some_and(|n| n.kind == Kind::Component));
@@ -1312,10 +1318,14 @@ pub fn apply(doc: &mut Document, out: &Value) -> HashMap<String, NodeId> {
             }
         }
         for (d, p) in matched {
-            let base = node_json(doc, d);
-            apply_props(doc, d, p, &base, false, &refs);
+            if doc.nodes.contains_key(&d) {
+                let base = node_json(doc, d);
+                apply_props(doc, d, p, &base, false, &refs);
+            }
         }
     }
+    lap("  instances", &mut t);
     doc.reflow();
+    lap("  reflow", &mut t);
     refs.nodes
 }
