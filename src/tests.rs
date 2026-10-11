@@ -1292,13 +1292,30 @@ fn multiplayer_host_join_edit_and_undo_only_mine() {
         }
     };
     settle(&mut a, &mut b, &|a, b| b.doc.nodes.contains_key(&ra) && a.doc.nodes.contains_key(&rb) && a.collab.as_ref().is_some_and(|c| c.peers.values().any(|p| p.name == "Bo")));
-    assert!(b.state().doc.nodes.contains_key(&ra), "Bo sees Ada's rectangle");
+    let dump = |h: &Harness<App>| {
+        let c = h.state().collab.as_ref();
+        format!("nodes {:?} connected {:?} client {:?}", h.state().doc.nodes.keys().collect::<Vec<_>>(), c.map(|c| c.connected), c.map(|c| c.client))
+    };
+    assert!(b.state().doc.nodes.contains_key(&ra), "Bo sees Ada's rectangle {ra}: Ada {} / Bo {}", dump(&a), dump(&b));
     assert!(a.state().doc.nodes.contains_key(&rb), "Ada sees Bo's ellipse");
     assert!(a.state().collab.as_ref().unwrap().peers.values().any(|p| p.name == "Bo"), "presence");
-    // Ada undoes: her rectangle goes away everywhere, Bo's ellipse stays.
+    // Bo is mid-drag (moving his ellipse) when Ada draws: her new layer survives the drag on both sides.
+    let (p0, p1) = (s(&b, 230., 30.), s(&b, 330., 60.));
+    move_to(&mut b, p0, Modifiers::NONE);
+    press(&mut b, p0, true, Modifiers::NONE);
+    move_to(&mut b, p0.lerp(p1, 0.5), Modifiers::NONE);
+    let rc = draw(&mut a, Key::R, (0.0, 300.0), (80.0, 380.0));
+    settle(&mut a, &mut b, &|_, b| b.doc.nodes.contains_key(&rc));
+    move_to(&mut b, p1, Modifiers::NONE);
+    press(&mut b, p1, false, Modifiers::NONE);
+    settle(&mut a, &mut b, &|a, b| a.doc.node(rb).rect == b.doc.node(rb).rect);
+    assert!(a.state().doc.nodes.contains_key(&rc) && b.state().doc.nodes.contains_key(&rc), "drawn during Bo's drag");
+    assert_eq!(a.state().doc.node(rb).rect, b.state().doc.node(rb).rect, "Bo's move reached Ada");
+    // Ada undoes: her latest rectangle goes away everywhere; her first one and Bo's ellipse stay.
     key(&mut a, Modifiers::COMMAND, Key::Z);
-    settle(&mut a, &mut b, &|a, b| !a.doc.nodes.contains_key(&ra) && !b.doc.nodes.contains_key(&ra));
-    assert!(!a.state().doc.nodes.contains_key(&ra) && !b.state().doc.nodes.contains_key(&ra));
+    settle(&mut a, &mut b, &|a, b| !a.doc.nodes.contains_key(&rc) && !b.doc.nodes.contains_key(&rc));
+    assert!(!a.state().doc.nodes.contains_key(&rc) && !b.state().doc.nodes.contains_key(&rc));
+    assert!(a.state().doc.nodes.contains_key(&ra) && b.state().doc.nodes.contains_key(&ra));
     assert!(a.state().doc.nodes.contains_key(&rb) && b.state().doc.nodes.contains_key(&rb), "undo leaves others' work");
 }
 
@@ -1705,4 +1722,29 @@ fn ellipse_arcs_draw_rings_and_slices() {
     assert!(!hit(&pie, 230.0, 30.0), "upper-left is empty");
     let svg = crate::export::to_svg(&doc, &[ring.id]);
     assert!(svg.contains("fill-rule=\"evenodd\"") && svg.contains("<path"), "{svg}");
+}
+
+#[test]
+fn layer_search_finds_text_and_groups_become_auto_layout_frames() {
+    let mut h = harness();
+    let mut t = Node::new(Kind::Text, r(0., 0., 80., 20.));
+    t.text = "Move more".into();
+    t.name = "Text 17".into();
+    let t = h.state_mut().doc.insert(0, None, None, t);
+    h.state_mut().layer_search = Some("move more".into());
+    h.run_steps(2);
+    assert!(h.query_by_label("Text 17").is_some(), "found by what it says");
+    h.state_mut().layer_search = None;
+    // Shift+A on a group: the group itself becomes the auto layout frame.
+    let a = draw(&mut h, Key::O, (0.0, 100.0), (40.0, 140.0));
+    let b = draw(&mut h, Key::O, (60.0, 100.0), (100.0, 140.0));
+    h.state_mut().sel = vec![a, b];
+    key(&mut h, Modifiers::COMMAND, Key::G);
+    let g = h.state().sel[0];
+    key(&mut h, Modifiers::SHIFT, Key::A);
+    assert_eq!(h.state().sel, vec![g]);
+    let n = h.state().doc.node(g);
+    assert_eq!((n.kind, n.layout.mode), (Kind::Frame, crate::doc::LayoutMode::Horizontal));
+    assert_eq!(n.children.len(), 2, "the ellipses lay out directly");
+    let _ = t;
 }

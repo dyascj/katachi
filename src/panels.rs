@@ -842,7 +842,8 @@ impl App {
             fn walk(app: &App, list: &[NodeId], depth: usize, q: &str, out: &mut Vec<(NodeId, usize)>) {
                 for &id in list.iter().rev() {
                     let n = app.doc.node(id);
-                    if n.name.to_lowercase().contains(q) {
+                    // Like Figma, text layers match on what they say as well as their name.
+                    if n.name.to_lowercase().contains(q) || (n.kind == Kind::Text && n.text.to_lowercase().contains(q)) {
                         out.push((id, depth));
                     }
                     walk(app, &n.children, depth + 1, q, out);
@@ -896,7 +897,7 @@ impl App {
             if !n.children.is_empty() {
                 paint_icon(p, chev, Icon::Chevron(n.expanded), theme::muted(ui.ctx()));
             }
-            paint_icon(p, Rect::from_center_size(pos2(x + 22.0, rect.center().y), vec2(16.0, 16.0)), kind_icon(n.kind), fg);
+            paint_icon(p, Rect::from_center_size(pos2(x + 22.0, rect.center().y), vec2(16.0, 16.0)), if n.is_mask { Icon::Opacity } else { kind_icon(n.kind) }, fg);
             let name_pos = pos2(x + 36.0, rect.center().y);
             let renaming = matches!(&self.renaming, Some((r, _)) if *r == id);
             if renaming {

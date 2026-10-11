@@ -66,6 +66,16 @@ pub enum Drag {
     Connect { from: NodeId },
 }
 
+impl Drag {
+    /// The document as it was when the drag began (drags re-apply themselves to it each frame).
+    pub fn base_mut(&mut self) -> Option<&mut Document> {
+        match self {
+            Drag::Move { base, .. } | Drag::Resize { base, .. } | Drag::Rotate { base, .. } | Drag::Create { base, .. } | Drag::Vector { base, .. } => Some(base),
+            _ => None,
+        }
+    }
+}
+
 /// What the pointer grabbed on the selection frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Grip {
@@ -432,7 +442,14 @@ impl App {
         c.me.page = self.page;
         c.me.selection = self.sel.clone();
         c.me.cursor = self.pointer_world;
-        let touched = c.tick(&mut self.doc, now);
+        let (touched, remote) = c.tick(&mut self.doc, now);
+        // A drag rebuilds the document from its starting copy every frame; that copy needs
+        // others' changes too, or they'd vanish (and go out as deletions) mid-drag.
+        if !remote.is_empty()
+            && let Some(base) = self.drag.as_mut().and_then(|d| d.base_mut())
+        {
+            crate::collab::apply(base, &remote);
+        }
         if !c.connected {
             self.collab = None;
             self.toast("Disconnected from the session".into());
@@ -717,13 +734,27 @@ impl App {
         if roots.is_empty() {
             return;
         }
+        // A group gets auto layout by becoming a frame, as in Figma (its children lay out directly).
+        let converted = matches!(roots[..], [g] if self.doc.node(g).kind == Kind::Group);
+        if let [g] = roots[..]
+            && converted
+        {
+            self.checkpoint();
+            let n = self.doc.node_mut(g);
+            n.kind = Kind::Frame;
+            n.fills.clear();
+            n.clip = false;
+            n.name = n.name.replacen("Group", "Frame", 1);
+            self.sel = vec![g];
+        }
+        let roots = self.sel_roots();
         let frames_only = roots.iter().all(|&id| {
             let n = self.doc.node(id);
             n.kind.is_frame() && n.layout.mode == LayoutMode::None
         });
         if !frames_only {
             self.group_selection(true);
-        } else {
+        } else if !converted {
             self.checkpoint();
         }
         for id in self.sel.clone() {
