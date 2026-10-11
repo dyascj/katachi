@@ -43,6 +43,10 @@ fn main() -> eframe::Result {
         mcp::stdio_bridge();
         return Ok(());
     }
+    if args.get(1).is_some_and(|a| a == "--version" || a == "-V") {
+        println!("katachi {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if args.get(1).is_some_and(|a| a == "serve") {
         serve_headless(&args[2..]);
         return Ok(());
