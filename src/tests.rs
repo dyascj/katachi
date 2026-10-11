@@ -1774,3 +1774,45 @@ fn assets_show_component_previews_and_search_filters_sets() {
     h.run_steps(31);
     assert_ne!(h.state().asset_thumbs[&chip].0, before);
 }
+
+#[test]
+fn exported_png_keeps_image_fills() {
+    let mut doc = crate::doc::Document::default();
+    let mut f = Node::new(Kind::Frame, r(0., 0., 300., 200.));
+    f.fills = vec![crate::doc::Paint::solid(crate::doc::Rgba::rgb(20, 20, 30))];
+    let f = doc.insert(0, None, None, f);
+    // A red photo, filling a wide tile (cropped to cover).
+    let img = image::RgbaImage::from_pixel(40, 60, image::Rgba([255, 0, 0, 255]));
+    let mut png = vec![];
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    doc.images.insert("photo".into(), std::sync::Arc::new(png));
+    let mut tile = Node::new(Kind::Rectangle, r(50., 50., 200., 100.));
+    let mut paint = crate::doc::Paint::solid(crate::doc::Rgba::WHITE);
+    paint.kind = crate::doc::PaintKind::Image;
+    paint.image = "photo".into();
+    tile.fills = vec![paint.clone()];
+    tile.radius = 12.0;
+    doc.insert(0, Some(f), None, tile.clone());
+    // The same with a (tiny) adjustment, as Codex's HUD had.
+    let mut adjusted = tile;
+    adjusted.rect = r(50., 160., 200., 30.);
+    paint.adjust.saturation = -0.01;
+    adjusted.fills = vec![paint];
+    doc.insert(0, Some(f), None, adjusted);
+    let png = crate::export::to_png(&doc, &[f], 1.0).unwrap();
+    let out = image::load_from_memory(&png).unwrap().to_rgba8();
+    assert_eq!(out.get_pixel(150, 100).0[..3], [255, 0, 0], "plain image fill");
+    assert_eq!(out.get_pixel(60, 60).0[..3], [255, 0, 0], "covers the tile from its corner");
+    assert!(out.get_pixel(150, 175).0[0] > 200 && out.get_pixel(150, 175).0[1] < 60, "adjusted image fill: {:?}", out.get_pixel(150, 175));
+}
+
+/// `KATACHI_EXPORT_FILE=x.katachi cargo test --release export_file -- --ignored`: first page's frames to target/export-N.png.
+#[test]
+#[ignore]
+fn export_file() {
+    let Some(f) = std::env::var_os("KATACHI_EXPORT_FILE") else { return };
+    let doc = crate::doc::parse_file(&std::fs::read_to_string(f).unwrap()).unwrap();
+    for (i, &id) in doc.pages[0].children.iter().enumerate() {
+        std::fs::write(format!("target/export-{i}.png"), crate::export::to_png(&doc, &[id], 1.0).unwrap()).unwrap();
+    }
+}

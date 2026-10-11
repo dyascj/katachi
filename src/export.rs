@@ -201,6 +201,7 @@ impl Svg<'_> {
                 let data = base64::engine::general_purpose::STANDARD.encode(bytes.as_slice());
                 let id = self.id("image");
                 use crate::doc::ScaleMode;
+                // Pattern content is laid out from the tile's own corner, so the image sits at 0, 0.
                 let (x, y, w, h) = (r.min.x, r.min.y, r.width(), r.height());
                 let href = format!("data:{mime};base64,{data}");
                 if p.scale_mode == ScaleMode::Tile {
@@ -218,7 +219,7 @@ impl Svg<'_> {
                     };
                     let _ = write!(
                         self.defs,
-                        r#"<pattern id="{id}" patternUnits="userSpaceOnUse" x="{x}" y="{y}" width="{w}" height="{h}"><image href="{href}" x="{x}" y="{y}" width="{w}" height="{h}" preserveAspectRatio="{aspect}"/></pattern>"#
+                        r#"<pattern id="{id}" patternUnits="userSpaceOnUse" x="{x}" y="{y}" width="{w}" height="{h}"><image href="{href}" x="0" y="0" width="{w}" height="{h}" preserveAspectRatio="{aspect}"/></pattern>"#
                     );
                 }
                 format!(r#"{name}="url(#{id})" {name}-opacity="{:.3}""#, p.alpha())
