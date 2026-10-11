@@ -128,6 +128,8 @@ pub struct App {
     pub drag: Option<Drag>,
     pub press: Option<Press>,
     pub pen: Vec<crate::doc::PathPoint>,
+    /// The press that closed the pen path; its release isn't a click.
+    pub pen_closed: bool,
     pub editing_text: Option<NodeId>,
     pub focus_text: bool,
     pub renaming: Option<(NodeId, String)>,
@@ -242,6 +244,7 @@ impl App {
             drag: None,
             press: None,
             pen: vec![],
+            pen_closed: false,
             editing_text: None,
             focus_text: false,
             renaming: None,
@@ -591,7 +594,8 @@ impl App {
                 let r = self.doc.node(g).rect;
                 let name = self.doc.auto_name("Frame");
                 let n = self.doc.node_mut(g);
-                *n = Node { id: n.id, parent: n.parent, children: n.children.clone(), name, ..Node::new(Kind::Frame, r) };
+                // Like Figma, a frame wrapped around a selection has no fill and doesn't clip.
+                *n = Node { id: n.id, parent: n.parent, children: n.children.clone(), name, fills: vec![], clip: false, ..Node::new(Kind::Frame, r) };
             }
             self.sel = vec![g];
         }

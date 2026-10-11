@@ -1608,6 +1608,19 @@ impl std::fmt::Debug for SyncCache {
     }
 }
 
+/// Whether a text layer still has the name Katachi gave it (its text, or "Text" / "Text 3").
+pub fn auto_text_name(name: &str, text: &str) -> bool {
+    let generic = name == "Text" || name.strip_prefix("Text ").is_some_and(|n| n.parse::<u32>().is_ok());
+    generic || name == text_layer_name(text)
+}
+
+/// A text layer's automatic name: its text on one line, cut at 60 characters.
+pub fn text_layer_name(text: &str) -> String {
+    let one: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cut: String = one.chars().take(60).collect();
+    if cut.is_empty() { "Text".into() } else { cut }
+}
+
 /// A .katachi file: `{"katachi": 1, "document": {...}}`.
 #[derive(Deserialize)]
 struct FileJson {

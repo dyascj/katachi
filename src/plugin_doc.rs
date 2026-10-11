@@ -1008,6 +1008,9 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
             let t = s("characters").to_string();
             n.spans.clear();
             n.lists = shift_lists(&n.lists, &n.text, &t);
+            if !changed("name") && crate::doc::auto_text_name(&n.name, &n.text) {
+                n.name = crate::doc::text_layer_name(&t);
+            }
             n.text = t;
         }
         if changed("fontSize") {

@@ -499,6 +499,17 @@ fn section_title(ui: &mut Ui, title: &str) -> bool {
     add
 }
 
+/// Figma's frame presets: group, then (name, width, height).
+const FRAME_PRESETS: &[(&str, &[(&str, u32, u32)])] = &[
+    ("Phone", &[("iPhone 16", 393, 852), ("iPhone 16 Pro", 402, 874), ("iPhone 16 Pro Max", 440, 956), ("iPhone 16 Plus", 430, 932), ("iPhone 14", 390, 844), ("iPhone SE", 320, 568), ("Android Compact", 412, 917), ("Android Medium", 700, 840)]),
+    ("Tablet", &[("iPad mini 8.3", 744, 1133), ("iPad Pro 11\"", 834, 1194), ("iPad Pro 12.9\"", 1024, 1366), ("Surface Pro 8", 1440, 960)]),
+    ("Desktop", &[("MacBook Air", 1280, 832), ("MacBook Pro 14\"", 1512, 982), ("MacBook Pro 16\"", 1728, 1117), ("Desktop", 1440, 1024), ("Wireframe", 1440, 1024), ("TV", 1280, 720)]),
+    ("Presentation", &[("Slide 16:9", 1920, 1080), ("Slide 4:3", 1024, 768)]),
+    ("Watch", &[("Apple Watch 45mm", 198, 242), ("Apple Watch 41mm", 176, 215), ("Apple Watch Ultra", 205, 251)]),
+    ("Paper", &[("A4", 595, 842), ("A5", 420, 595), ("A6", 297, 420), ("Letter", 612, 792), ("Tabloid", 792, 1224)]),
+    ("Social media", &[("Twitter post", 1200, 675), ("Facebook post", 1200, 630), ("Instagram post", 1080, 1350), ("Instagram story", 1080, 1920), ("LinkedIn post", 1200, 1200), ("YouTube thumbnail", 1280, 720), ("Dribbble shot", 400, 300)]),
+];
+
 fn heading(ui: &mut Ui, title: &str) {
     ui.add_space(4.0);
     ui.label(RichText::new(title).strong());
@@ -1043,6 +1054,9 @@ impl App {
                         if ui.add(egui::Button::new("Zoom to fit").shortcut_text("⇧1")).clicked() {
                             self.zoom_to(&ctx, None, false);
                         }
+                        if ui.add_enabled(!self.sel.is_empty(), egui::Button::new("Zoom to selection").shortcut_text("⇧2")).clicked() {
+                            self.zoom_to(&ctx, Some(self.sel.clone()), false);
+                        }
                         if ui.add(egui::Button::new("Zoom to 100%").shortcut_text("⇧0")).clicked() {
                             self.zoom_to(&ctx, None, true);
                         }
@@ -1063,6 +1077,11 @@ impl App {
                     self.comments_panel(ui);
                     return;
                 }
+                // Frame tool with nothing being drawn: Figma's frame presets.
+                if matches!(self.tool, Tool::Frame) && self.drag.is_none() && !self.prototype_tab {
+                    self.frame_presets(ui);
+                    return;
+                }
                 if self.prototype_tab {
                     self.prototype_props(ui);
                     return;
@@ -1076,6 +1095,54 @@ impl App {
                 self.export_props(ui);
             });
         });
+    }
+
+    /// The Frame tool's sidebar: click a preset to add a frame that size.
+    fn frame_presets(&mut self, ui: &mut Ui) {
+        let muted = theme::muted(ui.ctx());
+        let mut pick: Option<(&str, f32, f32)> = None;
+        for (group, items) in FRAME_PRESETS {
+            egui::CollapsingHeader::new(RichText::new(*group).strong()).default_open(*group == "Phone" || *group == "Desktop").show(ui, |ui| {
+                for &(name, w, h) in *items {
+                    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+                    if resp.hovered() {
+                        ui.painter().rect_filled(r, 4.0, theme::subtle(ui.ctx()));
+                    }
+                    ui.painter().text(r.left_center() + vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, name, FontId::proportional(12.0), ui.visuals().text_color());
+                    ui.painter().text(r.right_center() - vec2(6.0, 0.0), egui::Align2::RIGHT_CENTER, format!("{w}×{h}"), FontId::proportional(11.5), muted);
+                    if resp.clicked() {
+                        pick = Some((name, w as f32, h as f32));
+                    }
+                }
+            });
+        }
+        if let Some((name, w, h)) = pick {
+            self.add_preset_frame(ui.ctx(), name, w, h);
+        }
+    }
+
+    /// A new frame to the right of what's on the page (or mid-screen on an empty page), selected.
+    pub fn add_preset_frame(&mut self, ctx: &egui::Context, name: &str, w: f32, h: f32) {
+        self.checkpoint();
+        let kids = self.doc.pages[self.page].children.clone();
+        let b = self.doc.bounds(&kids);
+        let at = if kids.is_empty() || !b.is_finite() { (self.view_center_world() - vec2(w, h) / 2.0).round() } else { pos2(b.max.x + 100.0, b.min.y).round() };
+        let mut n = crate::doc::Node::new(Kind::Frame, Rect::from_min_size(at, vec2(w, h)));
+        n.name = name.to_string();
+        let id = self.doc.insert(self.page, None, None, n);
+        self.sel = vec![id];
+        self.set_tool(Tool::Move);
+        // Bring it into view without changing the zoom unless it doesn't fit.
+        let screen = self.canvas_rect.unwrap_or(ctx.content_rect());
+        let r = self.doc.node(id).rect;
+        let on = Rect::from_min_max(self.view.to_screen(r.min), self.view.to_screen(r.max));
+        if !screen.contains_rect(on) {
+            if on.width() < screen.width() * 0.9 && on.height() < screen.height() * 0.9 {
+                self.view.pan += screen.center() - on.center();
+            } else {
+                self.zoom_target = Some(id);
+            }
+        }
     }
 
     fn prototype_props(&mut self, ui: &mut Ui) {
@@ -1818,7 +1885,7 @@ impl App {
         let is_frame = roots.len() == 1 && n.kind.is_frame();
         let al = is_frame && n.layout.mode != LayoutMode::None;
         ui.horizontal(|ui| {
-            ui.label(RichText::new(if is_frame { "Auto layout" } else { "Layout" }).strong());
+            ui.label(RichText::new(if al { "Auto layout" } else { "Layout" }).strong());
             if is_frame {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (icon, tip) = if al { (Icon::Minus, "Remove auto layout (⌥⇧A)") } else { (Icon::Plus, "Add auto layout (⇧A)") };

@@ -1507,3 +1507,63 @@ fn renaming_a_layer_hands_the_keyboard_back() {
         key(&mut h, Modifiers::NONE, Key::V);
     }
 }
+
+#[test]
+fn figma_details_from_the_audit() {
+    let mut h = harness();
+    // Text layers are named after their text until renamed.
+    key(&mut h, Modifiers::NONE, Key::T);
+    let at = s(&h, -300.0, -200.0);
+    click(&mut h, at, Modifiers::NONE);
+    h.event(Event::Text("ATLANTA".into()));
+    h.run_steps(2);
+    let t = h.state().editing_text.expect("editing");
+    assert_eq!(h.state().doc.node(t).name, "ATLANTA");
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    h.state_mut().doc.node_mut(t).name = "City".into();
+    h.state_mut().editing_text = Some(t);
+    h.run_steps(2);
+    h.event(Event::Text("!".into()));
+    h.run_steps(2);
+    assert_eq!(h.state().doc.node(t).name, "City", "a hand-made name sticks");
+    key(&mut h, Modifiers::NONE, Key::Escape);
+
+    // Closing a pen path inside a frame leaves the path selected.
+    let f = draw(&mut h, Key::F, (0.0, 0.0), (300.0, 300.0));
+    key(&mut h, Modifiers::NONE, Key::P);
+    for (x, y) in [(50.0, 50.0), (200.0, 60.0), (120.0, 200.0)] {
+        let p = s(&h, x, y);
+        move_to(&mut h, p, Modifiers::NONE);
+        press(&mut h, p, true, Modifiers::NONE);
+        press(&mut h, p, false, Modifiers::NONE);
+    }
+    let first = s(&h, 50.0, 50.0);
+    move_to(&mut h, first, Modifiers::NONE);
+    press(&mut h, first, true, Modifiers::NONE);
+    press(&mut h, first, false, Modifiers::NONE);
+    h.run_steps(2);
+    let sel = h.state().sel.clone();
+    assert_eq!(sel.len(), 1);
+    assert_eq!(h.state().doc.node(sel[0]).kind, Kind::Vector, "the new path, not its frame");
+    assert_eq!(h.state().doc.node(sel[0]).parent, Some(f));
+
+    // Frame presets.
+    let ctx = h.ctx.clone();
+    h.state_mut().add_preset_frame(&ctx, "iPhone 16", 393.0, 852.0);
+    let id = h.state().sel[0];
+    let n = h.state().doc.node(id);
+    assert_eq!((n.name.as_str(), n.rect.width(), n.rect.height(), n.kind), ("iPhone 16", 393.0, 852.0, Kind::Frame));
+    assert!(n.rect.min.x >= 400.0, "placed beside what's already there");
+
+    // Wrapping layers in auto layout makes a transparent frame.
+    h.run_steps(2);
+    let c = h.state().canvas_rect.unwrap().center();
+    h.state_mut().view = crate::render::View { zoom: 1.0, pan: c.to_vec2() - vec2(60.0, 1225.0) };
+    let a = draw(&mut h, Key::R, (0.0, 1200.0), (50.0, 1250.0));
+    let b = draw(&mut h, Key::R, (80.0, 1200.0), (130.0, 1250.0));
+    h.state_mut().sel = vec![a, b];
+    key(&mut h, Modifiers::SHIFT, Key::A);
+    let w = h.state().sel[0];
+    assert_eq!(h.state().doc.node(w).layout.mode, crate::doc::LayoutMode::Horizontal);
+    assert!(h.state().doc.node(w).fills.is_empty());
+}

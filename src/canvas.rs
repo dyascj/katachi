@@ -127,11 +127,17 @@ impl App {
             && let Some(w) = world {
                 self.on_drag_end(w);
             }
-        if resp.clicked()
+        // The click that closed a pen path ends there (it could otherwise count as a
+        // double-click and select the frame under it).
+        let swallow = self.pen_closed && (resp.clicked() || resp.drag_stopped());
+        if swallow {
+            self.pen_closed = false;
+        }
+        if resp.clicked() && !swallow
             && let Some(w) = world {
                 self.on_click(w, mods);
             }
-        if resp.double_clicked() && self.tool == Tool::Move
+        if resp.double_clicked() && !swallow && self.tool == Tool::Move
             && let Some(w) = world {
                 self.on_double_click(w);
             }
@@ -420,6 +426,7 @@ impl App {
                 let close = self.pen.len() >= 2 && self.view.to_screen(self.pen[0].p).distance(s) < 8.0;
                 if close {
                     self.finish_pen(true);
+                    self.pen_closed = true;
                 } else {
                     let mut p = w;
                     if let (true, Some(last)) = (mods.shift, self.pen.last()) {
@@ -1444,6 +1451,10 @@ impl App {
             let node = self.doc.node_mut(id);
             node.spans = crate::doc::shift_spans(&node.spans, &n.text, &text);
             node.lists = crate::doc::shift_lists(&node.lists, &n.text, &text);
+            // Figma names a text layer after its text until it's renamed by hand.
+            if crate::doc::auto_text_name(&node.name, &n.text) {
+                node.name = crate::doc::text_layer_name(&text);
+            }
             node.text = text;
             self.dirty = true;
         }
