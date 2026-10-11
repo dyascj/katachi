@@ -1830,3 +1830,12 @@ fn dev_mode_lists_a_multi_selection() {
     assert_eq!(h.query_all_by_label("Ellipse 1").count(), 2);
     let _ = b;
 }
+
+#[test]
+fn slash_named_styles_group_into_folders() {
+    let mut h = harness();
+    crate::plugins::run(&mut h.state_mut().doc, 0, &[], "for (const n of ['HUD / Title', 'HUD / Body', 'Accent']) { const s = figma.createPaintStyle(); s.name = n; s.paints = [figma.util.solidPaint('#8E72FF')]; }").unwrap();
+    h.run_steps(2);
+    assert!(h.query_by_label("HUD").is_some(), "a HUD folder");
+    assert!(h.query_by_label("HUD / Title").is_none(), "names show without the folder");
+}

@@ -1193,6 +1193,54 @@ impl App {
         });
     }
 
+    /// One local style: preview, name (editable), edit and delete.
+    fn local_style_row(&mut self, ui: &mut Ui, st: &crate::doc::Style, delete: &mut Option<u64>) {
+        ui.horizontal(|ui| {
+            crate::paint_ui::style_preview(ui, &st.value);
+            // Inside a folder the field shows the last part; edits keep the folder.
+            let (folder, leaf) = match st.name.rsplit_once('/') {
+                Some((f, l)) => (Some(f.trim().to_string()), l.trim().to_string()),
+                None => (None, st.name.clone()),
+            };
+            let mut name = leaf;
+            let r = ui.add(egui::TextEdit::singleline(&mut name).frame(egui::Frame::NONE).desired_width(130.0));
+            if r.changed() {
+                self.begin_edit();
+                if let Some(x) = self.doc.styles.iter_mut().find(|x| x.id == st.id) {
+                    x.name = match &folder {
+                        Some(f) => format!("{f} / {name}"),
+                        None => name,
+                    };
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icon_button(ui, Icon::Minus, false, 22.0, "Delete style").clicked() {
+                    *delete = Some(st.id);
+                }
+                if let crate::doc::StyleValue::Paint(ps) = &st.value {
+                    let edit = icon_button(ui, Icon::Styles, false, 22.0, "Edit style");
+                    egui::Popup::menu(&edit).id(ui.id().with(("local-style", st.id))).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                        ui.set_width(240.0);
+                        let mut ps = ps.clone();
+                        let mut edited = false;
+                        for (i, p) in ps.iter_mut().enumerate().rev() {
+                            if !matches!(paint_row(ui, ui.id().with(("ls-paint", st.id, i)), p), PaintEvent::None) {
+                                edited = true;
+                            }
+                        }
+                        if edited {
+                            self.begin_edit();
+                            if let Some(x) = self.doc.styles.iter_mut().find(|x| x.id == st.id) {
+                                x.value = crate::doc::StyleValue::Paint(ps);
+                            }
+                            self.doc.reflow();
+                        }
+                    });
+                }
+            });
+        });
+    }
+
     /// The Frame tool's sidebar: click a preset to add a frame that size.
     fn frame_presets(&mut self, ui: &mut Ui) {
         let muted = theme::muted(ui.ctx());
@@ -1553,43 +1601,34 @@ impl App {
                 continue;
             }
             ui.label(RichText::new(label).color(theme::muted(ui.ctx())).small());
-            for st in list {
-                ui.horizontal(|ui| {
-                    crate::paint_ui::style_preview(ui, &st.value);
-                    let mut name = st.name.clone();
-                    let r = ui.add(egui::TextEdit::singleline(&mut name).frame(egui::Frame::NONE).desired_width(130.0));
-                    if r.changed() {
-                        self.begin_edit();
-                        if let Some(x) = self.doc.styles.iter_mut().find(|x| x.id == st.id) {
-                            x.name = name;
+            // Slash names make folders, as in Figma: "HUD / Title" sits in a HUD folder.
+            let mut list = list;
+            list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            let folder_of = |n: &str| n.rsplit_once('/').map(|(f, _)| f.trim().to_string());
+            let mut folders: Vec<Option<String>> = vec![];
+            for st in &list {
+                let f = folder_of(&st.name);
+                if !folders.contains(&f) {
+                    folders.push(f);
+                }
+            }
+            folders.sort_by_key(|f| f.is_some());
+            for f in folders {
+                let items: Vec<crate::doc::Style> = list.iter().filter(|st| folder_of(&st.name) == f).cloned().collect();
+                match &f {
+                    None => {
+                        for st in items {
+                            self.local_style_row(ui, &st, &mut delete);
                         }
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if icon_button(ui, Icon::Minus, false, 22.0, "Delete style").clicked() {
-                            delete = Some(st.id);
-                        }
-                        if let StyleValue::Paint(ps) = &st.value {
-                            let edit = icon_button(ui, Icon::Styles, false, 22.0, "Edit style");
-                            egui::Popup::menu(&edit).id(ui.id().with(("local-style", st.id))).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-                                ui.set_width(240.0);
-                                let mut ps = ps.clone();
-                                let mut edited = false;
-                                for (i, p) in ps.iter_mut().enumerate().rev() {
-                                    if !matches!(paint_row(ui, ui.id().with(("ls-paint", st.id, i)), p), PaintEvent::None) {
-                                        edited = true;
-                                    }
-                                }
-                                if edited {
-                                    self.begin_edit();
-                                    if let Some(x) = self.doc.styles.iter_mut().find(|x| x.id == st.id) {
-                                        x.value = StyleValue::Paint(ps);
-                                    }
-                                    self.doc.reflow();
-                                }
-                            });
-                        }
-                    });
-                });
+                    Some(name) => {
+                        egui::CollapsingHeader::new(name).id_salt(("style-folder", label, name)).default_open(true).show(ui, |ui| {
+                            for st in items {
+                                self.local_style_row(ui, &st, &mut delete);
+                            }
+                        });
+                    }
+                }
             }
         }
         if let Some(id) = delete {

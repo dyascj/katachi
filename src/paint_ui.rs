@@ -361,11 +361,24 @@ pub fn style_menu(ui: &mut Ui, id: egui::Id, styles: &[crate::doc::Style], same_
         ui.set_width(220.0);
         ui.label(egui::RichText::new("Local styles").strong());
         let mut any = false;
-        for s in styles.iter().filter(|s| same_kind(&s.value)) {
+        // Grouped by slash folders, as in Figma ("HUD / Title" under HUD).
+        let mut list: Vec<&crate::doc::Style> = styles.iter().filter(|s| same_kind(&s.value)).collect();
+        let split = |n: &str| n.rsplit_once('/').map(|(f, l)| (Some(f.trim().to_string()), l.trim().to_string())).unwrap_or((None, n.to_string()));
+        list.sort_by_key(|s| (split(&s.name).0.is_some(), s.name.to_lowercase()));
+        let mut folder: Option<String> = None;
+        for s in list {
             any = true;
+            let (f, leaf) = split(&s.name);
+            if f.is_some() && f != folder {
+                ui.label(egui::RichText::new(f.as_deref().unwrap_or_default()).small().color(crate::appearance::muted(ui.ctx())));
+            }
+            folder = f;
             ui.horizontal(|ui| {
+                if folder.is_some() {
+                    ui.add_space(8.0);
+                }
                 style_preview(ui, &s.value);
-                if ui.add(egui::Button::new(&s.name).frame(false)).clicked() {
+                if ui.add(egui::Button::new(&leaf).frame(false)).clicked() {
                     pick = Some(StylePick::Apply(s.id));
                     ui.close();
                 }
