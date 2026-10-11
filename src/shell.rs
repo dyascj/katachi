@@ -691,7 +691,7 @@ impl eframe::App for Shell {
         }
         self.wants();
         self.close_guard(&ctx);
-        if self.update.poll() {
+        if self.update.poll(&ctx) {
             ctx.request_repaint();
         }
     }
