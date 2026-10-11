@@ -1945,6 +1945,13 @@ impl Document {
         let mut writes = vec![];
         for n in self.nodes.values() {
             for &(prop, var) in &n.bindings {
+                // Inside an instance, a property overridden by hand keeps the override; the
+                // binding it copied from the main component no longer drives it.
+                if let Some(sync) = &n.synced
+                    && Self::bound_value_differs(n, sync, prop)
+                {
+                    continue;
+                }
                 if let Some(val) = resolve(var, n.id)
                     && !Self::binding_holds(n, prop, &val)
                 {
@@ -1976,6 +1983,24 @@ impl Document {
                 (Bindable::Visible, VarValue::Bool(b)) => n.visible = b,
                 _ => {}
             }
+        }
+    }
+
+    /// Whether `prop` differs between two versions of a layer.
+    fn bound_value_differs(a: &Node, b: &Node, prop: Bindable) -> bool {
+        match prop {
+            Bindable::Fill => a.fills != b.fills,
+            Bindable::Stroke => a.strokes != b.strokes,
+            Bindable::Opacity => a.opacity != b.opacity,
+            Bindable::Radius => a.radius != b.radius,
+            Bindable::Width => a.rect.width() != b.rect.width(),
+            Bindable::Height => a.rect.height() != b.rect.height(),
+            Bindable::Gap => a.layout.gap != b.layout.gap,
+            Bindable::Padding => a.layout.padding != b.layout.padding,
+            Bindable::StrokeWidth => a.stroke_width != b.stroke_width,
+            Bindable::FontSize => a.font_size != b.font_size,
+            Bindable::Text => a.text != b.text,
+            Bindable::Visible => a.visible != b.visible,
         }
     }
 
@@ -2030,23 +2055,44 @@ impl Document {
     }
 
     fn apply_styles_to(n: &mut Node, styles: &HashMap<StyleId, StyleValue>) {
-        {
-            for (link, stroke) in [(&mut n.fill_style, false), (&mut n.stroke_style, true)] {
-                match link.and_then(|id| styles.get(&id)) {
-                    Some(StyleValue::Paint(p)) => {
-                        if stroke { n.strokes = p.clone() } else { n.fills = p.clone() }
+        // Inside an instance, a property overridden by hand keeps the override; a style the
+        // main component's layer uses doesn't overwrite it.
+        let (fill_over, stroke_over, text_over, effect_over) = match &n.synced {
+            Some(s) => (
+                s.fills != n.fills,
+                s.strokes != n.strokes,
+                (s.font_family != n.font_family || s.font_size != n.font_size || s.font_weight != n.font_weight || s.line_height != n.line_height || s.letter_spacing != n.letter_spacing),
+                s.shadows != n.shadows,
+            ),
+            None => (false, false, false, false),
+        };
+        for (link, stroke) in [(&mut n.fill_style, false), (&mut n.stroke_style, true)] {
+            match link.and_then(|id| styles.get(&id)) {
+                Some(StyleValue::Paint(p)) => {
+                    if stroke && !stroke_over {
+                        n.strokes = p.clone()
+                    } else if !stroke && !fill_over {
+                        n.fills = p.clone()
                     }
-                    Some(_) | None => *link = None,
+                }
+                Some(_) | None => *link = None,
+            }
+        }
+        match n.text_style.and_then(|id| styles.get(&id)) {
+            Some(StyleValue::Text(t)) => {
+                if !text_over {
+                    t.apply(n)
                 }
             }
-            match n.text_style.and_then(|id| styles.get(&id)) {
-                Some(StyleValue::Text(t)) => t.apply(n),
-                _ => n.text_style = None,
+            _ => n.text_style = None,
+        }
+        match n.effect_style.and_then(|id| styles.get(&id)) {
+            Some(StyleValue::Effect(e)) => {
+                if !effect_over {
+                    n.shadows = e.clone()
+                }
             }
-            match n.effect_style.and_then(|id| styles.get(&id)) {
-                Some(StyleValue::Effect(e)) => n.shadows = e.clone(),
-                _ => n.effect_style = None,
-            }
+            _ => n.effect_style = None,
         }
     }
 

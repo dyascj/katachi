@@ -1573,3 +1573,38 @@ fn figma_details_from_the_audit() {
     assert_eq!(h.state().doc.node(w).layout.mode, crate::doc::LayoutMode::Horizontal);
     assert!(h.state().doc.node(w).fills.is_empty());
 }
+
+#[test]
+fn instance_overrides_survive_styles_and_variables_on_the_main_component() {
+    for via_style in [false, true] {
+        let mut doc = crate::doc::Document::default();
+        let step = |doc: &mut crate::doc::Document, js: &str| {
+            crate::plugins::run(doc, 0, &[], js).unwrap();
+            doc.reflow();
+        };
+        step(&mut doc, r##"
+            const c = figma.createComponent(); c.name = "Toggle"; c.resize(80, 40);
+            const track = figma.createRectangle(); track.name = "Track"; track.resize(80, 40); c.appendChild(track);
+            track.fills = [figma.util.solidPaint("#FF0000")];
+            c.createInstance().x = 200;
+        "##);
+        step(&mut doc, r##"
+            const i = figma.currentPage.findOne(n => n.type === "INSTANCE");
+            i.children[0].fills = [figma.util.solidPaint("#0000FF")];
+        "##);
+        step(&mut doc, if via_style { r##"
+            const track = figma.currentPage.findOne(n => n.name === "Track" && n.parent.type === "COMPONENT");
+            const st = figma.createPaintStyle(); st.name = "HUD / Accent"; st.paints = [figma.util.solidPaint("#00FF00")];
+            track.fillStyleId = st.id;
+        "## } else { r##"
+            const track = figma.currentPage.findOne(n => n.name === "Track" && n.parent.type === "COMPONENT");
+            const col = figma.variables.createVariableCollection("Theme");
+            const accent = figma.variables.createVariable("Accent", col, "COLOR");
+            accent.setValueForMode(col.modes[0].modeId, { r: 0, g: 1, b: 0, a: 1 });
+            track.fills = [figma.variables.setBoundVariableForPaint(figma.util.solidPaint("#000000"), "color", accent)];
+        "## });
+        let color = |inst: bool| doc.nodes.values().find(|n| n.name == "Track" && n.source.is_some() == inst).unwrap().fills[0].color;
+        assert_eq!(color(false), crate::doc::Rgba::rgb(0, 255, 0), "main follows (style: {via_style})");
+        assert_eq!(color(true), crate::doc::Rgba::rgb(0, 0, 255), "the instance keeps its override (style: {via_style})");
+    }
+}
