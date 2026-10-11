@@ -888,26 +888,26 @@ pub enum ScaleMode {
 pub struct Paint {
     pub color: Rgba,
     pub visible: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub kind: PaintKind,
     /// Gradient stops: position in 0..=1 and color.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub stops: Vec<(f32, Rgba)>,
     /// Gradient handles in the layer's unit square: linear start/end, or radial center/edge.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub from: Pos2,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub to: Pos2,
     /// Key into `Document::images`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub image: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub scale_mode: ScaleMode,
     /// Tile size relative to the image's pixels.
-    #[serde(default = "one")]
+    #[serde(default = "one", skip_serializing_if = "is_one")]
     pub tile_scale: f32,
     /// Image paints: color adjustments.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub adjust: ImageAdjust,
 }
 
@@ -1077,106 +1077,263 @@ impl Default for Shadow {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Node {
+    #[serde(skip_serializing_if = "dflt::id")]
     pub id: NodeId,
+    #[serde(skip_serializing_if = "dflt::name")]
     pub name: String,
+    #[serde(skip_serializing_if = "dflt::kind")]
     pub kind: Kind,
+    #[serde(skip_serializing_if = "dflt::parent")]
     pub parent: Option<NodeId>,
+    #[serde(skip_serializing_if = "dflt::children")]
     pub children: Vec<NodeId>,
+    #[serde(skip_serializing_if = "dflt::rect")]
     pub rect: Rect,
     /// Degrees counter-clockwise around the rect center, as shown in Figma.
+    #[serde(skip_serializing_if = "dflt::rotation")]
     pub rotation: f32,
+    #[serde(skip_serializing_if = "dflt::visible")]
     pub visible: bool,
+    #[serde(skip_serializing_if = "dflt::locked")]
     pub locked: bool,
+    #[serde(skip_serializing_if = "dflt::opacity")]
     pub opacity: f32,
+    #[serde(skip_serializing_if = "dflt::fills")]
     pub fills: Vec<Paint>,
+    #[serde(skip_serializing_if = "dflt::strokes")]
     pub strokes: Vec<Paint>,
+    #[serde(skip_serializing_if = "dflt::stroke_width")]
     pub stroke_width: f32,
+    #[serde(skip_serializing_if = "dflt::stroke_align")]
     pub stroke_align: StrokeAlign,
+    #[serde(skip_serializing_if = "dflt::radius")]
     pub radius: f32,
     /// Independent corners: top-left, top-right, bottom-right, bottom-left.
+    #[serde(skip_serializing_if = "dflt::corner_radii")]
     pub corner_radii: Option<[f32; 4]>,
     /// Dash pattern (dash, gap, ...); empty = solid.
+    #[serde(skip_serializing_if = "dflt::dash")]
     pub dash: Vec<f32>,
+    #[serde(skip_serializing_if = "dflt::cap")]
     pub cap: Cap,
+    #[serde(skip_serializing_if = "dflt::join")]
     pub join: Join,
+    #[serde(skip_serializing_if = "dflt::start_marker")]
     pub start_marker: Marker,
+    #[serde(skip_serializing_if = "dflt::end_marker")]
     pub end_marker: Marker,
     /// Polygon sides / star points.
+    #[serde(skip_serializing_if = "dflt::point_count")]
     pub point_count: u32,
     /// Star inner radius as a fraction of the outer.
+    #[serde(skip_serializing_if = "dflt::inner_ratio")]
     pub inner_ratio: f32,
+    #[serde(skip_serializing_if = "dflt::clip")]
     pub clip: bool,
+    #[serde(skip_serializing_if = "dflt::shadows")]
     pub shadows: Vec<Shadow>,
+    #[serde(skip_serializing_if = "dflt::layout")]
     pub layout: AutoLayout,
     /// Horizontal, vertical.
+    #[serde(skip_serializing_if = "dflt::sizing")]
     pub sizing: [Sizing; 2],
     /// Rectangles and frames: individual stroke weights (top, right, bottom, left).
+    #[serde(skip_serializing_if = "dflt::stroke_sides")]
     pub stroke_sides: Option<[f32; 4]>,
     /// Min and max width/height for hugging and filling layers.
+    #[serde(skip_serializing_if = "dflt::min_size")]
     pub min_size: [Option<f32>; 2],
+    #[serde(skip_serializing_if = "dflt::max_size")]
     pub max_size: [Option<f32>; 2],
+    #[serde(skip_serializing_if = "dflt::constraints")]
     pub constraints: [Constraint; 2],
     /// Ignores the parent's auto layout.
+    #[serde(skip_serializing_if = "dflt::absolute")]
     pub absolute: bool,
+    #[serde(skip_serializing_if = "dflt::bool_op")]
     pub bool_op: BoolOp,
     /// Clips the layers above it in the same parent.
+    #[serde(skip_serializing_if = "dflt::is_mask")]
     pub is_mask: bool,
+    #[serde(skip_serializing_if = "dflt::grids")]
     pub grids: Vec<LayoutGrid>,
+    #[serde(skip_serializing_if = "dflt::exports")]
     pub exports: Vec<ExportSetting>,
+    #[serde(skip_serializing_if = "dflt::blend")]
     pub blend: BlendMode,
     /// Prototype interactions.
+    #[serde(skip_serializing_if = "dflt::reactions")]
     pub reactions: Vec<Reaction>,
     /// Properties driven by variables.
+    #[serde(skip_serializing_if = "dflt::bindings")]
     pub bindings: Vec<(Bindable, VarId)>,
     /// Explicit variable modes set on this layer: (collection, mode index); children inherit.
+    #[serde(skip_serializing_if = "dflt::modes")]
     pub modes: Vec<(u64, usize)>,
     /// Linked shared styles.
+    #[serde(skip_serializing_if = "dflt::fill_style")]
     pub fill_style: Option<StyleId>,
+    #[serde(skip_serializing_if = "dflt::stroke_style")]
     pub stroke_style: Option<StyleId>,
+    #[serde(skip_serializing_if = "dflt::text_style")]
     pub text_style: Option<StyleId>,
+    #[serde(skip_serializing_if = "dflt::effect_style")]
     pub effect_style: Option<StyleId>,
     /// Components and sets: property definitions.
+    #[serde(skip_serializing_if = "dflt::comp_props")]
     pub comp_props: Vec<CompProp>,
     /// A layer inside a component bound to a property.
     #[serde(deserialize_with = "one_or_many_binds")]
+    #[serde(skip_serializing_if = "dflt::prop_bind")]
     pub prop_bind: Vec<(String, PropTarget)>,
     /// Instances: chosen property values (missing = the default).
+    #[serde(skip_serializing_if = "dflt::prop_values")]
     pub prop_values: Vec<(String, PropValue)>,
     /// Instances: the main component they copy.
+    #[serde(skip_serializing_if = "dflt::component")]
     pub component: Option<NodeId>,
     /// Inside an instance (and the instance itself): the component layer this mirrors.
+    #[serde(skip_serializing_if = "dflt::source")]
     pub source: Option<NodeId>,
     /// The source's values as last copied; a property that differs from this is an override.
+    #[serde(skip_serializing_if = "dflt::synced")]
     pub synced: Option<Box<Node>>,
+    #[serde(skip_serializing_if = "dflt::paths")]
     pub paths: Vec<SubPath>,
     /// Even-odd fill rule (holes by parity) instead of non-zero winding.
+    #[serde(skip_serializing_if = "dflt::even_odd")]
     pub even_odd: bool,
+    #[serde(skip_serializing_if = "dflt::text")]
     pub text: String,
+    #[serde(skip_serializing_if = "dflt::font_size")]
     pub font_size: f32,
+    #[serde(skip_serializing_if = "dflt::font_weight")]
     pub font_weight: u16,
+    #[serde(skip_serializing_if = "dflt::font_family")]
     pub font_family: String,
+    #[serde(skip_serializing_if = "dflt::text_sizing")]
     pub text_sizing: TextSizing,
+    #[serde(skip_serializing_if = "dflt::text_align")]
     pub text_align: TextAlign,
+    #[serde(skip_serializing_if = "dflt::text_valign")]
     pub text_valign: VAlign,
+    #[serde(skip_serializing_if = "dflt::line_height")]
     pub line_height: LineHeight,
     /// Percent of the font size.
+    #[serde(skip_serializing_if = "dflt::letter_spacing")]
     pub letter_spacing: f32,
+    #[serde(skip_serializing_if = "dflt::decoration")]
     pub decoration: Decoration,
+    #[serde(skip_serializing_if = "dflt::text_case")]
     pub text_case: TextCase,
     /// Extra space after each paragraph.
+    #[serde(skip_serializing_if = "dflt::paragraph_spacing")]
     pub paragraph_spacing: f32,
     /// End overflowing text with an ellipsis.
+    #[serde(skip_serializing_if = "dflt::truncate")]
     pub truncate: bool,
     /// With truncation on: lines before the ellipsis (0 = as many as fit).
+    #[serde(skip_serializing_if = "dflt::max_lines")]
     pub max_lines: u32,
     /// Styled character ranges (rich text).
+    #[serde(skip_serializing_if = "dflt::spans")]
     pub spans: Vec<TextSpan>,
     /// List formatting per paragraph (missing paragraphs are plain).
+    #[serde(skip_serializing_if = "dflt::lists")]
     pub lists: Vec<ListLine>,
     /// Wrapped lines from the last layout, used by export.
     #[serde(skip)]
     pub lines: Vec<String>,
+    #[serde(skip_serializing_if = "dflt::expanded")]
     pub expanded: bool,
+}
+
+/// Serialization leaves out fields at `Node::default()`'s values; `#[serde(default)]` fills
+/// them back in on load. Files get several times smaller and faster to write and read.
+mod dflt {
+    use super::*;
+    thread_local!(static D: Node = Node::default());
+    macro_rules! same {
+        ($($f:ident: $t:ty),* $(,)?) => { $(pub fn $f(v: &$t) -> bool { D.with(|d| d.$f == *v) })* };
+    }
+    same!(
+        id: NodeId,
+        name: String,
+        kind: Kind,
+        parent: Option<NodeId>,
+        children: Vec<NodeId>,
+        rect: Rect,
+        rotation: f32,
+        visible: bool,
+        locked: bool,
+        opacity: f32,
+        fills: Vec<Paint>,
+        strokes: Vec<Paint>,
+        stroke_width: f32,
+        stroke_align: StrokeAlign,
+        radius: f32,
+        corner_radii: Option<[f32; 4]>,
+        dash: Vec<f32>,
+        cap: Cap,
+        join: Join,
+        start_marker: Marker,
+        end_marker: Marker,
+        point_count: u32,
+        inner_ratio: f32,
+        clip: bool,
+        shadows: Vec<Shadow>,
+        layout: AutoLayout,
+        sizing: [Sizing; 2],
+        stroke_sides: Option<[f32; 4]>,
+        min_size: [Option<f32>; 2],
+        max_size: [Option<f32>; 2],
+        constraints: [Constraint; 2],
+        absolute: bool,
+        bool_op: BoolOp,
+        is_mask: bool,
+        grids: Vec<LayoutGrid>,
+        exports: Vec<ExportSetting>,
+        blend: BlendMode,
+        reactions: Vec<Reaction>,
+        bindings: Vec<(Bindable, VarId)>,
+        modes: Vec<(u64, usize)>,
+        fill_style: Option<StyleId>,
+        stroke_style: Option<StyleId>,
+        text_style: Option<StyleId>,
+        effect_style: Option<StyleId>,
+        comp_props: Vec<CompProp>,
+        prop_bind: Vec<(String, PropTarget)>,
+        prop_values: Vec<(String, PropValue)>,
+        component: Option<NodeId>,
+        source: Option<NodeId>,
+        synced: Option<Box<Node>>,
+        paths: Vec<SubPath>,
+        even_odd: bool,
+        text: String,
+        font_size: f32,
+        font_weight: u16,
+        font_family: String,
+        text_sizing: TextSizing,
+        text_align: TextAlign,
+        text_valign: VAlign,
+        line_height: LineHeight,
+        letter_spacing: f32,
+        decoration: Decoration,
+        text_case: TextCase,
+        paragraph_spacing: f32,
+        truncate: bool,
+        max_lines: u32,
+        spans: Vec<TextSpan>,
+        lists: Vec<ListLine>,
+        expanded: bool,
+    );
+}
+
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
+}
+fn is_one(v: &f32) -> bool {
+    *v == 1.0
 }
 
 impl Default for Node {
@@ -1448,6 +1605,23 @@ impl std::fmt::Debug for SyncCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SyncCache")
     }
+}
+
+/// A .katachi file: `{"katachi": 1, "document": {...}}`.
+#[derive(Deserialize)]
+struct FileJson {
+    document: Document,
+}
+
+/// Read a .katachi file's text.
+pub fn parse_file(text: &str) -> Result<Document, String> {
+    serde_json::from_str::<FileJson>(text).map(|f| f.document).map_err(|e| e.to_string())
+}
+
+/// A .katachi file's text.
+pub fn file_json(doc: &Document) -> String {
+    // Straight to text: going through a serde_json::Value doubles the time on big files.
+    format!(r#"{{"katachi":1,"document":{}}}"#, serde_json::to_string(doc).unwrap_or_default())
 }
 
 mod images_b64 {

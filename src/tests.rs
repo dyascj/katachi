@@ -1023,7 +1023,15 @@ fn autosave_and_recovery_roundtrip() {
     a.doc.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 0., 10., 10.)));
     a.dirty = true;
     a.autosave(100.0);
-    let left = crate::files::orphaned_recoveries(std::path::Path::new("none"));
+    // Written in the background.
+    let mut left = vec![];
+    for _ in 0..200 {
+        left = crate::files::orphaned_recoveries(std::path::Path::new("none"));
+        if !left.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert!(!left.is_empty(), "autosave written");
     // A new session sees the orphan and can recover it as unsaved work.
     let mut b = App::new(None);
@@ -1372,3 +1380,73 @@ fn select_matching_and_paste_to_replace() {
     assert_eq!(d.node(new).rect.center(), pos2(90., 10.), "centered where the replaced layer was");
 }
 
+
+/// `KATACHI_BENCH_FILE=big.katachi cargo test --release perf_bench -- --ignored --nocapture`:
+/// frame times on a real file (each page fitted, idle, panning, hovering), plus open, undo
+/// checkpoint and save costs.
+#[test]
+#[ignore]
+fn perf_bench() {
+    use std::time::Instant;
+    let Some(file) = std::env::var_os("KATACHI_BENCH_FILE") else { return };
+    let mut h = harness();
+    let t = Instant::now();
+    h.state_mut().open_path(file.into());
+    eprintln!("open {:?} ({} nodes, {} pages)", t.elapsed(), h.state().doc.nodes.len(), h.state().doc.pages.len());
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    let mut frame = |h: &mut Harness<'static, App>| {
+        let t = Instant::now();
+        h.step();
+        ms(t.elapsed())
+    };
+    for p in 0..h.state().doc.pages.len() {
+        h.state_mut().page = p;
+        h.state_mut().view_ready = false;
+        let first = frame(&mut h);
+        let idle: f64 = (0..10).map(|_| frame(&mut h)).sum::<f64>() / 10.0;
+        let pan: f64 = (0..10)
+            .map(|i| {
+                h.event(Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, if i % 2 == 0 { 40.0 } else { -40.0 }), modifiers: Modifiers::NONE, phase: egui::TouchPhase::Move });
+                frame(&mut h)
+            })
+            .sum::<f64>()
+            / 10.0;
+        let hover: f64 = (0..10)
+            .map(|i| {
+                h.event(Event::PointerMoved(pos2(400.0 + i as f32 * 50.0, 300.0 + i as f32 * 30.0)));
+                frame(&mut h)
+            })
+            .sum::<f64>()
+            / 10.0;
+        let name = h.state().doc.pages[p].name.clone();
+        let n = h.state().doc.pages[p].children.len();
+        eprintln!("page {p} {name:>32} ({n:>3} top): first {first:7.1} ms  idle {idle:6.1}  pan {pan:6.1}  hover {hover:6.1}");
+    }
+    let t = Instant::now();
+    h.state_mut().checkpoint();
+    eprintln!("undo checkpoint {:?}", t.elapsed());
+    let t = Instant::now();
+    let json = crate::doc::file_json(&h.state().doc);
+    eprintln!("serialize {:?} ({} MB)", t.elapsed(), json.len() >> 20);
+    let t = Instant::now();
+    let path = std::env::temp_dir().join("katachi-bench-save.katachi");
+    h.state_mut().save_to(path);
+    eprintln!("save {:?}", t.elapsed());
+}
+
+#[test]
+fn compact_files_load_back_identical() {
+    let mut doc = crate::doc::Document::default();
+    crate::plugins::run(&mut doc, 0, &[], include_str!("../assets/promo/showcase.js")).unwrap();
+    // Instances carry a snapshot of their main component, which is compacted too.
+    crate::plugins::run(&mut doc, 0, &[], r#"const set = figma.currentPage.findOne(n => n.name === "Button"); const i = set.children[1].createInstance(); i.x = 40; i.y = 2000;"#).unwrap();
+    let compact = crate::doc::file_json(&doc);
+    assert!(!compact.contains("inner_ratio") && !compact.contains("\"letter_spacing\":0"), "defaults are left out");
+    let back = crate::doc::parse_file(&compact).unwrap();
+    assert_eq!(serde_json::to_value(&back).unwrap(), serde_json::to_value(&doc).unwrap());
+    // Older files spelled out every field; missing ones load as defaults either way.
+    let old = r#"{"katachi":1,"document":{"pages":[{"name":"Page 1","children":[1],"background":[245,245,245,255]}],"nodes":{"1":{"id":1,"name":"R","kind":"Rectangle","opacity":1.0,"inner_ratio":0.382,"rect":{"min":{"x":0,"y":0},"max":{"x":10,"y":10}}}},"next_id":2}}"#;
+    let d = crate::doc::parse_file(old).unwrap();
+    assert_eq!(d.nodes[&1].opacity, 1.0);
+    assert!(d.nodes[&1].visible);
+}

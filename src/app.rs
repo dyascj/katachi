@@ -195,6 +195,8 @@ pub struct App {
     /// This session's crash-recovery autosave.
     recovery: PathBuf,
     last_autosave: f64,
+    /// Bumped when the autosave is cleared, so a background autosave that finishes late is dropped.
+    autosave_gen: std::sync::Arc<std::sync::Mutex<u64>>,
     /// Autosaves from sessions that crashed, offered on launch.
     pub recoverable: Vec<PathBuf>,
     undo: Vec<Document>,
@@ -299,6 +301,7 @@ impl App {
                 ))
             },
             last_autosave: 0.0,
+            autosave_gen: Default::default(),
             recoverable: vec![],
             undo: vec![],
             redo: vec![],
@@ -364,19 +367,31 @@ impl App {
     }
 
     fn document_json(&self) -> String {
-        serde_json::json!({ "katachi": 1, "document": self.doc }).to_string()
+        crate::doc::file_json(&self.doc)
     }
 
-    /// Every 30 s while there are unsaved changes, snapshot to the recovery folder.
+    /// Every 30 s while there are unsaved changes, snapshot to the recovery folder. The copy is
+    /// written on another thread so big files don't stall the canvas.
     pub fn autosave(&mut self, now: f64) {
         if self.dirty && now - self.last_autosave > 30.0 {
             self.last_autosave = now;
-            let _ = crate::files::write_atomic(&self.recovery, self.document_json().as_bytes());
+            let (doc, path, gen_lock) = (self.doc.clone(), self.recovery.clone(), self.autosave_gen.clone());
+            let generation = *gen_lock.lock().unwrap();
+            std::thread::spawn(move || {
+                let json = crate::doc::file_json(&doc);
+                // Skip the write if the work was saved or discarded meanwhile.
+                let g = gen_lock.lock().unwrap();
+                if *g == generation {
+                    let _ = crate::files::write_atomic(&path, json.as_bytes());
+                }
+            });
         }
     }
 
     /// The work is saved or deliberately discarded: drop this session's autosave.
     pub fn clear_recovery(&self) {
+        let mut g = self.autosave_gen.lock().unwrap();
+        *g += 1;
         let _ = std::fs::remove_file(&self.recovery);
     }
 
@@ -1152,8 +1167,7 @@ impl App {
         }
         let parsed = std::fs::read_to_string(&p)
             .map_err(|e| e.to_string())
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).map_err(|e| e.to_string()))
-            .and_then(|v| serde_json::from_value::<Document>(v["document"].clone()).map_err(|e| e.to_string()));
+            .and_then(|s| crate::doc::parse_file(&s));
         match parsed {
             Ok(doc) => {
                 self.reset_to(App::new(None));
@@ -1290,8 +1304,7 @@ impl App {
     pub fn recover(&mut self, p: &std::path::Path) {
         let parsed = std::fs::read_to_string(p)
             .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| serde_json::from_value::<Document>(v["document"].clone()).ok());
+            .and_then(|s| crate::doc::parse_file(&s).ok());
         if let Some(doc) = parsed {
             self.reset_to(App::new(None));
             self.doc = doc;
@@ -1342,8 +1355,7 @@ impl App {
         if let Some(p) = restore {
             let doc = std::fs::read_to_string(&p)
                 .ok()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                .and_then(|v| serde_json::from_value::<Document>(v["document"].clone()).ok());
+                .and_then(|s| crate::doc::parse_file(&s).ok());
             if let Some(doc) = doc {
                 self.checkpoint();
                 self.doc = doc;

@@ -609,8 +609,7 @@ pub fn ago(t: SystemTime) -> String {
 /// Render a file's first page to its Home thumbnail.
 fn write_thumb(file: &Path) -> Result<(), String> {
     let text = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
-    let mut v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let doc: crate::doc::Document = serde_json::from_value(v["document"].take()).map_err(|e| e.to_string())?;
+    let doc = crate::doc::parse_file(&text)?;
     let out = crate::files::thumb_path(file);
     let Some(page) = doc.pages.first() else { return Err("no pages".into()) };
     let ids = page.children.clone();
