@@ -1663,3 +1663,13 @@ fn ui_look() {
     h.run_steps(4);
     h.render().unwrap().save("target/look-autolayout.png").unwrap();
 }
+
+#[test]
+fn layer_rows_and_pages_are_named_for_assistive_tech() {
+    let mut h = harness();
+    draw(&mut h, Key::R, (0.0, 0.0), (50.0, 50.0));
+    h.run_steps(2);
+    assert!(h.query_by_label("Rectangle 1").is_some(), "layer row");
+    assert!(h.query_by_label("Page 1").is_some(), "page row");
+    assert!(h.query_by_label("Main menu").is_some(), "icon buttons");
+}

@@ -341,6 +341,7 @@ pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
 
 pub fn icon_button(ui: &mut Ui, icon: Icon, selected: bool, size: f32, tip: &str) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, tip));
     let (bg, fg) = if selected {
         (BLUE, Color32::WHITE)
     } else if resp.hovered() {
@@ -773,6 +774,8 @@ impl App {
         let mut delete = None;
         for i in 0..self.doc.pages.len() {
             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+            let page_name = self.doc.pages[i].name.clone();
+            resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, i == self.page, &page_name));
             if i == self.page {
                 ui.painter().rect_filled(rect, 4.0, theme::subtle(ui.ctx()));
             } else if resp.hovered() {
@@ -870,6 +873,8 @@ impl App {
             rects.push((id, rect));
             let n = self.doc.node(id).clone();
             let selected = self.sel.contains(&id);
+            // Screen readers and computer-use agents see the row as a named, selectable item.
+            resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &n.name));
             let in_selected = !selected && self.sel.iter().any(|&s| self.doc.is_ancestor(s, id));
             let p = &ui.painter().clone();
             if selected {
