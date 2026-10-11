@@ -1632,3 +1632,23 @@ fn add_variant_turns_a_component_into_a_set() {
     h.state_mut().add_variant_to(v2);
     assert_eq!(h.state().doc.node(set).children.len(), 3);
 }
+
+/// Renders panels Codex flagged, for a visual check: `cargo test --release ui_look -- --ignored`.
+#[test]
+#[ignore]
+fn ui_look() {
+    isolate_data();
+    let mut h = Harness::builder().with_size(vec2(1440.0, 900.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| {
+        crate::setup_style(&cc.egui_ctx);
+        let mut app = App::new(None);
+        app.recoverable.clear();
+        let c = app.doc.add_collection("Theme".into());
+        app.doc.collections.iter_mut().find(|x| x.id == c).unwrap().modes = vec!["Dark".into(), "Light".into()];
+        let v = app.doc.add_variable(c, "Accent".into(), crate::doc::VarValue::Color(crate::doc::Rgba::rgb(0x8E, 0x72, 0xFF)));
+        app.doc.variables.iter_mut().find(|x| x.id == v).unwrap().values = vec![crate::doc::VarValue::Color(crate::doc::Rgba::rgb(0x8E, 0x72, 0xFF)), crate::doc::VarValue::Color(crate::doc::Rgba::rgb(0x12, 0x34, 0x56))];
+        app.show_variables = true;
+        app
+    });
+    h.run_steps(4);
+    h.render().unwrap().save("target/look-variables.png").unwrap();
+}
