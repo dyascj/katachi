@@ -1816,3 +1816,17 @@ fn export_file() {
         std::fs::write(format!("target/export-{i}.png"), crate::export::to_png(&doc, &[id], 1.0).unwrap()).unwrap();
     }
 }
+
+#[test]
+fn dev_mode_lists_a_multi_selection() {
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (50.0, 50.0));
+    let b = draw(&mut h, Key::O, (100.0, 0.0), (150.0, 50.0));
+    h.state_mut().sel = vec![a, b];
+    h.state_mut().dev_mode = true;
+    h.run_steps(2);
+    assert!(h.query_by_label("2 layers selected").is_some());
+    // Each layer appears in the layers panel and in the Dev Mode list.
+    assert_eq!(h.query_all_by_label("Ellipse 1").count(), 2);
+    let _ = b;
+}

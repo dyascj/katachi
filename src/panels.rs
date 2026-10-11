@@ -1425,6 +1425,28 @@ impl App {
             ui.label(RichText::new("Select a layer to inspect its code and properties.").color(theme::muted(ui.ctx())));
             return;
         };
+        // Several layers: list them; Dev Mode inspects one at a time, so a click picks one.
+        if self.sel.len() > 1 {
+            ui.label(RichText::new(format!("{} layers selected", self.sel.len())).strong().size(14.0));
+            ui.label(RichText::new("Pick one to inspect its code.").color(theme::muted(ui.ctx())));
+            ui.add_space(4.0);
+            let mut pick = None;
+            for &s in &self.sel {
+                let n = self.doc.node(s);
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                    paint_icon(ui.painter(), r, kind_icon(n.kind), theme::icon(ui.ctx()));
+                    if ui.add(egui::Button::new(&n.name).frame(false)).clicked() {
+                        pick = Some(s);
+                    }
+                });
+            }
+            if let Some(s) = pick {
+                self.sel = vec![s];
+            }
+            ui.separator();
+            return;
+        }
         let n = self.doc.node(id).clone();
         ui.label(RichText::new(&n.name).strong().size(14.0));
         ui.label(RichText::new(format!("{}  ·  {} × {}", n.kind.label(), num(n.rect.width()), num(n.rect.height()))).color(theme::muted(ui.ctx())));
@@ -1793,7 +1815,8 @@ impl App {
             let title = match inst {
                 Some(i) => {
                     let main = self.doc.node(i).component.and_then(|c| self.doc.nodes.get(&c)).map_or("Missing component".into(), |c| c.name.clone());
-                    format!("Instance of {main}")
+                    let others = self.sel.len() - 1;
+                    if others > 0 { format!("{} instances, {main} and others", others + 1) } else { format!("Instance of {main}") }
                 }
                 None => self.doc.node(owner.unwrap()).name.clone(),
             };
@@ -1831,14 +1854,19 @@ impl App {
                             });
                         });
                         if pick != cur {
-                            let mut want = current.clone();
-                            want.retain(|(k, _)| *k != prop);
-                            want.push((prop.clone(), pick));
-                            if let Some(v) = self.doc.find_variant(set, &want) {
-                                self.checkpoint();
-                                self.doc.swap_component(i, v);
-                                self.doc.reflow();
+                            // Every selected instance of this set switches, each keeping its other properties.
+                            self.checkpoint();
+                            let targets: Vec<NodeId> = self.sel.iter().copied().filter(|&s| self.doc.node(s).component.and_then(|c| self.doc.nodes.get(&c)).and_then(|c| c.parent) == Some(set)).collect();
+                            for t in targets {
+                                let Some(tc) = self.doc.node(t).component else { continue };
+                                let mut want = crate::doc::variant_pairs(&self.doc.node(tc).name);
+                                want.retain(|(k, _)| *k != prop);
+                                want.push((prop.clone(), pick.clone()));
+                                if let Some(v) = self.doc.find_variant(set, &want) {
+                                    self.doc.swap_component(t, v);
+                                }
                             }
+                            self.doc.reflow();
                         }
                     }
                 }
@@ -1877,7 +1905,11 @@ impl App {
                 }
                 if changed {
                     self.begin_edit();
-                    self.doc.node_mut(i).prop_values = values;
+                    // Selected instances of the same component take the same values.
+                    let targets: Vec<NodeId> = self.sel.iter().copied().filter(|&s| s == i || self.doc.node(s).component == Some(c)).collect();
+                    for t in targets {
+                        self.doc.node_mut(t).prop_values = values.clone();
+                    }
                     self.doc.reflow();
                 }
             }
