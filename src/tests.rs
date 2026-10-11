@@ -1394,7 +1394,7 @@ fn perf_bench() {
     h.state_mut().open_path(file.into());
     eprintln!("open {:?} ({} nodes, {} pages)", t.elapsed(), h.state().doc.nodes.len(), h.state().doc.pages.len());
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-    let mut frame = |h: &mut Harness<'static, App>| {
+    let frame = |h: &mut Harness<'static, App>| {
         let t = Instant::now();
         h.step();
         ms(t.elapsed())
@@ -1422,9 +1422,45 @@ fn perf_bench() {
         let n = h.state().doc.pages[p].children.len();
         eprintln!("page {p} {name:>32} ({n:>3} top): first {first:7.1} ms  idle {idle:6.1}  pan {pan:6.1}  hover {hover:6.1}");
     }
+    let rss = || {
+        let out = std::process::Command::new("ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().unwrap_or(0) / 1024
+    };
+    let before = rss();
     let t = Instant::now();
+    for _ in 0..50 {
+        h.state_mut().checkpoint();
+    }
+    eprintln!("undo checkpoint {:?} each, 50 steps: +{} MB", t.elapsed() / 50, rss().saturating_sub(before));
+    // A real editing step: checkpoint, move a layer, reflow, draw.
+    h.state_mut().page = 2;
+    let id = h.state().doc.pages[2].children[0];
+    let before = rss();
+    let t = Instant::now();
+    for i in 0..50 {
+        let a = h.state_mut();
+        a.checkpoint();
+        let d = if i % 2 == 0 { 10.0 } else { -10.0 };
+        a.doc.node_mut(id).rect = a.doc.node(id).rect.translate(vec2(d, 0.0));
+        a.doc.reflow();
+        h.step();
+    }
+    eprintln!("edit + reflow + frame + checkpoint {:?} each, 50 steps: +{} MB", t.elapsed() / 50, rss().saturating_sub(before));
+    // Which part copies layers: count layers no longer shared with the last undo snapshot.
+    let shared = |a: &App| a.doc.nodes.iter().filter(|(_, n)| std::sync::Arc::strong_count(n) > 1).count();
     h.state_mut().checkpoint();
-    eprintln!("undo checkpoint {:?}", t.elapsed());
+    let n0 = shared(h.state());
+    let t = Instant::now();
+    h.state_mut().doc.reflow();
+    eprintln!("reflow {:?}", t.elapsed());
+    let n1 = shared(h.state());
+    h.step();
+    let n2 = shared(h.state());
+    eprintln!("shared layers: after checkpoint {n0}, after reflow {n1}, after a frame {n2}");
+    // Reflow should be idempotent: name the layers a second pass still changes.
+    let before = h.state().doc.nodes.clone();
+    h.state_mut().doc.reflow();
+    eprintln!("a second reflow still changes {} layers", h.state().doc.nodes.iter().filter(|(id, n)| !std::sync::Arc::ptr_eq(n, &before[id])).count());
     let t = Instant::now();
     let json = crate::doc::file_json(&h.state().doc);
     eprintln!("serialize {:?} ({} MB)", t.elapsed(), json.len() >> 20);

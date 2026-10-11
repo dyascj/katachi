@@ -60,7 +60,7 @@ pub fn diff(base: &Document, doc: &Document) -> Vec<Op> {
     let mut ops = vec![];
     for (id, n) in &doc.nodes {
         if base.nodes.get(id) != Some(n) {
-            ops.push(Op::Upsert(Box::new(n.clone())));
+            ops.push(Op::Upsert(Box::new((**n).clone())));
         }
     }
     for id in base.nodes.keys() {
@@ -91,7 +91,7 @@ pub fn apply(doc: &mut Document, ops: &[Op]) {
                 if let Some(local) = doc.nodes.get(&n.id) {
                     n.lines = local.lines.clone();
                 }
-                doc.nodes.insert(n.id, n);
+                doc.nodes.insert(n.id, std::sync::Arc::new(n));
             }
             Op::Remove(id) => {
                 doc.nodes.remove(id);
@@ -122,11 +122,13 @@ pub fn repair(doc: &mut Document) {
         page.children.retain(|c| seen.insert(*c));
     }
     let parents: HashMap<NodeId, Option<NodeId>> = doc.nodes.iter().map(|(k, n)| (*k, n.parent)).collect();
-    for n in doc.nodes.values_mut() {
-        let me = n.id;
-        n.children.retain(|c| parents.get(c) == Some(&Some(me)));
+    for arc in doc.nodes.values_mut() {
+        let me = arc.id;
         let mut seen = HashSet::new();
-        n.children.retain(|c| seen.insert(*c));
+        let kids: Vec<NodeId> = arc.children.iter().copied().filter(|c| parents.get(c) == Some(&Some(me)) && seen.insert(*c)).collect();
+        if kids != arc.children {
+            std::sync::Arc::make_mut(arc).children = kids;
+        }
     }
     let mut ordered: Vec<NodeId> = doc.nodes.keys().copied().collect();
     ordered.sort();

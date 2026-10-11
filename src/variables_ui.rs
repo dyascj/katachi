@@ -117,7 +117,9 @@ impl App {
                     if let Some(id) = delete {
                         self.doc.variables.retain(|v| v.id != id);
                         for n in self.doc.nodes.values_mut() {
-                            n.bindings.retain(|(_, v)| *v != id);
+                            if n.bindings.iter().any(|(_, v)| *v == id) {
+                                std::sync::Arc::make_mut(n).bindings.retain(|(_, v)| *v != id);
+                            }
                         }
                     }
                 });

@@ -2062,7 +2062,9 @@ impl App {
             (false, true, false, Key::D) => self.dev_mode = !self.dev_mode,
             (false, false, true, Key::L) => {
                 for n in self.doc.nodes.values_mut() {
-                    n.expanded = false;
+                    if n.expanded {
+                        std::sync::Arc::make_mut(n).expanded = false;
+                    }
                 }
             }
             (false, true, false, Key::H) => self.flip_selection(true),

@@ -1555,7 +1555,8 @@ pub const PAGE_BG: Rgba = Rgba::rgb(0xF5, 0xF5, 0xF5);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Document {
     pub pages: Vec<Page>,
-    pub nodes: HashMap<NodeId, Node>,
+    /// Shared with undo snapshots: editing a layer copies just that layer (`node_mut`).
+    pub nodes: HashMap<NodeId, std::sync::Arc<Node>>,
     pub next_id: NodeId,
     /// Embedded images: content hash -> encoded PNG/JPEG bytes (base64 in files).
     #[serde(default, with = "images_b64")]
@@ -1673,7 +1674,7 @@ impl Document {
         &self.nodes[&id]
     }
     pub fn node_mut(&mut self, id: NodeId) -> &mut Node {
-        self.nodes.get_mut(&id).expect("node exists")
+        std::sync::Arc::make_mut(self.nodes.get_mut(&id).expect("node exists"))
     }
 
     pub fn page_of(&self, id: NodeId) -> usize {
@@ -1740,7 +1741,7 @@ impl Document {
         if node.name.is_empty() {
             node.name = self.auto_name(node.kind.label());
         }
-        self.nodes.insert(id, node);
+        self.nodes.insert(id, std::sync::Arc::new(node));
         let list = self.children_of_mut(page, parent);
         let i = index.unwrap_or(list.len()).min(list.len());
         list.insert(i, id);
@@ -1897,52 +1898,90 @@ impl Document {
             .unwrap_or(0)
     }
 
-    /// A variable's concrete value as seen from `node`, following aliases.
-    pub fn resolve(&self, var: VarId, node: NodeId) -> Option<VarValue> {
-        let mut cur = var;
-        for _ in 0..8 {
-            let v = self.variable(cur)?;
-            let mode = self.mode_for(node, v.collection).min(v.values.len().saturating_sub(1));
-            match v.values.get(mode)? {
-                VarValue::Alias(next) => cur = *next,
-                other => return Some(other.clone()),
-            }
-        }
-        None
-    }
-
     /// Push variable values into bound properties.
     pub fn apply_variables(&mut self) {
         if self.variables.is_empty() {
             return;
         }
-        let bound: Vec<NodeId> = self.nodes.values().filter(|n| !n.bindings.is_empty()).map(|n| n.id).collect();
-        for id in bound {
-            for (prop, var) in self.nodes[&id].bindings.clone() {
-                let Some(val) = self.resolve(var, id) else { continue };
-                let n = self.node_mut(id);
-                match (prop, val) {
-                    (Bindable::Fill, VarValue::Color(c)) => match n.fills.last_mut() {
-                        Some(p) if p.kind == PaintKind::Solid => p.color = c,
-                        _ => n.fills = vec![Paint::solid(c)],
-                    },
-                    (Bindable::Stroke, VarValue::Color(c)) => match n.strokes.last_mut() {
-                        Some(p) if p.kind == PaintKind::Solid => p.color = c,
-                        _ => n.strokes = vec![Paint::solid(c)],
-                    },
-                    (Bindable::Opacity, VarValue::Number(v)) => n.opacity = (v / 100.0).clamp(0.0, 1.0),
-                    (Bindable::Radius, VarValue::Number(v)) => n.radius = v.max(0.0),
-                    (Bindable::Width, VarValue::Number(v)) => n.rect = Rect::from_min_size(n.rect.min, vec2(v.max(0.0), n.rect.height())),
-                    (Bindable::Height, VarValue::Number(v)) => n.rect = Rect::from_min_size(n.rect.min, vec2(n.rect.width(), v.max(0.0))),
-                    (Bindable::Gap, VarValue::Number(v)) => n.layout.gap = v,
-                    (Bindable::Padding, VarValue::Number(v)) => n.layout.padding = [v; 4],
-                    (Bindable::StrokeWidth, VarValue::Number(v)) => n.stroke_width = v.max(0.0),
-                    (Bindable::FontSize, VarValue::Number(v)) => n.font_size = v.max(1.0),
-                    (Bindable::Text, VarValue::Text(t)) => n.text = t,
-                    (Bindable::Visible, VarValue::Bool(b)) => n.visible = b,
-                    _ => {}
+        // Resolve everything first, against an index (this runs on every edit, over every bound layer).
+        let index: HashMap<VarId, &Variable> = self.variables.iter().map(|v| (v.id, v)).collect();
+        let any_modes = self.nodes.values().any(|n| !n.modes.is_empty());
+        let mode_for = |node: NodeId, collection: u64| -> usize {
+            let mut cur = any_modes.then_some(node);
+            while let Some(id) = cur {
+                let Some(n) = self.nodes.get(&id) else { break };
+                if let Some((_, m)) = n.modes.iter().find(|(c, _)| *c == collection) {
+                    return *m;
+                }
+                cur = n.parent;
+            }
+            0
+        };
+        let resolve = |var: VarId, node: NodeId| -> Option<VarValue> {
+            let mut cur = var;
+            for _ in 0..8 {
+                let v = index.get(&cur)?;
+                let mode = mode_for(node, v.collection).min(v.values.len().saturating_sub(1));
+                match v.values.get(mode)? {
+                    VarValue::Alias(next) => cur = *next,
+                    other => return Some(other.clone()),
                 }
             }
+            None
+        };
+        let mut writes = vec![];
+        for n in self.nodes.values() {
+            for &(prop, var) in &n.bindings {
+                if let Some(val) = resolve(var, n.id)
+                    && !Self::binding_holds(n, prop, &val)
+                {
+                    writes.push((n.id, prop, val));
+                }
+            }
+        }
+        // Only layers whose values change are written (and so copied away from undo snapshots).
+        for (id, prop, val) in writes {
+            let n = self.node_mut(id);
+            match (prop, val) {
+                (Bindable::Fill, VarValue::Color(c)) => match n.fills.last_mut() {
+                    Some(p) if p.kind == PaintKind::Solid => p.color = c,
+                    _ => n.fills = vec![Paint::solid(c)],
+                },
+                (Bindable::Stroke, VarValue::Color(c)) => match n.strokes.last_mut() {
+                    Some(p) if p.kind == PaintKind::Solid => p.color = c,
+                    _ => n.strokes = vec![Paint::solid(c)],
+                },
+                (Bindable::Opacity, VarValue::Number(v)) => n.opacity = (v / 100.0).clamp(0.0, 1.0),
+                (Bindable::Radius, VarValue::Number(v)) => n.radius = v.max(0.0),
+                (Bindable::Width, VarValue::Number(v)) => n.rect = Rect::from_min_size(n.rect.min, vec2(v.max(0.0), n.rect.height())),
+                (Bindable::Height, VarValue::Number(v)) => n.rect = Rect::from_min_size(n.rect.min, vec2(n.rect.width(), v.max(0.0))),
+                (Bindable::Gap, VarValue::Number(v)) => n.layout.gap = v,
+                (Bindable::Padding, VarValue::Number(v)) => n.layout.padding = [v; 4],
+                (Bindable::StrokeWidth, VarValue::Number(v)) => n.stroke_width = v.max(0.0),
+                (Bindable::FontSize, VarValue::Number(v)) => n.font_size = v.max(1.0),
+                (Bindable::Text, VarValue::Text(t)) => n.text = t,
+                (Bindable::Visible, VarValue::Bool(b)) => n.visible = b,
+                _ => {}
+            }
+        }
+    }
+
+    /// Whether a bound property already shows the variable's value.
+    fn binding_holds(n: &Node, prop: Bindable, val: &VarValue) -> bool {
+        match (prop, val) {
+            (Bindable::Fill, VarValue::Color(c)) => n.fills.last().is_some_and(|p| p.kind == PaintKind::Solid && p.color == *c),
+            (Bindable::Stroke, VarValue::Color(c)) => n.strokes.last().is_some_and(|p| p.kind == PaintKind::Solid && p.color == *c),
+            (Bindable::Opacity, VarValue::Number(v)) => n.opacity == (v / 100.0).clamp(0.0, 1.0),
+            (Bindable::Radius, VarValue::Number(v)) => n.radius == v.max(0.0),
+            (Bindable::Width, VarValue::Number(v)) => n.rect.width() == v.max(0.0),
+            (Bindable::Height, VarValue::Number(v)) => n.rect.height() == v.max(0.0),
+            (Bindable::Gap, VarValue::Number(v)) => n.layout.gap == *v,
+            (Bindable::Padding, VarValue::Number(v)) => n.layout.padding == [*v; 4],
+            (Bindable::StrokeWidth, VarValue::Number(v)) => n.stroke_width == v.max(0.0),
+            (Bindable::FontSize, VarValue::Number(v)) => n.font_size == v.max(1.0),
+            (Bindable::Text, VarValue::Text(t)) => n.text == *t,
+            (Bindable::Visible, VarValue::Bool(b)) => n.visible == *b,
+            _ => true,
         }
     }
 
@@ -1964,7 +2003,21 @@ impl Document {
             return;
         }
         let styles: HashMap<StyleId, StyleValue> = self.styles.iter().map(|s| (s.id, s.value.clone())).collect();
-        for n in self.nodes.values_mut() {
+        for arc in self.nodes.values_mut() {
+            if arc.fill_style.is_none() && arc.stroke_style.is_none() && arc.text_style.is_none() && arc.effect_style.is_none() {
+                continue;
+            }
+            // Work on a copy and only write back real changes, so layers stay shared with undo.
+            let mut n = (**arc).clone();
+            Self::apply_styles_to(&mut n, &styles);
+            if n != **arc {
+                *arc = std::sync::Arc::new(n);
+            }
+        }
+    }
+
+    fn apply_styles_to(n: &mut Node, styles: &HashMap<StyleId, StyleValue>) {
+        {
             for (link, stroke) in [(&mut n.fill_style, false), (&mut n.stroke_style, true)] {
                 match link.and_then(|id| styles.get(&id)) {
                     Some(StyleValue::Paint(p)) => {
@@ -1986,7 +2039,7 @@ impl Document {
 
     /// Create an instance of `comp` with its top-left at `at`.
     pub fn instantiate(&mut self, comp: NodeId, page: usize, parent: Option<NodeId>, index: Option<usize>, at: Pos2) -> NodeId {
-        let mut c = self.nodes[&comp].clone();
+        let mut c = (*self.nodes[&comp]).clone();
         if let Some(set) = c.parent.map(|p| &self.nodes[&p]).filter(|p| p.kind == Kind::ComponentSet) {
             c.name = set.name.clone();
         }
@@ -2025,7 +2078,7 @@ impl Document {
             if let Some(src) = self.nodes[&id].source.and_then(|s| self.nodes.get(&s)).cloned() {
                 let n = self.node_mut(id);
                 let keep = n.rect;
-                *n = Node { id: n.id, parent: n.parent, children: n.children.clone(), kind: n.kind, component: n.component, source: n.source, synced: None, ..src };
+                *n = Node { id: n.id, parent: n.parent, children: n.children.clone(), kind: n.kind, component: n.component, source: n.source, synced: None, ..(*src).clone() };
                 n.rect = keep;
                 n.synced = Some(Box::new(Node { children: vec![], ..n.clone() }));
             }
@@ -2054,7 +2107,7 @@ impl Document {
         }
         let nested = outer.is_some();
         let page = self.page_of(inst);
-        let mut c = self.nodes[&comp].clone();
+        let mut c = (*self.nodes[&comp]).clone();
         // Instances of a variant are named after the component set, as in Figma.
         if let Some(set) = c.parent.map(|p| &self.nodes[&p]).filter(|p| p.kind == Kind::ComponentSet) {
             c.name = set.name.clone();
@@ -2119,9 +2172,9 @@ impl Document {
                     e
                 }
                 None => {
-                    let mut n = Node { children: vec![], ..src.clone() };
+                    let mut n = Node { children: vec![], ..(*src).clone() };
                     n.source = Some(cid);
-                    n.synced = Some(Box::new(Node { children: vec![], ..src.clone() }));
+                    n.synced = Some(Box::new(Node { children: vec![], ..(*src).clone() }));
                     // Nested instances keep pointing at their own component.
                     let id = self.insert(page, Some(parent), None, n);
                     by_source.insert(cid, id);
@@ -2171,13 +2224,13 @@ impl Document {
         let ids: Vec<NodeId> = std::iter::once(comp).chain(self.descendants(comp)).collect();
         let cache = self.cache.0.clone();
         let mut st = cache.lock().unwrap();
-        let same = st.comps.get(&comp).is_some_and(|(_, snap)| snap.len() == ids.len() && snap.iter().zip(&ids).all(|(a, id)| *a == self.nodes[id]));
+        let same = st.comps.get(&comp).is_some_and(|(_, snap)| snap.len() == ids.len() && snap.iter().zip(&ids).all(|(a, id)| *a == *self.nodes[id]));
         let rev = if same {
             st.comps[&comp].0
         } else {
             st.next_rev += 1;
             let rev = st.next_rev;
-            st.comps.insert(comp, (rev, ids.iter().map(|id| self.nodes[id].clone()).collect()));
+            st.comps.insert(comp, (rev, ids.iter().map(|id| (*self.nodes[id]).clone()).collect()));
             rev
         };
         revs.insert(comp, rev);
@@ -2257,7 +2310,7 @@ impl Document {
             let n = &self.nodes[&d];
             if let Some(snap) = &n.synced
                 && (n.fills != snap.fills || n.text != snap.text || n.visible != snap.visible || n.strokes != snap.strokes || n.opacity != snap.opacity) {
-                    overrides.insert(path(self, d), n.clone());
+                    overrides.insert(path(self, d), (**n).clone());
                 }
         }
         for c in self.nodes[&inst].children.clone() {
@@ -2345,8 +2398,26 @@ impl Document {
 
     /// Re-derive everything computed from children: group bounds and auto layout.
     pub fn reflow(&mut self) {
+        // Layout passes write every layer they visit; layers that end up unchanged go back to
+        // sharing their old copy, so undo snapshots stay small.
+        let before = self.nodes.clone();
+        self.reflow_passes();
+        for (id, n) in self.nodes.iter_mut() {
+            if let Some(old) = before.get(id)
+                && !std::sync::Arc::ptr_eq(n, old)
+                && **n == **old
+            {
+                *n = old.clone();
+            }
+        }
+    }
+
+    fn reflow_passes(&mut self) {
+        let mut t = std::time::Instant::now();
         self.apply_styles();
+        crate::plugins::lap("reflow: styles", &mut t);
         self.apply_variables();
+        crate::plugins::lap("reflow: variables", &mut t);
         let instances: Vec<NodeId> = self.nodes.values().filter(|n| n.kind == Kind::Instance).map(|n| n.id).collect();
         for _ in 0..2 {
             let mut revs: HashMap<NodeId, u64> = HashMap::new();
@@ -2357,9 +2428,12 @@ impl Document {
                 }
             }
         }
+        crate::plugins::lap("reflow: instances", &mut t);
         // Instances copied their bindings; resolve them too, before layout uses sizes and gaps.
         self.apply_variables();
+        crate::plugins::lap("reflow: variables again", &mut t);
         self.reflow_layout();
+        crate::plugins::lap("reflow: layout", &mut t);
     }
 
     fn reflow_layout(&mut self) {
@@ -2664,7 +2738,7 @@ impl Document {
     pub fn boolean(&mut self, ids: &[NodeId], op: BoolOp) -> Option<NodeId> {
         let g = self.group(ids)?;
         let bottom = self.nodes[&g].children[0];
-        let b = self.nodes[&bottom].clone();
+        let b = (*self.nodes[&bottom]).clone();
         let n = self.node_mut(g);
         n.kind = Kind::Boolean;
         n.bool_op = op;
@@ -2711,8 +2785,8 @@ impl Document {
     pub fn extract(&self, ids: &[NodeId]) -> Vec<Node> {
         let mut out = vec![];
         for id in self.sort_by_z(ids) {
-            out.push(self.nodes[&id].clone());
-            out.extend(self.descendants(id).into_iter().map(|d| self.nodes[&d].clone()));
+            out.push((*self.nodes[&id]).clone());
+            out.extend(self.descendants(id).into_iter().map(|d| (*self.nodes[&d]).clone()));
         }
         out
     }
