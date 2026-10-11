@@ -1118,6 +1118,10 @@ fn prototype_connect_present_and_navigate() {
     let (p, q) = (s(&h, 80., 35.), s(&h, 400., 75.));
     drag(&mut h, p, q, Modifiers::NONE);
     assert_eq!(h.state().doc.node(btn).reactions[0].action, Action::Navigate(b));
+    // A label on top of the button, with no interaction of its own.
+    let mut label = Node::new(Kind::Text, r(40., 25., 30., 20.));
+    label.text = "Go".into();
+    h.state_mut().doc.insert(0, Some(a), None, label);
     // B goes back after a short delay.
     h.state_mut().doc.node_mut(b).reactions.push(crate::doc::Reaction { trigger: Trigger::AfterDelay(500), action: Action::Back, ..Default::default() });
     // Present from A and click the button: lands on B.

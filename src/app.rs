@@ -1222,7 +1222,7 @@ impl App {
     pub fn save(&mut self, save_as: bool) -> bool {
         let path = match (&self.path, save_as) {
             (Some(p), false) => p.clone(),
-            _ => match rfd::FileDialog::new().add_filter("Katachi", &["katachi"]).set_file_name("Untitled.katachi").save_file() {
+            _ => match rfd::FileDialog::new().add_filter("Katachi", &["katachi"]).set_file_name(format!("{}.katachi", self.display_name())).save_file() {
                 Some(p) => p,
                 None => return false,
             },

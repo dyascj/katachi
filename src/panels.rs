@@ -539,8 +539,8 @@ impl App {
             ui.horizontal(|ui| {
                 let menu = icon_button(ui, Icon::Menu, false, 28.0, "Main menu");
                 egui::Popup::menu(&menu).show(|ui| self.main_menu(ui));
-                let name = self.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned());
-                ui.label(RichText::new(name.unwrap_or_else(|| "Untitled".into())).strong());
+                // Truncated, so a long file name can't widen the panel.
+                ui.add(egui::Label::new(RichText::new(self.display_name()).strong()).truncate());
             });
             ui.horizontal(|ui| {
                 for (assets, label) in [(false, "File"), (true, "Assets")] {
@@ -1195,7 +1195,21 @@ impl App {
         let mut reactions = self.doc.node(id).reactions.clone();
         let mut changed = false;
         if section_title(ui, "Interactions") {
-            let to = frames.iter().copied().find(|f| *f != top);
+            // A new link points at the next frame to the right (then below), not whatever is first in the layer list.
+            let here = self.doc.node(top).rect.min;
+            let to = frames
+                .iter()
+                .copied()
+                .filter(|f| *f != top)
+                .min_by(|a, b| {
+                    let key = |f: NodeId| {
+                        let r = self.doc.node(f).rect.min;
+                        let ahead = r.x > here.x + 1.0 || (r.y > here.y + 1.0 && (r.x - here.x).abs() <= 1.0);
+                        (!ahead, (r - here).length())
+                    };
+                    let (ka, kb) = (key(*a), key(*b));
+                    ka.0.cmp(&kb.0).then(ka.1.total_cmp(&kb.1))
+                });
             reactions.push(Reaction { action: to.map_or(Action::Back, Action::Navigate), ..Default::default() });
             changed = true;
         }
