@@ -45,6 +45,7 @@ pub fn popover_frame(ui: &Ui) -> Frame {
 /// it. Returns true when the close button was clicked.
 pub fn header(ui: &mut Ui, title: &str) -> bool {
     let mut close = false;
+    ui.spacing_mut().item_spacing.y = 0.0;
     ui.horizontal(|ui| {
         ui.set_min_height(40.0);
         ui.add_space(16.0);
@@ -112,9 +113,20 @@ pub fn context_menu(resp: &Response, add: impl FnOnce(&mut Ui)) {
 
 /// `ui.menu_button`, styled as a Figma menu (submenus of it inherit the style).
 pub fn menu_button<'a, R>(ui: &mut Ui, atoms: impl egui::IntoAtoms<'a>, add: impl FnOnce(&mut Ui) -> R) -> Response {
-    use egui::containers::menu::{MenuButton, MenuConfig, SubMenuButton, is_in_menu};
+    use egui::containers::menu::{MenuButton, MenuConfig, SubMenu, SubMenuButton, is_in_menu};
     let config = MenuConfig::new().style(menu_style);
-    if is_in_menu(ui) { SubMenuButton::new(atoms).config(config).ui(ui, add).0 } else { MenuButton::new(atoms).config(config).ui(ui, add).0 }
+    if !is_in_menu(ui) {
+        return MenuButton::new(atoms).config(config).ui(ui, add).0;
+    }
+    // Inside a light popover: egui frames a submenu with the parent's style before applying
+    // the submenu's own, which gives white text on a white menu. Draw the button normally,
+    // then open the submenu from a dark-styled scope.
+    let resp = ui.add(egui::Button::new(atoms).right_text(SubMenuButton::RIGHT_ARROW));
+    ui.scope(|ui| {
+        menu_style(ui.style_mut());
+        SubMenu::new().config(config).show(ui, &resp, add);
+    });
+    resp
 }
 
 /// Width of the right panel; popovers from it open just left of it, as in Figma.
@@ -135,7 +147,7 @@ pub fn popover<R>(button: &Response, id: egui::Id, title: &str, width: f32, add:
         .width(width);
     if in_panel {
         let top = egui::pos2(edge, button.rect.min.y);
-        p = p.anchor(egui::Rect::from_min_max(top, top)).align(egui::RectAlign::LEFT_START).gap(8.0);
+        p = p.anchor(egui::Rect::from_min_max(top, top)).align(egui::RectAlign::LEFT_START).gap(1.0);
     }
     p.show(|ui| {
         popover_frame(ui)

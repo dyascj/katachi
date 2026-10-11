@@ -345,9 +345,9 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, selected: bool, size: f32, tip: &str
     let (bg, fg) = if selected {
         (BLUE, Color32::WHITE)
     } else if resp.hovered() {
-        (theme::subtle(ui.ctx()), theme::ink(ui.ctx()))
+        (ui.visuals().widgets.hovered.weak_bg_fill, ui.visuals().text_color())
     } else {
-        (Color32::TRANSPARENT, theme::ink(ui.ctx()))
+        (Color32::TRANSPARENT, ui.visuals().text_color())
     };
     ui.painter().rect_filled(rect, 5.0, bg);
     paint_icon(ui.painter(), rect, icon, fg);
@@ -1379,6 +1379,14 @@ impl App {
                         self.present(ctx.input(|i| i.time));
                     }
                     crate::chrome::menu_button(ui, format!("{}%", (self.view.zoom * 100.0).round()), |ui| {
+                        ui.set_min_width(200.0);
+                        // Figma's zoom menu starts with an editable percentage.
+                        let mut pct = (self.view.zoom * 100.0).round();
+                        if ui.add(egui::DragValue::new(&mut pct).range(2.0..=25600.0).suffix("%").speed(1.0)).changed() {
+                            let c = self.canvas_rect.map_or(ctx.content_rect().center(), |r| r.center());
+                            self.view.zoom_at(c, pct / 100.0 / self.view.zoom);
+                        }
+                        ui.separator();
                         if ui.add(egui::Button::new("Zoom in").shortcut_text("⌘+")).clicked() {
                             self.zoom_step(&ctx, 2.0);
                         }
@@ -1393,6 +1401,18 @@ impl App {
                         }
                         if ui.add(egui::Button::new("Zoom to 100%").shortcut_text("⇧0")).clicked() {
                             self.zoom_to(&ctx, None, true);
+                        }
+                        ui.separator();
+                        // View options with checks, as in Figma's zoom menu.
+                        for (on, label, short, which) in [(self.show_grids, "Layout guides", "⌃G", 0), (self.rulers, "Rulers", "⇧R", 1), (self.outline_mode, "Outlines", "⌘Y", 2), (self.show_comments, "Comments", "⇧C", 3)] {
+                            if ui.add(egui::Button::new(format!("{}{label}", if on { "✓  " } else { "     " })).shortcut_text(short)).clicked() {
+                                match which {
+                                    0 => self.show_grids = !self.show_grids,
+                                    1 => self.rulers = !self.rulers,
+                                    2 => self.outline_mode = !self.outline_mode,
+                                    _ => self.show_comments = !self.show_comments,
+                                }
+                            }
                         }
                     });
                 });
@@ -2765,14 +2785,23 @@ impl App {
         // Font family picker with search.
         let fam_id = ui.id().with("font-search");
         let resp = ui.add_sized([ui.available_width(), 24.0], egui::Button::new(&t.font_family));
+        // Each opening starts with an empty, focused search, as in Figma.
+        if resp.clicked() {
+            ui.data_mut(|d| d.insert_temp(fam_id, String::new()));
+        }
         crate::chrome::popover(&resp, fam_id.with("popup"), "Fonts", 240.0, |ui| {
             let mut q: String = ui.data(|d| d.get_temp(fam_id)).unwrap_or_default();
-            ui.add(egui::TextEdit::singleline(&mut q).hint_text("Search fonts").desired_width(f32::INFINITY));
+            let search = ui.add(egui::TextEdit::singleline(&mut q).hint_text("Search fonts").desired_width(f32::INFINITY));
+            if resp.clicked() {
+                search.request_focus();
+            }
             ui.data_mut(|d| d.insert_temp(fam_id, q.clone()));
-            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                 let ql = q.to_lowercase();
                 for f in families().iter().filter(|f| f.to_lowercase().contains(&ql)).take(400) {
-                    if ui.selectable_label(*f == t.font_family, f).clicked() {
+                    // The current font gets a check rather than a highlight.
+                    let current = *f == t.font_family;
+                    if ui.add(egui::Button::new(format!("{}{f}", if current { "✓  " } else { "     " })).frame(false)).clicked() {
                         t.font_family = f.clone();
                         let ws = weights_for(f);
                         if !ws.contains(&t.font_weight) {
@@ -3024,6 +3053,10 @@ impl App {
             };
             paints.push(Paint::solid(c));
             changed = true;
+            // A new stroke opens its editor right away, as in Figma.
+            if stroke {
+                egui::Popup::open_id(ui.ctx(), ui.id().with((stroke, paints.len() - 1, first)).with("popup"));
+            }
         }
         let mut remove = None;
         // Topmost paint first, as in Figma.
@@ -3309,6 +3342,8 @@ impl App {
         if add {
             shadows.push(Shadow::default());
             changed = true;
+            // A new effect opens its editor right away, as in Figma.
+            egui::Popup::open_id(ui.ctx(), ui.id().with(("shadow", shadows.len() - 1, first)).with("popup"));
         }
         let mut remove = None;
         for i in (0..shadows.len()).rev() {
@@ -3441,11 +3476,15 @@ impl App {
                                 if tools.len() > 1 {
                                     let more = icon_button(ui, Icon::Chevron(true), false, 14.0, "");
                                     // Tool flyouts open upward from the bottom toolbar, as dark menus.
-                                    egui::Popup::menu(&more).id(ui.id().with(("tools", g))).style(crate::chrome::menu_style).align(egui::RectAlign::TOP_START).show(|ui| {
+                                    let current = self.tool_groups[g];
+                                    egui::Popup::menu(&more).id(ui.id().with(("tools", g))).style(crate::chrome::menu_style).align(egui::RectAlign::TOP_START).gap(18.0).show(|ui| {
                                         for &(t, icon, label) in tools.iter() {
                                             ui.horizontal(|ui| {
+                                                // A check marks the group's current tool, as in Figma.
+                                                ui.add_sized([12.0, 18.0], egui::Label::new(if t == current { "✓" } else { "" }));
                                                 let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
-                                                paint_icon(ui.painter(), r, icon, theme::ink(ui.ctx()));
+                                                // The menu's own text color (menus are dark in both themes).
+                                                paint_icon(ui.painter(), r, icon, ui.visuals().text_color());
                                                 let (name, key) = label.split_once("  ").unwrap_or((label, ""));
                                                 if ui.add(egui::Button::new(name).shortcut_text(key).frame(false).min_size(vec2(140.0, 0.0))).clicked() {
                                                     self.set_tool(t);

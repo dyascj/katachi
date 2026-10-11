@@ -103,7 +103,7 @@ pub fn apply(ctx: &Context, a: &Appearance) {
             let v = &mut s.visuals;
             v.panel_fill = base;
             // Floating windows, popovers and menus are always solid, glass or not (as in Figma).
-            v.window_fill = base.to_opaque();
+            v.window_fill = if dark { Color32::from_gray(0x2C) } else { Color32::WHITE };
             let (field, hover, line, text, sel) = if dark {
                 (Color32::from_gray(0x38), Color32::from_gray(0x44), Color32::from_gray(0x44), Color32::from_gray(0xF0), Color32::from_rgb(0x1F, 0x4F, 0x7A))
             } else {

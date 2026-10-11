@@ -2223,6 +2223,8 @@ impl App {
             (false, _, _, Key::ArrowRight) => self.nudge(vec2(step, 0.0)),
             (false, _, _, Key::ArrowUp) => self.nudge(vec2(0.0, -step)),
             (false, _, _, Key::ArrowDown) => self.nudge(vec2(0.0, step)),
+            // Escape that closes a popover or menu does only that (Figma keeps the selection).
+            (false, false, false, Key::Escape) if egui::Popup::is_any_open(ctx) => {}
             (false, false, false, Key::Escape) => {
                 if !self.pen.is_empty() {
                     self.finish_pen(false);

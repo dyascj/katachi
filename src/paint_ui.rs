@@ -388,16 +388,12 @@ pub fn shadow_row(ui: &mut Ui, id: egui::Id, s: &mut Shadow) -> (bool, bool) {
     ui.horizontal(|ui| {
         let open = ui.add(egui::Button::new(s.kind.label()).frame(false));
         crate::chrome::popover(&open, id.with("popup"), s.kind.label(), 240.0, |ui| {
-            // The type picker sits in the editor itself: a dropdown here opens a second popup,
-            // and clicking in it would count as a click outside and close the editor.
-            egui::Grid::new(id.with("kind")).num_columns(2).spacing([4.0, 4.0]).show(ui, |ui| {
-                for (i, k) in [EffectKind::DropShadow, EffectKind::InnerShadow, EffectKind::LayerBlur, EffectKind::BackgroundBlur].into_iter().enumerate() {
-                    changed |= ui.add_sized([108.0, 22.0], egui::Button::selectable(s.kind == k, k.label())).clicked() && {
+            // Effect type as a dropdown, as in Figma's header.
+            crate::chrome::menu_button(ui, s.kind.label(), |ui| {
+                for k in [EffectKind::DropShadow, EffectKind::InnerShadow, EffectKind::LayerBlur, EffectKind::BackgroundBlur] {
+                    if ui.selectable_label(s.kind == k, k.label()).clicked() && s.kind != k {
                         s.kind = k;
-                        true
-                    };
-                    if i % 2 == 1 {
-                        ui.end_row();
+                        changed = true;
                     }
                 }
             });
@@ -419,8 +415,22 @@ pub fn shadow_row(ui: &mut Ui, id: egui::Id, s: &mut Shadow) -> (bool, bool) {
                 ui.end_row();
             });
             if s.kind.is_shadow() {
+                // Swatch, hex and opacity; the swatch expands the full picker in place.
                 ui.add_space(4.0);
-                changed |= rgb_picker(ui, &mut s.color);
+                let open_id = id.with("color-open");
+                let mut open: bool = ui.data(|d| d.get_temp(open_id)).unwrap_or(false);
+                ui.horizontal(|ui| {
+                    if swatch(ui, &Paint::solid(s.color)).on_hover_text("Color").clicked() {
+                        open = !open;
+                    }
+                    changed |= hex_field(ui, id.with("hex"), &mut s.color, 64.0);
+                    changed |= alpha_field(ui, &mut s.color);
+                });
+                ui.data_mut(|d| d.insert_temp(open_id, open));
+                if open {
+                    ui.add_space(6.0);
+                    changed |= rgb_picker(ui, &mut s.color);
+                }
             }
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

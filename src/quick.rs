@@ -175,6 +175,8 @@ impl App {
                         }
                     });
                     ui.add_space(2.0);
+                    // Rows sit flush at 32 points, as in Figma.
+                    ui.spacing_mut().item_spacing.y = 0.0;
                     if hits.is_empty() {
                         ui.label(RichText::new("No matches").color(crate::appearance::muted(ui.ctx())));
                     }
