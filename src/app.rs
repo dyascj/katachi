@@ -176,7 +176,9 @@ pub struct App {
     pub own_title_bar: bool,
     /// Theme and glass settings, and the glass state last given to the window.
     pub appearance: crate::appearance::Appearance,
-    pub show_appearance: bool,
+    /// The Settings modal, open on this tab.
+    pub settings_tab: Option<crate::settings::Tab>,
+    pub prefs: crate::settings::Prefs,
     glass_applied: Option<(bool, u8)>,
     /// The plugin that's running with a UI, if any.
     pub plugin: Option<PluginRun>,
@@ -289,7 +291,8 @@ impl App {
             plugin: None,
             own_title_bar: false,
             appearance: crate::appearance::load(),
-            show_appearance: false,
+            settings_tab: None,
+            prefs: crate::settings::load(),
             glass_applied: None,
             mcp: None,
             mcp_tried: cfg!(test),
@@ -372,6 +375,7 @@ impl App {
         self.mcp = from.mcp.take();
         self.mcp_tried = from.mcp_tried;
         self.appearance = from.appearance.clone();
+        self.prefs = from.prefs.clone();
         self.glass_applied = from.glass_applied;
         self.recoverable = std::mem::take(&mut from.recoverable);
         self.screenshot = from.screenshot.take();
@@ -1401,7 +1405,7 @@ impl App {
         };
         let mut open = true;
         let mut restore = None;
-        egui::Window::new("Version history").open(&mut open).collapsible(false).resizable(false).default_width(300.0).show(ctx, |ui| {
+        crate::chrome::window(ctx, "Version history", &mut open, 300.0, |ui| {
             let versions = crate::files::versions(&path);
             if versions.is_empty() {
                 ui.label("No saved versions yet.");
@@ -1525,14 +1529,7 @@ impl App {
 
     /// The appearance window, and keeping the window's desktop blur in step with glass.
     fn appearance_frame(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
-        if self.show_appearance {
-            let mut open = true;
-            if crate::appearance::window(ctx, &mut open, &mut self.appearance) {
-                crate::appearance::apply(ctx, &self.appearance);
-                crate::appearance::save(&self.appearance);
-            }
-            self.show_appearance = open;
-        }
+        self.settings_window(ctx);
         let want = (self.appearance.glass, self.appearance.blur);
         if self.glass_applied != Some(want) {
             crate::appearance::set_window_glass(frame, want.0, want.1);
@@ -1686,7 +1683,7 @@ impl App {
             }
             hits
         };
-        egui::Window::new("Find and replace").open(&mut open).collapsible(false).default_width(320.0).show(ctx, |ui| {
+        crate::chrome::window(ctx, "Find and replace", &mut open, 320.0, |ui| {
             let r = ui.add(egui::TextEdit::singleline(&mut self.find.1).hint_text("Find layers and text").desired_width(f32::INFINITY));
             if std::mem::take(&mut self.find.3) {
                 r.request_focus();
@@ -1738,7 +1735,7 @@ impl App {
         }
         let mut open = true;
         let mut run = false;
-        egui::Window::new("Run script").open(&mut open).collapsible(false).default_width(420.0).show(ctx, |ui| {
+        crate::chrome::window(ctx, "Run script", &mut open, 460.0, |ui| {
             ui.label(egui::RichText::new("JavaScript against Figma's plugin API (figma.currentPage, createRectangle, notify...)").weak());
             egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                 ui.add(egui::TextEdit::multiline(&mut self.console_code).code_editor().desired_rows(12).desired_width(f32::INFINITY));
@@ -1759,7 +1756,7 @@ impl App {
         }
         let mut open = true;
         let mut action: Option<&str> = None;
-        egui::Window::new("Collaborate").open(&mut open).collapsible(false).resizable(false).default_width(320.0).show(ctx, |ui| {
+        crate::chrome::window(ctx, "Multiplayer session", &mut open, 320.0, |ui| {
             if let Some(c) = &self.collab {
                 ui.label(egui::RichText::new(if c.hosting { "Hosting a live session" } else { "In a live session" }).strong());
                 ui.horizontal(|ui| {
@@ -1869,33 +1866,44 @@ impl App {
             return;
         }
         let mut action: Option<(PathBuf, bool)> = None;
-        egui::Modal::new("recover".into()).show(ctx, |ui| {
-            ui.set_width(360.0);
-            ui.heading("Recover unsaved work?");
-            ui.label("Katachi didn't close cleanly last time. These autosaves are available:");
-            ui.add_space(6.0);
-            for p in &self.recoverable {
-                let when = std::fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map_or(String::new(), |e| {
-                    let m = e.as_secs() / 60;
-                    if m < 60 { format!("{m} min ago") } else { format!("{} h ago", m / 60) }
-                });
-                ui.horizontal(|ui| {
-                    ui.label(when);
-                    if ui.button("Recover").clicked() {
-                        action = Some((p.clone(), true));
-                    }
-                    if ui.button("Discard").clicked() {
-                        action = Some((p.clone(), false));
-                    }
-                });
-            }
-        });
+        let list = self.recoverable.clone();
+        let mut dismiss = false;
+        let picked = crate::chrome::dialog(
+            ctx,
+            "recover",
+            "Recover unsaved work?",
+            360.0,
+            |ui| {
+                ui.label("Katachi didn't close cleanly last time. These autosaves are available:");
+                ui.add_space(8.0);
+                for p in &list {
+                    let when = std::fs::metadata(p).and_then(|m| m.modified()).ok().map_or(String::new(), |t| format!("Autosaved {}", crate::shell::ago(t)));
+                    ui.horizontal(|ui| {
+                        ui.label(when);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add(egui::Button::new(egui::RichText::new("Recover").color(egui::Color32::WHITE)).fill(crate::canvas::BLUE).corner_radius(6)).clicked() {
+                                action = Some((p.clone(), true));
+                            }
+                            if ui.add(egui::Button::new("Discard").corner_radius(6)).clicked() {
+                                action = Some((p.clone(), false));
+                            }
+                        });
+                    });
+                }
+            },
+            &[("Later", false)],
+        );
+        if picked.is_some() {
+            dismiss = true;
+        }
         match action {
             Some((p, true)) => self.recover(&p),
             Some((p, false)) => {
                 let _ = std::fs::remove_file(&p);
                 self.recoverable.retain(|q| *q != p);
             }
+            // Later: keep the autosaves on disk and ask again next launch.
+            None if dismiss => self.recoverable.clear(),
             None => {}
         }
     }
@@ -2068,6 +2076,7 @@ impl App {
         // Global shortcuts that work even while a field has focus.
         match (cmd, m.shift, key) {
             (true, false, Key::Slash | Key::K) if !m.alt => return self.toggle_quick_actions(),
+            (true, false, Key::Comma) => return self.open_settings(crate::settings::Tab::Account),
             (true, false, Key::S) => return void(self.save(false)),
             (true, true, Key::S) => return void(self.save(true)),
             (true, false, Key::O) => return self.request_open(),
@@ -2095,7 +2104,7 @@ impl App {
         if typing {
             return;
         }
-        let step = if m.shift { 10.0 } else { 1.0 };
+        let step = if m.shift { self.prefs.big_nudge } else { self.prefs.nudge };
         // Ctrl+G: show/hide layout guides.
         if m.ctrl && !m.mac_cmd && !m.alt && key == Key::G {
             self.show_grids = !self.show_grids;
@@ -2141,6 +2150,13 @@ impl App {
                     }
                 }
             }
+            // Figma's alignment shortcuts.
+            (false, false, true, Key::A) => self.align(Align::Left),
+            (false, false, true, Key::H) => self.align(Align::HCenter),
+            (false, false, true, Key::D) => self.align(Align::Right),
+            (false, false, true, Key::W) => self.align(Align::Top),
+            (false, false, true, Key::V) => self.align(Align::VCenter),
+            (false, false, true, Key::S) => self.align(Align::Bottom),
             (false, true, false, Key::H) => self.flip_selection(true),
             (false, true, false, Key::V) => self.flip_selection(false),
             (false, shift, false, Key::Tab) => {
@@ -2319,23 +2335,21 @@ impl App {
         }
         let Some(after) = self.confirm else { return };
         let mut choice = None;
-        egui::Modal::new("confirm-unsaved".into()).show(ctx, |ui| {
-            ui.set_width(320.0);
-            ui.heading("Save changes?");
-            ui.label("Your changes will be lost if you don't save them.");
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
-                    choice = Some(true);
-                }
-                if ui.button("Don't save").clicked() {
-                    choice = Some(false);
-                }
-                if ui.button("Cancel").clicked() {
-                    self.confirm = None;
-                }
-            });
-        });
+        match crate::chrome::dialog(
+            ctx,
+            "confirm-unsaved",
+            "Save changes?",
+            320.0,
+            |ui| {
+                ui.label(format!("Your changes to {} will be lost if you don't save them.", self.display_name()));
+            },
+            &[("Don't save", false), ("Cancel", false), ("Save", true)],
+        ) {
+            Some(0) => choice = Some(false),
+            Some(2) => choice = Some(true),
+            Some(_) => self.confirm = None,
+            None => {}
+        }
         let Some(save) = choice else { return };
         if save && !self.save(false) {
             return;

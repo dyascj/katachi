@@ -145,7 +145,10 @@ impl Shell {
             self.activate((to > 0).then(|| to as usize - 1));
         }
         if self.active.is_none() {
-            let (new, open) = ctx.input_mut(|i| (i.consume_key(Modifiers::COMMAND, Key::N), i.consume_key(Modifiers::COMMAND, Key::O)));
+            let (new, open, settings) = ctx.input_mut(|i| (i.consume_key(Modifiers::COMMAND, Key::N), i.consume_key(Modifiers::COMMAND, Key::O), i.consume_key(Modifiers::COMMAND, Key::Comma)));
+            if settings {
+                self.holder().open_settings(crate::settings::Tab::Account);
+            }
             if new {
                 self.new_tab();
             }
@@ -409,6 +412,7 @@ enum HomeAction {
     OpenDialog,
     Forget(PathBuf),
     Reveal(PathBuf),
+    Settings,
 }
 
 impl Home {
@@ -487,6 +491,9 @@ impl Home {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("Recents").size(22.0).strong().color(ink));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if pill(ui, "Settings", false).clicked() {
+                                    action = Some(HomeAction::Settings);
+                                }
                                 if pill(ui, "Open file…", false).clicked() {
                                     action = Some(HomeAction::OpenDialog);
                                 }
@@ -553,7 +560,7 @@ impl Home {
                                     if resp.clicked() {
                                         action = Some(HomeAction::Open(path.clone()));
                                     }
-                                    resp.context_menu(|ui| {
+                                    crate::chrome::context_menu(&resp, |ui| {
                                         if ui.button("Open").clicked() {
                                             action = Some(HomeAction::Open(path.clone()));
                                         }
@@ -676,6 +683,7 @@ impl eframe::App for Shell {
                         self.home.refresh = true;
                     }
                     Some(HomeAction::Reveal(p)) => reveal(&p),
+                    Some(HomeAction::Settings) => self.holder().open_settings(crate::settings::Tab::Account),
                     None => {}
                 }
             }

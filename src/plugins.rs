@@ -179,6 +179,13 @@ pub fn installed() -> Vec<Installed> {
         .unwrap_or_default()
 }
 
+/// Forget an installed plugin (its files stay where they are).
+pub fn uninstall(manifest: &std::path::Path) {
+    let mut all = installed();
+    all.retain(|x| x.manifest != manifest);
+    let _ = crate::files::write_atomic(&crate::files::data_dir().join("plugins.json"), serde_json::to_string(&all).unwrap_or_default().as_bytes());
+}
+
 /// Register a plugin from its Figma-style `manifest.json`.
 pub fn install(manifest: &std::path::Path) -> Result<Installed, String> {
     let m: Value = serde_json::from_str(&std::fs::read_to_string(manifest).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;

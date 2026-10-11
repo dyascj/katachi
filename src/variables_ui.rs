@@ -47,7 +47,7 @@ impl App {
         }
         let mut open = true;
         let before = (self.doc.collections.clone(), self.doc.variables.clone());
-        egui::Window::new("Local variables").open(&mut open).default_size([640.0, 420.0]).collapsible(false).show(ctx, |ui| {
+        crate::chrome::window(ctx, "Local variables", &mut open, 680.0, |ui| {
             if self.doc.collections.is_empty() {
                 ui.label("Variables store reusable values like colors and spacing, with modes such as Light and Dark.");
                 if ui.button("Create collection").clicked() {
@@ -165,7 +165,7 @@ impl App {
             ui.label(RichText::new("Variables").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let btn = icon_button(ui, Icon::Plus, false, 22.0, "Bind a property");
-                egui::Popup::menu(&btn).id(ui.id().with(("bind", id))).show(|ui| {
+                egui::Popup::menu(&btn).id(ui.id().with(("bind", id))).style(crate::chrome::menu_style).show(|ui| {
                     for prop in Bindable::ALL {
                         let usable = match prop {
                             Bindable::Text | Bindable::FontSize => n.kind == Kind::Text,
@@ -176,7 +176,7 @@ impl App {
                         if !usable {
                             continue;
                         }
-                        ui.menu_button(format!("{prop:?}"), |ui| {
+                        crate::chrome::menu_button(ui, format!("{prop:?}"), |ui| {
                             for v in self.doc.variables.iter().filter(|v| v.values.first().is_some_and(|x| prop.accepts(x) || matches!(x, VarValue::Alias(_)))) {
                                 if ui.button(&v.name).clicked() {
                                     add = Some((prop, v.id));
@@ -227,7 +227,7 @@ impl App {
                         Some(m) => c.modes.get(m).cloned().unwrap_or_default(),
                         None => format!("Auto ({})", c.modes[self.doc.mode_for(id, c.id).min(c.modes.len() - 1)]),
                     };
-                    egui::ComboBox::from_id_salt(("mode", id, c.id)).selected_text(shown).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt(("mode", id, c.id)).selected_text(shown).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
                         ui.selectable_value(&mut pick, None, "Auto");
                         for (i, m) in c.modes.iter().enumerate() {
                             ui.selectable_value(&mut pick, Some(i), m);

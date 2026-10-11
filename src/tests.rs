@@ -1936,3 +1936,54 @@ fn quick_actions_run_commands_and_find_layers() {
     key(&mut h, Modifiers::NONE, Key::Enter);
     assert_eq!(h.state().sel, vec![b]);
 }
+
+#[test]
+fn settings_modal_tabs_and_preferences() {
+    let mut h = harness();
+    key(&mut h, Modifiers::COMMAND, Key::Comma);
+    assert_eq!(h.state().settings_tab, Some(crate::settings::Tab::Account), "Cmd , opens Settings");
+    h.run_steps(2);
+    h.get_by_label("Canvas").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings_tab, Some(crate::settings::Tab::Canvas));
+    // Keep tool selected: two rectangles in a row without pressing R again.
+    h.state_mut().prefs.keep_tool_selected = true;
+    h.state_mut().settings_tab = None;
+    h.run_steps(2);
+    draw(&mut h, Key::R, (0.0, 0.0), (40.0, 40.0));
+    assert_eq!(h.state().tool, Tool::Rectangle, "still drawing rectangles");
+    h.state_mut().prefs.keep_tool_selected = false;
+    draw(&mut h, Key::R, (60.0, 0.0), (100.0, 40.0));
+    assert_eq!(h.state().tool, Tool::Move);
+    // Nudge amounts come from Settings.
+    h.state_mut().prefs.big_nudge = 8.0;
+    let id = h.state().sel[0];
+    let x = h.state().doc.node(id).rect.min.x;
+    key(&mut h, Modifiers::SHIFT, Key::ArrowRight);
+    assert_eq!(h.state().doc.node(id).rect.min.x, x + 8.0);
+}
+
+#[test]
+fn floating_surfaces_stay_solid_with_glass() {
+    let ctx = egui::Context::default();
+    let a = crate::appearance::Appearance { glass: true, panel_opacity: 0.4, ..Default::default() };
+    crate::appearance::apply(&ctx, &a);
+    for theme in [egui::Theme::Light, egui::Theme::Dark] {
+        let v = ctx.style_of(theme).visuals.clone();
+        assert!(v.panel_fill.a() < 255, "panels are glass");
+        assert_eq!(v.window_fill.a(), 255, "popovers, menus and windows are solid");
+    }
+    let mut s = egui::Style::default();
+    crate::chrome::menu_style(&mut s);
+    assert_eq!(s.visuals.window_fill, crate::chrome::MENU_BG, "menus are near-black in either theme");
+}
+
+#[test]
+fn main_menu_follows_figma() {
+    let mut h = harness();
+    h.get_by_label("Main menu").click();
+    h.run_steps(2);
+    for label in ["Back to files", "Actions…", "File", "Edit", "View", "Object", "Arrange", "Plugins", "Preferences", "Help and account"] {
+        assert!(h.query_all_by_label_contains(label).next().is_some(), "{label}");
+    }
+}

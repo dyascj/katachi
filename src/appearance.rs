@@ -102,8 +102,8 @@ pub fn apply(ctx: &Context, a: &Appearance) {
             s.visuals = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
             let v = &mut s.visuals;
             v.panel_fill = base;
-            // Floating windows and menus stay readable over the canvas.
-            v.window_fill = if a.glass { Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), base.a().max(235)) } else { base };
+            // Floating windows, popovers and menus are always solid, glass or not (as in Figma).
+            v.window_fill = base.to_opaque();
             let (field, hover, line, text, sel) = if dark {
                 (Color32::from_gray(0x38), Color32::from_gray(0x44), Color32::from_gray(0x44), Color32::from_gray(0xF0), Color32::from_rgb(0x1F, 0x4F, 0x7A))
             } else {
@@ -127,6 +127,7 @@ pub fn apply(ctx: &Context, a: &Appearance) {
             v.widgets.hovered.bg_fill = wash(hover);
             v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, if dark { Color32::from_gray(0x5A) } else { Color32::from_gray(0xD0) });
             v.window_stroke = egui::Stroke::new(1.0, line);
+            crate::chrome::style(s);
         });
     }
 }
@@ -143,7 +144,7 @@ pub fn subtle(ctx: &Context) -> Color32 {
     ctx.global_style().visuals.extreme_bg_color
 }
 pub fn sel_bg(ctx: &Context) -> Color32 {
-    pick(ctx, Color32::from_rgb(0xE5, 0xF4, 0xFF), Color32::from_rgb(0x1E, 0x3A, 0x54))
+    pick(ctx, Color32::from_rgb(0xE5, 0xF4, 0xFF), Color32::from_rgb(0x3C, 0x43, 0x60))
 }
 pub fn child_bg(ctx: &Context) -> Color32 {
     pick(ctx, Color32::from_rgb(0xF2, 0xF9, 0xFF), Color32::from_rgb(0x22, 0x30, 0x3D))
@@ -212,39 +213,6 @@ pub fn set_window_glass(frame: &eframe::Frame, glass: bool, radius: u8) {
 
 #[cfg(not(target_os = "macos"))]
 pub fn set_window_glass(_frame: &eframe::Frame, _glass: bool, _radius: u8) {}
-
-/// The appearance window (Main menu > Appearance).
-pub fn window(ctx: &Context, open: &mut bool, a: &mut Appearance) -> bool {
-    let before = a.clone();
-    egui::Window::new("Appearance").open(open).collapsible(false).resizable(false).default_width(300.0).show(ctx, |ui| {
-        ui.horizontal(|ui| {
-            ui.label("Theme");
-            for (t, label) in [(ThemePref::Light, "Light"), (ThemePref::Dark, "Dark"), (ThemePref::System, "System")] {
-                ui.selectable_value(&mut a.theme, t, label);
-            }
-        });
-        ui.separator();
-        ui.checkbox(&mut a.glass, "Glass").on_hover_text("Translucent panels over a blurred desktop; the canvas stays solid");
-        ui.add_enabled_ui(a.glass, |ui| {
-            let mut pct = (a.panel_opacity * 100.0).round();
-            if ui.add(egui::Slider::new(&mut pct, 15.0..=100.0).suffix("%").text("Panel opacity")).changed() {
-                a.panel_opacity = pct / 100.0;
-            }
-            if cfg!(target_os = "macos") {
-                ui.add(egui::Slider::new(&mut a.blur, 1..=64).text("Blur"));
-            }
-            ui.add(egui::Slider::new(&mut a.hue, 0.0..=360.0).suffix("°").text("Tint hue"));
-            let mut sat = (a.saturation * 100.0).round();
-            if ui.add(egui::Slider::new(&mut sat, 0.0..=100.0).suffix("%").text("Tint strength")).changed() {
-                a.saturation = sat / 100.0;
-            }
-        });
-        if ui.button("Reset").clicked() {
-            *a = Appearance::default();
-        }
-    });
-    *a != before
-}
 
 #[cfg(test)]
 mod tests {

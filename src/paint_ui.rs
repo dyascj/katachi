@@ -3,7 +3,7 @@
 use crate::canvas::num;
 use crate::doc::{Paint, PaintKind, Rgba, Shadow};
 use crate::panels::{Icon, icon_button};
-use egui::{Color32, DragValue, FontId, Popup, PopupCloseBehavior, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+use egui::{Color32, DragValue, FontId, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 
 pub fn parse_hex(s: &str) -> Option<Rgba> {
     let s = s.trim().trim_start_matches('#');
@@ -91,7 +91,7 @@ pub fn color_row(ui: &mut Ui, id: egui::Id, color: &mut Rgba) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
         let sw = swatch(ui, &Paint::solid(*color));
-        Popup::menu(&sw).id(id.with("popup")).close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+        crate::chrome::popover(&sw, id.with("popup"), "Color", 240.0, |ui| {
             changed |= rgb_picker(ui, color);
         });
         changed |= hex_field(ui, id.with("hex"), color, 56.0);
@@ -109,12 +109,11 @@ pub enum PaintEvent {
 }
 
 /// One Figma-style paint row: swatch (opens editor), value, opacity, visibility, remove.
-pub fn paint_row(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> PaintEvent {
+pub fn paint_row(ui: &mut Ui, id: egui::Id, paint: &mut Paint, title: &str) -> PaintEvent {
     let mut ev = PaintEvent::None;
     ui.horizontal(|ui| {
         let sw = swatch(ui, paint);
-        Popup::menu(&sw).id(id.with("popup")).close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-            ui.set_width(240.0);
+        crate::chrome::popover(&sw, id.with("popup"), title, 240.0, |ui| {
             if let Some(e) = paint_editor(ui, id, paint) {
                 ev = e;
             }
@@ -304,8 +303,7 @@ pub fn shadow_row(ui: &mut Ui, id: egui::Id, s: &mut Shadow) -> (bool, bool) {
     let (mut changed, mut remove) = (false, false);
     ui.horizontal(|ui| {
         let open = ui.add(egui::Button::new(s.kind.label()).frame(false));
-        Popup::menu(&open).id(id.with("popup")).close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-            ui.set_width(230.0);
+        crate::chrome::popover(&open, id.with("popup"), s.kind.label(), 240.0, |ui| {
             // The type picker sits in the editor itself: a dropdown here opens a second popup,
             // and clicking in it would count as a click outside and close the editor.
             egui::Grid::new(id.with("kind")).num_columns(2).spacing([4.0, 4.0]).show(ui, |ui| {
@@ -384,8 +382,7 @@ pub fn style_preview(ui: &mut Ui, v: &crate::doc::StyleValue) {
 pub fn style_menu(ui: &mut Ui, id: egui::Id, styles: &[crate::doc::Style], same_kind: impl Fn(&crate::doc::StyleValue) -> bool) -> Option<StylePick> {
     let mut pick = None;
     let btn = icon_button(ui, Icon::Styles, false, 22.0, "Styles");
-    Popup::menu(&btn).id(id).close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-        ui.set_width(220.0);
+    crate::chrome::popover(&btn, id, "Styles", 240.0, |ui| {
         ui.label(egui::RichText::new("Local styles").strong());
         let mut any = false;
         // Grouped by slash folders, as in Figma ("HUD / Title" under HUD).

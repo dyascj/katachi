@@ -153,7 +153,7 @@ impl App {
                 self.sel = vec![i];
             }
         }
-        resp.context_menu(|ui| self.context_menu(ui));
+        crate::chrome::context_menu(&resp, |ui| self.context_menu(ui));
 
         self.text_editor(ui, &painter);
         self.draw_overlays(&painter, ptr);
@@ -774,7 +774,10 @@ impl App {
                     let r = Rect::from_min_size(n.rect.min, n.rect.size().max(Vec2::splat(1.0)));
                     self.doc.set_rect(id, r);
                 }
-                self.tool = Tool::Move;
+                // Text goes straight to typing; shape tools stay on if "Keep tool selected" is set.
+                if n.kind == Kind::Text || !self.prefs.keep_tool_selected {
+                    self.tool = Tool::Move;
+                }
             }
             _ => {}
         }
@@ -817,7 +820,9 @@ impl App {
                 let node = self.shape_for(t, Rect::from_min_size(p, vec2(100.0, 100.0)));
                 let id = self.doc.insert(self.page, parent, None, node);
                 self.sel = vec![id];
-                self.tool = Tool::Move;
+                if !self.prefs.keep_tool_selected {
+                    self.tool = Tool::Move;
+                }
                 self.press = None;
             }
             _ => {}
@@ -1023,6 +1028,10 @@ impl App {
     /// Correction that snaps the masked edges of `moving` to nearby sibling edges/centers.
     /// Records guide lines for display.
     fn snap(&mut self, moving: Rect, exclude: &[NodeId], mx: [bool; 3], my: [bool; 3]) -> Vec2 {
+        if !self.prefs.snap_to_objects {
+            self.guides.clear();
+            return Vec2::ZERO;
+        }
         let tol = 5.0 / self.view.zoom;
         let targets = self.snap_targets(exclude);
         let xs = |r: Rect| [r.min.x, r.center().x, r.max.x];
@@ -1179,7 +1188,7 @@ impl App {
             ring.push(pts[0]);
             painter.extend(egui::Shape::dashed_line(&ring, Stroke::new(1.0, Color32::from_gray(0x99)), 4.0, 3.0));
         }
-        if let Some(h) = self.hover.filter(|h| !self.sel.contains(h)) {
+        if let Some(h) = self.hover.filter(|h| !self.sel.contains(h) && self.prefs.highlight_on_hover) {
             self.outline(painter, h, 2.0);
         }
         if self.vector_edit.is_some() {
@@ -1211,10 +1220,13 @@ impl App {
                 Some(Drag::Rotate { deg, .. }) => format!("{}°", num(*deg)),
                 _ => format!("{} × {}", num(fr.width()), num(fr.height())),
             };
-            let g = painter.layout_no_wrap(label, FontId::proportional(11.0), Color32::WHITE);
-            let pill = Rect::from_center_size(b.center_bottom() + vec2(0.0, 8.0 + g.size().y / 2.0 + 2.0), g.size() + vec2(8.0, 4.0));
-            painter.rect_filled(pill, 2.0, accent);
-            painter.galley(pill.min + vec2(4.0, 2.0), g, Color32::WHITE);
+            // The size label (rotation angle while rotating), unless turned off in Settings.
+            if self.prefs.show_dimensions || matches!(self.drag, Some(Drag::Rotate { .. })) {
+                let g = painter.layout_no_wrap(label, FontId::proportional(11.0), Color32::WHITE);
+                let pill = Rect::from_center_size(b.center_bottom() + vec2(0.0, 8.0 + g.size().y / 2.0 + 2.0), g.size() + vec2(8.0, 4.0));
+                painter.rect_filled(pill, 2.0, accent);
+                painter.galley(pill.min + vec2(4.0, 2.0), g, Color32::WHITE);
+            }
         }
         for g in &self.guides {
             painter.line_segment([self.view.to_screen(g[0]), self.view.to_screen(g[1])], Stroke::new(1.0, SNAP));
@@ -1397,10 +1409,12 @@ impl App {
             self.toast = None;
             return;
         }
+        // Figma's toast: a 40-point near-black card above the toolbar, centered on the canvas.
         let g = painter.layout_no_wrap(msg.clone(), FontId::proportional(12.0), Color32::WHITE);
-        let r = Rect::from_center_size(rect.center_bottom() - vec2(0.0, 80.0), g.size() + vec2(24.0, 14.0));
-        painter.rect_filled(r, CornerRadius::same(6), Color32::from_gray(0x1E));
-        painter.galley(r.min + vec2(12.0, 7.0), g, Color32::WHITE);
+        let r = Rect::from_center_size(rect.center_bottom() - vec2(0.0, 96.0), vec2(g.size().x + 32.0, 40.0));
+        painter.add(egui::Shape::Rect(egui::epaint::RectShape::filled(r.translate(vec2(0.0, 4.0)), CornerRadius::same(10), Color32::from_black_alpha(60)).with_blur_width(16.0)));
+        painter.rect(r, CornerRadius::same(10), crate::chrome::MENU_BG, Stroke::new(1.0, Color32::from_gray(0x3A)), StrokeKind::Inside);
+        painter.galley(r.center() - g.size() / 2.0, g, Color32::WHITE);
         painter.ctx().request_repaint();
     }
 
