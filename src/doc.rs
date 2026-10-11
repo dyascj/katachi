@@ -330,6 +330,24 @@ pub enum Bindable {
 }
 
 impl Bindable {
+    /// How the property reads in the UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            Bindable::Fill => "Fill",
+            Bindable::Stroke => "Stroke",
+            Bindable::Opacity => "Opacity",
+            Bindable::Radius => "Corner radius",
+            Bindable::Width => "Width",
+            Bindable::Height => "Height",
+            Bindable::Gap => "Gap",
+            Bindable::Padding => "Padding",
+            Bindable::StrokeWidth => "Stroke width",
+            Bindable::FontSize => "Font size",
+            Bindable::Text => "Text",
+            Bindable::Visible => "Visibility",
+        }
+    }
+
     pub const ALL: [Bindable; 12] = [
         Bindable::Fill,
         Bindable::Stroke,

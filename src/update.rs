@@ -39,7 +39,7 @@ pub struct Updater {
 impl Updater {
     /// Check now and every six hours, unless this is a development build.
     pub fn start() -> Self {
-        let off = cfg!(debug_assertions) || cfg!(test) || std::env::var_os("KATACHI_NO_UPDATE").is_some();
+        let off = cfg!(debug_assertions) || cfg!(test) || std::env::var_os("KATACHI_NO_UPDATE").is_some() || !crate::settings::load().check_updates;
         let u = Updater { state: Arc::new(Mutex::new(State::Idle)), seen: State::Idle, wake: Arc::default() };
         // Windows can't delete a running exe, so the last update's old copy goes now.
         if cfg!(windows) && let Ok(exe) = std::env::current_exe() {

@@ -47,7 +47,7 @@ impl App {
         }
         let mut open = true;
         let before = (self.doc.collections.clone(), self.doc.variables.clone());
-        egui::Window::new("Local variables").open(&mut open).default_size([640.0, 420.0]).collapsible(false).show(ctx, |ui| {
+        crate::chrome::window(ctx, "Local variables", &mut open, 760.0, |ui| {
             if self.doc.collections.is_empty() {
                 ui.label("Variables store reusable values like colors and spacing, with modes such as Light and Dark.");
                 if ui.button("Create collection").clicked() {
@@ -58,18 +58,23 @@ impl App {
             }
             let current = self.var_collection.filter(|c| self.doc.collections.iter().any(|x| x.id == *c)).unwrap_or(self.doc.collections[0].id);
             self.var_collection = Some(current);
-            ui.horizontal(|ui| {
+            // Collections in a left column, the selected one's table on the right, as in Figma.
+            ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width(160.0);
+                ui.label(egui::RichText::new("Collections").small().color(crate::appearance::muted(ui.ctx())));
                 for c in &self.doc.collections {
-                    if ui.selectable_label(c.id == current, &c.name).clicked() {
+                    if ui.add_sized([160.0, 26.0], egui::Button::selectable(c.id == current, &c.name)).clicked() {
                         self.var_collection = Some(c.id);
                     }
                 }
-                if ui.small_button("+ Collection").clicked() {
+                if ui.add(egui::Button::new("+  New collection").frame(false)).clicked() {
                     let id = self.doc.add_collection(format!("Collection {}", self.doc.collections.len() + 1));
                     self.var_collection = Some(id);
                 }
             });
             ui.separator();
+            ui.vertical(|ui| {
             let ci = self.doc.collections.iter().position(|c| c.id == current).unwrap();
             ui.horizontal(|ui| {
                 ui.label("Collection");
@@ -139,6 +144,8 @@ impl App {
                     }
                 }
             });
+            });
+            });
         });
         if (self.doc.collections.clone(), self.doc.variables.clone()) != before {
             // Record the edit for undo, then re-resolve bound layers.
@@ -165,7 +172,7 @@ impl App {
             ui.label(RichText::new("Variables").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let btn = icon_button(ui, Icon::Plus, false, 22.0, "Bind a property");
-                egui::Popup::menu(&btn).id(ui.id().with(("bind", id))).show(|ui| {
+                egui::Popup::menu(&btn).id(ui.id().with(("bind", id))).style(crate::chrome::menu_style).show(|ui| {
                     for prop in Bindable::ALL {
                         let usable = match prop {
                             Bindable::Text | Bindable::FontSize => n.kind == Kind::Text,
@@ -176,7 +183,7 @@ impl App {
                         if !usable {
                             continue;
                         }
-                        ui.menu_button(format!("{prop:?}"), |ui| {
+                        crate::chrome::menu_button(ui, prop.label(), |ui| {
                             for v in self.doc.variables.iter().filter(|v| v.values.first().is_some_and(|x| prop.accepts(x) || matches!(x, VarValue::Alias(_)))) {
                                 if ui.button(&v.name).clicked() {
                                     add = Some((prop, v.id));
@@ -200,7 +207,7 @@ impl App {
         let mut unbind = None;
         for (prop, var) in &n.bindings {
             ui.horizontal(|ui| {
-                ui.label(format!("{prop:?}"));
+                ui.label(prop.label());
                 let name = self.doc.variable(*var).map_or("Missing".into(), |v| v.name.clone());
                 ui.label(RichText::new(name).color(crate::canvas::BLUE));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -227,7 +234,7 @@ impl App {
                         Some(m) => c.modes.get(m).cloned().unwrap_or_default(),
                         None => format!("Auto ({})", c.modes[self.doc.mode_for(id, c.id).min(c.modes.len() - 1)]),
                     };
-                    egui::ComboBox::from_id_salt(("mode", id, c.id)).selected_text(shown).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt(("mode", id, c.id)).selected_text(shown).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
                         ui.selectable_value(&mut pick, None, "Auto");
                         for (i, m) in c.modes.iter().enumerate() {
                             ui.selectable_value(&mut pick, Some(i), m);

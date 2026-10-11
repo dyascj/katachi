@@ -1936,3 +1936,115 @@ fn quick_actions_run_commands_and_find_layers() {
     key(&mut h, Modifiers::NONE, Key::Enter);
     assert_eq!(h.state().sel, vec![b]);
 }
+
+#[test]
+fn settings_modal_tabs_and_preferences() {
+    let mut h = harness();
+    key(&mut h, Modifiers::COMMAND, Key::Comma);
+    assert_eq!(h.state().settings_tab, Some(crate::settings::Tab::Account), "Cmd , opens Settings");
+    h.run_steps(2);
+    h.get_by_label("Canvas").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings_tab, Some(crate::settings::Tab::Canvas));
+    // Keep tool selected: two rectangles in a row without pressing R again.
+    h.state_mut().prefs.keep_tool_selected = true;
+    h.state_mut().settings_tab = None;
+    h.run_steps(2);
+    draw(&mut h, Key::R, (0.0, 0.0), (40.0, 40.0));
+    assert_eq!(h.state().tool, Tool::Rectangle, "still drawing rectangles");
+    h.state_mut().prefs.keep_tool_selected = false;
+    draw(&mut h, Key::R, (60.0, 0.0), (100.0, 40.0));
+    assert_eq!(h.state().tool, Tool::Move);
+    // Nudge amounts come from Settings.
+    h.state_mut().prefs.big_nudge = 8.0;
+    let id = h.state().sel[0];
+    let x = h.state().doc.node(id).rect.min.x;
+    key(&mut h, Modifiers::SHIFT, Key::ArrowRight);
+    assert_eq!(h.state().doc.node(id).rect.min.x, x + 8.0);
+}
+
+#[test]
+fn floating_surfaces_stay_solid_with_glass() {
+    let ctx = egui::Context::default();
+    let a = crate::appearance::Appearance { glass: true, panel_opacity: 0.4, ..Default::default() };
+    crate::appearance::apply(&ctx, &a);
+    for theme in [egui::Theme::Light, egui::Theme::Dark] {
+        let v = ctx.style_of(theme).visuals.clone();
+        assert!(v.panel_fill.a() < 255, "panels are glass");
+        assert_eq!(v.window_fill.a(), 255, "popovers, menus and windows are solid");
+    }
+    let mut s = egui::Style::default();
+    crate::chrome::menu_style(&mut s);
+    assert_eq!(s.visuals.window_fill, crate::chrome::MENU_BG, "menus are near-black in either theme");
+}
+
+#[test]
+fn main_menu_follows_figma() {
+    let mut h = harness();
+    h.get_by_label("Main menu").click();
+    h.run_steps(2);
+    for label in ["Back to files", "Actions…", "File", "Edit", "View", "Object", "Arrange", "Plugins", "Preferences", "Help and account"] {
+        assert!(h.query_all_by_label_contains(label).next().is_some(), "{label}");
+    }
+}
+
+#[test]
+fn find_and_version_history_take_over_their_panels() {
+    let mut h = harness();
+    let mut t = Node::new(Kind::Text, r(0., 0., 80., 20.));
+    t.text = "Checkout".into();
+    t.name = "Label".into();
+    let t = h.state_mut().doc.insert(0, None, None, t);
+    key(&mut h, Modifiers::COMMAND, Key::F);
+    h.run_steps(2);
+    assert!(h.query_by_label("Layers").is_none(), "Find replaces Pages and Layers");
+    h.event(Event::Text("check".into()));
+    h.run_steps(2);
+    h.get_by_label("Label  \u{201C}Checkout\u{201D}").click();
+    h.run_steps(2);
+    assert_eq!(h.state().sel, vec![t]);
+    // Escape in the field closes Find.
+    h.state_mut().find.3 = true;
+    h.run_steps(2);
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    assert!(!h.state().find.0, "Escape closes Find");
+    h.state_mut().show_history = true;
+    h.run_steps(2);
+    assert!(h.query_by_label("Version history").is_some());
+    assert!(h.query_by_label("Design").is_none(), "replaces the Design panel");
+    h.get_by_label("Close").click();
+    h.run_steps(2);
+    assert!(!h.state().show_history);
+}
+
+#[test]
+fn color_picker_drags_and_escape_from_find_keeps_selection() {
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (80.0, 80.0));
+    // Open the fill popover from its swatch, then drag across the color square.
+    h.get_all_by_label("Color swatch").next().unwrap().click();
+    h.run_steps(3);
+    let before = h.state().doc.node(id).fills[0].color;
+    let popover = egui::Popup::is_any_open(&h.ctx);
+    assert!(popover, "fill editor open");
+    let sq = h.get_by_label("Saturation and brightness").rect();
+    let (a, b) = (sq.min + vec2(10.0, 10.0), sq.min + vec2(sq.width() * 0.8, sq.height() * 0.6));
+    move_to(&mut h, a, Modifiers::NONE);
+    press(&mut h, a, true, Modifiers::NONE);
+    for i in 1..=5 {
+        move_to(&mut h, a.lerp(b, i as f32 / 5.0), Modifiers::NONE);
+    }
+    let mid = h.state().doc.node(id).fills[0].color;
+    press(&mut h, b, false, Modifiers::NONE);
+    let found = (mid != before).then_some(());
+    assert!(found.is_some(), "dragging in the picker changes the fill while the button is held");
+    assert!(egui::Popup::is_any_open(&h.ctx), "and the editor stays open");
+    // Find, then Escape: Find closes and the selection stays.
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    h.state_mut().sel = vec![id];
+    key(&mut h, Modifiers::COMMAND, Key::F);
+    h.run_steps(2);
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    assert!(!h.state().find.0);
+    assert_eq!(h.state().sel, vec![id], "selection kept");
+}

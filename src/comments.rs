@@ -4,7 +4,16 @@ use crate::app::{App, Tool};
 use crate::doc::Comment;
 use egui::{Color32, FontId, Painter, Pos2, Rect, RichText, Stroke, Ui, vec2};
 
+/// Your name on comments and in multiplayer: the one set in Settings, or the system user name.
 pub fn author() -> String {
+    author_from(&crate::settings::load())
+}
+
+pub fn author_from(p: &crate::settings::Prefs) -> String {
+    if p.name.trim().is_empty() { system_name() } else { p.name.trim().to_string() }
+}
+
+pub fn system_name() -> String {
     let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default();
     let mut c = user.chars();
     match c.next() {

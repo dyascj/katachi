@@ -3,7 +3,7 @@
 use crate::canvas::num;
 use crate::doc::{Paint, PaintKind, Rgba, Shadow};
 use crate::panels::{Icon, icon_button};
-use egui::{Color32, DragValue, FontId, Popup, PopupCloseBehavior, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+use egui::{Color32, DragValue, FontId, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 
 pub fn parse_hex(s: &str) -> Option<Rgba> {
     let s = s.trim().trim_start_matches('#');
@@ -45,19 +45,105 @@ pub fn alpha_field(ui: &mut Ui, color: &mut Rgba) -> bool {
     changed
 }
 
-/// Inline RGB picker (alpha lives in its own field, as in Figma).
+/// Figma's color picker: a saturation and brightness square, then thin hue and opacity sliders
+/// with round knobs, then hex and opacity.
 fn rgb_picker(ui: &mut Ui, color: &mut Rgba) -> bool {
-    let mut c = Color32::from_rgb(color.0[0], color.0[1], color.0[2]);
-    let changed = egui::color_picker::color_picker_color32(ui, &mut c, egui::color_picker::Alpha::Opaque);
-    if changed {
-        *color = Rgba([c.r(), c.g(), c.b(), color.a()]);
+    use egui::ecolor::Hsva;
+    use egui::epaint::{Mesh, Vertex, WHITE_UV};
+    let id = ui.id().with("figma-picker");
+    let rgb = Color32::from_rgb(color.0[0], color.0[1], color.0[2]);
+    let mut hsv = Hsva::from(rgb);
+    // Grays and black have no hue: keep the last one so the square doesn't jump to red.
+    let kept: Option<(Color32, f32)> = ui.data(|d| d.get_temp(id));
+    if let Some((c, h)) = kept
+        && c == rgb
+    {
+        hsv.h = h;
     }
+    let mut changed = false;
+    let w = ui.available_width();
+    let quad = |m: &mut Mesh, r: Rect, [tl, tr, br, bl]: [Color32; 4]| {
+        let base = m.vertices.len() as u32;
+        for (p, c) in [(r.left_top(), tl), (r.right_top(), tr), (r.right_bottom(), br), (r.left_bottom(), bl)] {
+            m.vertices.push(Vertex { pos: p, uv: WHITE_UV, color: c });
+        }
+        m.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    };
+    let knob = |ui: &Ui, c: egui::Pos2, fill: Color32| {
+        ui.painter().circle(c, 6.0, fill, Stroke::new(2.0, Color32::WHITE));
+        ui.painter().circle_stroke(c, 7.0, Stroke::new(1.0, Color32::from_black_alpha(60)));
+    };
+    // Saturation (x) and brightness (y).
+    let (sq, resp) = ui.allocate_exact_size(vec2(w, w), Sense::click_and_drag());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Slider, true, "Saturation and brightness"));
+    let pure = Color32::from(Hsva::new(hsv.h, 1.0, 1.0, 1.0));
+    let mut m = Mesh::default();
+    quad(&mut m, sq, [Color32::WHITE, pure, pure, Color32::WHITE]);
+    quad(&mut m, sq, [Color32::TRANSPARENT, Color32::TRANSPARENT, Color32::BLACK, Color32::BLACK]);
+    ui.painter().add(m);
+    ui.painter().rect_stroke(sq, 4.0, Stroke::new(1.0, Color32::from_black_alpha(25)), StrokeKind::Inside);
+    if let Some(p) = resp.interact_pointer_pos() {
+        hsv.s = ((p.x - sq.min.x) / sq.width()).clamp(0.0, 1.0);
+        hsv.v = 1.0 - ((p.y - sq.min.y) / sq.height()).clamp(0.0, 1.0);
+        changed = true;
+    }
+    knob(ui, egui::pos2(sq.min.x + hsv.s * sq.width(), sq.min.y + (1.0 - hsv.v) * sq.height()), Color32::from(Hsva::new(hsv.h, hsv.s, hsv.v, 1.0)));
+    ui.add_space(6.0);
+    // Hue.
+    let (bar, resp) = ui.allocate_exact_size(vec2(w, 12.0), Sense::click_and_drag());
+    let mut m = Mesh::default();
+    for i in 0..6 {
+        let (a, b) = (i as f32 / 6.0, (i + 1) as f32 / 6.0);
+        let r = Rect::from_min_max(egui::pos2(bar.min.x + a * bar.width(), bar.min.y), egui::pos2(bar.min.x + b * bar.width(), bar.max.y));
+        let (ca, cb) = (Color32::from(Hsva::new(a, 1.0, 1.0, 1.0)), Color32::from(Hsva::new(b, 1.0, 1.0, 1.0)));
+        quad(&mut m, r, [ca, cb, cb, ca]);
+    }
+    ui.painter().add(m);
+    if let Some(p) = resp.interact_pointer_pos() {
+        hsv.h = ((p.x - bar.min.x) / bar.width()).clamp(0.0, 0.9999);
+        changed = true;
+    }
+    knob(ui, egui::pos2(bar.min.x + hsv.h * bar.width(), bar.center().y), pure);
+    ui.add_space(6.0);
+    // Opacity.
+    let (bar, resp) = ui.allocate_exact_size(vec2(w, 12.0), Sense::click_and_drag());
+    for i in 0..(bar.width() / 6.0) as usize {
+        for j in 0..2 {
+            if (i + j) % 2 == 0 {
+                let r = Rect::from_min_size(egui::pos2(bar.min.x + i as f32 * 6.0, bar.min.y + j as f32 * 6.0), vec2(6.0, 6.0)).intersect(bar);
+                ui.painter().rect_filled(r, 0.0, Color32::from_gray(0xD8));
+            }
+        }
+    }
+    let solid = Color32::from(Hsva::new(hsv.h, hsv.s, hsv.v, 1.0));
+    let mut m = Mesh::default();
+    quad(&mut m, bar, [Color32::TRANSPARENT, solid, solid, Color32::TRANSPARENT]);
+    ui.painter().add(m);
+    let mut a = color.a() as f32 / 255.0;
+    if let Some(p) = resp.interact_pointer_pos() {
+        a = ((p.x - bar.min.x) / bar.width()).clamp(0.0, 1.0);
+        changed = true;
+    }
+    knob(ui, egui::pos2(bar.min.x + a * bar.width(), bar.center().y), solid);
+    if changed {
+        let c = Color32::from(Hsva::new(hsv.h, hsv.s, hsv.v, 1.0));
+        *color = Rgba([c.r(), c.g(), c.b(), (a * 255.0).round() as u8]);
+        ui.data_mut(|d| d.insert_temp(id, (c, hsv.h)));
+    }
+    ui.add_space(8.0);
+    // Hex and opacity, as Figma shows under the sliders.
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Hex").color(crate::appearance::muted(ui.ctx())));
+        changed |= hex_field(ui, id.with("hex"), color, 80.0);
+        changed |= alpha_field(ui, color);
+    });
     changed
 }
 
 /// Checkerboard-backed swatch showing a paint; returns the click response.
 fn swatch(ui: &mut Ui, p: &Paint) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Color swatch"));
     let painter = ui.painter_at(rect);
     for i in 0..4 {
         let (x, y) = ((i % 2) as f32, (i / 2) as f32);
@@ -91,7 +177,7 @@ pub fn color_row(ui: &mut Ui, id: egui::Id, color: &mut Rgba) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
         let sw = swatch(ui, &Paint::solid(*color));
-        Popup::menu(&sw).id(id.with("popup")).close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+        crate::chrome::popover(&sw, id.with("popup"), "Color", 240.0, |ui| {
             changed |= rgb_picker(ui, color);
         });
         changed |= hex_field(ui, id.with("hex"), color, 56.0);
@@ -109,12 +195,11 @@ pub enum PaintEvent {
 }
 
 /// One Figma-style paint row: swatch (opens editor), value, opacity, visibility, remove.
-pub fn paint_row(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> PaintEvent {
+pub fn paint_row(ui: &mut Ui, id: egui::Id, paint: &mut Paint, title: &str) -> PaintEvent {
     let mut ev = PaintEvent::None;
     ui.horizontal(|ui| {
         let sw = swatch(ui, paint);
-        Popup::menu(&sw).id(id.with("popup")).close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-            ui.set_width(240.0);
+        crate::chrome::popover(&sw, id.with("popup"), title, 240.0, |ui| {
             if let Some(e) = paint_editor(ui, id, paint) {
                 ev = e;
             }
@@ -304,18 +389,13 @@ pub fn shadow_row(ui: &mut Ui, id: egui::Id, s: &mut Shadow) -> (bool, bool) {
     let (mut changed, mut remove) = (false, false);
     ui.horizontal(|ui| {
         let open = ui.add(egui::Button::new(s.kind.label()).frame(false));
-        Popup::menu(&open).id(id.with("popup")).close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-            ui.set_width(230.0);
-            // The type picker sits in the editor itself: a dropdown here opens a second popup,
-            // and clicking in it would count as a click outside and close the editor.
-            egui::Grid::new(id.with("kind")).num_columns(2).spacing([4.0, 4.0]).show(ui, |ui| {
-                for (i, k) in [EffectKind::DropShadow, EffectKind::InnerShadow, EffectKind::LayerBlur, EffectKind::BackgroundBlur].into_iter().enumerate() {
-                    changed |= ui.add_sized([108.0, 22.0], egui::Button::selectable(s.kind == k, k.label())).clicked() && {
+        crate::chrome::popover(&open, id.with("popup"), s.kind.label(), 240.0, |ui| {
+            // Effect type as a dropdown, as in Figma's header.
+            crate::chrome::menu_button(ui, s.kind.label(), |ui| {
+                for k in [EffectKind::DropShadow, EffectKind::InnerShadow, EffectKind::LayerBlur, EffectKind::BackgroundBlur] {
+                    if ui.selectable_label(s.kind == k, k.label()).clicked() && s.kind != k {
                         s.kind = k;
-                        true
-                    };
-                    if i % 2 == 1 {
-                        ui.end_row();
+                        changed = true;
                     }
                 }
             });
@@ -337,11 +417,22 @@ pub fn shadow_row(ui: &mut Ui, id: egui::Id, s: &mut Shadow) -> (bool, bool) {
                 ui.end_row();
             });
             if s.kind.is_shadow() {
+                // Swatch, hex and opacity; the swatch expands the full picker in place.
+                ui.add_space(4.0);
+                let open_id = id.with("color-open");
+                let mut open: bool = ui.data(|d| d.get_temp(open_id)).unwrap_or(false);
                 ui.horizontal(|ui| {
-                    changed |= hex_field(ui, id.with("hex"), &mut s.color, 56.0);
+                    if swatch(ui, &Paint::solid(s.color)).on_hover_text("Color").clicked() {
+                        open = !open;
+                    }
+                    changed |= hex_field(ui, id.with("hex"), &mut s.color, 64.0);
                     changed |= alpha_field(ui, &mut s.color);
                 });
-                changed |= rgb_picker(ui, &mut s.color);
+                ui.data_mut(|d| d.insert_temp(open_id, open));
+                if open {
+                    ui.add_space(6.0);
+                    changed |= rgb_picker(ui, &mut s.color);
+                }
             }
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -384,8 +475,7 @@ pub fn style_preview(ui: &mut Ui, v: &crate::doc::StyleValue) {
 pub fn style_menu(ui: &mut Ui, id: egui::Id, styles: &[crate::doc::Style], same_kind: impl Fn(&crate::doc::StyleValue) -> bool) -> Option<StylePick> {
     let mut pick = None;
     let btn = icon_button(ui, Icon::Styles, false, 22.0, "Styles");
-    Popup::menu(&btn).id(id).close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-        ui.set_width(220.0);
+    crate::chrome::popover(&btn, id, "Styles", 240.0, |ui| {
         ui.label(egui::RichText::new("Local styles").strong());
         let mut any = false;
         // Grouped by slash folders, as in Figma ("HUD / Title" under HUD).

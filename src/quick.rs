@@ -67,7 +67,10 @@ const COMMANDS: &[(&str, &str, Run)] = &[
         a.find.3 = true;
     }),
     ("Version history", "", |a, _| a.show_history = true),
-    ("Appearance (theme and glass)", "", |a, _| a.show_appearance = true),
+    ("Settings", "⌘,", |a, _| a.open_settings(crate::settings::Tab::Account)),
+    ("Appearance (theme and glass)", "", |a, _| a.open_settings(crate::settings::Tab::Appearance)),
+    ("Keyboard shortcuts", "", |a, _| a.open_settings(crate::settings::Tab::Shortcuts)),
+    ("Manage plugins", "", |a, _| a.open_settings(crate::settings::Tab::Plugins)),
     ("Run script (plugin console)", "", |a, _| a.show_console = true),
     ("Export selection", "⇧⌘E", |a, c| a.export(c)),
     ("Place image", "⇧⌘K", |a, _| a.import_dialog()),
@@ -103,19 +106,26 @@ impl App {
 
     pub fn quick_actions(&mut self, ctx: &egui::Context) {
         let Some((mut q, mut pick)) = self.quick.take() else { return };
-        // Results: commands, then plugins, then layers by name (up to 12 in all).
+        // Tabs, as in Figma: All, Layers, Plugins (0, 1, 2).
+        let tab_id = egui::Id::new("quick-tab");
+        let mut tab: u8 = ctx.data(|d| d.get_temp(tab_id)).unwrap_or(0);
+        // Results: commands, then plugins, then layers by name (up to 10).
         let mut hits: Vec<(Hit, String, String)> = vec![];
-        for (i, (label, short, _)) in COMMANDS.iter().enumerate() {
-            if matches(label, &q) {
-                hits.push((Hit::Command(i), label.to_string(), short.to_string()));
+        if tab == 0 {
+            for (i, (label, short, _)) in COMMANDS.iter().enumerate() {
+                if matches(label, &q) {
+                    hits.push((Hit::Command(i), label.to_string(), short.to_string()));
+                }
             }
         }
-        for p in crate::plugins::installed() {
-            if matches(&p.name, &q) {
-                hits.push((Hit::Plugin(p.clone()), format!("Run {}", p.name), "Plugin".into()));
+        if tab != 1 {
+            for p in crate::plugins::installed() {
+                if matches(&p.name, &q) {
+                    hits.push((Hit::Plugin(p.clone()), format!("Run {}", p.name), "Plugin".into()));
+                }
             }
         }
-        if !q.trim().is_empty() {
+        if tab != 2 && (!q.trim().is_empty() || tab == 1) {
             for (pi, page) in self.doc.pages.iter().enumerate() {
                 let mut stack = page.children.clone();
                 while let Some(id) = stack.pop() {
@@ -127,7 +137,7 @@ impl App {
                 }
             }
         }
-        hits.truncate(12);
+        hits.truncate(10);
         pick = pick.min(hits.len().saturating_sub(1));
         let (up, down, enter, esc) = ctx.input_mut(|i| {
             (i.consume_key(egui::Modifiers::NONE, Key::ArrowUp), i.consume_key(egui::Modifiers::NONE, Key::ArrowDown), i.consume_key(egui::Modifiers::NONE, Key::Enter), i.consume_key(egui::Modifiers::NONE, Key::Escape))
@@ -141,24 +151,37 @@ impl App {
         let mut run = enter.then(|| hits.get(pick).cloned()).flatten().map(|h| h.0);
         let screen = ctx.content_rect();
         egui::Area::new(egui::Id::new("quick-actions"))
-            .fixed_pos(egui::pos2(screen.center().x - 260.0, screen.min.y + 90.0))
+            .fixed_pos(egui::pos2(screen.center().x - 256.0, screen.min.y + 140.0))
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).inner_margin(10).show(ui, |ui| {
-                    ui.set_width(520.0);
-                    let r = ui.add(egui::TextEdit::singleline(&mut q).hint_text("Search actions, tools, plugins and layers").desired_width(f32::INFINITY).font(egui::FontId::proportional(15.0)));
+                // Figma's Actions window: 512 wide, search on top, tabs, 32-point rows, no title.
+                crate::chrome::popover_frame(ui).inner_margin(8).show(ui, |ui| {
+                    ui.set_width(496.0);
+                    let r = ui.add(egui::TextEdit::singleline(&mut q).hint_text("Search actions, layers and plugins").desired_width(f32::INFINITY).font(egui::FontId::proportional(14.0)).margin(egui::vec2(10.0, 8.0)));
                     if !r.has_focus() {
                         r.request_focus();
                     }
                     if r.changed() {
                         pick = 0;
                     }
-                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        for (i, label) in ["All", "Layers", "Plugins"].into_iter().enumerate() {
+                            let on = tab == i as u8;
+                            let fill = if on { crate::appearance::subtle(ui.ctx()) } else { egui::Color32::TRANSPARENT };
+                            if ui.add(egui::Button::new(RichText::new(label).size(12.0)).fill(fill).stroke(egui::Stroke::NONE).corner_radius(6)).clicked() {
+                                tab = i as u8;
+                                pick = 0;
+                            }
+                        }
+                    });
+                    ui.add_space(2.0);
+                    // Rows sit flush at 32 points, as in Figma.
+                    ui.spacing_mut().item_spacing.y = 0.0;
                     if hits.is_empty() {
                         ui.label(RichText::new("No matches").color(crate::appearance::muted(ui.ctx())));
                     }
                     for (i, (hit, label, detail)) in hits.iter().enumerate() {
-                        let resp = ui.add_sized([ui.available_width(), 26.0], egui::Button::selectable(i == pick, "").frame(false));
+                        let resp = ui.add_sized([ui.available_width(), 32.0], egui::Button::selectable(i == pick, "").frame(false));
                         let p = ui.painter();
                         p.text(resp.rect.left_center() + egui::vec2(8.0, 0.0), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(13.5), ui.visuals().text_color());
                         p.text(resp.rect.right_center() - egui::vec2(8.0, 0.0), egui::Align2::RIGHT_CENTER, detail, egui::FontId::proportional(12.0), crate::appearance::muted(ui.ctx()));
@@ -172,7 +195,9 @@ impl App {
                     }
                 });
             });
+        ctx.data_mut(|d| d.insert_temp(tab_id, tab));
         if esc {
+            ctx.data_mut(|d| d.insert_temp(tab_id, 0u8));
             return;
         }
         match run {

@@ -345,9 +345,9 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, selected: bool, size: f32, tip: &str
     let (bg, fg) = if selected {
         (BLUE, Color32::WHITE)
     } else if resp.hovered() {
-        (theme::subtle(ui.ctx()), theme::ink(ui.ctx()))
+        (ui.visuals().widgets.hovered.weak_bg_fill, ui.visuals().text_color())
     } else {
-        (Color32::TRANSPARENT, theme::ink(ui.ctx()))
+        (Color32::TRANSPARENT, ui.visuals().text_color())
     };
     ui.painter().rect_filled(rect, 5.0, bg);
     paint_icon(ui.painter(), rect, icon, fg);
@@ -427,7 +427,7 @@ fn num_field(ui: &mut Ui, v: &mut f32, label: &str, min: f32, width: f32) -> boo
 fn sizing_menu(ui: &mut Ui, id: egui::Id, mode: &mut Sizing, can_hug: bool, can_fill: bool, axis: usize, bounds: (&mut Option<f32>, &mut Option<f32>), cur: f32) -> bool {
     let resp = icon_button(ui, Icon::Chevron(true), false, 18.0, "Resizing");
     let mut changed = false;
-    egui::Popup::menu(&resp).id(id).show(|ui| {
+    egui::Popup::menu(&resp).id(id).style(crate::chrome::menu_style).show(|ui| {
         for (m, ok, label) in [(Sizing::Fixed, true, "Fixed"), (Sizing::Hug, can_hug, "Hug contents"), (Sizing::Fill, can_fill, "Fill container")] {
             if ok && ui.selectable_label(*mode == m, label).clicked() && *mode != m {
                 *mode = m;
@@ -514,7 +514,7 @@ const FRAME_PRESETS: &[(&str, &[(&str, u32, u32)])] = &[
 /// A dropdown inside a popover. egui's ComboBox opens its own popup, and a click there counts as
 /// outside the popover and closes it; a menu submenu belongs to the popover instead.
 fn dropdown(ui: &mut Ui, text: impl std::fmt::Display, add: impl FnOnce(&mut Ui)) {
-    ui.menu_button(text.to_string(), add);
+    crate::chrome::menu_button(ui, text.to_string(), add);
 }
 
 fn heading(ui: &mut Ui, title: &str) {
@@ -539,7 +539,7 @@ impl App {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let menu = icon_button(ui, Icon::Menu, false, 28.0, "Main menu");
-                egui::Popup::menu(&menu).show(|ui| self.main_menu(ui));
+                egui::Popup::menu(&menu).style(crate::chrome::menu_style).show(|ui| self.main_menu(ui));
                 // Truncated, so a long file name can't widen the panel.
                 ui.add(egui::Label::new(RichText::new(self.display_name()).strong()).truncate());
             });
@@ -553,6 +553,10 @@ impl App {
                 }
             });
             ui.separator();
+            if self.find.0 {
+                self.find_panel(ui);
+                return;
+            }
             if self.left_tab_assets {
                 self.assets(ui);
                 return;
@@ -704,138 +708,367 @@ impl App {
         Some(tex)
     }
 
+    /// The main menu, laid out like Figma's: Actions, then File / Edit / View / Object / Arrange,
+    /// then Plugins and Preferences, then Help.
     fn main_menu(&mut self, ui: &mut Ui) {
+        use crate::settings::Tab;
         let ctx = ui.ctx().clone();
+        ui.set_min_width(220.0);
         let item = |ui: &mut Ui, label: &str, short: &str| ui.add(egui::Button::new(label).shortcut_text(short)).clicked();
+        let has = !self.sel.is_empty();
+        let enabled = |ui: &mut Ui, on: bool, label: &str, short: &str| ui.add_enabled(on, egui::Button::new(label).shortcut_text(short)).clicked();
         if item(ui, "Back to files", "") {
             self.want = Some(crate::app::Want::Home);
             ui.close();
         }
+        if item(ui, "Actions…", "⌘K") {
+            self.toggle_quick_actions();
+            ui.close();
+        }
         ui.separator();
-        if item(ui, "New design file", "⌘N") {
-            self.request_new();
-            ui.close();
-        }
-        if item(ui, "Open… (.katachi or Figma .fig)", "⌘O") {
-            self.request_open();
-            ui.close();
-        }
-        let recent = crate::files::recent();
-        ui.add_enabled_ui(!recent.is_empty(), |ui| {
-            ui.menu_button("Open recent", |ui| {
-                for p in recent {
-                    let label = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                    if ui.button(label).on_hover_text(p.display().to_string()).clicked() {
-                        if self.dirty {
-                            self.toast("Save or discard changes first (⌘S)".into());
-                        } else {
-                            self.open_path(p);
+        ui.menu_button("File", |ui| {
+            if item(ui, "New design file", "⌘N") {
+                self.request_new();
+                ui.close();
+            }
+            if item(ui, "Open…", "⌘O") {
+                self.request_open();
+                ui.close();
+            }
+            let recent = crate::files::recent();
+            ui.add_enabled_ui(!recent.is_empty(), |ui| {
+                ui.menu_button("Open recent", |ui| {
+                    for p in recent {
+                        let label = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                        if ui.button(label).on_hover_text(p.display().to_string()).clicked() {
+                            self.want = Some(crate::app::Want::Open(p));
+                            ui.close();
                         }
-                        ui.close();
                     }
-                }
+                });
             });
+            ui.separator();
+            if item(ui, "Save", "⌘S") {
+                self.save(false);
+                ui.close();
+            }
+            if item(ui, "Save as…", "⇧⌘S") {
+                self.save(true);
+                ui.close();
+            }
+            if item(ui, "Show version history", "") {
+                self.show_history = true;
+                ui.close();
+            }
+            ui.separator();
+            if item(ui, "Place image…", "⇧⌘K") {
+                self.import_dialog();
+                ui.close();
+            }
+            if item(ui, "Export…", "⇧⌘E") {
+                self.export(&ctx);
+                ui.close();
+            }
+            ui.separator();
+            if item(ui, "Multiplayer session…", "") {
+                self.show_collab = true;
+                ui.close();
+            }
         });
-        if item(ui, "Save", "⌘S") {
-            self.save(false);
-            ui.close();
-        }
-        if item(ui, "Save as…", "⇧⌘S") {
-            self.save(true);
-            ui.close();
-        }
-        if item(ui, "Collaborate…", "") {
-            self.show_collab = true;
-            ui.close();
-        }
-        if item(ui, "Local variables…", "") {
-            self.show_variables = true;
-            ui.close();
-        }
-        if item(ui, "Version history…", "") {
-            self.show_history = true;
-            ui.close();
-        }
+        ui.menu_button("Edit", |ui| {
+            if item(ui, "Undo", "⌘Z") {
+                self.undo();
+                ui.close();
+            }
+            if item(ui, "Redo", "⇧⌘Z") {
+                self.redo();
+                ui.close();
+            }
+            ui.separator();
+            if enabled(ui, has, "Copy", "⌘C") {
+                self.copy(&ctx);
+                ui.close();
+            }
+            if item(ui, "Paste", "⌘V") {
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                ui.close();
+            }
+            if enabled(ui, has, "Duplicate", "⌘D") {
+                self.duplicate_selection();
+                ui.close();
+            }
+            if enabled(ui, has, "Delete", "⌫") {
+                self.delete_selection();
+                ui.close();
+            }
+            ui.separator();
+            if enabled(ui, has, "Copy properties", "⌥⌘C") {
+                self.style_clip = self.sel.first().map(|&id| self.doc.node(id).clone());
+                ui.close();
+            }
+            if enabled(ui, self.style_clip.is_some(), "Paste properties", "⌥⌘V") {
+                self.paste_style();
+                ui.close();
+            }
+            ui.separator();
+            if item(ui, "Select all", "⌘A") {
+                self.select_all();
+                ui.close();
+            }
+            if enabled(ui, has, "Select matching layers", "⌥⌘A") {
+                self.select_matching();
+                ui.close();
+            }
+            if item(ui, "Find and replace…", "⌘F") {
+                self.find.0 = true;
+                self.find.3 = true;
+                ui.close();
+            }
+        });
+        ui.menu_button("View", |ui| {
+            let check = |ui: &mut Ui, on: bool, label: &str, short: &str| ui.add(egui::Button::new(format!("{}{label}", if on { "✓  " } else { "     " })).shortcut_text(short)).clicked();
+            if check(ui, self.show_grids, "Layout guides", "⌃G") {
+                self.show_grids = !self.show_grids;
+                ui.close();
+            }
+            if check(ui, self.rulers, "Rulers", "⇧R") {
+                self.rulers = !self.rulers;
+                ui.close();
+            }
+            if check(ui, self.outline_mode, "Outlines", "⌘Y") {
+                self.outline_mode = !self.outline_mode;
+                ui.close();
+            }
+            if check(ui, self.show_comments, "Comments", "⇧C") {
+                self.show_comments = !self.show_comments;
+                ui.close();
+            }
+            if check(ui, self.ui_hidden, "Hide UI", "⌘\\") {
+                self.ui_hidden = !self.ui_hidden;
+                ui.close();
+            }
+            ui.separator();
+            if item(ui, "Zoom in", "⌘+") {
+                self.zoom_step(&ctx, 2.0);
+                ui.close();
+            }
+            if item(ui, "Zoom out", "⌘-") {
+                self.zoom_step(&ctx, 0.5);
+                ui.close();
+            }
+            if item(ui, "Zoom to fit", "⇧1") {
+                self.zoom_to(&ctx, None, false);
+                ui.close();
+            }
+            if item(ui, "Zoom to 100%", "⇧0") {
+                self.zoom_to(&ctx, None, true);
+                ui.close();
+            }
+            if enabled(ui, has, "Zoom to selection", "⇧2") {
+                self.zoom_to(&ctx, Some(self.sel.clone()), false);
+                ui.close();
+            }
+            ui.separator();
+            if check(ui, self.dev_mode, "Dev Mode", "⇧D") {
+                self.dev_mode = !self.dev_mode;
+                ui.close();
+            }
+            if item(ui, "Local variables", "") {
+                self.show_variables = true;
+                ui.close();
+            }
+        });
+        ui.menu_button("Object", |ui| {
+            if enabled(ui, has, "Group selection", "⌘G") {
+                self.group_selection(false);
+                ui.close();
+            }
+            if enabled(ui, has, "Frame selection", "⌥⌘G") {
+                self.group_selection(true);
+                ui.close();
+            }
+            if enabled(ui, has, "Ungroup", "⇧⌘G") {
+                self.ungroup_selection();
+                ui.close();
+            }
+            ui.separator();
+            if enabled(ui, has, "Add auto layout", "⇧A") {
+                self.add_auto_layout();
+                ui.close();
+            }
+            if enabled(ui, has, "Create component", "⌥⌘K") {
+                self.create_component();
+                ui.close();
+            }
+            if enabled(ui, has, "Detach instance", "⌥⌘B") {
+                self.detach_selection();
+                ui.close();
+            }
+            ui.separator();
+            if enabled(ui, has, "Use as mask", "⌃⌘M") {
+                self.toggle_mask();
+                ui.close();
+            }
+            ui.add_enabled_ui(has, |ui| {
+                ui.menu_button("Boolean groups", |ui| {
+                    for (op, label, short) in [
+                        (crate::doc::BoolOp::Union, "Union selection", "⌥⇧U"),
+                        (crate::doc::BoolOp::Subtract, "Subtract selection", "⌥⇧S"),
+                        (crate::doc::BoolOp::Intersect, "Intersect selection", "⌥⇧I"),
+                        (crate::doc::BoolOp::Exclude, "Exclude selection", "⌥⇧E"),
+                    ] {
+                        if item(ui, label, short) {
+                            self.boolean_selection(op);
+                            ui.close();
+                        }
+                    }
+                });
+            });
+            if enabled(ui, has, "Flatten", "⌘E") {
+                self.flatten_selection();
+                ui.close();
+            }
+            if enabled(ui, has, "Outline stroke", "⌥⌘O") {
+                self.outline_stroke_selection();
+                ui.close();
+            }
+            ui.separator();
+            if enabled(ui, has, "Flip horizontal", "⇧H") {
+                self.flip_selection(true);
+                ui.close();
+            }
+            if enabled(ui, has, "Flip vertical", "⇧V") {
+                self.flip_selection(false);
+                ui.close();
+            }
+            ui.separator();
+            if enabled(ui, has, "Show/Hide selection", "⇧⌘H") {
+                self.toggle_visible();
+                ui.close();
+            }
+            if enabled(ui, has, "Lock/Unlock selection", "⇧⌘L") {
+                self.toggle_locked();
+                ui.close();
+            }
+        });
+        ui.menu_button("Arrange", |ui| {
+            for (order, label, short) in [(crate::doc::Order::Front, "Bring to front", "⌥⌘]"), (crate::doc::Order::Forward, "Bring forward", "⌘]"), (crate::doc::Order::Backward, "Send backward", "⌘["), (crate::doc::Order::Back, "Send to back", "⌥⌘[")] {
+                if enabled(ui, has, label, short) {
+                    self.reorder_selection(order);
+                    ui.close();
+                }
+            }
+            ui.separator();
+            for (a, label, short) in [
+                (crate::app::Align::Left, "Align left", "⌥A"),
+                (crate::app::Align::HCenter, "Align horizontal centers", "⌥H"),
+                (crate::app::Align::Right, "Align right", "⌥D"),
+                (crate::app::Align::Top, "Align top", "⌥W"),
+                (crate::app::Align::VCenter, "Align vertical centers", "⌥V"),
+                (crate::app::Align::Bottom, "Align bottom", "⌥S"),
+            ] {
+                if enabled(ui, has, label, short) {
+                    self.align(a);
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if enabled(ui, self.sel.len() > 2, "Distribute horizontal spacing", "⌃⌥H") {
+                self.distribute_selection(true);
+                ui.close();
+            }
+            if enabled(ui, self.sel.len() > 2, "Distribute vertical spacing", "⌃⌥V") {
+                self.distribute_selection(false);
+                ui.close();
+            }
+            if enabled(ui, self.sel.len() > 1, "Tidy up", "⌃⌥T") {
+                self.tidy_up();
+                ui.close();
+            }
+        });
+        ui.separator();
         ui.menu_button("Plugins", |ui| {
-            for p in crate::plugins::installed() {
+            let installed = crate::plugins::installed();
+            for p in &installed {
                 if ui.button(&p.name).clicked() {
-                    match crate::plugins::load(&p) {
+                    match crate::plugins::load(p) {
                         Ok((code, html, id)) => self.run_plugin(&p.name, Some(&id), &code, html.as_deref()),
                         Err(e) => self.toast(format!("{}: {e}", p.name)),
                     }
                     ui.close();
                 }
             }
-            ui.menu_button("Development", |ui| {
-                if ui.button("Import plugin from manifest…").clicked() {
-                    if let Some(f) = rfd::FileDialog::new().add_filter("Plugin manifest", &["json"]).pick_file() {
-                        match crate::plugins::install(&f) {
-                            Ok(p) => self.toast(format!("Installed {}", p.name)),
-                            Err(e) => self.toast(format!("Couldn't import plugin: {e}")),
-                        }
-                    }
-                    ui.close();
-                }
-                if ui.button("Run script…").clicked() {
-                    self.show_console = true;
-                    ui.close();
-                }
-            });
-        });
-        ui.menu_button("MCP server", |ui| {
-            let port = crate::mcp::port();
-            if self.mcp_listening() {
-                ui.label(format!("Listening on http://127.0.0.1:{port}/mcp"));
-                if ui.button("Copy Claude Code setup command").clicked() {
-                    ui.ctx().copy_text(format!("claude mcp add --transport http katachi http://127.0.0.1:{port}/mcp"));
-                    self.toast("Copied; run it in a terminal".into());
-                    ui.close();
-                }
-                if ui.button("Copy stdio config (Claude Desktop, Cursor)").clicked() {
-                    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "katachi".into());
-                    let cfg = serde_json::json!({ "mcpServers": { "katachi": { "command": exe, "args": ["mcp"] } } });
-                    ui.ctx().copy_text(serde_json::to_string_pretty(&cfg).unwrap_or_default());
-                    self.toast("Copied MCP config".into());
-                    ui.close();
-                }
-            } else {
-                ui.label(format!("Not running: port {port} is in use (another Katachi window?)"));
+            if !installed.is_empty() {
+                ui.separator();
+            }
+            if item(ui, "Run script…", "") {
+                self.show_console = true;
+                ui.close();
+            }
+            if item(ui, "Manage plugins…", "") {
+                self.open_settings(Tab::Plugins);
+                ui.close();
             }
         });
-        if item(ui, "Place image / SVG…", "⇧⌘K") {
-            self.import_dialog();
-            ui.close();
-        }
-        if item(ui, "Export…", "⇧⌘E") {
-            self.export(&ui.ctx().clone());
-            ui.close();
-        }
+        ui.menu_button("Preferences", |ui| {
+            let check = |ui: &mut Ui, on: bool, label: &str| ui.button(format!("{}{label}", if on { "✓  " } else { "     " })).clicked();
+            let p = self.prefs.clone();
+            let mut next = p.clone();
+            if check(ui, p.snap_to_objects, "Snap to objects") {
+                next.snap_to_objects = !p.snap_to_objects;
+            }
+            if check(ui, p.keep_tool_selected, "Keep tool selected after use") {
+                next.keep_tool_selected = !p.keep_tool_selected;
+            }
+            if check(ui, p.highlight_on_hover, "Highlight layers on hover") {
+                next.highlight_on_hover = !p.highlight_on_hover;
+            }
+            if check(ui, p.show_dimensions, "Show dimensions on objects") {
+                next.show_dimensions = !p.show_dimensions;
+            }
+            if next != p {
+                self.prefs = next;
+                crate::settings::save(&self.prefs);
+                ui.close();
+            }
+            ui.separator();
+            if item(ui, "Nudge amount…", "") {
+                self.open_settings(Tab::Canvas);
+                ui.close();
+            }
+            if item(ui, "Theme and glass…", "") {
+                self.open_settings(Tab::Appearance);
+                ui.close();
+            }
+            if item(ui, "Settings…", "⌘,") {
+                self.open_settings(Tab::Account);
+                ui.close();
+            }
+        });
         ui.separator();
-        if item(ui, "Undo", "⌘Z") {
-            self.undo();
-            ui.close();
-        }
-        if item(ui, "Redo", "⇧⌘Z") {
-            self.redo();
-            ui.close();
-        }
-        ui.separator();
-        if item(ui, "Appearance…", "") {
-            self.show_appearance = true;
-            ui.close();
-        }
-        if item(ui, "Zoom to fit", "⇧1") {
-            self.zoom_to(&ctx, None, false);
-            ui.close();
-        }
-        if item(ui, "Zoom to 100%", "⇧0") {
-            self.zoom_to(&ctx, None, true);
-            ui.close();
-        }
-        if item(ui, if self.outline_mode { "Show fills" } else { "Outline mode" }, "⌘Y") {
-            self.outline_mode = !self.outline_mode;
-            ui.close();
-        }
+        ui.menu_button("Help and account", |ui| {
+            if item(ui, "Keyboard shortcuts", "") {
+                self.open_settings(Tab::Shortcuts);
+                ui.close();
+            }
+            if item(ui, "Connect an AI agent (MCP)…", "") {
+                self.open_settings(Tab::Agents);
+                ui.close();
+            }
+            if item(ui, "Release notes", "") {
+                ctx.open_url(egui::OpenUrl::new_tab("https://github.com/dyascj/katachi/releases"));
+                ui.close();
+            }
+            if item(ui, "Report a problem", "") {
+                ctx.open_url(egui::OpenUrl::new_tab("https://github.com/dyascj/katachi/issues/new"));
+                ui.close();
+            }
+            ui.separator();
+            if item(ui, "Settings…", "⌘,") {
+                self.open_settings(Tab::Account);
+                ui.close();
+            }
+        });
     }
 
     fn pages_list(&mut self, ui: &mut Ui) {
@@ -890,7 +1123,7 @@ impl App {
             if resp.double_clicked() {
                 self.renaming_page = Some((i, self.doc.pages[i].name.clone()));
             }
-            resp.context_menu(|ui| {
+            crate::chrome::context_menu(&resp, |ui| {
                 if ui.button("Rename").clicked() {
                     self.renaming_page = Some((i, self.doc.pages[i].name.clone()));
                     ui.close();
@@ -949,7 +1182,8 @@ impl App {
         let mut rects: Vec<(NodeId, Rect)> = vec![];
         let shift = ui.input(|i| i.modifiers.shift || i.modifiers.command);
         for &(id, depth) in rows {
-            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click_and_drag());
+            // Figma's layer rows are 32 points tall.
+            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click_and_drag());
             rects.push((id, rect));
             let n = self.doc.node(id).clone();
             let selected = self.sel.contains(&id);
@@ -1049,7 +1283,7 @@ impl App {
             if resp.secondary_clicked() && !self.sel.contains(&id) {
                 self.sel = vec![id];
             }
-            resp.context_menu(|ui| self.context_menu(ui));
+            crate::chrome::context_menu(&resp, |ui| self.context_menu(ui));
         }
         self.layer_drop(ui, &rects);
     }
@@ -1104,6 +1338,10 @@ impl App {
 
     pub fn right_panel(&mut self, ui: &mut Ui) {
         egui::Panel::right("right").resizable(false).exact_size(248.0).show(ui, |ui| {
+            if self.show_history {
+                self.history_panel(ui);
+                return;
+            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if self.dev_mode {
@@ -1140,7 +1378,15 @@ impl App {
                     if icon_button(ui, Icon::Play, false, 24.0, "Present (⌥⌘↵)").clicked() {
                         self.present(ctx.input(|i| i.time));
                     }
-                    ui.menu_button(format!("{}%", (self.view.zoom * 100.0).round()), |ui| {
+                    crate::chrome::menu_button(ui, format!("{}%", (self.view.zoom * 100.0).round()), |ui| {
+                        ui.set_min_width(200.0);
+                        // Figma's zoom menu starts with an editable percentage.
+                        let mut pct = (self.view.zoom * 100.0).round();
+                        if ui.add(egui::DragValue::new(&mut pct).range(2.0..=25600.0).suffix("%").speed(1.0)).changed() {
+                            let c = self.canvas_rect.map_or(ctx.content_rect().center(), |r| r.center());
+                            self.view.zoom_at(c, pct / 100.0 / self.view.zoom);
+                        }
+                        ui.separator();
                         if ui.add(egui::Button::new("Zoom in").shortcut_text("⌘+")).clicked() {
                             self.zoom_step(&ctx, 2.0);
                         }
@@ -1155,6 +1401,18 @@ impl App {
                         }
                         if ui.add(egui::Button::new("Zoom to 100%").shortcut_text("⇧0")).clicked() {
                             self.zoom_to(&ctx, None, true);
+                        }
+                        ui.separator();
+                        // View options with checks, as in Figma's zoom menu.
+                        for (on, label, short, which) in [(self.show_grids, "Layout guides", "⌃G", 0), (self.rulers, "Rulers", "⇧R", 1), (self.outline_mode, "Outlines", "⌘Y", 2), (self.show_comments, "Comments", "⇧C", 3)] {
+                            if ui.add(egui::Button::new(format!("{}{label}", if on { "✓  " } else { "     " })).shortcut_text(short)).clicked() {
+                                match which {
+                                    0 => self.show_grids = !self.show_grids,
+                                    1 => self.rulers = !self.rulers,
+                                    2 => self.outline_mode = !self.outline_mode,
+                                    _ => self.show_comments = !self.show_comments,
+                                }
+                            }
                         }
                     });
                 });
@@ -1223,12 +1481,11 @@ impl App {
                 }
                 if let crate::doc::StyleValue::Paint(ps) = &st.value {
                     let edit = icon_button(ui, Icon::Styles, false, 22.0, "Edit style");
-                    egui::Popup::menu(&edit).id(ui.id().with(("local-style", st.id))).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-                        ui.set_width(240.0);
+                    crate::chrome::popover(&edit, ui.id().with(("local-style", st.id)), "Edit style", 240.0, |ui| {
                         let mut ps = ps.clone();
                         let mut edited = false;
                         for (i, p) in ps.iter_mut().enumerate().rev() {
-                            if !matches!(paint_row(ui, ui.id().with(("ls-paint", st.id, i)), p), PaintEvent::None) {
+                            if !matches!(paint_row(ui, ui.id().with(("ls-paint", st.id, i)), p, "Fill"), PaintEvent::None) {
                                 edited = true;
                             }
                         }
@@ -1356,8 +1613,7 @@ impl App {
             let pid = ui.id().with(("reaction", id, i));
             ui.horizontal(|ui| {
                 let open = ui.add(egui::Button::new(describe(&self.doc, r)).frame(false).truncate());
-                egui::Popup::menu(&open).id(pid).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-                    ui.set_width(240.0);
+                crate::chrome::popover(&open, pid, "Interaction", 240.0, |ui| {
                     let before = r.clone();
                     egui::Grid::new(pid.with("grid")).num_columns(2).show(ui, |ui| {
                         ui.label("Trigger");
@@ -1866,12 +2122,11 @@ impl App {
             // An instance's title is its swap picker, as in Figma.
             match inst.filter(|i| *i == id) {
                 Some(i) => {
-                    ui.menu_button(RichText::new(title).strong().color(purple), |ui| {
+                    crate::chrome::menu_button(ui, RichText::new(title).strong().color(purple), |ui| {
                         if self.swap_menu(ui, i) {
                             ui.close();
                         }
                     })
-                    .response
                     .on_hover_text("Swap instance");
                 }
                 None => {
@@ -1890,7 +2145,7 @@ impl App {
                         let mut pick = cur.clone();
                         ui.horizontal(|ui| {
                             ui.label(&prop);
-                            egui::ComboBox::from_id_salt(("variant", i, &prop)).selected_text(&pick).width(110.0).show_ui(ui, |ui| {
+                            egui::ComboBox::from_id_salt(("variant", i, &prop)).selected_text(&pick).width(110.0).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
                                 for v in &values {
                                     ui.selectable_value(&mut pick, v.clone(), v);
                                 }
@@ -1931,7 +2186,7 @@ impl App {
                             }
                             PropValue::Swap(target) => {
                                 let comps: Vec<NodeId> = self.doc.nodes.values().filter(|n| n.kind == Kind::Component).map(|n| n.id).collect();
-                                egui::ComboBox::from_id_salt(("swap", i, &p.name)).selected_text(self.doc.nodes.get(target).map_or("Missing".into(), |n| n.name.clone())).show_ui(ui, |ui| {
+                                egui::ComboBox::from_id_salt(("swap", i, &p.name)).selected_text(self.doc.nodes.get(target).map_or("Missing".into(), |n| n.name.clone())).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
                                     for cid in comps {
                                         let name = self.doc.node(cid).name.clone();
                                         ui.selectable_value(target, cid, name);
@@ -1985,7 +2240,8 @@ impl App {
                     ui.label(RichText::new("Properties").strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let add = icon_button(ui, Icon::Plus, false, 22.0, "Add property");
-                        egui::Popup::menu(&add).id(ui.id().with(("add-prop", def))).show(|ui| {
+                        egui::Popup::menu(&add).id(ui.id().with(("add-prop", def))).style(crate::chrome::menu_style).show(|ui| {
+                            ui.label(RichText::new("Create property").small().color(crate::chrome::MENU_MUTED));
                             let fresh = |props: &[CompProp], base: &str| {
                                 (1..).map(|k| format!("{base} {k}")).find(|nm| !props.iter().any(|p| &p.name == nm)).unwrap()
                             };
@@ -2104,7 +2360,7 @@ impl App {
                     let before = cur.clone();
                     ui.horizontal(|ui| {
                         ui.label(label);
-                        egui::ComboBox::from_id_salt(("bind", id, label)).selected_text(cur.clone().unwrap_or_else(|| "None".into())).show_ui(ui, |ui| {
+                        egui::ComboBox::from_id_salt(("bind", id, label)).selected_text(cur.clone().unwrap_or_else(|| "None".into())).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
                             ui.selectable_value(&mut cur, None, "None");
                             for p in props.iter().filter(|p| fits(p, t)) {
                                 ui.selectable_value(&mut cur, Some(p.name.clone()), &p.name);
@@ -2401,7 +2657,7 @@ impl App {
         let mut changed = false;
         ui.horizontal(|ui| {
             for (axis, cur) in c.iter_mut().enumerate() {
-                egui::ComboBox::from_id_salt(("constraint", axis)).width(half(ui) - 12.0).selected_text(names(axis, *cur)).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt(("constraint", axis)).width(half(ui) - 12.0).selected_text(names(axis, *cur)).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
                     for k in [Constraint::Min, Constraint::Max, Constraint::Stretch, Constraint::Center, Constraint::Scale] {
                         changed |= ui.selectable_value(cur, k, names(axis, k)).changed();
                     }
@@ -2419,7 +2675,7 @@ impl App {
             ui.label(RichText::new("Appearance").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let mut blend = n.blend;
-                egui::ComboBox::from_id_salt("blend").width(96.0).selected_text(format!("{blend:?}")).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("blend").width(96.0).selected_text(format!("{blend:?}")).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
                     for b in crate::doc::BlendMode::ALL {
                         ui.selectable_value(&mut blend, b, format!("{b:?}"));
                     }
@@ -2529,15 +2785,23 @@ impl App {
         // Font family picker with search.
         let fam_id = ui.id().with("font-search");
         let resp = ui.add_sized([ui.available_width(), 24.0], egui::Button::new(&t.font_family));
-        egui::Popup::menu(&resp).id(fam_id.with("popup")).show(|ui| {
-            ui.set_width(220.0);
+        // Each opening starts with an empty, focused search, as in Figma.
+        if resp.clicked() {
+            ui.data_mut(|d| d.insert_temp(fam_id, String::new()));
+        }
+        crate::chrome::popover(&resp, fam_id.with("popup"), "Fonts", 240.0, |ui| {
             let mut q: String = ui.data(|d| d.get_temp(fam_id)).unwrap_or_default();
-            ui.add(egui::TextEdit::singleline(&mut q).hint_text("Search fonts").desired_width(f32::INFINITY));
+            let search = ui.add(egui::TextEdit::singleline(&mut q).hint_text("Search fonts").desired_width(f32::INFINITY));
+            if resp.clicked() {
+                search.request_focus();
+            }
             ui.data_mut(|d| d.insert_temp(fam_id, q.clone()));
-            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                 let ql = q.to_lowercase();
                 for f in families().iter().filter(|f| f.to_lowercase().contains(&ql)).take(400) {
-                    if ui.selectable_label(*f == t.font_family, f).clicked() {
+                    // The current font gets a check rather than a highlight.
+                    let current = *f == t.font_family;
+                    if ui.add(egui::Button::new(format!("{}{f}", if current { "✓  " } else { "     " })).frame(false)).clicked() {
                         t.font_family = f.clone();
                         let ws = weights_for(f);
                         if !ws.contains(&t.font_weight) {
@@ -2549,7 +2813,7 @@ impl App {
             });
         });
         ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("weight").width(half(ui) - 12.0).selected_text(weight_name(t.font_weight)).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("weight").width(half(ui) - 12.0).selected_text(weight_name(t.font_weight)).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
                 for w in weights_for(&t.font_family) {
                     ui.selectable_value(&mut t.font_weight, w, weight_name(w));
                 }
@@ -2612,7 +2876,7 @@ impl App {
                 TextSizing::AutoHeight => "Auto height",
                 TextSizing::Fixed => "Fixed size",
             };
-            egui::ComboBox::from_id_salt("text-sizing").width(half(ui) - 12.0).selected_text(sizing).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("text-sizing").width(half(ui) - 12.0).selected_text(sizing).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
                 ui.selectable_value(&mut t.text_sizing, TextSizing::AutoWidth, "Auto width");
                 ui.selectable_value(&mut t.text_sizing, TextSizing::AutoHeight, "Auto height");
                 ui.selectable_value(&mut t.text_sizing, TextSizing::Fixed, "Fixed size");
@@ -2623,7 +2887,7 @@ impl App {
                 TextCase::Lower => "aa  Lower",
                 TextCase::Title => "Aa  Title",
             };
-            egui::ComboBox::from_id_salt("text-case").width(half(ui) - 12.0).selected_text(case).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("text-case").width(half(ui) - 12.0).selected_text(case).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
                 ui.selectable_value(&mut t.text_case, TextCase::Original, "As typed");
                 ui.selectable_value(&mut t.text_case, TextCase::Upper, "UPPER CASE");
                 ui.selectable_value(&mut t.text_case, TextCase::Lower, "lower case");
@@ -2755,13 +3019,11 @@ impl App {
             ui.horizontal(|ui| {
                 style_preview(ui, &style.value);
                 let open = ui.add(egui::Button::new(&style.name).frame(false));
-                egui::Popup::menu(&open).id(ui.id().with(("edit-style", style.id))).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-                    ui.set_width(240.0);
-                    ui.label(RichText::new(format!("Edit {}", style.name)).strong());
+                crate::chrome::popover(&open, ui.id().with(("edit-style", style.id)), &format!("Edit {}", style.name), 240.0, |ui| {
                     if let StyleValue::Paint(mut ps) = style.value.clone() {
                         let mut edited = false;
                         for (i, p) in ps.iter_mut().enumerate().rev() {
-                            if !matches!(paint_row(ui, ui.id().with(("style-paint", style.id, i)), p), PaintEvent::None) {
+                            if !matches!(paint_row(ui, ui.id().with(("style-paint", style.id, i)), p, "Fill"), PaintEvent::None) {
                                 edited = true;
                             }
                         }
@@ -2791,12 +3053,16 @@ impl App {
             };
             paints.push(Paint::solid(c));
             changed = true;
+            // A new stroke opens its editor right away, as in Figma.
+            if stroke {
+                egui::Popup::open_id(ui.ctx(), ui.id().with((stroke, paints.len() - 1, first)).with("popup"));
+            }
         }
         let mut remove = None;
         // Topmost paint first, as in Figma.
         for i in (0..paints.len()).rev() {
             let id = ui.id().with((stroke, i, first));
-            match paint_row(ui, id, &mut paints[i]) {
+            match paint_row(ui, id, &mut paints[i], if stroke { "Stroke" } else { "Fill" }) {
                 PaintEvent::None => {}
                 PaintEvent::Changed => changed = true,
                 PaintEvent::Remove => remove = Some(i),
@@ -2818,7 +3084,7 @@ impl App {
                     .add(DragValue::new(&mut width).range(0.0..=1000.0).speed(0.1).prefix("Weight  ").custom_formatter(|v, _| num(v as f32)))
                     .changed();
                 if n.kind != Kind::Vector {
-                    egui::ComboBox::from_id_salt("stroke-align").width(70.0).selected_text(format!("{align:?}")).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("stroke-align").width(70.0).selected_text(format!("{align:?}")).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
                         for a in [StrokeAlign::Inside, StrokeAlign::Center, StrokeAlign::Outside] {
                             stroke_changed |= ui.selectable_value(&mut align, a, format!("{a:?}")).changed();
                         }
@@ -2834,7 +3100,7 @@ impl App {
                         Marker::Circle => "●",
                     };
                     for (i, m) in [&mut ends.0, &mut ends.1].into_iter().enumerate() {
-                        egui::ComboBox::from_id_salt(("marker", i)).width(28.0).selected_text(label(*m)).show_ui(ui, |ui| {
+                        egui::ComboBox::from_id_salt(("marker", i)).width(28.0).selected_text(label(*m)).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
                             for k in [Marker::None, Marker::Arrow, Marker::Triangle, Marker::Circle] {
                                 ui.selectable_value(m, k, format!("{} {k:?}", label(k)));
                             }
@@ -2850,8 +3116,7 @@ impl App {
                 }
                 // Dashes, caps, and joins live in a settings popover, like Figma.
                 let more = icon_button(ui, Icon::Menu, false, 22.0, "Advanced stroke");
-                egui::Popup::menu(&more).id(ui.id().with("stroke-more")).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-                    ui.set_width(200.0);
+                crate::chrome::popover(&more, ui.id().with("stroke-more"), "Stroke settings", 240.0, |ui| {
                     let mut style = (n.dash.clone(), n.cap, n.join);
                     let dash_id = ui.id().with(("dash", n.id));
                     let shown = style.0.iter().map(|d| num(*d)).collect::<Vec<_>>().join(", ");
@@ -2968,8 +3233,7 @@ impl App {
                     GridKind::Rows => format!("{} rows", g.count),
                 };
                 let open = ui.add(egui::Button::new(label).frame(false));
-                egui::Popup::menu(&open).id(ui.id().with(("grid", id, i))).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-                    ui.set_width(220.0);
+                crate::chrome::popover(&open, ui.id().with(("grid", id, i)), "Layout guide", 240.0, |ui| {
                     ui.horizontal(|ui| {
                         for k in [GridKind::Grid, GridKind::Columns, GridKind::Rows] {
                             ui.selectable_value(&mut g.kind, k, format!("{k:?}"));
@@ -3078,6 +3342,8 @@ impl App {
         if add {
             shadows.push(Shadow::default());
             changed = true;
+            // A new effect opens its editor right away, as in Figma.
+            egui::Popup::open_id(ui.ctx(), ui.id().with(("shadow", shadows.len() - 1, first)).with("popup"));
         }
         let mut remove = None;
         for i in (0..shadows.len()).rev() {
@@ -3123,7 +3389,7 @@ impl App {
         });
         let fmt_combo = |ui: &mut Ui, id: egui::Id, f: &mut ExportFormat| {
             let mut changed = false;
-            egui::ComboBox::from_id_salt(id).width(56.0).selected_text(f.ext().to_uppercase()).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt(id).width(56.0).selected_text(f.ext().to_uppercase()).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
                 for k in [ExportFormat::Png, ExportFormat::Jpg, ExportFormat::Svg, ExportFormat::Pdf] {
                     changed |= ui.selectable_value(f, k, k.ext().to_uppercase()).changed();
                 }
@@ -3132,7 +3398,7 @@ impl App {
         };
         let scale_combo = |ui: &mut Ui, id: egui::Id, s: &mut f32| {
             let mut changed = false;
-            egui::ComboBox::from_id_salt(id).width(48.0).selected_text(format!("{}x", num(*s))).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt(id).width(48.0).selected_text(format!("{}x", num(*s))).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
                 for v in [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0] {
                     changed |= ui.selectable_value(s, v, format!("{}x", num(v))).changed();
                 }
@@ -3209,11 +3475,16 @@ impl App {
                                 }
                                 if tools.len() > 1 {
                                     let more = icon_button(ui, Icon::Chevron(true), false, 14.0, "");
-                                    egui::Popup::menu(&more).id(ui.id().with(("tools", g))).show(|ui| {
+                                    // Tool flyouts open upward from the bottom toolbar, as dark menus.
+                                    let current = self.tool_groups[g];
+                                    egui::Popup::menu(&more).id(ui.id().with(("tools", g))).style(crate::chrome::menu_style).align(egui::RectAlign::TOP_START).gap(18.0).show(|ui| {
                                         for &(t, icon, label) in tools.iter() {
                                             ui.horizontal(|ui| {
+                                                // A check marks the group's current tool, as in Figma.
+                                                ui.add_sized([12.0, 18.0], egui::Label::new(if t == current { "✓" } else { "" }));
                                                 let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
-                                                paint_icon(ui.painter(), r, icon, theme::ink(ui.ctx()));
+                                                // The menu's own text color (menus are dark in both themes).
+                                                paint_icon(ui.painter(), r, icon, ui.visuals().text_color());
                                                 let (name, key) = label.split_once("  ").unwrap_or((label, ""));
                                                 if ui.add(egui::Button::new(name).shortcut_text(key).frame(false).min_size(vec2(140.0, 0.0))).clicked() {
                                                     self.set_tool(t);
