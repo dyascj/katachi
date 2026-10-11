@@ -24,7 +24,9 @@ jobs:
           # Two full builds nearly fill the runner's disk; keep only the app before packaging.
           mkdir -p "$RUNNER_TEMP/stage" && cp -R target/Katachi.app "$RUNNER_TEMP/stage/"
           rm -rf target
-          hdiutil create -volname Katachi -srcfolder "$RUNNER_TEMP/stage/Katachi.app" -ov -format UDZO Katachi-macos.dmg
+          # hdiutil can underestimate the volume size for -srcfolder; size it from the app plus headroom.
+          size=$(( $(du -sm "$RUNNER_TEMP/stage/Katachi.app" | cut -f1) + 32 ))
+          hdiutil create -volname Katachi -srcfolder "$RUNNER_TEMP/stage/Katachi.app" -size "${size}m" -ov -format UDZO Katachi-macos.dmg
           # What the in-app updater downloads.
           tar -czf Katachi-macos.app.tar.gz -C "$RUNNER_TEMP/stage" Katachi.app
       - uses: softprops/action-gh-release@v2
