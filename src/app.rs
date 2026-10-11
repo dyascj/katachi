@@ -85,11 +85,20 @@ pub struct Press {
 }
 
 /// What to do once the user has dealt with unsaved changes.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum After {
     Close,
-    New,
-    Open,
+    CloseTab,
+}
+
+/// Something only the window (the tab strip) can do, asked for by a tab.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Want {
+    NewTab,
+    Open(PathBuf),
+    OpenDialog,
+    CloseTab,
+    Home,
 }
 
 /// A plugin with a UI, running until it closes.
@@ -149,7 +158,7 @@ pub struct App {
     pub outline_mode: bool,
     pub show_grids: bool,
     pub show_history: bool,
-    /// macOS draws no title bar for Katachi; Katachi draws its own (off in tests, on in the promo film).
+    /// A bare title strip over the app (the promo film); the window's tab strip replaces it normally.
     pub own_title_bar: bool,
     /// Theme and glass settings, and the glass state last given to the window.
     pub appearance: crate::appearance::Appearance,
@@ -204,12 +213,15 @@ pub struct App {
     pub text_keys: std::collections::HashMap<NodeId, u64>,
     in_gesture: bool,
     pub path: Option<PathBuf>,
+    /// Name for an unsaved document that came from somewhere (an imported .fig).
+    pub draft_name: Option<String>,
+    pub want: Option<Want>,
     pub dirty: bool,
     pub export_scale: f32,
     pub export_svg: bool,
     pub confirm: Option<After>,
     pub prev_sel: Vec<NodeId>,
-    allow_close: bool,
+    pub allow_close: bool,
     pub toast: Option<(String, f64)>,
     title: String,
     screenshot: Option<(PathBuf, u32)>,
@@ -255,7 +267,7 @@ impl App {
             find: (false, String::new(), String::new(), false),
             clip_frag: None,
             plugin: None,
-            own_title_bar: cfg!(target_os = "macos") && !cfg!(test),
+            own_title_bar: false,
             appearance: crate::appearance::load(),
             show_appearance: false,
             glass_applied: None,
@@ -301,6 +313,8 @@ impl App {
             text_keys: Default::default(),
             in_gesture: false,
             path: None,
+            draft_name: None,
+            want: None,
             dirty: false,
             export_scale: 1.0,
             export_svg: false,
@@ -320,6 +334,33 @@ impl App {
             app.page = pg.min(app.doc.pages.len() - 1);
         }
         app
+    }
+
+    /// The file's name, as tabs and the title show it.
+    pub fn display_name(&self) -> String {
+        match (&self.path, &self.draft_name) {
+            (Some(p), _) => p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+            (None, Some(n)) => n.clone(),
+            (None, None) => "Untitled".into(),
+        }
+    }
+
+    /// Take over the session (MCP server, appearance, crash recovery) from the tab that had it.
+    pub fn take_session(&mut self, from: &mut App) {
+        self.mcp = from.mcp.take();
+        self.mcp_tried = from.mcp_tried;
+        self.appearance = from.appearance.clone();
+        self.glass_applied = from.glass_applied;
+        self.recoverable = std::mem::take(&mut from.recoverable);
+        self.screenshot = from.screenshot.take();
+    }
+
+    /// The session's own work, for frames where this app isn't on screen (Home).
+    pub fn session_frame(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        self.recovery_prompt(ctx);
+        self.appearance_frame(ctx, frame);
+        self.mcp_frame(ctx);
+        self.debug_screenshot(ctx);
     }
 
     fn document_json(&self) -> String {
@@ -1133,15 +1174,10 @@ impl App {
                 self.doc = doc;
                 self.dirty = true;
                 let name = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                self.draft_name = Some(name.clone());
                 self.toast(format!("Imported {name}: {} layers. Save to keep it as a .katachi file.", self.doc.nodes.len()));
             }
             Err(e) => self.toast(format!("Couldn't import: {e}")),
-        }
-    }
-
-    pub fn open_dialog(&mut self) {
-        if let Some(p) = rfd::FileDialog::new().add_filter("Katachi or Figma", &["katachi", "fig"]).pick_file() {
-            self.open_path(p);
         }
     }
 
@@ -1236,14 +1272,16 @@ impl App {
         });
     }
 
+    /// New and Open make tabs.
     pub fn request_new(&mut self) {
-        if self.dirty { self.confirm = Some(After::New) } else { self.new_file() }
+        self.want = Some(Want::NewTab);
     }
 
     pub fn request_open(&mut self) {
-        if self.dirty { self.confirm = Some(After::Open) } else { self.open_dialog() }
+        self.want = Some(Want::OpenDialog);
     }
 
+    #[cfg(test)]
     pub fn new_file(&mut self) {
         self.reset_to(App::new(None));
     }
@@ -2147,14 +2185,6 @@ impl eframe::App for App {
             return;
         }
         self.shortcuts(&ctx);
-        // Files opened from Finder or the Dock.
-        for p in crate::macos_open::take() {
-            if self.dirty {
-                self.toast(format!("Save or discard changes before opening {}", p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()));
-            } else {
-                self.open_path(p);
-            }
-        }
         self.title_bar(ui);
         if !self.ui_hidden {
             self.left_panel(ui);
@@ -2183,8 +2213,7 @@ impl eframe::App for App {
         if !ctx.input(|i| i.pointer.any_down()) && !ctx.egui_wants_keyboard_input() {
             self.in_gesture = false;
         }
-        let name = self.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned());
-        let title = format!("{}{} – Katachi", name.as_deref().unwrap_or("Untitled"), if self.dirty { " (Edited)" } else { "" });
+        let title = format!("{}{} – Katachi", self.display_name(), if self.dirty { " (Edited)" } else { "" });
         if title != self.title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.title = title;
@@ -2229,11 +2258,10 @@ impl App {
                 self.allow_close = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
-            After::New => self.new_file(),
-            After::Open => {
-                self.dirty = false;
+            After::CloseTab => {
                 self.clear_recovery();
-                self.open_dialog();
+                self.allow_close = true;
+                self.want = Some(Want::CloseTab);
             }
         }
     }

@@ -7,7 +7,7 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
 /// Keep autosaves and recents out of the real user folder.
-fn isolate_data() {
+pub fn isolate_data() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let dir = std::env::temp_dir().join(format!("katachi-test-data-{}", std::process::id()));

@@ -22,9 +22,13 @@ jobs:
             -output target/Katachi.app/Contents/MacOS/katachi
           codesign --force --deep --sign - target/Katachi.app
           hdiutil create -volname Katachi -srcfolder target/Katachi.app -ov -format UDZO Katachi-macos.dmg
+          # What the in-app updater downloads.
+          tar -czf Katachi-macos.app.tar.gz -C target Katachi.app
       - uses: softprops/action-gh-release@v2
         with:
-          files: Katachi-macos.dmg
+          files: |
+            Katachi-macos.dmg
+            Katachi-macos.app.tar.gz
 
   windows:
     runs-on: windows-latest
@@ -52,3 +56,23 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: Katachi-linux-x86_64.tar.gz
+
+  # Sign every asset so the in-app updater can check downloads against the key built into Katachi.
+  sign:
+    needs: [macos, windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Sign release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" -D dist
+          printf '%s\n' "$KEY" > key
+          for f in dist/*; do
+            case "$f" in *.minisig) continue ;; esac
+            minisign -S -s key -m "$f" -t "Katachi $GITHUB_REF_NAME $(basename "$f")" </dev/null
+          done
+          rm key
+          gh release upload "$GITHUB_REF_NAME" dist/*.minisig -R "$GITHUB_REPOSITORY" --clobber

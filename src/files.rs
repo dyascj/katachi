@@ -57,10 +57,26 @@ pub fn add_recent(p: &Path) {
     let mut list = recent();
     list.retain(|q| q != p);
     list.insert(0, p.to_path_buf());
-    list.truncate(10);
+    list.truncate(40);
     if let Ok(json) = serde_json::to_string(&list) {
         let _ = write_atomic(&data_dir().join("recent.json"), json.as_bytes());
     }
+}
+
+pub fn forget_recent(p: &Path) {
+    let mut list = recent();
+    list.retain(|q| q != p);
+    if let Ok(json) = serde_json::to_string(&list) {
+        let _ = write_atomic(&data_dir().join("recent.json"), json.as_bytes());
+    }
+}
+
+/// Where Home keeps a file's thumbnail.
+pub fn thumb_path(file: &Path) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    file.hash(&mut h);
+    data_dir().join("thumbs").join(format!("{:016x}.png", h.finish()))
 }
 
 fn history_dir(file: &Path) -> PathBuf {
