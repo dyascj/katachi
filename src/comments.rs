@@ -125,6 +125,8 @@ impl App {
         };
         let p = self.view.to_screen(self.doc.comment_pos(&c)) + vec2(36.0, -28.0);
         let mut action: Option<&str> = None;
+        let mut edited: Option<(usize, String)> = None;
+        let mut stop_editing = false;
         let mut reply = std::mem::take(&mut self.comment_reply);
         egui::Area::new(egui::Id::new(("comment-thread", id))).fixed_pos(p).order(egui::Order::Foreground).show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
@@ -144,17 +146,53 @@ impl App {
                     });
                 });
                 ui.separator();
-                for (who, text, t) in &c.messages {
+                // Editing one of your own messages: (index, draft), kept in egui's memory.
+                let edit_id = egui::Id::new(("comment-edit", id));
+                let mut editing: Option<(usize, String)> = ui.data(|d| d.get_temp(edit_id));
+                let me = author();
+                for (i, (who, text, t)) in c.messages.iter().enumerate() {
                     ui.horizontal(|ui| {
                         let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), egui::Sense::hover());
                         ui.painter().circle_filled(r.center(), 10.0, avatar(who));
                         ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, who.chars().next().unwrap_or('?').to_string(), FontId::proportional(10.0), Color32::WHITE);
                         ui.label(RichText::new(who).strong());
                         ui.label(RichText::new(ago(*t)).color(crate::appearance::faint(ui.ctx())).small());
+                        if *who == me && editing.is_none() {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("Edit").clicked() {
+                                    editing = Some((i, text.clone()));
+                                }
+                            });
+                        }
                     });
-                    ui.label(text);
+                    match &mut editing {
+                        Some((at, draft)) if *at == i => {
+                            ui.add(egui::TextEdit::multiline(draft).desired_rows(2).desired_width(f32::INFINITY));
+                            ui.horizontal(|ui| {
+                                if ui.small_button("Save").clicked() && !draft.trim().is_empty() {
+                                    edited = Some((i, draft.trim().to_string()));
+                                }
+                                if ui.small_button("Cancel").clicked() || edited.is_some() {
+                                    stop_editing = true;
+                                }
+                            });
+                        }
+                        _ => {
+                            ui.label(text);
+                        }
+                    }
                     ui.add_space(4.0);
                 }
+                if stop_editing {
+                    editing = None;
+                }
+                ui.data_mut(|d| {
+                    if let Some(e) = editing {
+                        d.insert_temp(edit_id, e);
+                    } else {
+                        d.remove::<(usize, String)>(edit_id);
+                    }
+                });
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut reply).hint_text("Reply").desired_width(190.0));
@@ -164,6 +202,12 @@ impl App {
                 });
             });
         });
+        if let Some((i, text)) = edited {
+            self.checkpoint();
+            if let Some(m) = self.doc.comments.iter_mut().find(|x| x.id == id).and_then(|c| c.messages.get_mut(i)) {
+                m.1 = text;
+            }
+        }
         match action {
             Some("close") => self.open_comment = None,
             Some("delete") => {

@@ -881,6 +881,41 @@ pub enum ScaleMode {
     Fit,
     Stretch,
     Tile,
+    /// Figma's Crop: like Fill, zoomed by `tile_scale` (1 = cover) and shifted by `from`
+    /// (-1..1 of the room to move on each axis, 0 = centered).
+    Crop,
+}
+
+/// An embedded image's pixel size (read from its header).
+pub fn image_size(doc: &Document, key: &str) -> Option<Vec2> {
+    let bytes = doc.images.get(key)?;
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(bytes.as_slice())).with_guessed_format().ok()?.into_dimensions().ok()?;
+    Some(vec2(w as f32, h as f32))
+}
+
+/// Crop settings from Figma's imageTransform (layer unit square -> image unit square).
+pub fn crop_from_transform(p: &mut Paint, t: [[f32; 3]; 2], layer: Vec2, image: Vec2) {
+    let (a, d, tx, ty) = (t[0][0].max(1e-6), t[1][1].max(1e-6), t[0][2], t[1][2]);
+    let (la, ia) = (layer.x / layer.y.max(1e-6), image.x / image.y.max(1e-6));
+    let cover = if la > ia { vec2(1.0, ia / la) } else { vec2(la / ia, 1.0) };
+    p.scale_mode = ScaleMode::Crop;
+    p.tile_scale = (cover.x / a).max(cover.y / d).max(1.0);
+    let span = cover / p.tile_scale;
+    let c = pos2(tx + a / 2.0, ty + d / 2.0);
+    let off = |c: f32, s: f32| if 1.0 - s > 1e-6 { ((c - 0.5) / ((1.0 - s) / 2.0)).clamp(-1.0, 1.0) } else { 0.0 };
+    p.from = pos2(off(c.x, span.x), off(c.y, span.y));
+}
+
+/// The part of an image a Fill or Crop paint shows, in the image's unit square: center and size.
+pub fn crop_window(p: &Paint, layer: Vec2, image: Vec2) -> (Pos2, Vec2) {
+    let (la, ia) = (layer.x / layer.y.max(1e-6), image.x / image.y.max(1e-6));
+    let cover = if la > ia { vec2(1.0, ia / la) } else { vec2(la / ia, 1.0) };
+    if p.scale_mode != ScaleMode::Crop {
+        return (pos2(0.5, 0.5), cover);
+    }
+    let span = cover / p.tile_scale.max(1.0);
+    let c = pos2(0.5 + p.from.x.clamp(-1.0, 1.0) * (1.0 - span.x) / 2.0, 0.5 + p.from.y.clamp(-1.0, 1.0) * (1.0 - span.y) / 2.0);
+    (c, span)
 }
 
 /// A fill or stroke paint. For gradients and images, `color`'s alpha is the paint opacity.
@@ -1128,6 +1163,10 @@ pub struct Node {
     /// Star inner radius as a fraction of the outer.
     #[serde(skip_serializing_if = "dflt::inner_ratio")]
     pub inner_ratio: f32,
+    /// Ellipse arc, as in Figma: start angle and sweep in degrees (clockwise from 3 o'clock) and
+    /// the inner radius as a fraction of the outer. None draws the whole ellipse.
+    #[serde(skip_serializing_if = "dflt::arc")]
+    pub arc: Option<[f32; 3]>,
     #[serde(skip_serializing_if = "dflt::clip")]
     pub clip: bool,
     #[serde(skip_serializing_if = "dflt::shadows")]
@@ -1280,6 +1319,7 @@ mod dflt {
         end_marker: Marker,
         point_count: u32,
         inner_ratio: f32,
+        arc: Option<[f32; 3]>,
         clip: bool,
         shadows: Vec<Shadow>,
         layout: AutoLayout,
@@ -1362,6 +1402,7 @@ impl Default for Node {
             end_marker: Marker::None,
             point_count: 5,
             inner_ratio: 0.382,
+            arc: None,
             clip: false,
             shadows: vec![],
             layout: AutoLayout::default(),
@@ -1495,6 +1536,42 @@ impl Node {
     }
 
     /// Unrotated outline of polygons and stars, in world space.
+    /// An ellipse with a partial sweep or a hole.
+    pub fn is_arc(&self) -> bool {
+        self.kind == Kind::Ellipse && self.arc.is_some_and(|a| a != [0.0, 360.0, 0.0])
+    }
+
+    /// An arc ellipse's outline, as closed polygons: the outer arc, then the inner arc back (a
+    /// ring or donut slice) or the center (a pie slice). A full ring is two loops, the inner one
+    /// reversed so it's a hole under either fill rule. `grow` widens the radii (stroke alignment).
+    pub fn arc_outline(&self, grow: f32) -> Vec<Vec<Pos2>> {
+        let [start, sweep, ratio] = self.arc.unwrap_or([0.0, 360.0, 0.0]);
+        let sweep = sweep.clamp(-360.0, 360.0);
+        let c = self.rect.center();
+        let (rx, ry) = (self.rect.width() / 2.0 + grow, self.rect.height() / 2.0 + grow);
+        let (irx, iry) = ((self.rect.width() / 2.0 * ratio - grow).max(0.0), (self.rect.height() / 2.0 * ratio - grow).max(0.0));
+        let n = ((sweep.abs() / 360.0) * 96.0).ceil().max(8.0) as usize;
+        let at = |i: usize, a: f32, b: f32| {
+            let t = (start + sweep * i as f32 / n as f32).to_radians();
+            c + vec2(a * t.cos(), b * t.sin())
+        };
+        let hole = ratio > 0.0 && irx > 0.0 && iry > 0.0;
+        if sweep.abs() >= 359.99 {
+            let mut loops = vec![(0..n).map(|i| at(i, rx, ry)).collect::<Vec<_>>()];
+            if hole {
+                loops.push((0..n).rev().map(|i| at(i, irx, iry)).collect());
+            }
+            return loops;
+        }
+        let mut p: Vec<Pos2> = (0..=n).map(|i| at(i, rx, ry)).collect();
+        if hole {
+            p.extend((0..=n).rev().map(|i| at(i, irx, iry)));
+        } else {
+            p.push(c);
+        }
+        vec![p]
+    }
+
     pub fn star_points(&self) -> Vec<Pos2> {
         let r = self.rect;
         let (c, rx, ry) = (r.center(), r.width() / 2.0, r.height() / 2.0);
@@ -1548,6 +1625,9 @@ pub struct Page {
     /// Prototype starting frames, in order.
     #[serde(default)]
     pub flows: Vec<NodeId>,
+    /// Where the page was last viewed: world center x, y and zoom (saved in the file, as Figma does).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<[f32; 3]>,
 }
 
 pub const PAGE_BG: Rgba = Rgba::rgb(0xF5, 0xF5, 0xF5);
@@ -1608,6 +1688,19 @@ impl std::fmt::Debug for SyncCache {
     }
 }
 
+/// Whether a text layer still has the name Katachi gave it (its text, or "Text" / "Text 3").
+pub fn auto_text_name(name: &str, text: &str) -> bool {
+    let generic = name == "Text" || name.strip_prefix("Text ").is_some_and(|n| n.parse::<u32>().is_ok());
+    generic || name == text_layer_name(text)
+}
+
+/// A text layer's automatic name: its text on one line, cut at 60 characters.
+pub fn text_layer_name(text: &str) -> String {
+    let one: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cut: String = one.chars().take(60).collect();
+    if cut.is_empty() { "Text".into() } else { cut }
+}
+
 /// A .katachi file: `{"katachi": 1, "document": {...}}`.
 #[derive(Deserialize)]
 struct FileJson {
@@ -1656,7 +1749,7 @@ pub enum Order {
 impl Default for Document {
     fn default() -> Self {
         Self {
-            pages: vec![Page { name: "Page 1".into(), children: vec![], background: PAGE_BG, flows: vec![] }],
+            pages: vec![Page { name: "Page 1".into(), children: vec![], background: PAGE_BG, flows: vec![], view: None }],
             nodes: HashMap::new(),
             next_id: 1,
             images: HashMap::new(),
@@ -1932,6 +2025,13 @@ impl Document {
         let mut writes = vec![];
         for n in self.nodes.values() {
             for &(prop, var) in &n.bindings {
+                // Inside an instance, a property overridden by hand keeps the override; the
+                // binding it copied from the main component no longer drives it.
+                if let Some(sync) = &n.synced
+                    && Self::bound_value_differs(n, sync, prop)
+                {
+                    continue;
+                }
                 if let Some(val) = resolve(var, n.id)
                     && !Self::binding_holds(n, prop, &val)
                 {
@@ -1963,6 +2063,24 @@ impl Document {
                 (Bindable::Visible, VarValue::Bool(b)) => n.visible = b,
                 _ => {}
             }
+        }
+    }
+
+    /// Whether `prop` differs between two versions of a layer.
+    fn bound_value_differs(a: &Node, b: &Node, prop: Bindable) -> bool {
+        match prop {
+            Bindable::Fill => a.fills != b.fills,
+            Bindable::Stroke => a.strokes != b.strokes,
+            Bindable::Opacity => a.opacity != b.opacity,
+            Bindable::Radius => a.radius != b.radius,
+            Bindable::Width => a.rect.width() != b.rect.width(),
+            Bindable::Height => a.rect.height() != b.rect.height(),
+            Bindable::Gap => a.layout.gap != b.layout.gap,
+            Bindable::Padding => a.layout.padding != b.layout.padding,
+            Bindable::StrokeWidth => a.stroke_width != b.stroke_width,
+            Bindable::FontSize => a.font_size != b.font_size,
+            Bindable::Text => a.text != b.text,
+            Bindable::Visible => a.visible != b.visible,
         }
     }
 
@@ -2017,23 +2135,44 @@ impl Document {
     }
 
     fn apply_styles_to(n: &mut Node, styles: &HashMap<StyleId, StyleValue>) {
-        {
-            for (link, stroke) in [(&mut n.fill_style, false), (&mut n.stroke_style, true)] {
-                match link.and_then(|id| styles.get(&id)) {
-                    Some(StyleValue::Paint(p)) => {
-                        if stroke { n.strokes = p.clone() } else { n.fills = p.clone() }
+        // Inside an instance, a property overridden by hand keeps the override; a style the
+        // main component's layer uses doesn't overwrite it.
+        let (fill_over, stroke_over, text_over, effect_over) = match &n.synced {
+            Some(s) => (
+                s.fills != n.fills,
+                s.strokes != n.strokes,
+                (s.font_family != n.font_family || s.font_size != n.font_size || s.font_weight != n.font_weight || s.line_height != n.line_height || s.letter_spacing != n.letter_spacing),
+                s.shadows != n.shadows,
+            ),
+            None => (false, false, false, false),
+        };
+        for (link, stroke) in [(&mut n.fill_style, false), (&mut n.stroke_style, true)] {
+            match link.and_then(|id| styles.get(&id)) {
+                Some(StyleValue::Paint(p)) => {
+                    if stroke && !stroke_over {
+                        n.strokes = p.clone()
+                    } else if !stroke && !fill_over {
+                        n.fills = p.clone()
                     }
-                    Some(_) | None => *link = None,
+                }
+                Some(_) | None => *link = None,
+            }
+        }
+        match n.text_style.and_then(|id| styles.get(&id)) {
+            Some(StyleValue::Text(t)) => {
+                if !text_over {
+                    t.apply(n)
                 }
             }
-            match n.text_style.and_then(|id| styles.get(&id)) {
-                Some(StyleValue::Text(t)) => t.apply(n),
-                _ => n.text_style = None,
+            _ => n.text_style = None,
+        }
+        match n.effect_style.and_then(|id| styles.get(&id)) {
+            Some(StyleValue::Effect(e)) => {
+                if !effect_over {
+                    n.shadows = e.clone()
+                }
             }
-            match n.effect_style.and_then(|id| styles.get(&id)) {
-                Some(StyleValue::Effect(e)) => n.shadows = e.clone(),
-                _ => n.effect_style = None,
-            }
+            _ => n.effect_style = None,
         }
     }
 
@@ -2855,7 +2994,7 @@ impl Document {
         None
     }
 
-    fn hit_self(&self, n: &Node, p: Pos2, tol: f32) -> bool {
+    pub fn hit_self(&self, n: &Node, p: Pos2, tol: f32) -> bool {
         let p = n.to_local(p);
         match n.kind {
             Kind::Group | Kind::Boolean => false,
@@ -2866,6 +3005,10 @@ impl Document {
             Kind::Polygon | Kind::Star => {
                 let pts = n.star_points();
                 contains(&[(pts, true)], p, false)
+            }
+            Kind::Ellipse if n.is_arc() => {
+                let polys: Vec<(Vec<Pos2>, bool)> = n.arc_outline(tol).into_iter().map(|p| (p, true)).collect();
+                contains(&polys, p, true)
             }
             Kind::Ellipse => {
                 let c = n.rect.center();

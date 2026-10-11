@@ -232,13 +232,40 @@ fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEve
             }
             ui.horizontal(|ui| {
                 use crate::doc::ScaleMode;
-                for m in [ScaleMode::Fill, ScaleMode::Fit, ScaleMode::Stretch, ScaleMode::Tile] {
+                for m in [ScaleMode::Fill, ScaleMode::Fit, ScaleMode::Crop, ScaleMode::Stretch, ScaleMode::Tile] {
                     if ui.selectable_label(paint.scale_mode == m, format!("{m:?}")).clicked() && paint.scale_mode != m {
+                        // Crop starts from what Fill shows.
+                        if m == ScaleMode::Crop {
+                            paint.tile_scale = 1.0;
+                            paint.from = egui::Pos2::ZERO;
+                        }
                         paint.scale_mode = m;
                         ev = Some(PaintEvent::Changed);
                     }
                 }
             });
+            if paint.scale_mode == crate::doc::ScaleMode::Crop {
+                let mut zoom = paint.tile_scale * 100.0;
+                let (mut ox, mut oy) = (paint.from.x * 100.0, paint.from.y * 100.0);
+                ui.horizontal(|ui| {
+                    ui.add_sized([76.0, 18.0], egui::Label::new("Zoom"));
+                    if ui.add(egui::Slider::new(&mut zoom, 100.0..=800.0).suffix("%").logarithmic(true)).changed() {
+                        paint.tile_scale = zoom / 100.0;
+                        ev = Some(PaintEvent::Changed);
+                    }
+                });
+                for (v, label) in [(&mut ox, "Horizontal"), (&mut oy, "Vertical")] {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([76.0, 18.0], egui::Label::new(label));
+                        if ui.add(egui::Slider::new(v, -100.0..=100.0).show_value(false)).changed() {
+                            ev = Some(PaintEvent::Changed);
+                        }
+                    });
+                }
+                if matches!(ev, Some(PaintEvent::Changed)) {
+                    paint.from = egui::Pos2::new(ox / 100.0, oy / 100.0);
+                }
+            }
             ui.separator();
             let a = &mut paint.adjust;
             for (v, label) in [
@@ -279,11 +306,20 @@ pub fn shadow_row(ui: &mut Ui, id: egui::Id, s: &mut Shadow) -> (bool, bool) {
         let open = ui.add(egui::Button::new(s.kind.label()).frame(false));
         Popup::menu(&open).id(id.with("popup")).close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
             ui.set_width(230.0);
-            egui::ComboBox::from_id_salt(id.with("kind")).selected_text(s.kind.label()).show_ui(ui, |ui| {
-                for k in [EffectKind::DropShadow, EffectKind::InnerShadow, EffectKind::LayerBlur, EffectKind::BackgroundBlur] {
-                    changed |= ui.selectable_value(&mut s.kind, k, k.label()).changed();
+            // The type picker sits in the editor itself: a dropdown here opens a second popup,
+            // and clicking in it would count as a click outside and close the editor.
+            egui::Grid::new(id.with("kind")).num_columns(2).spacing([4.0, 4.0]).show(ui, |ui| {
+                for (i, k) in [EffectKind::DropShadow, EffectKind::InnerShadow, EffectKind::LayerBlur, EffectKind::BackgroundBlur].into_iter().enumerate() {
+                    changed |= ui.add_sized([108.0, 22.0], egui::Button::selectable(s.kind == k, k.label())).clicked() && {
+                        s.kind = k;
+                        true
+                    };
+                    if i % 2 == 1 {
+                        ui.end_row();
+                    }
                 }
             });
+            ui.separator();
             egui::Grid::new(id.with("grid")).num_columns(4).show(ui, |ui| {
                 let mut field = |ui: &mut Ui, label: &str, v: &mut f32, min: f32| {
                     ui.label(label);
@@ -352,11 +388,24 @@ pub fn style_menu(ui: &mut Ui, id: egui::Id, styles: &[crate::doc::Style], same_
         ui.set_width(220.0);
         ui.label(egui::RichText::new("Local styles").strong());
         let mut any = false;
-        for s in styles.iter().filter(|s| same_kind(&s.value)) {
+        // Grouped by slash folders, as in Figma ("HUD / Title" under HUD).
+        let mut list: Vec<&crate::doc::Style> = styles.iter().filter(|s| same_kind(&s.value)).collect();
+        let split = |n: &str| n.rsplit_once('/').map(|(f, l)| (Some(f.trim().to_string()), l.trim().to_string())).unwrap_or((None, n.to_string()));
+        list.sort_by_key(|s| (split(&s.name).0.is_some(), s.name.to_lowercase()));
+        let mut folder: Option<String> = None;
+        for s in list {
             any = true;
+            let (f, leaf) = split(&s.name);
+            if f.is_some() && f != folder {
+                ui.label(egui::RichText::new(f.as_deref().unwrap_or_default()).small().color(crate::appearance::muted(ui.ctx())));
+            }
+            folder = f;
             ui.horizontal(|ui| {
+                if folder.is_some() {
+                    ui.add_space(8.0);
+                }
                 style_preview(ui, &s.value);
-                if ui.add(egui::Button::new(&s.name).frame(false)).clicked() {
+                if ui.add(egui::Button::new(&leaf).frame(false)).clicked() {
                     pick = Some(StylePick::Apply(s.id));
                     ui.close();
                 }

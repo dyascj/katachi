@@ -46,10 +46,13 @@ turn the check off.
 **Files and tabs**
 - Home: recent files as thumbnails, with search, New design file, and Open (Katachi or Figma `.fig`)
 - Each file opens in its own tab, as in Figma's desktop app; Ctrl Tab switches, Cmd W closes
+- Quick actions (Cmd / or Cmd K): search and run any command, tool, plugin, or layer
+- Files and pages reopen where you left them
 
 **Canvas and tools**
 - Infinite canvas with pan, zoom, pixel grid at 800%+, rulers (Shift R), and smart guides
 - Move, Scale (K), Frame, Section, Slice, Rectangle, Line, Arrow, Ellipse, Polygon, Star, Pen, Pencil, Text, Comment
+- Frame presets for phones, tablets, desktops, slides, watches, paper, and social posts
 - Figma's selection rules: click-through top-level frames, groups and instances select first, double-click to dive in, Cmd-click for deep select, pressing inside a selected parent drags the parent
 - Resize from any edge or corner, rotate past the corners (Shift snaps to 15°), Alt-drag to duplicate
 - Alt-hover distance measurements, flip (Shift H/V), distribute and tidy up, alignment
@@ -65,15 +68,17 @@ turn the check off.
 - Boolean, text, and instance-swap component properties
 - Color, text, and effect styles
 - Variables with collections and modes (for example Light and Dark), aliases, and bindings for colors, sizes, spacing, radius, text, and visibility
-- Assets panel to drag components onto the canvas
+- Assets panel with component previews, grouped by page, to drag onto the canvas
+- Swap instances, add variants from the right-click menu, and group styles into folders with slash names
 
 **Vectors**
-- Multi-contour paths with even-odd or non-zero fill, vector edit mode for anchors and handles
+- Multi-contour paths with even-odd or non-zero fill, vector edit mode for anchors and handles (point position, bend, delete)
+- Ellipse arcs: start, sweep, and ratio for pies, donuts, and rings
 - Live boolean groups: union, subtract, intersect, exclude
 - Flatten (Cmd E), outline stroke (Alt Cmd O), SVG import by paste, drag-and-drop, or File > Place
 
 **Paint and effects**
-- Solid, linear, and radial gradient fills, and images (fill, fit, stretch, tile) with exposure, contrast, saturation, temperature, tint, highlights, and shadows
+- Solid, linear, and radial gradient fills, and images (fill, fit, crop, stretch, tile) with exposure, contrast, saturation, temperature, tint, highlights, and shadows
 - Strokes with inside / center / outside alignment, individual side weights, dashes, caps, joins, and arrow markers
 - Drop shadow, inner shadow, layer blur, background blur, blend modes, masks, independent corner radii
 - Selection colors: every color in a selection, editable in one place
@@ -143,6 +148,7 @@ turn the check off.
 | Rulers, layout guides, hide UI, outline mode | Shift R, Ctrl G, Cmd \, Cmd Y |
 | Dev Mode, present | Shift D, Alt Cmd Enter |
 | Save, open, place image, export | Cmd S, Cmd O, Shift Cmd K, Shift Cmd E |
+| Quick actions | Cmd / or Cmd K |
 | Find and replace | Cmd F |
 | Next and previous tab, close tab | Ctrl Tab, Ctrl Shift Tab, Cmd W |
 | Copy as PNG, paste to replace, select matching layers | Shift Cmd C, Shift Cmd R, Alt Cmd A |

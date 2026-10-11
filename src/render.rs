@@ -67,6 +67,17 @@ pub fn node_path(n: &Node, v: &View, grow: f32) -> Path {
             }
             b.end(true);
         }
+        Kind::Ellipse if n.is_arc() => {
+            for poly in n.arc_outline(grow / v.zoom) {
+                let q = v.to_screen(poly[0]);
+                b.begin(point(q.x, q.y));
+                for p in &poly[1..] {
+                    let q = v.to_screen(*p);
+                    b.line_to(point(q.x, q.y));
+                }
+                b.end(true);
+            }
+        }
         Kind::Ellipse => {
             let c = r.center();
             b.add_ellipse(
@@ -531,17 +542,17 @@ fn paint_geo(painter: &Painter, sc: &mut Scene, n: &Node, geo: VertexBuffers<Pos
         PaintKind::Image => match sc.tex.image(ctx, sc.doc, &p.image, &p.adjust) {
             Some((id, size)) => {
                 let (la, ia) = (n.rect.width() / n.rect.height().max(1e-6), size.x / size.y.max(1e-6));
-                // How much of the image's unit square spans the layer, per axis.
-                let (su, sv) = match p.scale_mode {
-                    crate::doc::ScaleMode::Fit => if la > ia { (la / ia, 1.0) } else { (1.0, ia / la) },
-                    crate::doc::ScaleMode::Stretch => (1.0, 1.0),
-                    _ => if la > ia { (1.0, ia / la) } else { (la / ia, 1.0) },
+                // Which part of the image's unit square spans the layer: center and size.
+                let (c, span) = match p.scale_mode {
+                    crate::doc::ScaleMode::Fit => (pos2(0.5, 0.5), if la > ia { vec2(la / ia, 1.0) } else { vec2(1.0, ia / la) }),
+                    crate::doc::ScaleMode::Stretch => (pos2(0.5, 0.5), vec2(1.0, 1.0)),
+                    _ => crate::doc::crop_window(p, n.rect.size(), size),
                 };
                 // Skip the 1px transparent border around the texture.
                 let (pw, ph) = (size.x + 2.0, size.y + 2.0);
                 (id, Box::new(move |s| {
                     let q = unit(s);
-                    let (u, v) = (0.5 + (q.x - 0.5) * su, 0.5 + (q.y - 0.5) * sv);
+                    let (u, v) = (c.x + (q.x - 0.5) * span.x, c.y + (q.y - 0.5) * span.y);
                     pos2((1.0 + u * size.x) / pw, (1.0 + v * size.y) / ph)
                 }))
             }
