@@ -1913,3 +1913,26 @@ fn crop_mode_zooms_and_pans_the_image() {
     assert_eq!(back.scale_mode, crate::doc::ScaleMode::Crop);
     assert!((back.tile_scale - 2.0).abs() < 1e-4 && (back.from.x - 1.0).abs() < 1e-4);
 }
+
+#[test]
+fn quick_actions_run_commands_and_find_layers() {
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (40.0, 40.0));
+    let b = draw(&mut h, Key::R, (60.0, 0.0), (100.0, 40.0));
+    h.state_mut().sel = vec![a, b];
+    key(&mut h, Modifiers::COMMAND, Key::Slash);
+    assert!(h.state().quick.is_some(), "Cmd / opens it");
+    h.event(Event::Text("add auto".into()));
+    h.run_steps(2);
+    key(&mut h, Modifiers::NONE, Key::Enter);
+    assert!(h.state().quick.is_none());
+    let w = h.state().sel[0];
+    assert_eq!(h.state().doc.node(w).layout.mode, crate::doc::LayoutMode::Horizontal, "ran Add auto layout");
+    // Layers by name.
+    h.state_mut().doc.node_mut(b).name = "Checkout button".into();
+    key(&mut h, Modifiers::COMMAND, Key::K);
+    h.event(Event::Text("checkout".into()));
+    h.run_steps(2);
+    key(&mut h, Modifiers::NONE, Key::Enter);
+    assert_eq!(h.state().sel, vec![b]);
+}

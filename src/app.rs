@@ -191,6 +191,8 @@ pub struct App {
     pub find: (bool, String, String, bool),
     /// Plugins > Run script console.
     pub show_console: bool,
+    /// Quick actions (Cmd / or Cmd K): query and highlighted row.
+    pub quick: Option<(String, usize)>,
     pub console_code: String,
     pub show_variables: bool,
     /// Dev Mode: inspect and code instead of design controls.
@@ -293,6 +295,7 @@ impl App {
             mcp_tried: cfg!(test),
             debug_plugin: std::env::var_os("KATACHI_PLUGIN").map(PathBuf::from),
             show_console: false,
+            quick: None,
             console_code: "for (const n of figma.currentPage.selection) {\n  n.rotation += 15;\n}\nfigma.notify(`Rotated ${figma.currentPage.selection.length} layers`);\n".into(),
             show_variables: false,
             dev_mode: false,
@@ -2064,6 +2067,7 @@ impl App {
         let cmd = m.command;
         // Global shortcuts that work even while a field has focus.
         match (cmd, m.shift, key) {
+            (true, false, Key::Slash | Key::K) if !m.alt => return self.toggle_quick_actions(),
             (true, false, Key::S) => return void(self.save(false)),
             (true, true, Key::S) => return void(self.save(true)),
             (true, false, Key::O) => return self.request_open(),
@@ -2286,6 +2290,7 @@ impl eframe::App for App {
         self.history_window(&ctx);
         self.console_window(&ctx);
         self.find_window(&ctx);
+        self.quick_actions(&ctx);
         self.plugin_frame(&ctx, frame);
         self.appearance_frame(&ctx, frame);
         self.mcp_frame(&ctx);

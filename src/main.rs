@@ -19,6 +19,7 @@ mod plugin_view;
 mod plugins;
 mod panels;
 mod prototype;
+mod quick;
 mod render;
 mod shell;
 mod svg_import;

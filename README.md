@@ -143,6 +143,7 @@ turn the check off.
 | Rulers, layout guides, hide UI, outline mode | Shift R, Ctrl G, Cmd \, Cmd Y |
 | Dev Mode, present | Shift D, Alt Cmd Enter |
 | Save, open, place image, export | Cmd S, Cmd O, Shift Cmd K, Shift Cmd E |
+| Quick actions | Cmd / or Cmd K |
 | Find and replace | Cmd F |
 | Next and previous tab, close tab | Ctrl Tab, Ctrl Shift Tab, Cmd W |
 | Copy as PNG, paste to replace, select matching layers | Shift Cmd C, Shift Cmd R, Alt Cmd A |
