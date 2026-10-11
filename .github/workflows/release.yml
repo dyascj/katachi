@@ -62,6 +62,7 @@ jobs:
     needs: [macos, windows, linux]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y minisign
       - name: Sign release assets
         env:
@@ -76,3 +77,12 @@ jobs:
           done
           rm key
           gh release upload "$GITHUB_REF_NAME" dist/*.minisig -R "$GITHUB_REPOSITORY" --clobber
+      # Hand-written notes live in release-notes/<tag>.md. Signing comes first, so updates still
+      # work if this fails, but a release without notes fails loudly here.
+      - name: Publish release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="release-notes/$GITHUB_REF_NAME.md"
+          if [ ! -f "$notes" ]; then echo "::error::Write $notes before tagging"; exit 1; fi
+          gh release edit "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --title "Katachi ${GITHUB_REF_NAME#v}" --notes-file "$notes"

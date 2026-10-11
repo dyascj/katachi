@@ -34,7 +34,7 @@ katachi [file.katachi]
 ```
 
 Tagged releases (`v*`) build a universal macOS `.dmg`, a Windows `.zip`, and a Linux `.tar.gz` through
-GitHub Actions. Building from source needs Rust 1.92 or newer.
+GitHub Actions. Building from source needs Rust 1.92 or newer. To cut a release, write `release-notes/vX.Y.Z.md`, bump the version in `Cargo.toml`, and push the tag; the workflow signs every asset and publishes those notes.
 
 **Updates.** Installed release builds check GitHub for a newer release at launch. When there is one,
 **Update now** appears in the tab strip: it downloads your platform's build, checks its signature
