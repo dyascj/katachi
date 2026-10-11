@@ -2003,7 +2003,11 @@ fn find_and_version_history_take_over_their_panels() {
     h.get_by_label("Label  \u{201C}Checkout\u{201D}").click();
     h.run_steps(2);
     assert_eq!(h.state().sel, vec![t]);
-    h.state_mut().find.0 = false;
+    // Escape in the field closes Find.
+    h.state_mut().find.3 = true;
+    h.run_steps(2);
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    assert!(!h.state().find.0, "Escape closes Find");
     h.state_mut().show_history = true;
     h.run_steps(2);
     assert!(h.query_by_label("Version history").is_some());

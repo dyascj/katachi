@@ -1697,7 +1697,8 @@ impl App {
                 });
             });
             let r = ui.add(egui::TextEdit::singleline(&mut self.find.1).hint_text("Find layers and text").desired_width(f32::INFINITY));
-            if r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            // Escape in the field closes Find (egui drops the field's focus on the same press).
+            if (r.has_focus() || r.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 open = false;
             }
             if std::mem::take(&mut self.find.3) {

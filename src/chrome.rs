@@ -88,6 +88,9 @@ pub fn menu_style(s: &mut egui::Style) {
         w.bg_stroke = Stroke::NONE;
     }
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_gray(0x3A));
+    // Disabled items fade toward the menu's own color, so they read the same in both themes.
+    v.widgets.noninteractive.weak_bg_fill = MENU_BG;
+    v.disabled_alpha = 0.45;
     for w in [&mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
         w.weak_bg_fill = MENU_HOVER;
         w.bg_fill = MENU_HOVER;
@@ -152,8 +155,14 @@ pub fn popover<R>(button: &Response, id: egui::Id, title: &str, width: f32, add:
 /// popover look, a title row with a close button, draggable, no dimming.
 pub fn window<R>(ctx: &egui::Context, title: &str, open: &mut bool, width: f32, add: impl FnOnce(&mut Ui) -> R) -> Option<R> {
     let mut close = false;
+    // Below the tab strip, centered, never over the traffic lights.
+    let screen = ctx.content_rect();
+    let room = egui::Rect::from_min_max(egui::pos2(screen.min.x, screen.min.y + crate::shell::STRIP_H + 8.0), screen.max);
     let out = egui::Window::new(title)
         .open(open)
+        .pivot(egui::Align2::CENTER_TOP)
+        .default_pos(egui::pos2(screen.center().x, room.min.y + 48.0))
+        .constrain_to(room)
         .title_bar(false)
         .collapsible(false)
         .resizable(false)

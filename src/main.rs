@@ -94,6 +94,16 @@ fn setup_style(ctx: &egui::Context) {
         list.extend(fallbacks.iter().cloned());
         fonts.families.insert(FontFamily::Name((*name).into()), list);
     }
+    // Shortcut glyphs (⌥ ⌃ ⇧ ⌫) aren't in Inter: fall back to a system symbol font.
+    for p in ["/System/Library/Fonts/Apple Symbols.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf", "C:\\Windows\\Fonts\\seguisym.ttf"] {
+        if let Ok(bytes) = std::fs::read(p) {
+            fonts.font_data.insert("symbols".into(), Arc::new(FontData::from_owned(bytes)));
+            for list in fonts.families.values_mut() {
+                list.push("symbols".into());
+            }
+            break;
+        }
+    }
     ctx.set_fonts(fonts);
     ctx.options_mut(|o| o.zoom_with_keyboard = false);
     appearance::apply(ctx, &appearance::load());
