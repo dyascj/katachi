@@ -1276,20 +1276,24 @@ fn multiplayer_host_join_edit_and_undo_only_mine() {
     // Ada draws; Bo sees it. Bo draws; Ada sees it.
     let ra = draw(&mut a, Key::R, (0.0, 0.0), (100.0, 100.0));
     let rb = draw(&mut b, Key::O, (200.0, 0.0), (260.0, 60.0));
-    let settle = |a: &mut Harness<App>, b: &mut Harness<App>| {
-        for _ in 0..60 {
+    // Up to 5 s for the sockets (tests run in parallel and the machine may be busy).
+    let settle = |a: &mut Harness<App>, b: &mut Harness<App>, done: &dyn Fn(&App, &App) -> bool| {
+        for _ in 0..1000 {
             a.step();
             b.step();
+            if done(a.state(), b.state()) {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     };
-    settle(&mut a, &mut b);
+    settle(&mut a, &mut b, &|a, b| b.doc.nodes.contains_key(&ra) && a.doc.nodes.contains_key(&rb) && a.collab.as_ref().is_some_and(|c| c.peers.values().any(|p| p.name == "Bo")));
     assert!(b.state().doc.nodes.contains_key(&ra), "Bo sees Ada's rectangle");
     assert!(a.state().doc.nodes.contains_key(&rb), "Ada sees Bo's ellipse");
     assert!(a.state().collab.as_ref().unwrap().peers.values().any(|p| p.name == "Bo"), "presence");
     // Ada undoes: her rectangle goes away everywhere, Bo's ellipse stays.
     key(&mut a, Modifiers::COMMAND, Key::Z);
-    settle(&mut a, &mut b);
+    settle(&mut a, &mut b, &|a, b| !a.doc.nodes.contains_key(&ra) && !b.doc.nodes.contains_key(&ra));
     assert!(!a.state().doc.nodes.contains_key(&ra) && !b.state().doc.nodes.contains_key(&ra));
     assert!(a.state().doc.nodes.contains_key(&rb) && b.state().doc.nodes.contains_key(&rb), "undo leaves others' work");
 }
