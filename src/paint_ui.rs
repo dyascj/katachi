@@ -75,6 +75,7 @@ fn rgb_picker(ui: &mut Ui, color: &mut Rgba) -> bool {
     };
     // Saturation (x) and brightness (y).
     let (sq, resp) = ui.allocate_exact_size(vec2(w, w), Sense::click_and_drag());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Slider, true, "Saturation and brightness"));
     let pure = Color32::from(Hsva::new(hsv.h, 1.0, 1.0, 1.0));
     let mut m = Mesh::default();
     quad(&mut m, sq, [Color32::WHITE, pure, pure, Color32::WHITE]);
@@ -142,6 +143,7 @@ fn rgb_picker(ui: &mut Ui, color: &mut Rgba) -> bool {
 /// Checkerboard-backed swatch showing a paint; returns the click response.
 fn swatch(ui: &mut Ui, p: &Paint) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Color swatch"));
     let painter = ui.painter_at(rect);
     for i in 0..4 {
         let (x, y) = ((i % 2) as f32, (i / 2) as f32);

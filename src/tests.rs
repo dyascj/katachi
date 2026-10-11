@@ -2016,3 +2016,35 @@ fn find_and_version_history_take_over_their_panels() {
     h.run_steps(2);
     assert!(!h.state().show_history);
 }
+
+#[test]
+fn color_picker_drags_and_escape_from_find_keeps_selection() {
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (80.0, 80.0));
+    // Open the fill popover from its swatch, then drag across the color square.
+    h.get_all_by_label("Color swatch").next().unwrap().click();
+    h.run_steps(3);
+    let before = h.state().doc.node(id).fills[0].color;
+    let popover = egui::Popup::is_any_open(&h.ctx);
+    assert!(popover, "fill editor open");
+    let sq = h.get_by_label("Saturation and brightness").rect();
+    let (a, b) = (sq.min + vec2(10.0, 10.0), sq.min + vec2(sq.width() * 0.8, sq.height() * 0.6));
+    move_to(&mut h, a, Modifiers::NONE);
+    press(&mut h, a, true, Modifiers::NONE);
+    for i in 1..=5 {
+        move_to(&mut h, a.lerp(b, i as f32 / 5.0), Modifiers::NONE);
+    }
+    let mid = h.state().doc.node(id).fills[0].color;
+    press(&mut h, b, false, Modifiers::NONE);
+    let found = (mid != before).then_some(());
+    assert!(found.is_some(), "dragging in the picker changes the fill while the button is held");
+    assert!(egui::Popup::is_any_open(&h.ctx), "and the editor stays open");
+    // Find, then Escape: Find closes and the selection stays.
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    h.state_mut().sel = vec![id];
+    key(&mut h, Modifiers::COMMAND, Key::F);
+    h.run_steps(2);
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    assert!(!h.state().find.0);
+    assert_eq!(h.state().sel, vec![id], "selection kept");
+}
