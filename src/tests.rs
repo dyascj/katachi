@@ -1690,6 +1690,16 @@ fn ui_look() {
     h.state_mut().sel = vec![ids[1]];
     h.run_steps(4);
     h.render().unwrap().save("target/look-arcs.png").unwrap();
+    // Assets: the showcase's components as a grid.
+    {
+        let a = h.state_mut();
+        crate::plugins::run(&mut a.doc, 0, &[], include_str!("../assets/promo/showcase.js")).unwrap();
+        crate::plugins::run(&mut a.doc, 0, &[], "for (const c of ['Chip', 'Avatar', 'Card']) { const k = figma.createComponent(); k.name = c; k.resize(80, 40); k.y = 3000; k.cornerRadius = 12; k.fills = [figma.util.solidPaint('#4DA8FF')]; }").unwrap();
+        a.left_tab_assets = true;
+    }
+    h.run_steps(6);
+    h.render().unwrap().save("target/look-assets.png").unwrap();
+    eprintln!("asset thumbnails: {} ; tiles labeled: Button {} Chip {}", h.state().asset_thumbs.len(), h.query_all_by_label("Button").count(), h.query_all_by_label("Chip").count());
 }
 
 #[test]
@@ -1747,4 +1757,20 @@ fn layer_search_finds_text_and_groups_become_auto_layout_frames() {
     assert_eq!((n.kind, n.layout.mode), (Kind::Frame, crate::doc::LayoutMode::Horizontal));
     assert_eq!(n.children.len(), 2, "the ellipses lay out directly");
     let _ = t;
+}
+
+#[test]
+fn assets_show_component_previews_and_search_filters_sets() {
+    let mut h = harness();
+    crate::plugins::run(&mut h.state_mut().doc, 0, &[], include_str!("../assets/promo/showcase.js")).unwrap();
+    crate::plugins::run(&mut h.state_mut().doc, 0, &[], "const k = figma.createComponent(); k.name = 'Chip'; k.resize(80, 40);").unwrap();
+    h.state_mut().left_tab_assets = true;
+    h.run_steps(4);
+    assert_eq!(h.state().asset_thumbs.len(), 2, "the Button set and Chip");
+    // Editing a component re-renders just its preview.
+    let chip = h.state().doc.nodes.values().find(|n| n.name == "Chip").unwrap().id;
+    let before = h.state().asset_thumbs[&chip].0;
+    h.state_mut().doc.node_mut(chip).radius = 12.0;
+    h.run_steps(31);
+    assert_ne!(h.state().asset_thumbs[&chip].0, before);
 }

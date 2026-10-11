@@ -154,6 +154,8 @@ pub struct App {
     /// Zoom to this layer on the next frame (after page switches settle).
     pub zoom_target: Option<NodeId>,
     pub left_tab_assets: bool,
+    /// Assets panel previews: component -> (content key, texture).
+    pub asset_thumbs: std::collections::HashMap<NodeId, (u64, egui::TextureHandle)>,
     /// Last tool used in each toolbar group (move, frame, shape, pen, text).
     pub tool_groups: [Tool; 6],
     pub presenting: Option<crate::prototype::Presentation>,
@@ -267,6 +269,7 @@ impl App {
             pending_frame: None,
             zoom_target: None,
             left_tab_assets: false,
+            asset_thumbs: Default::default(),
             tool_groups: [Tool::Move, Tool::Frame, Tool::Rectangle, Tool::Pen, Tool::Text, Tool::Comment],
             presenting: None,
             prototype_tab: false,

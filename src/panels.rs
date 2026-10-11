@@ -586,14 +586,14 @@ impl App {
         let mut q: String = ui.data(|d| d.get_temp(search_id)).unwrap_or_default();
         ui.add(egui::TextEdit::singleline(&mut q).hint_text("Search assets").desired_width(f32::INFINITY));
         ui.data_mut(|d| d.insert_temp(search_id, q.clone()));
+        let q = q.to_lowercase();
         ui.add_space(4.0);
-        ui.label(RichText::new("Local components").strong());
+        // Sets appear once (placing their first variant); components inside sets don't.
         let mut comps: Vec<(usize, NodeId, String)> = self
             .doc
             .nodes
             .values()
-            .filter(|n| n.kind == Kind::Component && n.name.to_lowercase().contains(&q.to_lowercase()) || n.kind == Kind::ComponentSet)
-            // A set appears once and places its first variant.
+            .filter(|n| matches!(n.kind, Kind::Component | Kind::ComponentSet) && n.name.to_lowercase().contains(&q))
             .filter(|n| !n.parent.is_some_and(|p| self.doc.node(p).kind == Kind::ComponentSet))
             .filter_map(|n| match n.kind {
                 Kind::ComponentSet => n.children.first().map(|&v| (self.doc.page_of(n.id), v, n.name.clone())),
@@ -602,27 +602,106 @@ impl App {
             .collect();
         comps.sort_by(|a, b| (a.0, &a.2).cmp(&(b.0, &b.2)));
         if comps.is_empty() {
-            ui.label(RichText::new("Create components with ⌥⌘K to reuse them here.").color(theme::muted(ui.ctx())));
+            ui.label(RichText::new(if q.is_empty() { "Create components with ⌥⌘K to reuse them here." } else { "No components match." }).color(theme::muted(ui.ctx())));
+            return;
         }
+        ui.label(RichText::new("Local components").strong());
+        // Thumbnails are rendered a few per frame, so opening a big library doesn't stall.
+        let mut budget = 6;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for (page, id, name) in comps {
-                let r = ui.dnd_drag_source(ui.id().with(("asset", id)), AssetDrag(id), |ui| {
-                    ui.horizontal(|ui| {
-                        let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-                        paint_icon(ui.painter(), rect, Icon::Component, crate::canvas::PURPLE);
-                        ui.label(&name);
-                        ui.label(RichText::new(&self.doc.pages[page].name).color(theme::faint(ui.ctx())).small());
-                    });
-                });
-                if r.response.double_clicked() {
-                    let at = self.view_center_world();
-                    self.checkpoint();
-                    let size = self.doc.node(id).rect.size();
-                    let i = self.doc.instantiate(id, self.page, None, None, (at - size / 2.0).round());
-                    self.sel = vec![i];
+            for page in 0..self.doc.pages.len() {
+                let items: Vec<(NodeId, String)> = comps.iter().filter(|c| c.0 == page).map(|c| (c.1, c.2.clone())).collect();
+                if items.is_empty() {
+                    continue;
                 }
+                egui::CollapsingHeader::new(RichText::new(&self.doc.pages[page].name).color(theme::muted(ui.ctx())))
+                    .id_salt(("asset-page", page))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let tile = 70.0;
+                        let gap = 8.0;
+                        let cols = ((ui.available_width() + gap) / (tile + gap)).floor().max(1.0) as usize;
+                        for row in items.chunks(cols) {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = gap;
+                                for (id, name) in row {
+                                    self.asset_tile(ui, *id, name, tile, &mut budget);
+                                }
+                            });
+                        }
+                    });
             }
         });
+        if budget == 0 {
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// One component in the Assets grid: a preview over its name. Drag onto the canvas, or
+    /// double-click to place it mid-screen.
+    fn asset_tile(&mut self, ui: &mut Ui, id: NodeId, name: &str, size: f32, budget: &mut usize) {
+        let tex = self.asset_thumb(ui.ctx(), id, budget);
+        let r = ui.dnd_drag_source(ui.id().with(("asset", id)), AssetDrag(id), |ui| {
+            ui.vertical(|ui| {
+                ui.set_width(size);
+                let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
+                let p = ui.painter();
+                p.rect_filled(rect, 6.0, theme::subtle(ui.ctx()));
+                if resp.hovered() {
+                    p.rect_stroke(rect, 6.0, Stroke::new(1.0, BLUE), egui::StrokeKind::Inside);
+                }
+                if let Some(tex) = &tex {
+                    let s = tex.size_vec2();
+                    let fit = ((size - 12.0) / s.x).min((size - 12.0) / s.y);
+                    p.image(tex.id(), Rect::from_center_size(rect.center(), s * fit), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+                } else {
+                    paint_icon(p, Rect::from_center_size(rect.center(), vec2(18.0, 18.0)), Icon::Component, crate::canvas::PURPLE);
+                }
+                ui.add(egui::Label::new(RichText::new(name).small()).truncate());
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+            });
+        });
+        let r = r.response.on_hover_text(name);
+        if r.double_clicked() {
+            let at = self.view_center_world();
+            self.checkpoint();
+            let size = self.doc.node(id).rect.size();
+            let i = self.doc.instantiate(id, self.page, None, None, (at - size / 2.0).round());
+            self.sel = vec![i];
+        }
+    }
+
+    /// A component's preview, re-rendered when its content changes. Each tile re-checks its
+    /// content every 30 frames (staggered), so a big library costs little per frame.
+    fn asset_thumb(&mut self, ctx: &egui::Context, id: NodeId, budget: &mut usize) -> Option<egui::TextureHandle> {
+        use std::hash::{Hash, Hasher};
+        let due = (ctx.cumulative_frame_nr() + id) % 30 == 0;
+        if let Some((_, tex)) = self.asset_thumbs.get(&id)
+            && (!due || *budget == 0)
+        {
+            return Some(tex.clone());
+        }
+        let mut h = std::hash::DefaultHasher::new();
+        for n in std::iter::once(id).chain(self.doc.descendants(id)) {
+            serde_json::to_vec(&*self.doc.nodes[&n]).unwrap_or_default().hash(&mut h);
+        }
+        let key = h.finish();
+        if let Some((k, tex)) = self.asset_thumbs.get(&id)
+            && *k == key
+        {
+            return Some(tex.clone());
+        }
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        let b = crate::export::export_bounds(&self.doc, &[id]);
+        let scale = (128.0 / b.width().max(b.height()).max(1.0)).min(4.0);
+        let svg = crate::export::to_svg(&self.doc, &[id]);
+        let (px, [w, hgt]) = crate::export::rasterize(&svg, scale)?;
+        let tex = ctx.load_texture(format!("asset-{id}"), egui::ColorImage::from_rgba_premultiplied([w, hgt], &px), egui::TextureOptions::LINEAR);
+        self.asset_thumbs.insert(id, (key, tex.clone()));
+        Some(tex)
     }
 
     fn main_menu(&mut self, ui: &mut Ui) {
