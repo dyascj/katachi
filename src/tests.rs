@@ -1865,3 +1865,22 @@ fn files_and_pages_reopen_where_they_were_viewed() {
     g.run_steps(2);
     assert_eq!(g.state().view.zoom, 2.5);
 }
+
+#[test]
+fn vector_edit_panel_bends_and_moves_points() {
+    let mut h = harness();
+    let mut v = Node::vector(&[crate::doc::PathPoint { p: pos2(0., 0.), ..Default::default() }, crate::doc::PathPoint { p: pos2(100., 0.), ..Default::default() }, crate::doc::PathPoint { p: pos2(50., 80.), ..Default::default() }], true);
+    v.name = "Tri".into();
+    let id = h.state_mut().doc.insert(0, None, None, v);
+    h.state_mut().enter_vector_edit(id);
+    h.state_mut().vector_edit.as_mut().unwrap().selected = vec![(0, 2)];
+    h.run_steps(2);
+    assert!(h.query_by_label("Edit vector").is_some());
+    h.get_by_label("Bend").click();
+    h.run_steps(2);
+    let p = h.state().doc.node(id).paths[0].points[2];
+    assert!(p.h_in != vec2(0., 0.) && p.h_out != vec2(0., 0.), "smooth now");
+    h.get_by_label("Done").click();
+    h.run_steps(2);
+    assert!(h.state().vector_edit.is_none());
+}

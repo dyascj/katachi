@@ -1182,6 +1182,10 @@ impl App {
                     self.prototype_props(ui);
                     return;
                 }
+                if self.vector_edit.is_some() {
+                    self.vector_edit_panel(ui);
+                    return;
+                }
                 if self.sel.is_empty() {
                     self.page_props(ui);
                 } else {
