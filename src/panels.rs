@@ -2043,7 +2043,8 @@ impl App {
         let mut sizing_changed = false;
         ui.horizontal(|ui| {
             let menus = roots.len() == 1 && (can_hug || parent_al);
-            let wide = if menus { half(ui) - 22.0 } else { half(ui) };
+            // Two fields and two 18-point menu buttons, with the gaps between them, fill the row exactly.
+            let wide = if menus { (ui.max_rect().width() - 2.0 * 18.0 - 3.0 * ui.spacing().item_spacing.x) / 2.0 } else { half(ui) };
             for (axis, v, label) in [(0usize, &mut w, "W"), (1, &mut h, "H")] {
                 let shown = match (menus, sizing[axis]) {
                     (true, Sizing::Hug) => "W Hug",

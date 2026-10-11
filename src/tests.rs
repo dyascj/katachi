@@ -1651,4 +1651,15 @@ fn ui_look() {
     });
     h.run_steps(4);
     h.render().unwrap().save("target/look-variables.png").unwrap();
+    // An auto layout frame with a child, selected: the Design panel.
+    h.state_mut().show_variables = false;
+    let mut f = Node::new(Kind::Frame, r(0., 0., 300., 100.));
+    f.name = "Row".into();
+    let f = h.state_mut().doc.insert(0, None, None, f);
+    h.state_mut().doc.insert(0, Some(f), None, Node::new(Kind::Rectangle, r(10., 10., 40., 40.)));
+    h.state_mut().sel = vec![f];
+    h.state_mut().add_auto_layout();
+    h.state_mut().doc.node_mut(f).shadows.push(Default::default());
+    h.run_steps(4);
+    h.render().unwrap().save("target/look-autolayout.png").unwrap();
 }
