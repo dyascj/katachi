@@ -266,6 +266,17 @@ fn restart() {
 mod tests {
     use super::*;
 
+    /// `cargo test --release live_release -- --ignored`: the latest GitHub release offers this
+    /// platform's build, and its download matches its signature.
+    #[test]
+    #[ignore]
+    fn live_release_is_signed() {
+        let Some(State::Available { version, url, sig }) = check("0.0.1").unwrap() else { panic!("no release with a signed {ASSET}") };
+        let data = curl(&[&url]).unwrap();
+        assert!(verified(&data, &curl_text(&sig).unwrap()), "{version}: {ASSET} doesn't match its signature");
+        eprintln!("Katachi {version}: {ASSET} ({} MB) verified", data.len() >> 20);
+    }
+
     #[test]
     fn versions_compare_numerically() {
         assert!(newer("v0.2.0", "0.1.0"));
