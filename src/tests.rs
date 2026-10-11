@@ -1884,3 +1884,32 @@ fn vector_edit_panel_bends_and_moves_points() {
     h.run_steps(2);
     assert!(h.state().vector_edit.is_none());
 }
+
+#[test]
+fn crop_mode_zooms_and_pans_the_image() {
+    let mut doc = crate::doc::Document::default();
+    // Left half red, right half blue.
+    let img = image::RgbaImage::from_fn(100, 50, |x, _| if x < 50 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) });
+    let mut png = vec![];
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    doc.images.insert("two".into(), std::sync::Arc::new(png));
+    let mut n = Node::new(Kind::Rectangle, r(0., 0., 100., 50.));
+    let mut p = crate::doc::Paint::solid(crate::doc::Rgba::WHITE);
+    p.kind = crate::doc::PaintKind::Image;
+    p.image = "two".into();
+    p.scale_mode = crate::doc::ScaleMode::Crop;
+    p.tile_scale = 2.0;
+    p.from = pos2(1.0, 0.0);
+    n.fills = vec![p];
+    let id = doc.insert(0, None, None, n);
+    let out = image::load_from_memory(&crate::export::to_png(&doc, &[id], 1.0).unwrap()).unwrap().to_rgba8();
+    assert_eq!(out.get_pixel(5, 25).0[..3], [0, 0, 255], "zoomed 2x to the right half: blue at the left edge");
+    assert_eq!(out.get_pixel(95, 25).0[..3], [0, 0, 255]);
+    // Through the plugin API: Figma's imageTransform round-trips.
+    let v = crate::plugin_doc::node_json(&doc, id);
+    let t = &v["fills"][0]["imageTransform"];
+    assert!((t[0][0].as_f64().unwrap() - 0.5).abs() < 1e-4 && (t[0][2].as_f64().unwrap() - 0.5).abs() < 1e-4, "{t}");
+    let back = crate::plugin_doc::paint_from(&v["fills"][0], &doc, Some(egui::vec2(100.0, 50.0))).unwrap();
+    assert_eq!(back.scale_mode, crate::doc::ScaleMode::Crop);
+    assert!((back.tile_scale - 2.0).abs() < 1e-4 && (back.from.x - 1.0).abs() < 1e-4);
+}

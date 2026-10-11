@@ -232,13 +232,40 @@ fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEve
             }
             ui.horizontal(|ui| {
                 use crate::doc::ScaleMode;
-                for m in [ScaleMode::Fill, ScaleMode::Fit, ScaleMode::Stretch, ScaleMode::Tile] {
+                for m in [ScaleMode::Fill, ScaleMode::Fit, ScaleMode::Crop, ScaleMode::Stretch, ScaleMode::Tile] {
                     if ui.selectable_label(paint.scale_mode == m, format!("{m:?}")).clicked() && paint.scale_mode != m {
+                        // Crop starts from what Fill shows.
+                        if m == ScaleMode::Crop {
+                            paint.tile_scale = 1.0;
+                            paint.from = egui::Pos2::ZERO;
+                        }
                         paint.scale_mode = m;
                         ev = Some(PaintEvent::Changed);
                     }
                 }
             });
+            if paint.scale_mode == crate::doc::ScaleMode::Crop {
+                let mut zoom = paint.tile_scale * 100.0;
+                let (mut ox, mut oy) = (paint.from.x * 100.0, paint.from.y * 100.0);
+                ui.horizontal(|ui| {
+                    ui.add_sized([76.0, 18.0], egui::Label::new("Zoom"));
+                    if ui.add(egui::Slider::new(&mut zoom, 100.0..=800.0).suffix("%").logarithmic(true)).changed() {
+                        paint.tile_scale = zoom / 100.0;
+                        ev = Some(PaintEvent::Changed);
+                    }
+                });
+                for (v, label) in [(&mut ox, "Horizontal"), (&mut oy, "Vertical")] {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([76.0, 18.0], egui::Label::new(label));
+                        if ui.add(egui::Slider::new(v, -100.0..=100.0).show_value(false)).changed() {
+                            ev = Some(PaintEvent::Changed);
+                        }
+                    });
+                }
+                if matches!(ev, Some(PaintEvent::Changed)) {
+                    paint.from = egui::Pos2::new(ox / 100.0, oy / 100.0);
+                }
+            }
             ui.separator();
             let a = &mut paint.adjust;
             for (v, label) in [

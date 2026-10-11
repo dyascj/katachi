@@ -211,6 +211,16 @@ impl Svg<'_> {
                         self.defs,
                         r#"<pattern id="{id}" patternUnits="userSpaceOnUse" x="{x}" y="{y}" width="{iw}" height="{ih}"><image href="{href}" x="0" y="0" width="{iw}" height="{ih}" preserveAspectRatio="none"/></pattern>"#
                     );
+                } else if p.scale_mode == ScaleMode::Crop {
+                    // The crop window, as a viewBox over the image at its own pixel size.
+                    let dims = image::ImageReader::new(std::io::Cursor::new(bytes.as_slice())).with_guessed_format().ok().and_then(|r| r.into_dimensions().ok());
+                    let (iw, ih) = dims.map_or((w, h), |(a, b)| (a as f32, b as f32));
+                    let (c, span) = crate::doc::crop_window(p, egui::vec2(w, h), egui::vec2(iw, ih));
+                    let (vx, vy, vw, vh) = ((c.x - span.x / 2.0) * iw, (c.y - span.y / 2.0) * ih, span.x * iw, span.y * ih);
+                    let _ = write!(
+                        self.defs,
+                        r#"<pattern id="{id}" patternUnits="userSpaceOnUse" x="{x}" y="{y}" width="{w}" height="{h}"><svg x="0" y="0" width="{w}" height="{h}" viewBox="{vx} {vy} {vw} {vh}" preserveAspectRatio="none"><image href="{href}" width="{iw}" height="{ih}"/></svg></pattern>"#
+                    );
                 } else {
                     let aspect = match p.scale_mode {
                         ScaleMode::Fit => "xMidYMid meet",

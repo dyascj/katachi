@@ -881,6 +881,41 @@ pub enum ScaleMode {
     Fit,
     Stretch,
     Tile,
+    /// Figma's Crop: like Fill, zoomed by `tile_scale` (1 = cover) and shifted by `from`
+    /// (-1..1 of the room to move on each axis, 0 = centered).
+    Crop,
+}
+
+/// An embedded image's pixel size (read from its header).
+pub fn image_size(doc: &Document, key: &str) -> Option<Vec2> {
+    let bytes = doc.images.get(key)?;
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(bytes.as_slice())).with_guessed_format().ok()?.into_dimensions().ok()?;
+    Some(vec2(w as f32, h as f32))
+}
+
+/// Crop settings from Figma's imageTransform (layer unit square -> image unit square).
+pub fn crop_from_transform(p: &mut Paint, t: [[f32; 3]; 2], layer: Vec2, image: Vec2) {
+    let (a, d, tx, ty) = (t[0][0].max(1e-6), t[1][1].max(1e-6), t[0][2], t[1][2]);
+    let (la, ia) = (layer.x / layer.y.max(1e-6), image.x / image.y.max(1e-6));
+    let cover = if la > ia { vec2(1.0, ia / la) } else { vec2(la / ia, 1.0) };
+    p.scale_mode = ScaleMode::Crop;
+    p.tile_scale = (cover.x / a).max(cover.y / d).max(1.0);
+    let span = cover / p.tile_scale;
+    let c = pos2(tx + a / 2.0, ty + d / 2.0);
+    let off = |c: f32, s: f32| if 1.0 - s > 1e-6 { ((c - 0.5) / ((1.0 - s) / 2.0)).clamp(-1.0, 1.0) } else { 0.0 };
+    p.from = pos2(off(c.x, span.x), off(c.y, span.y));
+}
+
+/// The part of an image a Fill or Crop paint shows, in the image's unit square: center and size.
+pub fn crop_window(p: &Paint, layer: Vec2, image: Vec2) -> (Pos2, Vec2) {
+    let (la, ia) = (layer.x / layer.y.max(1e-6), image.x / image.y.max(1e-6));
+    let cover = if la > ia { vec2(1.0, ia / la) } else { vec2(la / ia, 1.0) };
+    if p.scale_mode != ScaleMode::Crop {
+        return (pos2(0.5, 0.5), cover);
+    }
+    let span = cover / p.tile_scale.max(1.0);
+    let c = pos2(0.5 + p.from.x.clamp(-1.0, 1.0) * (1.0 - span.x) / 2.0, 0.5 + p.from.y.clamp(-1.0, 1.0) * (1.0 - span.y) / 2.0);
+    (c, span)
 }
 
 /// A fill or stroke paint. For gradients and images, `color`'s alpha is the paint opacity.
