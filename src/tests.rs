@@ -1486,3 +1486,24 @@ fn compact_files_load_back_identical() {
     assert_eq!(d.nodes[&1].opacity, 1.0);
     assert!(d.nodes[&1].visible);
 }
+
+#[test]
+fn renaming_a_layer_hands_the_keyboard_back() {
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    for (finish, expect) in [(Key::Enter, "Card"), (Key::Escape, "Card")] {
+        h.state_mut().renaming = Some((id, h.state().doc.node(id).name.clone()));
+        h.run_steps(2);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+        h.event(Event::Text(if finish == Key::Enter { "Card".into() } else { "Nope".into() }));
+        h.run_steps(2);
+        key(&mut h, Modifiers::NONE, finish);
+        h.run_steps(2);
+        assert_eq!(h.state().doc.node(id).name, expect, "Enter commits, Escape cancels");
+        assert!(h.state().renaming.is_none());
+        // Shortcuts reach the canvas again.
+        key(&mut h, Modifiers::NONE, Key::O);
+        assert_eq!(h.state().tool, Tool::Ellipse, "after {finish:?}");
+        key(&mut h, Modifiers::NONE, Key::V);
+    }
+}

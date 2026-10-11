@@ -764,9 +764,12 @@ impl App {
             if let Some((pi, buf)) = &mut self.renaming_page
                 && *pi == i {
                     let r = ui.put(rect.shrink2(vec2(6.0, 3.0)), egui::TextEdit::singleline(buf));
-                    r.request_focus();
-                    if r.lost_focus() {
-                        let name = buf.trim().to_string();
+                    let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    if !r.has_focus() && !r.lost_focus() && !cancel {
+                        r.request_focus();
+                    }
+                    if r.lost_focus() || cancel {
+                        let name = if cancel { String::new() } else { buf.trim().to_string() };
                         self.renaming_page = None;
                         if !name.is_empty() && name != self.doc.pages[i].name {
                             self.checkpoint();
@@ -878,11 +881,19 @@ impl App {
                 let mut buf = self.renaming.as_ref().unwrap().1.clone();
                 let edit_rect = Rect::from_min_max(pos2(name_pos.x - 2.0, rect.min.y + 3.0), rect.max - vec2(48.0, 3.0));
                 let r = ui.put(edit_rect, egui::TextEdit::singleline(&mut buf));
-                r.request_focus();
+                // Focus once; Enter or clicking away commits, Escape cancels, and either way the
+                // keyboard goes back to the canvas.
+                let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                if !r.has_focus() && !r.lost_focus() && !cancel {
+                    r.request_focus();
+                }
                 self.renaming = Some((id, buf.clone()));
-                if r.lost_focus() {
+                if r.lost_focus() || cancel {
                     self.renaming = None;
-                    let name = buf.trim().to_string();
+                    if r.has_focus() {
+                        r.surrender_focus();
+                    }
+                    let name = if cancel { String::new() } else { buf.trim().to_string() };
                     if !name.is_empty() && name != self.doc.node(id).name {
                         self.checkpoint();
                         self.doc.node_mut(id).name = name;
