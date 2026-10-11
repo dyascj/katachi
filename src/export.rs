@@ -25,6 +25,17 @@ fn esc(s: &str) -> String {
 fn shape(n: &Node, o: Vec2, grow: f32, attrs: &str) -> String {
     let r = n.rect.translate(-o).expand(grow);
     match n.kind {
+        Kind::Ellipse if n.is_arc() => {
+            let d: String = n
+                .arc_outline(grow)
+                .iter()
+                .map(|poly| {
+                    let pts: Vec<String> = poly.iter().map(|p| format!("{} {}", p.x - o.x, p.y - o.y)).collect();
+                    format!("M{}Z", pts.join("L"))
+                })
+                .collect();
+            format!(r#"<path d="{d}" fill-rule="evenodd" {attrs}/>"#)
+        }
         Kind::Ellipse => format!(
             r#"<ellipse cx="{}" cy="{}" rx="{}" ry="{}" {attrs}/>"#,
             r.center().x,

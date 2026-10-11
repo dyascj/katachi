@@ -67,6 +67,17 @@ pub fn node_path(n: &Node, v: &View, grow: f32) -> Path {
             }
             b.end(true);
         }
+        Kind::Ellipse if n.is_arc() => {
+            for poly in n.arc_outline(grow / v.zoom) {
+                let q = v.to_screen(poly[0]);
+                b.begin(point(q.x, q.y));
+                for p in &poly[1..] {
+                    let q = v.to_screen(*p);
+                    b.line_to(point(q.x, q.y));
+                }
+                b.end(true);
+            }
+        }
         Kind::Ellipse => {
             let c = r.center();
             b.add_ellipse(

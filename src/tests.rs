@@ -1662,6 +1662,17 @@ fn ui_look() {
     h.state_mut().doc.node_mut(f).shadows.push(Default::default());
     h.run_steps(4);
     h.render().unwrap().save("target/look-autolayout.png").unwrap();
+    // Arcs: a dial ring, a donut slice and a pie, selected.
+    let mut ids = vec![];
+    for (i, arc) in [[0.0, 360.0, 0.8], [135.0, 270.0, 0.7], [-90.0, 120.0, 0.0]].into_iter().enumerate() {
+        let mut e = Node::new(Kind::Ellipse, r(400. + i as f32 * 160., 0., 140., 140.));
+        e.arc = Some(arc);
+        e.fills = vec![crate::doc::Paint::solid(crate::doc::Rgba::rgb(0x8E, 0x72, 0xFF))];
+        ids.push(h.state_mut().doc.insert(0, None, None, e));
+    }
+    h.state_mut().sel = vec![ids[1]];
+    h.run_steps(4);
+    h.render().unwrap().save("target/look-arcs.png").unwrap();
 }
 
 #[test]
@@ -1672,4 +1683,26 @@ fn layer_rows_and_pages_are_named_for_assistive_tech() {
     assert!(h.query_by_label("Rectangle 1").is_some(), "layer row");
     assert!(h.query_by_label("Page 1").is_some(), "page row");
     assert!(h.query_by_label("Main menu").is_some(), "icon buttons");
+}
+
+#[test]
+fn ellipse_arcs_draw_rings_and_slices() {
+    let mut doc = crate::doc::Document::default();
+    crate::plugins::run(&mut doc, 0, &[], r##"
+        const ring = figma.createEllipse(); ring.name = "Ring"; ring.resize(100, 100);
+        ring.arcData = { startingAngle: 0, endingAngle: 2 * Math.PI, innerRadius: 0.8 };
+        const pie = figma.createEllipse(); pie.name = "Pie"; pie.resize(100, 100); pie.x = 200;
+        pie.arcData = { startingAngle: 0, endingAngle: Math.PI / 2, innerRadius: 0 };
+    "##).unwrap();
+    let get = |name: &str| doc.nodes.values().find(|n| n.name == name).unwrap().clone();
+    let (ring, pie) = (get("Ring"), get("Pie"));
+    assert_eq!(ring.arc, Some([0.0, 360.0, 0.8]));
+    assert!(pie.arc.is_some_and(|a| (a[1] - 90.0).abs() < 0.01));
+    // The ring's hole and the slice's empty quarters don't hit; their solid parts do.
+    let hit = |n: &crate::doc::Node, x: f32, y: f32| doc.hit_self(n, pos2(x, y), 0.0);
+    assert!(hit(&ring, 5.0, 50.0) && !hit(&ring, 50.0, 50.0));
+    assert!(hit(&pie, 270.0, 70.0), "lower-right quarter (clockwise from 3 o'clock)");
+    assert!(!hit(&pie, 230.0, 30.0), "upper-left is empty");
+    let svg = crate::export::to_svg(&doc, &[ring.id]);
+    assert!(svg.contains("fill-rule=\"evenodd\"") && svg.contains("<path"), "{svg}");
 }

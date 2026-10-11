@@ -1536,6 +1536,27 @@ impl App {
             ui.separator();
             self.layout_guides(ui, n.id);
         }
+        if n.kind == Kind::Ellipse {
+            // Figma's arc controls: start angle, sweep (as a percentage of a full turn), ratio.
+            let [mut start, sweep, ratio] = n.arc.unwrap_or([0.0, 360.0, 0.0]);
+            let (mut sweep_pct, mut ratio_pct) = (sweep / 3.6, ratio * 100.0);
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                ui.label("Arc");
+                changed |= ui.add(DragValue::new(&mut start).speed(1.0).suffix("°")).on_hover_text("Start").changed();
+                changed |= ui.add(DragValue::new(&mut sweep_pct).range(-100.0..=100.0).speed(0.5).suffix("%")).on_hover_text("Sweep").changed();
+                changed |= ui.add(DragValue::new(&mut ratio_pct).range(0.0..=99.0).speed(0.5).suffix("%")).on_hover_text("Ratio").changed();
+            });
+            if changed {
+                self.begin_edit();
+                let arc = [start.rem_euclid(360.0), sweep_pct * 3.6, ratio_pct / 100.0];
+                for &id in &self.sel.clone() {
+                    if self.doc.node(id).kind == Kind::Ellipse {
+                        self.doc.node_mut(id).arc = (arc != [0.0, 360.0, 0.0]).then_some(arc);
+                    }
+                }
+            }
+        }
         if matches!(n.kind, Kind::Polygon | Kind::Star) {
             let (mut count, mut ratio) = (n.point_count as f32, n.inner_ratio * 100.0);
             let mut changed = false;

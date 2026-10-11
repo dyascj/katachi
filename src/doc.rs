@@ -1128,6 +1128,10 @@ pub struct Node {
     /// Star inner radius as a fraction of the outer.
     #[serde(skip_serializing_if = "dflt::inner_ratio")]
     pub inner_ratio: f32,
+    /// Ellipse arc, as in Figma: start angle and sweep in degrees (clockwise from 3 o'clock) and
+    /// the inner radius as a fraction of the outer. None draws the whole ellipse.
+    #[serde(skip_serializing_if = "dflt::arc")]
+    pub arc: Option<[f32; 3]>,
     #[serde(skip_serializing_if = "dflt::clip")]
     pub clip: bool,
     #[serde(skip_serializing_if = "dflt::shadows")]
@@ -1280,6 +1284,7 @@ mod dflt {
         end_marker: Marker,
         point_count: u32,
         inner_ratio: f32,
+        arc: Option<[f32; 3]>,
         clip: bool,
         shadows: Vec<Shadow>,
         layout: AutoLayout,
@@ -1362,6 +1367,7 @@ impl Default for Node {
             end_marker: Marker::None,
             point_count: 5,
             inner_ratio: 0.382,
+            arc: None,
             clip: false,
             shadows: vec![],
             layout: AutoLayout::default(),
@@ -1495,6 +1501,42 @@ impl Node {
     }
 
     /// Unrotated outline of polygons and stars, in world space.
+    /// An ellipse with a partial sweep or a hole.
+    pub fn is_arc(&self) -> bool {
+        self.kind == Kind::Ellipse && self.arc.is_some_and(|a| a != [0.0, 360.0, 0.0])
+    }
+
+    /// An arc ellipse's outline, as closed polygons: the outer arc, then the inner arc back (a
+    /// ring or donut slice) or the center (a pie slice). A full ring is two loops, the inner one
+    /// reversed so it's a hole under either fill rule. `grow` widens the radii (stroke alignment).
+    pub fn arc_outline(&self, grow: f32) -> Vec<Vec<Pos2>> {
+        let [start, sweep, ratio] = self.arc.unwrap_or([0.0, 360.0, 0.0]);
+        let sweep = sweep.clamp(-360.0, 360.0);
+        let c = self.rect.center();
+        let (rx, ry) = (self.rect.width() / 2.0 + grow, self.rect.height() / 2.0 + grow);
+        let (irx, iry) = ((self.rect.width() / 2.0 * ratio - grow).max(0.0), (self.rect.height() / 2.0 * ratio - grow).max(0.0));
+        let n = ((sweep.abs() / 360.0) * 96.0).ceil().max(8.0) as usize;
+        let at = |i: usize, a: f32, b: f32| {
+            let t = (start + sweep * i as f32 / n as f32).to_radians();
+            c + vec2(a * t.cos(), b * t.sin())
+        };
+        let hole = ratio > 0.0 && irx > 0.0 && iry > 0.0;
+        if sweep.abs() >= 359.99 {
+            let mut loops = vec![(0..n).map(|i| at(i, rx, ry)).collect::<Vec<_>>()];
+            if hole {
+                loops.push((0..n).rev().map(|i| at(i, irx, iry)).collect());
+            }
+            return loops;
+        }
+        let mut p: Vec<Pos2> = (0..=n).map(|i| at(i, rx, ry)).collect();
+        if hole {
+            p.extend((0..=n).rev().map(|i| at(i, irx, iry)));
+        } else {
+            p.push(c);
+        }
+        vec![p]
+    }
+
     pub fn star_points(&self) -> Vec<Pos2> {
         let r = self.rect;
         let (c, rx, ry) = (r.center(), r.width() / 2.0, r.height() / 2.0);
@@ -2914,7 +2956,7 @@ impl Document {
         None
     }
 
-    fn hit_self(&self, n: &Node, p: Pos2, tol: f32) -> bool {
+    pub fn hit_self(&self, n: &Node, p: Pos2, tol: f32) -> bool {
         let p = n.to_local(p);
         match n.kind {
             Kind::Group | Kind::Boolean => false,
@@ -2925,6 +2967,10 @@ impl Document {
             Kind::Polygon | Kind::Star => {
                 let pts = n.star_points();
                 contains(&[(pts, true)], p, false)
+            }
+            Kind::Ellipse if n.is_arc() => {
+                let polys: Vec<(Vec<Pos2>, bool)> = n.arc_outline(tol).into_iter().map(|p| (p, true)).collect();
+                contains(&polys, p, true)
             }
             Kind::Ellipse => {
                 let c = n.rect.center();

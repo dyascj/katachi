@@ -522,6 +522,10 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
         v["maxLines"] = if n.max_lines > 0 { json!(n.max_lines) } else { Value::Null };
         v["textStyleId"] = json!(n.text_style.map(|s| format!("S:{s}")).unwrap_or_default());
     }
+    if n.kind == Kind::Ellipse {
+        let [start, sweep, ratio] = n.arc.unwrap_or([0.0, 360.0, 0.0]);
+        v["arcData"] = json!({ "startingAngle": start.to_radians(), "endingAngle": (start + sweep).to_radians(), "innerRadius": ratio });
+    }
     if matches!(n.kind, Kind::Polygon | Kind::Star) {
         v["pointCount"] = json!(n.point_count);
         v["innerRadius"] = json!(n.inner_ratio);
@@ -1092,6 +1096,14 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
             }
             n.spans = style_range(&n.spans, len, a.min(len), b.min(len), &st);
         }
+    }
+    if changed("arcData") && n.kind == Kind::Ellipse {
+        let a = &v["arcData"];
+        let f = |k: &str, d: f32| a[k].as_f64().map_or(d, |x| x as f32);
+        let start = f("startingAngle", 0.0).to_degrees();
+        let sweep = (f("endingAngle", std::f32::consts::TAU).to_degrees() - start).clamp(-360.0, 360.0);
+        let arc = [start.rem_euclid(360.0), sweep, f("innerRadius", 0.0).clamp(0.0, 0.99)];
+        n.arc = (arc != [0.0, 360.0, 0.0]).then_some(arc);
     }
     if changed("pointCount") {
         n.point_count = v["pointCount"].as_u64().unwrap_or(5).clamp(3, 60) as u32;
