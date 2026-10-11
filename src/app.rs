@@ -1138,7 +1138,10 @@ impl App {
             let parent = self.frame_at(pts[0].p, &[]);
             let id = self.doc.insert(self.page, parent, None, Node::vector(&pts, closed));
             self.sel = vec![id];
-            self.tool = Tool::Move;
+            // Closing a path keeps the pen, as in Figma: Escape then leaves it with the path selected.
+            if !closed {
+                self.tool = Tool::Move;
+            }
         }
     }
 

@@ -1550,6 +1550,8 @@ fn figma_details_from_the_audit() {
     assert_eq!(sel.len(), 1);
     assert_eq!(h.state().doc.node(sel[0]).kind, Kind::Vector, "the new path, not its frame");
     assert_eq!(h.state().doc.node(sel[0]).parent, Some(f));
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    assert_eq!((h.state().tool, h.state().sel.clone()), (Tool::Move, sel), "Escape leaves the pen with the path still selected");
 
     // Frame presets.
     let ctx = h.ctx.clone();
