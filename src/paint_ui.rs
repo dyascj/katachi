@@ -279,11 +279,20 @@ pub fn shadow_row(ui: &mut Ui, id: egui::Id, s: &mut Shadow) -> (bool, bool) {
         let open = ui.add(egui::Button::new(s.kind.label()).frame(false));
         Popup::menu(&open).id(id.with("popup")).close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
             ui.set_width(230.0);
-            egui::ComboBox::from_id_salt(id.with("kind")).selected_text(s.kind.label()).show_ui(ui, |ui| {
-                for k in [EffectKind::DropShadow, EffectKind::InnerShadow, EffectKind::LayerBlur, EffectKind::BackgroundBlur] {
-                    changed |= ui.selectable_value(&mut s.kind, k, k.label()).changed();
+            // The type picker sits in the editor itself: a dropdown here opens a second popup,
+            // and clicking in it would count as a click outside and close the editor.
+            egui::Grid::new(id.with("kind")).num_columns(2).spacing([4.0, 4.0]).show(ui, |ui| {
+                for (i, k) in [EffectKind::DropShadow, EffectKind::InnerShadow, EffectKind::LayerBlur, EffectKind::BackgroundBlur].into_iter().enumerate() {
+                    changed |= ui.add_sized([108.0, 22.0], egui::Button::selectable(s.kind == k, k.label())).clicked() && {
+                        s.kind = k;
+                        true
+                    };
+                    if i % 2 == 1 {
+                        ui.end_row();
+                    }
                 }
             });
+            ui.separator();
             egui::Grid::new(id.with("grid")).num_columns(4).show(ui, |ui| {
                 let mut field = |ui: &mut Ui, label: &str, v: &mut f32, min: f32| {
                     ui.label(label);

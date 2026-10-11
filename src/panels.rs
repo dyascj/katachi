@@ -510,6 +510,12 @@ const FRAME_PRESETS: &[(&str, &[(&str, u32, u32)])] = &[
     ("Social media", &[("Twitter post", 1200, 675), ("Facebook post", 1200, 630), ("Instagram post", 1080, 1350), ("Instagram story", 1080, 1920), ("LinkedIn post", 1200, 1200), ("YouTube thumbnail", 1280, 720), ("Dribbble shot", 400, 300)]),
 ];
 
+/// A dropdown inside a popover. egui's ComboBox opens its own popup, and a click there counts as
+/// outside the popover and closes it; a menu submenu belongs to the popover instead.
+fn dropdown(ui: &mut Ui, text: impl std::fmt::Display, add: impl FnOnce(&mut Ui)) {
+    ui.menu_button(text.to_string(), add);
+}
+
 fn heading(ui: &mut Ui, title: &str) {
     ui.add_space(4.0);
     ui.label(RichText::new(title).strong());
@@ -1205,7 +1211,7 @@ impl App {
                             Trigger::WhilePressed => "While pressing".into(),
                             Trigger::AfterDelay(ms) => format!("After delay {ms}ms"),
                         };
-                        egui::ComboBox::from_id_salt(pid.with("trig")).selected_text(t_label(&r.trigger)).show_ui(ui, |ui| {
+                        dropdown(ui, t_label(&r.trigger), |ui| {
                             for t in [Trigger::OnClick, Trigger::OnHover, Trigger::WhilePressed, Trigger::AfterDelay(800)] {
                                 let label = t_label(&t);
                                 ui.selectable_value(&mut r.trigger, t, label);
@@ -1227,7 +1233,7 @@ impl App {
                             Action::OpenUrl(_) => "Open link",
                         };
                         let first = frames.iter().copied().find(|f| *f != top).unwrap_or(top);
-                        egui::ComboBox::from_id_salt(pid.with("act")).selected_text(a_label).show_ui(ui, |ui| {
+                        dropdown(ui, a_label, |ui| {
                             ui.selectable_value(&mut r.action, Action::Navigate(first), "Navigate to");
                             ui.selectable_value(&mut r.action, Action::Back, "Back");
                             ui.selectable_value(&mut r.action, Action::OpenOverlay(first), "Open overlay");
@@ -1239,7 +1245,7 @@ impl App {
                         match &mut r.action {
                             Action::Navigate(dest) | Action::OpenOverlay(dest) => {
                                 ui.label("Destination");
-                                egui::ComboBox::from_id_salt(pid.with("dest")).selected_text(name(&self.doc, *dest)).show_ui(ui, |ui| {
+                                dropdown(ui, name(&self.doc, *dest), |ui| {
                                     for &f in &frames {
                                         ui.selectable_value(dest, f, name(&self.doc, f));
                                     }
@@ -1263,7 +1269,7 @@ impl App {
                                 TransitionKind::Push => "Push",
                                 TransitionKind::SlideIn => "Slide in",
                             };
-                            egui::ComboBox::from_id_salt(pid.with("kind")).selected_text(k_label(r.transition.kind)).show_ui(ui, |ui| {
+                            dropdown(ui, k_label(r.transition.kind), |ui| {
                                 for k in [TransitionKind::Instant, TransitionKind::Dissolve, TransitionKind::SmartAnimate, TransitionKind::MoveIn, TransitionKind::Push, TransitionKind::SlideIn] {
                                     ui.selectable_value(&mut r.transition.kind, k, k_label(k));
                                 }
@@ -2672,7 +2678,7 @@ impl App {
                             ui.add(DragValue::new(&mut g.count).range(1..=100));
                             ui.end_row();
                             ui.label("Type");
-                            egui::ComboBox::from_id_salt(("grid-align", id, i)).selected_text(format!("{:?}", g.align)).show_ui(ui, |ui| {
+                            dropdown(ui, format!("{:?}", g.align), |ui| {
                                 for a in [GridAlign::Stretch, GridAlign::Min, GridAlign::Center, GridAlign::Max] {
                                     ui.selectable_value(&mut g.align, a, format!("{a:?}"));
                                 }
