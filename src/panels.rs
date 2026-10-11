@@ -553,6 +553,10 @@ impl App {
                 }
             });
             ui.separator();
+            if self.find.0 {
+                self.find_panel(ui);
+                return;
+            }
             if self.left_tab_assets {
                 self.assets(ui);
                 return;
@@ -1334,6 +1338,10 @@ impl App {
 
     pub fn right_panel(&mut self, ui: &mut Ui) {
         egui::Panel::right("right").resizable(false).exact_size(248.0).show(ui, |ui| {
+            if self.show_history {
+                self.history_panel(ui);
+                return;
+            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if self.dev_mode {

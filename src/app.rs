@@ -1394,23 +1394,26 @@ impl App {
     }
 
     /// File > Version history: every save of this file, restorable (undoably).
-    fn history_window(&mut self, ctx: &egui::Context) {
-        if !self.show_history {
-            return;
-        }
-        let Some(path) = self.path.clone() else {
-            self.show_history = false;
-            self.toast("Save the file to start its version history".into());
-            return;
-        };
+    /// Version history, shown in place of the Design panel, as in Figma.
+    pub fn history_panel(&mut self, ui: &mut egui::Ui) {
         let mut open = true;
         let mut restore = None;
-        crate::chrome::window(ctx, "Version history", &mut open, 300.0, |ui| {
+        if crate::chrome::header(ui, "Version history") {
+            open = false;
+        }
+        ui.add_space(8.0);
+        match self.path.clone() {
+            None => {
+                ui.label(egui::RichText::new("Save the file to start its version history.").color(crate::appearance::muted(ui.ctx())));
+            }
+            Some(path) => {
+            ui.label(egui::RichText::new("Each save is kept. Restore one to bring it back as a change you can undo.").small().color(crate::appearance::muted(ui.ctx())));
+            ui.add_space(6.0);
             let versions = crate::files::versions(&path);
             if versions.is_empty() {
                 ui.label("No saved versions yet.");
             }
-            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 for (i, (p, age)) in versions.iter().enumerate() {
                     let when = match age {
                         0..=59 => "Just now".to_string(),
@@ -1428,7 +1431,8 @@ impl App {
                     });
                 }
             });
-        });
+            }
+        }
         if let Some(p) = restore {
             let doc = std::fs::read_to_string(&p)
                 .ok()
@@ -1661,10 +1665,10 @@ impl App {
         self.plugin = Some(run);
     }
 
-    fn find_window(&mut self, ctx: &egui::Context) {
-        if !self.find.0 {
-            return;
-        }
+    /// Find and replace (Cmd F), shown in place of Pages and Layers, as in Figma.
+    pub fn find_panel(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         let mut open = true;
         let (mut jump, mut replace) = (None, false);
         let q = self.find.1.trim().to_lowercase();
@@ -1683,8 +1687,19 @@ impl App {
             }
             hits
         };
-        crate::chrome::window(ctx, "Find and replace", &mut open, 320.0, |ui| {
+        {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Find").strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if crate::chrome::close_button(ui).on_hover_text("Close (Esc)").clicked() {
+                        open = false;
+                    }
+                });
+            });
             let r = ui.add(egui::TextEdit::singleline(&mut self.find.1).hint_text("Find layers and text").desired_width(f32::INFINITY));
+            if r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                open = false;
+            }
             if std::mem::take(&mut self.find.3) {
                 r.request_focus();
             }
@@ -1696,7 +1711,7 @@ impl App {
             if !q.is_empty() {
                 ui.label(egui::RichText::new(format!("{} results", hits.len())).weak());
             }
-            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 for &(pi, id) in hits.iter().take(500) {
                     let n = self.doc.node(id);
                     let detail = if n.kind == Kind::Text && n.text.to_lowercase().contains(&q) { n.text.lines().find(|l| l.to_lowercase().contains(&q)).unwrap_or("").to_string() } else { String::new() };
@@ -1707,7 +1722,7 @@ impl App {
                     }
                 }
             });
-        });
+        }
         if let Some((pi, id)) = jump {
             self.select_page(pi);
             self.sel = vec![id];
@@ -2303,9 +2318,7 @@ impl eframe::App for App {
         }
         self.collab_window(&ctx);
         self.recovery_prompt(&ctx);
-        self.history_window(&ctx);
         self.console_window(&ctx);
-        self.find_window(&ctx);
         self.quick_actions(&ctx);
         self.plugin_frame(&ctx, frame);
         self.appearance_frame(&ctx, frame);

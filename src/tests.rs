@@ -1987,3 +1987,28 @@ fn main_menu_follows_figma() {
         assert!(h.query_all_by_label_contains(label).next().is_some(), "{label}");
     }
 }
+
+#[test]
+fn find_and_version_history_take_over_their_panels() {
+    let mut h = harness();
+    let mut t = Node::new(Kind::Text, r(0., 0., 80., 20.));
+    t.text = "Checkout".into();
+    t.name = "Label".into();
+    let t = h.state_mut().doc.insert(0, None, None, t);
+    key(&mut h, Modifiers::COMMAND, Key::F);
+    h.run_steps(2);
+    assert!(h.query_by_label("Layers").is_none(), "Find replaces Pages and Layers");
+    h.event(Event::Text("check".into()));
+    h.run_steps(2);
+    h.get_by_label("Label  \u{201C}Checkout\u{201D}").click();
+    h.run_steps(2);
+    assert_eq!(h.state().sel, vec![t]);
+    h.state_mut().find.0 = false;
+    h.state_mut().show_history = true;
+    h.run_steps(2);
+    assert!(h.query_by_label("Version history").is_some());
+    assert!(h.query_by_label("Design").is_none(), "replaces the Design panel");
+    h.get_by_label("Close").click();
+    h.run_steps(2);
+    assert!(!h.state().show_history);
+}
