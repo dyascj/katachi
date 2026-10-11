@@ -881,6 +881,41 @@ pub enum ScaleMode {
     Fit,
     Stretch,
     Tile,
+    /// Figma's Crop: like Fill, zoomed by `tile_scale` (1 = cover) and shifted by `from`
+    /// (-1..1 of the room to move on each axis, 0 = centered).
+    Crop,
+}
+
+/// An embedded image's pixel size (read from its header).
+pub fn image_size(doc: &Document, key: &str) -> Option<Vec2> {
+    let bytes = doc.images.get(key)?;
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(bytes.as_slice())).with_guessed_format().ok()?.into_dimensions().ok()?;
+    Some(vec2(w as f32, h as f32))
+}
+
+/// Crop settings from Figma's imageTransform (layer unit square -> image unit square).
+pub fn crop_from_transform(p: &mut Paint, t: [[f32; 3]; 2], layer: Vec2, image: Vec2) {
+    let (a, d, tx, ty) = (t[0][0].max(1e-6), t[1][1].max(1e-6), t[0][2], t[1][2]);
+    let (la, ia) = (layer.x / layer.y.max(1e-6), image.x / image.y.max(1e-6));
+    let cover = if la > ia { vec2(1.0, ia / la) } else { vec2(la / ia, 1.0) };
+    p.scale_mode = ScaleMode::Crop;
+    p.tile_scale = (cover.x / a).max(cover.y / d).max(1.0);
+    let span = cover / p.tile_scale;
+    let c = pos2(tx + a / 2.0, ty + d / 2.0);
+    let off = |c: f32, s: f32| if 1.0 - s > 1e-6 { ((c - 0.5) / ((1.0 - s) / 2.0)).clamp(-1.0, 1.0) } else { 0.0 };
+    p.from = pos2(off(c.x, span.x), off(c.y, span.y));
+}
+
+/// The part of an image a Fill or Crop paint shows, in the image's unit square: center and size.
+pub fn crop_window(p: &Paint, layer: Vec2, image: Vec2) -> (Pos2, Vec2) {
+    let (la, ia) = (layer.x / layer.y.max(1e-6), image.x / image.y.max(1e-6));
+    let cover = if la > ia { vec2(1.0, ia / la) } else { vec2(la / ia, 1.0) };
+    if p.scale_mode != ScaleMode::Crop {
+        return (pos2(0.5, 0.5), cover);
+    }
+    let span = cover / p.tile_scale.max(1.0);
+    let c = pos2(0.5 + p.from.x.clamp(-1.0, 1.0) * (1.0 - span.x) / 2.0, 0.5 + p.from.y.clamp(-1.0, 1.0) * (1.0 - span.y) / 2.0);
+    (c, span)
 }
 
 /// A fill or stroke paint. For gradients and images, `color`'s alpha is the paint opacity.
@@ -888,26 +923,26 @@ pub enum ScaleMode {
 pub struct Paint {
     pub color: Rgba,
     pub visible: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub kind: PaintKind,
     /// Gradient stops: position in 0..=1 and color.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub stops: Vec<(f32, Rgba)>,
     /// Gradient handles in the layer's unit square: linear start/end, or radial center/edge.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub from: Pos2,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub to: Pos2,
     /// Key into `Document::images`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub image: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub scale_mode: ScaleMode,
     /// Tile size relative to the image's pixels.
-    #[serde(default = "one")]
+    #[serde(default = "one", skip_serializing_if = "is_one")]
     pub tile_scale: f32,
     /// Image paints: color adjustments.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub adjust: ImageAdjust,
 }
 
@@ -1077,106 +1112,268 @@ impl Default for Shadow {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Node {
+    #[serde(skip_serializing_if = "dflt::id")]
     pub id: NodeId,
+    #[serde(skip_serializing_if = "dflt::name")]
     pub name: String,
+    #[serde(skip_serializing_if = "dflt::kind")]
     pub kind: Kind,
+    #[serde(skip_serializing_if = "dflt::parent")]
     pub parent: Option<NodeId>,
+    #[serde(skip_serializing_if = "dflt::children")]
     pub children: Vec<NodeId>,
+    #[serde(skip_serializing_if = "dflt::rect")]
     pub rect: Rect,
     /// Degrees counter-clockwise around the rect center, as shown in Figma.
+    #[serde(skip_serializing_if = "dflt::rotation")]
     pub rotation: f32,
+    #[serde(skip_serializing_if = "dflt::visible")]
     pub visible: bool,
+    #[serde(skip_serializing_if = "dflt::locked")]
     pub locked: bool,
+    #[serde(skip_serializing_if = "dflt::opacity")]
     pub opacity: f32,
+    #[serde(skip_serializing_if = "dflt::fills")]
     pub fills: Vec<Paint>,
+    #[serde(skip_serializing_if = "dflt::strokes")]
     pub strokes: Vec<Paint>,
+    #[serde(skip_serializing_if = "dflt::stroke_width")]
     pub stroke_width: f32,
+    #[serde(skip_serializing_if = "dflt::stroke_align")]
     pub stroke_align: StrokeAlign,
+    #[serde(skip_serializing_if = "dflt::radius")]
     pub radius: f32,
     /// Independent corners: top-left, top-right, bottom-right, bottom-left.
+    #[serde(skip_serializing_if = "dflt::corner_radii")]
     pub corner_radii: Option<[f32; 4]>,
     /// Dash pattern (dash, gap, ...); empty = solid.
+    #[serde(skip_serializing_if = "dflt::dash")]
     pub dash: Vec<f32>,
+    #[serde(skip_serializing_if = "dflt::cap")]
     pub cap: Cap,
+    #[serde(skip_serializing_if = "dflt::join")]
     pub join: Join,
+    #[serde(skip_serializing_if = "dflt::start_marker")]
     pub start_marker: Marker,
+    #[serde(skip_serializing_if = "dflt::end_marker")]
     pub end_marker: Marker,
     /// Polygon sides / star points.
+    #[serde(skip_serializing_if = "dflt::point_count")]
     pub point_count: u32,
     /// Star inner radius as a fraction of the outer.
+    #[serde(skip_serializing_if = "dflt::inner_ratio")]
     pub inner_ratio: f32,
+    /// Ellipse arc, as in Figma: start angle and sweep in degrees (clockwise from 3 o'clock) and
+    /// the inner radius as a fraction of the outer. None draws the whole ellipse.
+    #[serde(skip_serializing_if = "dflt::arc")]
+    pub arc: Option<[f32; 3]>,
+    #[serde(skip_serializing_if = "dflt::clip")]
     pub clip: bool,
+    #[serde(skip_serializing_if = "dflt::shadows")]
     pub shadows: Vec<Shadow>,
+    #[serde(skip_serializing_if = "dflt::layout")]
     pub layout: AutoLayout,
     /// Horizontal, vertical.
+    #[serde(skip_serializing_if = "dflt::sizing")]
     pub sizing: [Sizing; 2],
     /// Rectangles and frames: individual stroke weights (top, right, bottom, left).
+    #[serde(skip_serializing_if = "dflt::stroke_sides")]
     pub stroke_sides: Option<[f32; 4]>,
     /// Min and max width/height for hugging and filling layers.
+    #[serde(skip_serializing_if = "dflt::min_size")]
     pub min_size: [Option<f32>; 2],
+    #[serde(skip_serializing_if = "dflt::max_size")]
     pub max_size: [Option<f32>; 2],
+    #[serde(skip_serializing_if = "dflt::constraints")]
     pub constraints: [Constraint; 2],
     /// Ignores the parent's auto layout.
+    #[serde(skip_serializing_if = "dflt::absolute")]
     pub absolute: bool,
+    #[serde(skip_serializing_if = "dflt::bool_op")]
     pub bool_op: BoolOp,
     /// Clips the layers above it in the same parent.
+    #[serde(skip_serializing_if = "dflt::is_mask")]
     pub is_mask: bool,
+    #[serde(skip_serializing_if = "dflt::grids")]
     pub grids: Vec<LayoutGrid>,
+    #[serde(skip_serializing_if = "dflt::exports")]
     pub exports: Vec<ExportSetting>,
+    #[serde(skip_serializing_if = "dflt::blend")]
     pub blend: BlendMode,
     /// Prototype interactions.
+    #[serde(skip_serializing_if = "dflt::reactions")]
     pub reactions: Vec<Reaction>,
     /// Properties driven by variables.
+    #[serde(skip_serializing_if = "dflt::bindings")]
     pub bindings: Vec<(Bindable, VarId)>,
     /// Explicit variable modes set on this layer: (collection, mode index); children inherit.
+    #[serde(skip_serializing_if = "dflt::modes")]
     pub modes: Vec<(u64, usize)>,
     /// Linked shared styles.
+    #[serde(skip_serializing_if = "dflt::fill_style")]
     pub fill_style: Option<StyleId>,
+    #[serde(skip_serializing_if = "dflt::stroke_style")]
     pub stroke_style: Option<StyleId>,
+    #[serde(skip_serializing_if = "dflt::text_style")]
     pub text_style: Option<StyleId>,
+    #[serde(skip_serializing_if = "dflt::effect_style")]
     pub effect_style: Option<StyleId>,
     /// Components and sets: property definitions.
+    #[serde(skip_serializing_if = "dflt::comp_props")]
     pub comp_props: Vec<CompProp>,
     /// A layer inside a component bound to a property.
     #[serde(deserialize_with = "one_or_many_binds")]
+    #[serde(skip_serializing_if = "dflt::prop_bind")]
     pub prop_bind: Vec<(String, PropTarget)>,
     /// Instances: chosen property values (missing = the default).
+    #[serde(skip_serializing_if = "dflt::prop_values")]
     pub prop_values: Vec<(String, PropValue)>,
     /// Instances: the main component they copy.
+    #[serde(skip_serializing_if = "dflt::component")]
     pub component: Option<NodeId>,
     /// Inside an instance (and the instance itself): the component layer this mirrors.
+    #[serde(skip_serializing_if = "dflt::source")]
     pub source: Option<NodeId>,
     /// The source's values as last copied; a property that differs from this is an override.
+    #[serde(skip_serializing_if = "dflt::synced")]
     pub synced: Option<Box<Node>>,
+    #[serde(skip_serializing_if = "dflt::paths")]
     pub paths: Vec<SubPath>,
     /// Even-odd fill rule (holes by parity) instead of non-zero winding.
+    #[serde(skip_serializing_if = "dflt::even_odd")]
     pub even_odd: bool,
+    #[serde(skip_serializing_if = "dflt::text")]
     pub text: String,
+    #[serde(skip_serializing_if = "dflt::font_size")]
     pub font_size: f32,
+    #[serde(skip_serializing_if = "dflt::font_weight")]
     pub font_weight: u16,
+    #[serde(skip_serializing_if = "dflt::font_family")]
     pub font_family: String,
+    #[serde(skip_serializing_if = "dflt::text_sizing")]
     pub text_sizing: TextSizing,
+    #[serde(skip_serializing_if = "dflt::text_align")]
     pub text_align: TextAlign,
+    #[serde(skip_serializing_if = "dflt::text_valign")]
     pub text_valign: VAlign,
+    #[serde(skip_serializing_if = "dflt::line_height")]
     pub line_height: LineHeight,
     /// Percent of the font size.
+    #[serde(skip_serializing_if = "dflt::letter_spacing")]
     pub letter_spacing: f32,
+    #[serde(skip_serializing_if = "dflt::decoration")]
     pub decoration: Decoration,
+    #[serde(skip_serializing_if = "dflt::text_case")]
     pub text_case: TextCase,
     /// Extra space after each paragraph.
+    #[serde(skip_serializing_if = "dflt::paragraph_spacing")]
     pub paragraph_spacing: f32,
     /// End overflowing text with an ellipsis.
+    #[serde(skip_serializing_if = "dflt::truncate")]
     pub truncate: bool,
     /// With truncation on: lines before the ellipsis (0 = as many as fit).
+    #[serde(skip_serializing_if = "dflt::max_lines")]
     pub max_lines: u32,
     /// Styled character ranges (rich text).
+    #[serde(skip_serializing_if = "dflt::spans")]
     pub spans: Vec<TextSpan>,
     /// List formatting per paragraph (missing paragraphs are plain).
+    #[serde(skip_serializing_if = "dflt::lists")]
     pub lists: Vec<ListLine>,
     /// Wrapped lines from the last layout, used by export.
     #[serde(skip)]
     pub lines: Vec<String>,
+    #[serde(skip_serializing_if = "dflt::expanded")]
     pub expanded: bool,
+}
+
+/// Serialization leaves out fields at `Node::default()`'s values; `#[serde(default)]` fills
+/// them back in on load. Files get several times smaller and faster to write and read.
+mod dflt {
+    use super::*;
+    thread_local!(static D: Node = Node::default());
+    macro_rules! same {
+        ($($f:ident: $t:ty),* $(,)?) => { $(pub fn $f(v: &$t) -> bool { D.with(|d| d.$f == *v) })* };
+    }
+    same!(
+        id: NodeId,
+        name: String,
+        kind: Kind,
+        parent: Option<NodeId>,
+        children: Vec<NodeId>,
+        rect: Rect,
+        rotation: f32,
+        visible: bool,
+        locked: bool,
+        opacity: f32,
+        fills: Vec<Paint>,
+        strokes: Vec<Paint>,
+        stroke_width: f32,
+        stroke_align: StrokeAlign,
+        radius: f32,
+        corner_radii: Option<[f32; 4]>,
+        dash: Vec<f32>,
+        cap: Cap,
+        join: Join,
+        start_marker: Marker,
+        end_marker: Marker,
+        point_count: u32,
+        inner_ratio: f32,
+        arc: Option<[f32; 3]>,
+        clip: bool,
+        shadows: Vec<Shadow>,
+        layout: AutoLayout,
+        sizing: [Sizing; 2],
+        stroke_sides: Option<[f32; 4]>,
+        min_size: [Option<f32>; 2],
+        max_size: [Option<f32>; 2],
+        constraints: [Constraint; 2],
+        absolute: bool,
+        bool_op: BoolOp,
+        is_mask: bool,
+        grids: Vec<LayoutGrid>,
+        exports: Vec<ExportSetting>,
+        blend: BlendMode,
+        reactions: Vec<Reaction>,
+        bindings: Vec<(Bindable, VarId)>,
+        modes: Vec<(u64, usize)>,
+        fill_style: Option<StyleId>,
+        stroke_style: Option<StyleId>,
+        text_style: Option<StyleId>,
+        effect_style: Option<StyleId>,
+        comp_props: Vec<CompProp>,
+        prop_bind: Vec<(String, PropTarget)>,
+        prop_values: Vec<(String, PropValue)>,
+        component: Option<NodeId>,
+        source: Option<NodeId>,
+        synced: Option<Box<Node>>,
+        paths: Vec<SubPath>,
+        even_odd: bool,
+        text: String,
+        font_size: f32,
+        font_weight: u16,
+        font_family: String,
+        text_sizing: TextSizing,
+        text_align: TextAlign,
+        text_valign: VAlign,
+        line_height: LineHeight,
+        letter_spacing: f32,
+        decoration: Decoration,
+        text_case: TextCase,
+        paragraph_spacing: f32,
+        truncate: bool,
+        max_lines: u32,
+        spans: Vec<TextSpan>,
+        lists: Vec<ListLine>,
+        expanded: bool,
+    );
+}
+
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
+}
+fn is_one(v: &f32) -> bool {
+    *v == 1.0
 }
 
 impl Default for Node {
@@ -1205,6 +1402,7 @@ impl Default for Node {
             end_marker: Marker::None,
             point_count: 5,
             inner_ratio: 0.382,
+            arc: None,
             clip: false,
             shadows: vec![],
             layout: AutoLayout::default(),
@@ -1338,6 +1536,42 @@ impl Node {
     }
 
     /// Unrotated outline of polygons and stars, in world space.
+    /// An ellipse with a partial sweep or a hole.
+    pub fn is_arc(&self) -> bool {
+        self.kind == Kind::Ellipse && self.arc.is_some_and(|a| a != [0.0, 360.0, 0.0])
+    }
+
+    /// An arc ellipse's outline, as closed polygons: the outer arc, then the inner arc back (a
+    /// ring or donut slice) or the center (a pie slice). A full ring is two loops, the inner one
+    /// reversed so it's a hole under either fill rule. `grow` widens the radii (stroke alignment).
+    pub fn arc_outline(&self, grow: f32) -> Vec<Vec<Pos2>> {
+        let [start, sweep, ratio] = self.arc.unwrap_or([0.0, 360.0, 0.0]);
+        let sweep = sweep.clamp(-360.0, 360.0);
+        let c = self.rect.center();
+        let (rx, ry) = (self.rect.width() / 2.0 + grow, self.rect.height() / 2.0 + grow);
+        let (irx, iry) = ((self.rect.width() / 2.0 * ratio - grow).max(0.0), (self.rect.height() / 2.0 * ratio - grow).max(0.0));
+        let n = ((sweep.abs() / 360.0) * 96.0).ceil().max(8.0) as usize;
+        let at = |i: usize, a: f32, b: f32| {
+            let t = (start + sweep * i as f32 / n as f32).to_radians();
+            c + vec2(a * t.cos(), b * t.sin())
+        };
+        let hole = ratio > 0.0 && irx > 0.0 && iry > 0.0;
+        if sweep.abs() >= 359.99 {
+            let mut loops = vec![(0..n).map(|i| at(i, rx, ry)).collect::<Vec<_>>()];
+            if hole {
+                loops.push((0..n).rev().map(|i| at(i, irx, iry)).collect());
+            }
+            return loops;
+        }
+        let mut p: Vec<Pos2> = (0..=n).map(|i| at(i, rx, ry)).collect();
+        if hole {
+            p.extend((0..=n).rev().map(|i| at(i, irx, iry)));
+        } else {
+            p.push(c);
+        }
+        vec![p]
+    }
+
     pub fn star_points(&self) -> Vec<Pos2> {
         let r = self.rect;
         let (c, rx, ry) = (r.center(), r.width() / 2.0, r.height() / 2.0);
@@ -1391,6 +1625,9 @@ pub struct Page {
     /// Prototype starting frames, in order.
     #[serde(default)]
     pub flows: Vec<NodeId>,
+    /// Where the page was last viewed: world center x, y and zoom (saved in the file, as Figma does).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<[f32; 3]>,
 }
 
 pub const PAGE_BG: Rgba = Rgba::rgb(0xF5, 0xF5, 0xF5);
@@ -1398,7 +1635,8 @@ pub const PAGE_BG: Rgba = Rgba::rgb(0xF5, 0xF5, 0xF5);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Document {
     pub pages: Vec<Page>,
-    pub nodes: HashMap<NodeId, Node>,
+    /// Shared with undo snapshots: editing a layer copies just that layer (`node_mut`).
+    pub nodes: HashMap<NodeId, std::sync::Arc<Node>>,
     pub next_id: NodeId,
     /// Embedded images: content hash -> encoded PNG/JPEG bytes (base64 in files).
     #[serde(default, with = "images_b64")]
@@ -1450,6 +1688,36 @@ impl std::fmt::Debug for SyncCache {
     }
 }
 
+/// Whether a text layer still has the name Katachi gave it (its text, or "Text" / "Text 3").
+pub fn auto_text_name(name: &str, text: &str) -> bool {
+    let generic = name == "Text" || name.strip_prefix("Text ").is_some_and(|n| n.parse::<u32>().is_ok());
+    generic || name == text_layer_name(text)
+}
+
+/// A text layer's automatic name: its text on one line, cut at 60 characters.
+pub fn text_layer_name(text: &str) -> String {
+    let one: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cut: String = one.chars().take(60).collect();
+    if cut.is_empty() { "Text".into() } else { cut }
+}
+
+/// A .katachi file: `{"katachi": 1, "document": {...}}`.
+#[derive(Deserialize)]
+struct FileJson {
+    document: Document,
+}
+
+/// Read a .katachi file's text.
+pub fn parse_file(text: &str) -> Result<Document, String> {
+    serde_json::from_str::<FileJson>(text).map(|f| f.document).map_err(|e| e.to_string())
+}
+
+/// A .katachi file's text.
+pub fn file_json(doc: &Document) -> String {
+    // Straight to text: going through a serde_json::Value doubles the time on big files.
+    format!(r#"{{"katachi":1,"document":{}}}"#, serde_json::to_string(doc).unwrap_or_default())
+}
+
 mod images_b64 {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
@@ -1481,7 +1749,7 @@ pub enum Order {
 impl Default for Document {
     fn default() -> Self {
         Self {
-            pages: vec![Page { name: "Page 1".into(), children: vec![], background: PAGE_BG, flows: vec![] }],
+            pages: vec![Page { name: "Page 1".into(), children: vec![], background: PAGE_BG, flows: vec![], view: None }],
             nodes: HashMap::new(),
             next_id: 1,
             images: HashMap::new(),
@@ -1499,7 +1767,7 @@ impl Document {
         &self.nodes[&id]
     }
     pub fn node_mut(&mut self, id: NodeId) -> &mut Node {
-        self.nodes.get_mut(&id).expect("node exists")
+        std::sync::Arc::make_mut(self.nodes.get_mut(&id).expect("node exists"))
     }
 
     pub fn page_of(&self, id: NodeId) -> usize {
@@ -1566,7 +1834,7 @@ impl Document {
         if node.name.is_empty() {
             node.name = self.auto_name(node.kind.label());
         }
-        self.nodes.insert(id, node);
+        self.nodes.insert(id, std::sync::Arc::new(node));
         let list = self.children_of_mut(page, parent);
         let i = index.unwrap_or(list.len()).min(list.len());
         list.insert(i, id);
@@ -1723,52 +1991,115 @@ impl Document {
             .unwrap_or(0)
     }
 
-    /// A variable's concrete value as seen from `node`, following aliases.
-    pub fn resolve(&self, var: VarId, node: NodeId) -> Option<VarValue> {
-        let mut cur = var;
-        for _ in 0..8 {
-            let v = self.variable(cur)?;
-            let mode = self.mode_for(node, v.collection).min(v.values.len().saturating_sub(1));
-            match v.values.get(mode)? {
-                VarValue::Alias(next) => cur = *next,
-                other => return Some(other.clone()),
-            }
-        }
-        None
-    }
-
     /// Push variable values into bound properties.
     pub fn apply_variables(&mut self) {
         if self.variables.is_empty() {
             return;
         }
-        let bound: Vec<NodeId> = self.nodes.values().filter(|n| !n.bindings.is_empty()).map(|n| n.id).collect();
-        for id in bound {
-            for (prop, var) in self.nodes[&id].bindings.clone() {
-                let Some(val) = self.resolve(var, id) else { continue };
-                let n = self.node_mut(id);
-                match (prop, val) {
-                    (Bindable::Fill, VarValue::Color(c)) => match n.fills.last_mut() {
-                        Some(p) if p.kind == PaintKind::Solid => p.color = c,
-                        _ => n.fills = vec![Paint::solid(c)],
-                    },
-                    (Bindable::Stroke, VarValue::Color(c)) => match n.strokes.last_mut() {
-                        Some(p) if p.kind == PaintKind::Solid => p.color = c,
-                        _ => n.strokes = vec![Paint::solid(c)],
-                    },
-                    (Bindable::Opacity, VarValue::Number(v)) => n.opacity = (v / 100.0).clamp(0.0, 1.0),
-                    (Bindable::Radius, VarValue::Number(v)) => n.radius = v.max(0.0),
-                    (Bindable::Width, VarValue::Number(v)) => n.rect = Rect::from_min_size(n.rect.min, vec2(v.max(0.0), n.rect.height())),
-                    (Bindable::Height, VarValue::Number(v)) => n.rect = Rect::from_min_size(n.rect.min, vec2(n.rect.width(), v.max(0.0))),
-                    (Bindable::Gap, VarValue::Number(v)) => n.layout.gap = v,
-                    (Bindable::Padding, VarValue::Number(v)) => n.layout.padding = [v; 4],
-                    (Bindable::StrokeWidth, VarValue::Number(v)) => n.stroke_width = v.max(0.0),
-                    (Bindable::FontSize, VarValue::Number(v)) => n.font_size = v.max(1.0),
-                    (Bindable::Text, VarValue::Text(t)) => n.text = t,
-                    (Bindable::Visible, VarValue::Bool(b)) => n.visible = b,
-                    _ => {}
+        // Resolve everything first, against an index (this runs on every edit, over every bound layer).
+        let index: HashMap<VarId, &Variable> = self.variables.iter().map(|v| (v.id, v)).collect();
+        let any_modes = self.nodes.values().any(|n| !n.modes.is_empty());
+        let mode_for = |node: NodeId, collection: u64| -> usize {
+            let mut cur = any_modes.then_some(node);
+            while let Some(id) = cur {
+                let Some(n) = self.nodes.get(&id) else { break };
+                if let Some((_, m)) = n.modes.iter().find(|(c, _)| *c == collection) {
+                    return *m;
+                }
+                cur = n.parent;
+            }
+            0
+        };
+        let resolve = |var: VarId, node: NodeId| -> Option<VarValue> {
+            let mut cur = var;
+            for _ in 0..8 {
+                let v = index.get(&cur)?;
+                let mode = mode_for(node, v.collection).min(v.values.len().saturating_sub(1));
+                match v.values.get(mode)? {
+                    VarValue::Alias(next) => cur = *next,
+                    other => return Some(other.clone()),
                 }
             }
+            None
+        };
+        let mut writes = vec![];
+        for n in self.nodes.values() {
+            for &(prop, var) in &n.bindings {
+                // Inside an instance, a property overridden by hand keeps the override; the
+                // binding it copied from the main component no longer drives it.
+                if let Some(sync) = &n.synced
+                    && Self::bound_value_differs(n, sync, prop)
+                {
+                    continue;
+                }
+                if let Some(val) = resolve(var, n.id)
+                    && !Self::binding_holds(n, prop, &val)
+                {
+                    writes.push((n.id, prop, val));
+                }
+            }
+        }
+        // Only layers whose values change are written (and so copied away from undo snapshots).
+        for (id, prop, val) in writes {
+            let n = self.node_mut(id);
+            match (prop, val) {
+                (Bindable::Fill, VarValue::Color(c)) => match n.fills.last_mut() {
+                    Some(p) if p.kind == PaintKind::Solid => p.color = c,
+                    _ => n.fills = vec![Paint::solid(c)],
+                },
+                (Bindable::Stroke, VarValue::Color(c)) => match n.strokes.last_mut() {
+                    Some(p) if p.kind == PaintKind::Solid => p.color = c,
+                    _ => n.strokes = vec![Paint::solid(c)],
+                },
+                (Bindable::Opacity, VarValue::Number(v)) => n.opacity = (v / 100.0).clamp(0.0, 1.0),
+                (Bindable::Radius, VarValue::Number(v)) => n.radius = v.max(0.0),
+                (Bindable::Width, VarValue::Number(v)) => n.rect = Rect::from_min_size(n.rect.min, vec2(v.max(0.0), n.rect.height())),
+                (Bindable::Height, VarValue::Number(v)) => n.rect = Rect::from_min_size(n.rect.min, vec2(n.rect.width(), v.max(0.0))),
+                (Bindable::Gap, VarValue::Number(v)) => n.layout.gap = v,
+                (Bindable::Padding, VarValue::Number(v)) => n.layout.padding = [v; 4],
+                (Bindable::StrokeWidth, VarValue::Number(v)) => n.stroke_width = v.max(0.0),
+                (Bindable::FontSize, VarValue::Number(v)) => n.font_size = v.max(1.0),
+                (Bindable::Text, VarValue::Text(t)) => n.text = t,
+                (Bindable::Visible, VarValue::Bool(b)) => n.visible = b,
+                _ => {}
+            }
+        }
+    }
+
+    /// Whether `prop` differs between two versions of a layer.
+    fn bound_value_differs(a: &Node, b: &Node, prop: Bindable) -> bool {
+        match prop {
+            Bindable::Fill => a.fills != b.fills,
+            Bindable::Stroke => a.strokes != b.strokes,
+            Bindable::Opacity => a.opacity != b.opacity,
+            Bindable::Radius => a.radius != b.radius,
+            Bindable::Width => a.rect.width() != b.rect.width(),
+            Bindable::Height => a.rect.height() != b.rect.height(),
+            Bindable::Gap => a.layout.gap != b.layout.gap,
+            Bindable::Padding => a.layout.padding != b.layout.padding,
+            Bindable::StrokeWidth => a.stroke_width != b.stroke_width,
+            Bindable::FontSize => a.font_size != b.font_size,
+            Bindable::Text => a.text != b.text,
+            Bindable::Visible => a.visible != b.visible,
+        }
+    }
+
+    /// Whether a bound property already shows the variable's value.
+    fn binding_holds(n: &Node, prop: Bindable, val: &VarValue) -> bool {
+        match (prop, val) {
+            (Bindable::Fill, VarValue::Color(c)) => n.fills.last().is_some_and(|p| p.kind == PaintKind::Solid && p.color == *c),
+            (Bindable::Stroke, VarValue::Color(c)) => n.strokes.last().is_some_and(|p| p.kind == PaintKind::Solid && p.color == *c),
+            (Bindable::Opacity, VarValue::Number(v)) => n.opacity == (v / 100.0).clamp(0.0, 1.0),
+            (Bindable::Radius, VarValue::Number(v)) => n.radius == v.max(0.0),
+            (Bindable::Width, VarValue::Number(v)) => n.rect.width() == v.max(0.0),
+            (Bindable::Height, VarValue::Number(v)) => n.rect.height() == v.max(0.0),
+            (Bindable::Gap, VarValue::Number(v)) => n.layout.gap == *v,
+            (Bindable::Padding, VarValue::Number(v)) => n.layout.padding == [*v; 4],
+            (Bindable::StrokeWidth, VarValue::Number(v)) => n.stroke_width == v.max(0.0),
+            (Bindable::FontSize, VarValue::Number(v)) => n.font_size == v.max(1.0),
+            (Bindable::Text, VarValue::Text(t)) => n.text == *t,
+            (Bindable::Visible, VarValue::Bool(b)) => n.visible == *b,
+            _ => true,
         }
     }
 
@@ -1790,29 +2121,64 @@ impl Document {
             return;
         }
         let styles: HashMap<StyleId, StyleValue> = self.styles.iter().map(|s| (s.id, s.value.clone())).collect();
-        for n in self.nodes.values_mut() {
-            for (link, stroke) in [(&mut n.fill_style, false), (&mut n.stroke_style, true)] {
-                match link.and_then(|id| styles.get(&id)) {
-                    Some(StyleValue::Paint(p)) => {
-                        if stroke { n.strokes = p.clone() } else { n.fills = p.clone() }
+        for arc in self.nodes.values_mut() {
+            if arc.fill_style.is_none() && arc.stroke_style.is_none() && arc.text_style.is_none() && arc.effect_style.is_none() {
+                continue;
+            }
+            // Work on a copy and only write back real changes, so layers stay shared with undo.
+            let mut n = (**arc).clone();
+            Self::apply_styles_to(&mut n, &styles);
+            if n != **arc {
+                *arc = std::sync::Arc::new(n);
+            }
+        }
+    }
+
+    fn apply_styles_to(n: &mut Node, styles: &HashMap<StyleId, StyleValue>) {
+        // Inside an instance, a property overridden by hand keeps the override; a style the
+        // main component's layer uses doesn't overwrite it.
+        let (fill_over, stroke_over, text_over, effect_over) = match &n.synced {
+            Some(s) => (
+                s.fills != n.fills,
+                s.strokes != n.strokes,
+                (s.font_family != n.font_family || s.font_size != n.font_size || s.font_weight != n.font_weight || s.line_height != n.line_height || s.letter_spacing != n.letter_spacing),
+                s.shadows != n.shadows,
+            ),
+            None => (false, false, false, false),
+        };
+        for (link, stroke) in [(&mut n.fill_style, false), (&mut n.stroke_style, true)] {
+            match link.and_then(|id| styles.get(&id)) {
+                Some(StyleValue::Paint(p)) => {
+                    if stroke && !stroke_over {
+                        n.strokes = p.clone()
+                    } else if !stroke && !fill_over {
+                        n.fills = p.clone()
                     }
-                    Some(_) | None => *link = None,
+                }
+                Some(_) | None => *link = None,
+            }
+        }
+        match n.text_style.and_then(|id| styles.get(&id)) {
+            Some(StyleValue::Text(t)) => {
+                if !text_over {
+                    t.apply(n)
                 }
             }
-            match n.text_style.and_then(|id| styles.get(&id)) {
-                Some(StyleValue::Text(t)) => t.apply(n),
-                _ => n.text_style = None,
+            _ => n.text_style = None,
+        }
+        match n.effect_style.and_then(|id| styles.get(&id)) {
+            Some(StyleValue::Effect(e)) => {
+                if !effect_over {
+                    n.shadows = e.clone()
+                }
             }
-            match n.effect_style.and_then(|id| styles.get(&id)) {
-                Some(StyleValue::Effect(e)) => n.shadows = e.clone(),
-                _ => n.effect_style = None,
-            }
+            _ => n.effect_style = None,
         }
     }
 
     /// Create an instance of `comp` with its top-left at `at`.
     pub fn instantiate(&mut self, comp: NodeId, page: usize, parent: Option<NodeId>, index: Option<usize>, at: Pos2) -> NodeId {
-        let mut c = self.nodes[&comp].clone();
+        let mut c = (*self.nodes[&comp]).clone();
         if let Some(set) = c.parent.map(|p| &self.nodes[&p]).filter(|p| p.kind == Kind::ComponentSet) {
             c.name = set.name.clone();
         }
@@ -1851,7 +2217,7 @@ impl Document {
             if let Some(src) = self.nodes[&id].source.and_then(|s| self.nodes.get(&s)).cloned() {
                 let n = self.node_mut(id);
                 let keep = n.rect;
-                *n = Node { id: n.id, parent: n.parent, children: n.children.clone(), kind: n.kind, component: n.component, source: n.source, synced: None, ..src };
+                *n = Node { id: n.id, parent: n.parent, children: n.children.clone(), kind: n.kind, component: n.component, source: n.source, synced: None, ..(*src).clone() };
                 n.rect = keep;
                 n.synced = Some(Box::new(Node { children: vec![], ..n.clone() }));
             }
@@ -1880,7 +2246,7 @@ impl Document {
         }
         let nested = outer.is_some();
         let page = self.page_of(inst);
-        let mut c = self.nodes[&comp].clone();
+        let mut c = (*self.nodes[&comp]).clone();
         // Instances of a variant are named after the component set, as in Figma.
         if let Some(set) = c.parent.map(|p| &self.nodes[&p]).filter(|p| p.kind == Kind::ComponentSet) {
             c.name = set.name.clone();
@@ -1945,9 +2311,9 @@ impl Document {
                     e
                 }
                 None => {
-                    let mut n = Node { children: vec![], ..src.clone() };
+                    let mut n = Node { children: vec![], ..(*src).clone() };
                     n.source = Some(cid);
-                    n.synced = Some(Box::new(Node { children: vec![], ..src.clone() }));
+                    n.synced = Some(Box::new(Node { children: vec![], ..(*src).clone() }));
                     // Nested instances keep pointing at their own component.
                     let id = self.insert(page, Some(parent), None, n);
                     by_source.insert(cid, id);
@@ -1997,13 +2363,13 @@ impl Document {
         let ids: Vec<NodeId> = std::iter::once(comp).chain(self.descendants(comp)).collect();
         let cache = self.cache.0.clone();
         let mut st = cache.lock().unwrap();
-        let same = st.comps.get(&comp).is_some_and(|(_, snap)| snap.len() == ids.len() && snap.iter().zip(&ids).all(|(a, id)| *a == self.nodes[id]));
+        let same = st.comps.get(&comp).is_some_and(|(_, snap)| snap.len() == ids.len() && snap.iter().zip(&ids).all(|(a, id)| *a == *self.nodes[id]));
         let rev = if same {
             st.comps[&comp].0
         } else {
             st.next_rev += 1;
             let rev = st.next_rev;
-            st.comps.insert(comp, (rev, ids.iter().map(|id| self.nodes[id].clone()).collect()));
+            st.comps.insert(comp, (rev, ids.iter().map(|id| (*self.nodes[id]).clone()).collect()));
             rev
         };
         revs.insert(comp, rev);
@@ -2083,7 +2449,7 @@ impl Document {
             let n = &self.nodes[&d];
             if let Some(snap) = &n.synced
                 && (n.fills != snap.fills || n.text != snap.text || n.visible != snap.visible || n.strokes != snap.strokes || n.opacity != snap.opacity) {
-                    overrides.insert(path(self, d), n.clone());
+                    overrides.insert(path(self, d), (**n).clone());
                 }
         }
         for c in self.nodes[&inst].children.clone() {
@@ -2171,8 +2537,26 @@ impl Document {
 
     /// Re-derive everything computed from children: group bounds and auto layout.
     pub fn reflow(&mut self) {
+        // Layout passes write every layer they visit; layers that end up unchanged go back to
+        // sharing their old copy, so undo snapshots stay small.
+        let before = self.nodes.clone();
+        self.reflow_passes();
+        for (id, n) in self.nodes.iter_mut() {
+            if let Some(old) = before.get(id)
+                && !std::sync::Arc::ptr_eq(n, old)
+                && **n == **old
+            {
+                *n = old.clone();
+            }
+        }
+    }
+
+    fn reflow_passes(&mut self) {
+        let mut t = std::time::Instant::now();
         self.apply_styles();
+        crate::plugins::lap("reflow: styles", &mut t);
         self.apply_variables();
+        crate::plugins::lap("reflow: variables", &mut t);
         let instances: Vec<NodeId> = self.nodes.values().filter(|n| n.kind == Kind::Instance).map(|n| n.id).collect();
         for _ in 0..2 {
             let mut revs: HashMap<NodeId, u64> = HashMap::new();
@@ -2183,9 +2567,12 @@ impl Document {
                 }
             }
         }
+        crate::plugins::lap("reflow: instances", &mut t);
         // Instances copied their bindings; resolve them too, before layout uses sizes and gaps.
         self.apply_variables();
+        crate::plugins::lap("reflow: variables again", &mut t);
         self.reflow_layout();
+        crate::plugins::lap("reflow: layout", &mut t);
     }
 
     fn reflow_layout(&mut self) {
@@ -2490,7 +2877,7 @@ impl Document {
     pub fn boolean(&mut self, ids: &[NodeId], op: BoolOp) -> Option<NodeId> {
         let g = self.group(ids)?;
         let bottom = self.nodes[&g].children[0];
-        let b = self.nodes[&bottom].clone();
+        let b = (*self.nodes[&bottom]).clone();
         let n = self.node_mut(g);
         n.kind = Kind::Boolean;
         n.bool_op = op;
@@ -2537,8 +2924,8 @@ impl Document {
     pub fn extract(&self, ids: &[NodeId]) -> Vec<Node> {
         let mut out = vec![];
         for id in self.sort_by_z(ids) {
-            out.push(self.nodes[&id].clone());
-            out.extend(self.descendants(id).into_iter().map(|d| self.nodes[&d].clone()));
+            out.push((*self.nodes[&id]).clone());
+            out.extend(self.descendants(id).into_iter().map(|d| (*self.nodes[&d]).clone()));
         }
         out
     }
@@ -2607,7 +2994,7 @@ impl Document {
         None
     }
 
-    fn hit_self(&self, n: &Node, p: Pos2, tol: f32) -> bool {
+    pub fn hit_self(&self, n: &Node, p: Pos2, tol: f32) -> bool {
         let p = n.to_local(p);
         match n.kind {
             Kind::Group | Kind::Boolean => false,
@@ -2618,6 +3005,10 @@ impl Document {
             Kind::Polygon | Kind::Star => {
                 let pts = n.star_points();
                 contains(&[(pts, true)], p, false)
+            }
+            Kind::Ellipse if n.is_arc() => {
+                let polys: Vec<(Vec<Pos2>, bool)> = n.arc_outline(tol).into_iter().map(|p| (p, true)).collect();
+                contains(&polys, p, true)
             }
             Kind::Ellipse => {
                 let c = n.rect.center();

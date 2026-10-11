@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-pub const STRIP_H: f32 = 38.0;
+/// Matches where macOS centers the traffic lights (16 points down), so they sit mid-strip.
+pub const STRIP_H: f32 = 32.0;
 const BLUE: Color32 = Color32::from_rgb(0x0D, 0x99, 0xFF);
 
 pub struct Shell {
@@ -218,8 +219,9 @@ impl Shell {
             // Update now.
             if let Some(label) = self.update.button_label() {
                 let g = p.layout_no_wrap(label.into(), FontId::proportional(13.0), Color32::WHITE);
-                let b = Rect::from_min_size(pos2(x, r.center().y - 13.0), vec2(g.size().x + 22.0, 26.0));
+                let b = Rect::from_min_size(pos2(x, r.center().y - 11.0), vec2(g.size().x + 20.0, 22.0));
                 let resp = ui.interact(b, egui::Id::new("update-now"), Sense::click());
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
                 let busy = self.update.busy();
                 p.rect_filled(b, 6.0, if busy { BLUE.gamma_multiply(0.6) } else if resp.hovered() { Color32::from_rgb(0x0B, 0x8A, 0xE6) } else { BLUE });
                 p.galley(b.center() - g.size() / 2.0, g, Color32::WHITE);
@@ -234,6 +236,7 @@ impl Shell {
             p.vline(x, r.y_range(), Stroke::new(1.0, line));
             let home = Rect::from_min_size(pos2(x, r.min.y), vec2(46.0, r.height()));
             let resp = ui.interact(home, egui::Id::new("tab-home"), Sense::click());
+            resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, self.active.is_none(), "Home"));
             if self.active.is_none() {
                 p.rect_filled(home, 0.0, face);
             } else if resp.hovered() {
@@ -256,6 +259,7 @@ impl Shell {
                 }
                 let on = self.active == Some(i);
                 let resp = ui.interact(tr, egui::Id::new(("tab", i)), Sense::click());
+                resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, on, t.display_name()));
                 if on {
                     p.rect_filled(tr, 0.0, face);
                 } else if resp.hovered() {
@@ -292,9 +296,10 @@ impl Shell {
                 p.vline(x, r.y_range(), Stroke::new(1.0, line));
             }
             // New tab.
-            let plus = Rect::from_min_size(pos2(x + 6.0, r.center().y - 13.0), vec2(26.0, 26.0));
+            let plus = Rect::from_min_size(pos2(x + 6.0, r.center().y - 12.0), vec2(24.0, 24.0));
             if plus.max.x < r.max.x {
                 let resp = ui.interact(plus, egui::Id::new("tab-new"), Sense::click());
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "New design file"));
                 if resp.hovered() {
                     p.rect_filled(plus, 6.0, bar.gamma_multiply(0.9));
                 }
@@ -524,6 +529,7 @@ impl Home {
                                 ui.spacing_mut().item_spacing.x = gap;
                                 for (path, when) in row {
                                     let (r, resp) = ui.allocate_exact_size(vec2(cw, th + 64.0), Sense::click());
+                                    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name(path)));
                                     let p = ui.painter();
                                     let thumb = Rect::from_min_size(r.min, vec2(cw, th));
                                     p.rect_filled(r, 10.0, ui.visuals().panel_fill);
@@ -609,8 +615,7 @@ pub fn ago(t: SystemTime) -> String {
 /// Render a file's first page to its Home thumbnail.
 fn write_thumb(file: &Path) -> Result<(), String> {
     let text = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
-    let mut v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let doc: crate::doc::Document = serde_json::from_value(v["document"].take()).map_err(|e| e.to_string())?;
+    let doc = crate::doc::parse_file(&text)?;
     let out = crate::files::thumb_path(file);
     let Some(page) = doc.pages.first() else { return Err("no pages".into()) };
     let ids = page.children.clone();
@@ -687,7 +692,7 @@ impl eframe::App for Shell {
         }
         self.wants();
         self.close_guard(&ctx);
-        if self.update.poll() {
+        if self.update.poll(&ctx) {
             ctx.request_repaint();
         }
     }

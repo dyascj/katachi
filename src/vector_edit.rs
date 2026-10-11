@@ -237,9 +237,15 @@ impl App {
 
     /// Double-click an anchor: corner <-> smooth.
     pub fn vector_toggle_smooth(&mut self, s: Pos2) -> bool {
-        let Some(Grab::Anchor((si, pi))) = self.vector_grab(s) else { return false };
-        let id = self.vector_edit.as_ref().unwrap().id;
+        let Some(Grab::Anchor(at)) = self.vector_grab(s) else { return false };
         self.checkpoint();
+        self.toggle_smooth_at(at);
+        true
+    }
+
+    /// Bend a corner into a smooth point, or straighten a smooth one.
+    fn toggle_smooth_at(&mut self, (si, pi): PointRef) {
+        let id = self.vector_edit.as_ref().unwrap().id;
         let n = self.doc.node_mut(id);
         let sp = &mut n.paths[si];
         let k = sp.points.len();
@@ -261,7 +267,67 @@ impl App {
             sp.points[pi].h_in = -dir * len;
         }
         self.doc.refit_vector_keep(id);
-        true
+    }
+
+    /// The Design panel while editing a vector: the selected point's position, Bend, Delete, Done.
+    pub fn vector_edit_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(ve) = self.vector_edit.as_ref() else { return };
+        let (id, selected) = (ve.id, ve.selected.clone());
+        let muted = crate::appearance::muted(ui.ctx());
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Edit vector").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Done").on_hover_text("Esc or Enter").clicked() {
+                    self.exit_vector_edit();
+                }
+            });
+        });
+        if self.vector_edit.is_none() {
+            return;
+        }
+        match selected.as_slice() {
+            [] => {
+                ui.label(egui::RichText::new("Select a point to edit it.").color(muted));
+            }
+            [one] => {
+                // Positions read like the layer's X and Y: relative to the parent frame.
+                let origin = self.doc.node(id).parent.map_or(Pos2::ZERO, |p| self.doc.node(p).rect.min);
+                let Some(pt) = self.doc.node(id).paths.get(one.0).and_then(|sp| sp.points.get(one.1)).copied() else { return };
+                let w = world(self, id, pt.p) - origin.to_vec2();
+                let (mut x, mut y) = (w.x, w.y);
+                let mut moved = false;
+                ui.horizontal(|ui| {
+                    ui.label("X");
+                    moved |= ui.add(egui::DragValue::new(&mut x).speed(0.5)).changed();
+                    ui.label("Y");
+                    moved |= ui.add(egui::DragValue::new(&mut y).speed(0.5)).changed();
+                });
+                if moved {
+                    self.begin_edit();
+                    let to = local(self, id, egui::pos2(x, y) + origin.to_vec2());
+                    if let Some(p) = self.doc.node_mut(id).paths.get_mut(one.0).and_then(|sp| sp.points.get_mut(one.1)) {
+                        p.p = to;
+                    }
+                    self.doc.refit_vector_keep(id);
+                }
+            }
+            many => {
+                ui.label(format!("{} points selected", many.len()));
+            }
+        }
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!selected.is_empty(), egui::Button::new("Bend")).on_hover_text("Smooth or straighten the selected points (double-click a point)").clicked() {
+                self.checkpoint();
+                for &at in &selected {
+                    self.toggle_smooth_at(at);
+                }
+            }
+            if ui.add_enabled(!selected.is_empty(), egui::Button::new("Delete")).on_hover_text("Delete the selected points (⌫)").clicked() {
+                self.vector_delete_points();
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("Click a segment to add a point. Drag points or their handles; Shift-click selects several.").small().color(muted));
     }
 
     pub fn draw_vector_edit(&self, painter: &Painter) {

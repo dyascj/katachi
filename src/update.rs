@@ -32,24 +32,29 @@ pub enum State {
 pub struct Updater {
     pub(crate) state: Arc<Mutex<State>>,
     seen: State,
+    /// The window, so the background check can wake it when it finds an update.
+    wake: Arc<Mutex<Option<egui::Context>>>,
 }
 
 impl Updater {
     /// Check now and every six hours, unless this is a development build.
     pub fn start() -> Self {
         let off = cfg!(debug_assertions) || cfg!(test) || std::env::var_os("KATACHI_NO_UPDATE").is_some();
-        let u = Updater { state: Arc::new(Mutex::new(State::Idle)), seen: State::Idle };
+        let u = Updater { state: Arc::new(Mutex::new(State::Idle)), seen: State::Idle, wake: Arc::default() };
         // Windows can't delete a running exe, so the last update's old copy goes now.
         if cfg!(windows) && let Ok(exe) = std::env::current_exe() {
             let _ = std::fs::remove_file(exe.with_file_name("katachi.old.exe"));
         }
         if !off {
-            let state = u.state.clone();
+            let (state, wake) = (u.state.clone(), u.wake.clone());
             std::thread::spawn(move || loop {
                 if let Ok(Some(found)) = check(env!("CARGO_PKG_VERSION")) {
                     let mut s = state.lock().unwrap();
                     if matches!(*s, State::Idle | State::Available { .. } | State::Failed(_)) {
                         *s = found;
+                    }
+                    if let Some(ctx) = wake.lock().unwrap().as_ref() {
+                        ctx.request_repaint();
                     }
                 }
                 std::thread::sleep(std::time::Duration::from_secs(6 * 3600));
@@ -60,11 +65,17 @@ impl Updater {
 
     #[cfg(test)]
     pub fn off() -> Self {
-        Updater { state: Arc::new(Mutex::new(State::Idle)), seen: State::Idle }
+        Updater { state: Arc::new(Mutex::new(State::Idle)), seen: State::Idle, wake: Arc::default() }
     }
 
     /// Pick up the worker's state; true when it changed (or a restart is due).
-    pub fn poll(&mut self) -> bool {
+    pub fn poll(&mut self, ctx: &egui::Context) -> bool {
+        {
+            let mut w = self.wake.lock().unwrap();
+            if w.is_none() {
+                *w = Some(ctx.clone());
+            }
+        }
         let now = self.state.lock().unwrap().clone();
         let changed = now != self.seen;
         if changed && let State::Ready(_) = &now {
@@ -117,10 +128,13 @@ impl Updater {
         };
         *s = State::Installing(version.clone());
         drop(s);
-        let state = self.state.clone();
+        let (state, wake) = (self.state.clone(), self.wake.clone());
         std::thread::spawn(move || {
             let done = install(&url, &sig).map_or_else(|e| State::Failed(format!("Couldn't update: {e}")), |()| State::Ready(version));
             *state.lock().unwrap() = done;
+            if let Some(ctx) = wake.lock().unwrap().as_ref() {
+                ctx.request_repaint();
+            }
         });
     }
 }

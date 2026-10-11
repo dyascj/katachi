@@ -19,6 +19,7 @@ mod plugin_view;
 mod plugins;
 mod panels;
 mod prototype;
+mod quick;
 mod render;
 mod shell;
 mod svg_import;
@@ -98,8 +99,7 @@ fn serve_headless(args: &[String]) {
     let doc = file
         .as_ref()
         .and_then(|f| std::fs::read_to_string(f).ok())
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| serde_json::from_value::<doc::Document>(v["document"].clone()).ok())
+        .and_then(|s| doc::parse_file(&s).ok())
         .unwrap_or_default();
     let listener = std::net::TcpListener::bind(("0.0.0.0", port)).expect("port in use");
     let shared = collab::serve(listener, doc);
@@ -108,7 +108,7 @@ fn serve_headless(args: &[String]) {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(5));
         if let Some(f) = &file {
-            let json = serde_json::json!({ "katachi": 1, "document": *shared.lock().unwrap() }).to_string();
+            let json = doc::file_json(&shared.lock().unwrap());
             if json != last {
                 let _ = files::write_atomic(f, json.as_bytes());
                 last = json;

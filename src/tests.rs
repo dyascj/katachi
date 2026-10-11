@@ -1023,7 +1023,15 @@ fn autosave_and_recovery_roundtrip() {
     a.doc.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 0., 10., 10.)));
     a.dirty = true;
     a.autosave(100.0);
-    let left = crate::files::orphaned_recoveries(std::path::Path::new("none"));
+    // Written in the background.
+    let mut left = vec![];
+    for _ in 0..200 {
+        left = crate::files::orphaned_recoveries(std::path::Path::new("none"));
+        if !left.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert!(!left.is_empty(), "autosave written");
     // A new session sees the orphan and can recover it as unsaved work.
     let mut b = App::new(None);
@@ -1110,6 +1118,10 @@ fn prototype_connect_present_and_navigate() {
     let (p, q) = (s(&h, 80., 35.), s(&h, 400., 75.));
     drag(&mut h, p, q, Modifiers::NONE);
     assert_eq!(h.state().doc.node(btn).reactions[0].action, Action::Navigate(b));
+    // A label on top of the button, with no interaction of its own.
+    let mut label = Node::new(Kind::Text, r(40., 25., 30., 20.));
+    label.text = "Go".into();
+    h.state_mut().doc.insert(0, Some(a), None, label);
     // B goes back after a short delay.
     h.state_mut().doc.node_mut(b).reactions.push(crate::doc::Reaction { trigger: Trigger::AfterDelay(500), action: Action::Back, ..Default::default() });
     // Present from A and click the button: lands on B.
@@ -1268,21 +1280,42 @@ fn multiplayer_host_join_edit_and_undo_only_mine() {
     // Ada draws; Bo sees it. Bo draws; Ada sees it.
     let ra = draw(&mut a, Key::R, (0.0, 0.0), (100.0, 100.0));
     let rb = draw(&mut b, Key::O, (200.0, 0.0), (260.0, 60.0));
-    let settle = |a: &mut Harness<App>, b: &mut Harness<App>| {
-        for _ in 0..60 {
+    // Up to 5 s for the sockets (tests run in parallel and the machine may be busy).
+    let settle = |a: &mut Harness<App>, b: &mut Harness<App>, done: &dyn Fn(&App, &App) -> bool| {
+        for _ in 0..1000 {
             a.step();
             b.step();
+            if done(a.state(), b.state()) {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     };
-    settle(&mut a, &mut b);
-    assert!(b.state().doc.nodes.contains_key(&ra), "Bo sees Ada's rectangle");
+    settle(&mut a, &mut b, &|a, b| b.doc.nodes.contains_key(&ra) && a.doc.nodes.contains_key(&rb) && a.collab.as_ref().is_some_and(|c| c.peers.values().any(|p| p.name == "Bo")));
+    let dump = |h: &Harness<App>| {
+        let c = h.state().collab.as_ref();
+        format!("nodes {:?} connected {:?} client {:?}", h.state().doc.nodes.keys().collect::<Vec<_>>(), c.map(|c| c.connected), c.map(|c| c.client))
+    };
+    assert!(b.state().doc.nodes.contains_key(&ra), "Bo sees Ada's rectangle {ra}: Ada {} / Bo {}", dump(&a), dump(&b));
     assert!(a.state().doc.nodes.contains_key(&rb), "Ada sees Bo's ellipse");
     assert!(a.state().collab.as_ref().unwrap().peers.values().any(|p| p.name == "Bo"), "presence");
-    // Ada undoes: her rectangle goes away everywhere, Bo's ellipse stays.
+    // Bo is mid-drag (moving his ellipse) when Ada draws: her new layer survives the drag on both sides.
+    let (p0, p1) = (s(&b, 230., 30.), s(&b, 330., 60.));
+    move_to(&mut b, p0, Modifiers::NONE);
+    press(&mut b, p0, true, Modifiers::NONE);
+    move_to(&mut b, p0.lerp(p1, 0.5), Modifiers::NONE);
+    let rc = draw(&mut a, Key::R, (0.0, 300.0), (80.0, 380.0));
+    settle(&mut a, &mut b, &|_, b| b.doc.nodes.contains_key(&rc));
+    move_to(&mut b, p1, Modifiers::NONE);
+    press(&mut b, p1, false, Modifiers::NONE);
+    settle(&mut a, &mut b, &|a, b| a.doc.node(rb).rect == b.doc.node(rb).rect);
+    assert!(a.state().doc.nodes.contains_key(&rc) && b.state().doc.nodes.contains_key(&rc), "drawn during Bo's drag");
+    assert_eq!(a.state().doc.node(rb).rect, b.state().doc.node(rb).rect, "Bo's move reached Ada");
+    // Ada undoes: her latest rectangle goes away everywhere; her first one and Bo's ellipse stay.
     key(&mut a, Modifiers::COMMAND, Key::Z);
-    settle(&mut a, &mut b);
-    assert!(!a.state().doc.nodes.contains_key(&ra) && !b.state().doc.nodes.contains_key(&ra));
+    settle(&mut a, &mut b, &|a, b| !a.doc.nodes.contains_key(&rc) && !b.doc.nodes.contains_key(&rc));
+    assert!(!a.state().doc.nodes.contains_key(&rc) && !b.state().doc.nodes.contains_key(&rc));
+    assert!(a.state().doc.nodes.contains_key(&ra) && b.state().doc.nodes.contains_key(&ra));
     assert!(a.state().doc.nodes.contains_key(&rb) && b.state().doc.nodes.contains_key(&rb), "undo leaves others' work");
 }
 
@@ -1372,3 +1405,534 @@ fn select_matching_and_paste_to_replace() {
     assert_eq!(d.node(new).rect.center(), pos2(90., 10.), "centered where the replaced layer was");
 }
 
+
+/// `KATACHI_BENCH_FILE=big.katachi cargo test --release perf_bench -- --ignored --nocapture`:
+/// frame times on a real file (each page fitted, idle, panning, hovering), plus open, undo
+/// checkpoint and save costs.
+#[test]
+#[ignore]
+fn perf_bench() {
+    use std::time::Instant;
+    let Some(file) = std::env::var_os("KATACHI_BENCH_FILE") else { return };
+    let mut h = harness();
+    let t = Instant::now();
+    h.state_mut().open_path(file.into());
+    eprintln!("open {:?} ({} nodes, {} pages)", t.elapsed(), h.state().doc.nodes.len(), h.state().doc.pages.len());
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    let frame = |h: &mut Harness<'static, App>| {
+        let t = Instant::now();
+        h.step();
+        ms(t.elapsed())
+    };
+    for p in 0..h.state().doc.pages.len() {
+        h.state_mut().page = p;
+        h.state_mut().view_ready = false;
+        let first = frame(&mut h);
+        let idle: f64 = (0..10).map(|_| frame(&mut h)).sum::<f64>() / 10.0;
+        let pan: f64 = (0..10)
+            .map(|i| {
+                h.event(Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, if i % 2 == 0 { 40.0 } else { -40.0 }), modifiers: Modifiers::NONE, phase: egui::TouchPhase::Move });
+                frame(&mut h)
+            })
+            .sum::<f64>()
+            / 10.0;
+        let hover: f64 = (0..10)
+            .map(|i| {
+                h.event(Event::PointerMoved(pos2(400.0 + i as f32 * 50.0, 300.0 + i as f32 * 30.0)));
+                frame(&mut h)
+            })
+            .sum::<f64>()
+            / 10.0;
+        let name = h.state().doc.pages[p].name.clone();
+        let n = h.state().doc.pages[p].children.len();
+        eprintln!("page {p} {name:>32} ({n:>3} top): first {first:7.1} ms  idle {idle:6.1}  pan {pan:6.1}  hover {hover:6.1}");
+    }
+    let rss = || {
+        let out = std::process::Command::new("ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().unwrap_or(0) / 1024
+    };
+    let before = rss();
+    let t = Instant::now();
+    for _ in 0..50 {
+        h.state_mut().checkpoint();
+    }
+    eprintln!("undo checkpoint {:?} each, 50 steps: +{} MB", t.elapsed() / 50, rss().saturating_sub(before));
+    // A real editing step: checkpoint, move a layer, reflow, draw.
+    h.state_mut().page = 2;
+    let id = h.state().doc.pages[2].children[0];
+    let before = rss();
+    let t = Instant::now();
+    for i in 0..50 {
+        let a = h.state_mut();
+        a.checkpoint();
+        let d = if i % 2 == 0 { 10.0 } else { -10.0 };
+        a.doc.node_mut(id).rect = a.doc.node(id).rect.translate(vec2(d, 0.0));
+        a.doc.reflow();
+        h.step();
+    }
+    eprintln!("edit + reflow + frame + checkpoint {:?} each, 50 steps: +{} MB", t.elapsed() / 50, rss().saturating_sub(before));
+    // Which part copies layers: count layers no longer shared with the last undo snapshot.
+    let shared = |a: &App| a.doc.nodes.iter().filter(|(_, n)| std::sync::Arc::strong_count(n) > 1).count();
+    h.state_mut().checkpoint();
+    let n0 = shared(h.state());
+    let t = Instant::now();
+    h.state_mut().doc.reflow();
+    eprintln!("reflow {:?}", t.elapsed());
+    let n1 = shared(h.state());
+    h.step();
+    let n2 = shared(h.state());
+    eprintln!("shared layers: after checkpoint {n0}, after reflow {n1}, after a frame {n2}");
+    // Reflow should be idempotent: name the layers a second pass still changes.
+    let before = h.state().doc.nodes.clone();
+    h.state_mut().doc.reflow();
+    eprintln!("a second reflow still changes {} layers", h.state().doc.nodes.iter().filter(|(id, n)| !std::sync::Arc::ptr_eq(n, &before[id])).count());
+    let t = Instant::now();
+    let json = crate::doc::file_json(&h.state().doc);
+    eprintln!("serialize {:?} ({} MB)", t.elapsed(), json.len() >> 20);
+    let t = Instant::now();
+    let path = std::env::temp_dir().join("katachi-bench-save.katachi");
+    h.state_mut().save_to(path);
+    eprintln!("save {:?}", t.elapsed());
+}
+
+#[test]
+fn compact_files_load_back_identical() {
+    let mut doc = crate::doc::Document::default();
+    crate::plugins::run(&mut doc, 0, &[], include_str!("../assets/promo/showcase.js")).unwrap();
+    // Instances carry a snapshot of their main component, which is compacted too.
+    crate::plugins::run(&mut doc, 0, &[], r#"const set = figma.currentPage.findOne(n => n.name === "Button"); const i = set.children[1].createInstance(); i.x = 40; i.y = 2000;"#).unwrap();
+    let compact = crate::doc::file_json(&doc);
+    assert!(!compact.contains("inner_ratio") && !compact.contains("\"letter_spacing\":0"), "defaults are left out");
+    let back = crate::doc::parse_file(&compact).unwrap();
+    assert_eq!(serde_json::to_value(&back).unwrap(), serde_json::to_value(&doc).unwrap());
+    // Older files spelled out every field; missing ones load as defaults either way.
+    let old = r#"{"katachi":1,"document":{"pages":[{"name":"Page 1","children":[1],"background":[245,245,245,255]}],"nodes":{"1":{"id":1,"name":"R","kind":"Rectangle","opacity":1.0,"inner_ratio":0.382,"rect":{"min":{"x":0,"y":0},"max":{"x":10,"y":10}}}},"next_id":2}}"#;
+    let d = crate::doc::parse_file(old).unwrap();
+    assert_eq!(d.nodes[&1].opacity, 1.0);
+    assert!(d.nodes[&1].visible);
+}
+
+#[test]
+fn renaming_a_layer_hands_the_keyboard_back() {
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    for (finish, expect) in [(Key::Enter, "Card"), (Key::Escape, "Card")] {
+        h.state_mut().renaming = Some((id, h.state().doc.node(id).name.clone()));
+        h.run_steps(2);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+        h.event(Event::Text(if finish == Key::Enter { "Card".into() } else { "Nope".into() }));
+        h.run_steps(2);
+        key(&mut h, Modifiers::NONE, finish);
+        h.run_steps(2);
+        assert_eq!(h.state().doc.node(id).name, expect, "Enter commits, Escape cancels");
+        assert!(h.state().renaming.is_none());
+        // Shortcuts reach the canvas again.
+        key(&mut h, Modifiers::NONE, Key::O);
+        assert_eq!(h.state().tool, Tool::Ellipse, "after {finish:?}");
+        key(&mut h, Modifiers::NONE, Key::V);
+    }
+}
+
+#[test]
+fn figma_details_from_the_audit() {
+    let mut h = harness();
+    // Text layers are named after their text until renamed.
+    key(&mut h, Modifiers::NONE, Key::T);
+    let at = s(&h, -300.0, -200.0);
+    click(&mut h, at, Modifiers::NONE);
+    h.event(Event::Text("ATLANTA".into()));
+    h.run_steps(2);
+    let t = h.state().editing_text.expect("editing");
+    assert_eq!(h.state().doc.node(t).name, "ATLANTA");
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    h.state_mut().doc.node_mut(t).name = "City".into();
+    h.state_mut().editing_text = Some(t);
+    h.run_steps(2);
+    h.event(Event::Text("!".into()));
+    h.run_steps(2);
+    assert_eq!(h.state().doc.node(t).name, "City", "a hand-made name sticks");
+    key(&mut h, Modifiers::NONE, Key::Escape);
+
+    // Closing a pen path inside a frame leaves the path selected.
+    let f = draw(&mut h, Key::F, (0.0, 0.0), (300.0, 300.0));
+    key(&mut h, Modifiers::NONE, Key::P);
+    for (x, y) in [(50.0, 50.0), (200.0, 60.0), (120.0, 200.0)] {
+        let p = s(&h, x, y);
+        move_to(&mut h, p, Modifiers::NONE);
+        press(&mut h, p, true, Modifiers::NONE);
+        press(&mut h, p, false, Modifiers::NONE);
+    }
+    let first = s(&h, 50.0, 50.0);
+    move_to(&mut h, first, Modifiers::NONE);
+    press(&mut h, first, true, Modifiers::NONE);
+    press(&mut h, first, false, Modifiers::NONE);
+    h.run_steps(2);
+    let sel = h.state().sel.clone();
+    assert_eq!(sel.len(), 1);
+    assert_eq!(h.state().doc.node(sel[0]).kind, Kind::Vector, "the new path, not its frame");
+    assert_eq!(h.state().doc.node(sel[0]).parent, Some(f));
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    assert_eq!((h.state().tool, h.state().sel.clone()), (Tool::Move, sel), "Escape leaves the pen with the path still selected");
+
+    // Frame presets.
+    let ctx = h.ctx.clone();
+    h.state_mut().add_preset_frame(&ctx, "iPhone 16", 393.0, 852.0);
+    let id = h.state().sel[0];
+    let n = h.state().doc.node(id);
+    assert_eq!((n.name.as_str(), n.rect.width(), n.rect.height(), n.kind), ("iPhone 16", 393.0, 852.0, Kind::Frame));
+    assert!(n.rect.min.x >= 400.0, "placed beside what's already there");
+
+    // Wrapping layers in auto layout makes a transparent frame.
+    h.run_steps(2);
+    let c = h.state().canvas_rect.unwrap().center();
+    h.state_mut().view = crate::render::View { zoom: 1.0, pan: c.to_vec2() - vec2(60.0, 1225.0) };
+    let a = draw(&mut h, Key::R, (0.0, 1200.0), (50.0, 1250.0));
+    let b = draw(&mut h, Key::R, (80.0, 1200.0), (130.0, 1250.0));
+    h.state_mut().sel = vec![a, b];
+    key(&mut h, Modifiers::SHIFT, Key::A);
+    let w = h.state().sel[0];
+    assert_eq!(h.state().doc.node(w).layout.mode, crate::doc::LayoutMode::Horizontal);
+    assert!(h.state().doc.node(w).fills.is_empty());
+}
+
+#[test]
+fn instance_overrides_survive_styles_and_variables_on_the_main_component() {
+    for via_style in [false, true] {
+        let mut doc = crate::doc::Document::default();
+        let step = |doc: &mut crate::doc::Document, js: &str| {
+            crate::plugins::run(doc, 0, &[], js).unwrap();
+            doc.reflow();
+        };
+        step(&mut doc, r##"
+            const c = figma.createComponent(); c.name = "Toggle"; c.resize(80, 40);
+            const track = figma.createRectangle(); track.name = "Track"; track.resize(80, 40); c.appendChild(track);
+            track.fills = [figma.util.solidPaint("#FF0000")];
+            c.createInstance().x = 200;
+        "##);
+        step(&mut doc, r##"
+            const i = figma.currentPage.findOne(n => n.type === "INSTANCE");
+            i.children[0].fills = [figma.util.solidPaint("#0000FF")];
+        "##);
+        step(&mut doc, if via_style { r##"
+            const track = figma.currentPage.findOne(n => n.name === "Track" && n.parent.type === "COMPONENT");
+            const st = figma.createPaintStyle(); st.name = "HUD / Accent"; st.paints = [figma.util.solidPaint("#00FF00")];
+            track.fillStyleId = st.id;
+        "## } else { r##"
+            const track = figma.currentPage.findOne(n => n.name === "Track" && n.parent.type === "COMPONENT");
+            const col = figma.variables.createVariableCollection("Theme");
+            const accent = figma.variables.createVariable("Accent", col, "COLOR");
+            accent.setValueForMode(col.modes[0].modeId, { r: 0, g: 1, b: 0, a: 1 });
+            track.fills = [figma.variables.setBoundVariableForPaint(figma.util.solidPaint("#000000"), "color", accent)];
+        "## });
+        let color = |inst: bool| doc.nodes.values().find(|n| n.name == "Track" && n.source.is_some() == inst).unwrap().fills[0].color;
+        assert_eq!(color(false), crate::doc::Rgba::rgb(0, 255, 0), "main follows (style: {via_style})");
+        assert_eq!(color(true), crate::doc::Rgba::rgb(0, 0, 255), "the instance keeps its override (style: {via_style})");
+    }
+}
+
+#[test]
+fn add_variant_turns_a_component_into_a_set() {
+    let mut h = harness();
+    let f = draw(&mut h, Key::F, (0.0, 0.0), (120.0, 40.0));
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::K);
+    let c = h.state().sel[0];
+    assert_eq!(h.state().doc.node(c).kind, Kind::Component);
+    let _ = f;
+    h.state_mut().add_variant_to(c);
+    let v2 = h.state().sel[0];
+    let set = h.state().doc.node(c).parent.expect("in a set");
+    assert_eq!(h.state().doc.node(set).kind, Kind::ComponentSet);
+    assert_eq!(h.state().doc.node(set).children.len(), 2);
+    assert_eq!(h.state().doc.node(c).name, "Property 1=Default");
+    assert_eq!(h.state().doc.node(v2).name, "Property 1=Variant2");
+    // Again on a variant: a third one in the same set.
+    h.state_mut().add_variant_to(v2);
+    assert_eq!(h.state().doc.node(set).children.len(), 3);
+}
+
+/// Renders panels Codex flagged, for a visual check: `cargo test --release ui_look -- --ignored`.
+#[test]
+#[ignore]
+fn ui_look() {
+    isolate_data();
+    let mut h = Harness::builder().with_size(vec2(1440.0, 900.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| {
+        crate::setup_style(&cc.egui_ctx);
+        let mut app = App::new(None);
+        app.recoverable.clear();
+        let c = app.doc.add_collection("Theme".into());
+        app.doc.collections.iter_mut().find(|x| x.id == c).unwrap().modes = vec!["Dark".into(), "Light".into()];
+        let v = app.doc.add_variable(c, "Accent".into(), crate::doc::VarValue::Color(crate::doc::Rgba::rgb(0x8E, 0x72, 0xFF)));
+        app.doc.variables.iter_mut().find(|x| x.id == v).unwrap().values = vec![crate::doc::VarValue::Color(crate::doc::Rgba::rgb(0x8E, 0x72, 0xFF)), crate::doc::VarValue::Color(crate::doc::Rgba::rgb(0x12, 0x34, 0x56))];
+        app.show_variables = true;
+        app
+    });
+    h.run_steps(4);
+    h.render().unwrap().save("target/look-variables.png").unwrap();
+    // An auto layout frame with a child, selected: the Design panel.
+    h.state_mut().show_variables = false;
+    let mut f = Node::new(Kind::Frame, r(0., 0., 300., 100.));
+    f.name = "Row".into();
+    let f = h.state_mut().doc.insert(0, None, None, f);
+    h.state_mut().doc.insert(0, Some(f), None, Node::new(Kind::Rectangle, r(10., 10., 40., 40.)));
+    h.state_mut().sel = vec![f];
+    h.state_mut().add_auto_layout();
+    h.state_mut().doc.node_mut(f).shadows.push(Default::default());
+    h.run_steps(4);
+    h.render().unwrap().save("target/look-autolayout.png").unwrap();
+    // Arcs: a dial ring, a donut slice and a pie, selected.
+    let mut ids = vec![];
+    for (i, arc) in [[0.0, 360.0, 0.8], [135.0, 270.0, 0.7], [-90.0, 120.0, 0.0]].into_iter().enumerate() {
+        let mut e = Node::new(Kind::Ellipse, r(400. + i as f32 * 160., 0., 140., 140.));
+        e.arc = Some(arc);
+        e.fills = vec![crate::doc::Paint::solid(crate::doc::Rgba::rgb(0x8E, 0x72, 0xFF))];
+        ids.push(h.state_mut().doc.insert(0, None, None, e));
+    }
+    h.state_mut().sel = vec![ids[1]];
+    h.run_steps(4);
+    h.render().unwrap().save("target/look-arcs.png").unwrap();
+    // Assets: the showcase's components as a grid.
+    {
+        let a = h.state_mut();
+        crate::plugins::run(&mut a.doc, 0, &[], include_str!("../assets/promo/showcase.js")).unwrap();
+        crate::plugins::run(&mut a.doc, 0, &[], "for (const c of ['Chip', 'Avatar', 'Card']) { const k = figma.createComponent(); k.name = c; k.resize(80, 40); k.y = 3000; k.cornerRadius = 12; k.fills = [figma.util.solidPaint('#4DA8FF')]; }").unwrap();
+        a.left_tab_assets = true;
+    }
+    h.run_steps(6);
+    h.render().unwrap().save("target/look-assets.png").unwrap();
+    eprintln!("asset thumbnails: {} ; tiles labeled: Button {} Chip {}", h.state().asset_thumbs.len(), h.query_all_by_label("Button").count(), h.query_all_by_label("Chip").count());
+}
+
+#[test]
+fn layer_rows_and_pages_are_named_for_assistive_tech() {
+    let mut h = harness();
+    draw(&mut h, Key::R, (0.0, 0.0), (50.0, 50.0));
+    h.run_steps(2);
+    assert!(h.query_by_label("Rectangle 1").is_some(), "layer row");
+    assert!(h.query_by_label("Page 1").is_some(), "page row");
+    assert!(h.query_by_label("Main menu").is_some(), "icon buttons");
+}
+
+#[test]
+fn ellipse_arcs_draw_rings_and_slices() {
+    let mut doc = crate::doc::Document::default();
+    crate::plugins::run(&mut doc, 0, &[], r##"
+        const ring = figma.createEllipse(); ring.name = "Ring"; ring.resize(100, 100);
+        ring.arcData = { startingAngle: 0, endingAngle: 2 * Math.PI, innerRadius: 0.8 };
+        const pie = figma.createEllipse(); pie.name = "Pie"; pie.resize(100, 100); pie.x = 200;
+        pie.arcData = { startingAngle: 0, endingAngle: Math.PI / 2, innerRadius: 0 };
+    "##).unwrap();
+    let get = |name: &str| doc.nodes.values().find(|n| n.name == name).unwrap().clone();
+    let (ring, pie) = (get("Ring"), get("Pie"));
+    assert_eq!(ring.arc, Some([0.0, 360.0, 0.8]));
+    assert!(pie.arc.is_some_and(|a| (a[1] - 90.0).abs() < 0.01));
+    // The ring's hole and the slice's empty quarters don't hit; their solid parts do.
+    let hit = |n: &crate::doc::Node, x: f32, y: f32| doc.hit_self(n, pos2(x, y), 0.0);
+    assert!(hit(&ring, 5.0, 50.0) && !hit(&ring, 50.0, 50.0));
+    assert!(hit(&pie, 270.0, 70.0), "lower-right quarter (clockwise from 3 o'clock)");
+    assert!(!hit(&pie, 230.0, 30.0), "upper-left is empty");
+    let svg = crate::export::to_svg(&doc, &[ring.id]);
+    assert!(svg.contains("fill-rule=\"evenodd\"") && svg.contains("<path"), "{svg}");
+}
+
+#[test]
+fn layer_search_finds_text_and_groups_become_auto_layout_frames() {
+    let mut h = harness();
+    let mut t = Node::new(Kind::Text, r(0., 0., 80., 20.));
+    t.text = "Move more".into();
+    t.name = "Text 17".into();
+    let t = h.state_mut().doc.insert(0, None, None, t);
+    h.state_mut().layer_search = Some("move more".into());
+    h.run_steps(2);
+    assert!(h.query_by_label("Text 17").is_some(), "found by what it says");
+    h.state_mut().layer_search = None;
+    // Shift+A on a group: the group itself becomes the auto layout frame.
+    let a = draw(&mut h, Key::O, (0.0, 100.0), (40.0, 140.0));
+    let b = draw(&mut h, Key::O, (60.0, 100.0), (100.0, 140.0));
+    h.state_mut().sel = vec![a, b];
+    key(&mut h, Modifiers::COMMAND, Key::G);
+    let g = h.state().sel[0];
+    key(&mut h, Modifiers::SHIFT, Key::A);
+    assert_eq!(h.state().sel, vec![g]);
+    let n = h.state().doc.node(g);
+    assert_eq!((n.kind, n.layout.mode), (Kind::Frame, crate::doc::LayoutMode::Horizontal));
+    assert_eq!(n.children.len(), 2, "the ellipses lay out directly");
+    let _ = t;
+}
+
+#[test]
+fn assets_show_component_previews_and_search_filters_sets() {
+    let mut h = harness();
+    crate::plugins::run(&mut h.state_mut().doc, 0, &[], include_str!("../assets/promo/showcase.js")).unwrap();
+    crate::plugins::run(&mut h.state_mut().doc, 0, &[], "const k = figma.createComponent(); k.name = 'Chip'; k.resize(80, 40);").unwrap();
+    h.state_mut().left_tab_assets = true;
+    h.run_steps(4);
+    assert_eq!(h.state().asset_thumbs.len(), 2, "the Button set and Chip");
+    // Editing a component re-renders just its preview.
+    let chip = h.state().doc.nodes.values().find(|n| n.name == "Chip").unwrap().id;
+    let before = h.state().asset_thumbs[&chip].0;
+    h.state_mut().doc.node_mut(chip).radius = 12.0;
+    h.run_steps(31);
+    assert_ne!(h.state().asset_thumbs[&chip].0, before);
+}
+
+#[test]
+fn exported_png_keeps_image_fills() {
+    let mut doc = crate::doc::Document::default();
+    let mut f = Node::new(Kind::Frame, r(0., 0., 300., 200.));
+    f.fills = vec![crate::doc::Paint::solid(crate::doc::Rgba::rgb(20, 20, 30))];
+    let f = doc.insert(0, None, None, f);
+    // A red photo, filling a wide tile (cropped to cover).
+    let img = image::RgbaImage::from_pixel(40, 60, image::Rgba([255, 0, 0, 255]));
+    let mut png = vec![];
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    doc.images.insert("photo".into(), std::sync::Arc::new(png));
+    let mut tile = Node::new(Kind::Rectangle, r(50., 50., 200., 100.));
+    let mut paint = crate::doc::Paint::solid(crate::doc::Rgba::WHITE);
+    paint.kind = crate::doc::PaintKind::Image;
+    paint.image = "photo".into();
+    tile.fills = vec![paint.clone()];
+    tile.radius = 12.0;
+    doc.insert(0, Some(f), None, tile.clone());
+    // The same with a (tiny) adjustment, as Codex's HUD had.
+    let mut adjusted = tile;
+    adjusted.rect = r(50., 160., 200., 30.);
+    paint.adjust.saturation = -0.01;
+    adjusted.fills = vec![paint];
+    doc.insert(0, Some(f), None, adjusted);
+    let png = crate::export::to_png(&doc, &[f], 1.0).unwrap();
+    let out = image::load_from_memory(&png).unwrap().to_rgba8();
+    assert_eq!(out.get_pixel(150, 100).0[..3], [255, 0, 0], "plain image fill");
+    assert_eq!(out.get_pixel(60, 60).0[..3], [255, 0, 0], "covers the tile from its corner");
+    assert!(out.get_pixel(150, 175).0[0] > 200 && out.get_pixel(150, 175).0[1] < 60, "adjusted image fill: {:?}", out.get_pixel(150, 175));
+}
+
+/// `KATACHI_EXPORT_FILE=x.katachi cargo test --release export_file -- --ignored`: first page's frames to target/export-N.png.
+#[test]
+#[ignore]
+fn export_file() {
+    let Some(f) = std::env::var_os("KATACHI_EXPORT_FILE") else { return };
+    let doc = crate::doc::parse_file(&std::fs::read_to_string(f).unwrap()).unwrap();
+    for (i, &id) in doc.pages[0].children.iter().enumerate() {
+        std::fs::write(format!("target/export-{i}.png"), crate::export::to_png(&doc, &[id], 1.0).unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn dev_mode_lists_a_multi_selection() {
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (50.0, 50.0));
+    let b = draw(&mut h, Key::O, (100.0, 0.0), (150.0, 50.0));
+    h.state_mut().sel = vec![a, b];
+    h.state_mut().dev_mode = true;
+    h.run_steps(2);
+    assert!(h.query_by_label("2 layers selected").is_some());
+    // Each layer appears in the layers panel and in the Dev Mode list.
+    assert_eq!(h.query_all_by_label("Ellipse 1").count(), 2);
+    let _ = b;
+}
+
+#[test]
+fn slash_named_styles_group_into_folders() {
+    let mut h = harness();
+    crate::plugins::run(&mut h.state_mut().doc, 0, &[], "for (const n of ['HUD / Title', 'HUD / Body', 'Accent']) { const s = figma.createPaintStyle(); s.name = n; s.paints = [figma.util.solidPaint('#8E72FF')]; }").unwrap();
+    h.run_steps(2);
+    assert!(h.query_by_label("HUD").is_some(), "a HUD folder");
+    assert!(h.query_by_label("HUD / Title").is_none(), "names show without the folder");
+}
+
+#[test]
+fn files_and_pages_reopen_where_they_were_viewed() {
+    let mut h = harness();
+    draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    h.state_mut().view.zoom = 2.5;
+    h.state_mut().view.pan += vec2(-300.0, 120.0);
+    h.run_steps(1);
+    let r = h.state().canvas_rect.unwrap();
+    let center = h.state().view.to_world(r.center());
+    let path = std::env::temp_dir().join(format!("katachi-view-{}.katachi", std::process::id()));
+    assert!(h.state_mut().save_to(path.clone()));
+    let mut g = harness();
+    g.state_mut().open_path(path);
+    g.run_steps(2);
+    let back = g.state().view.to_world(g.state().canvas_rect.unwrap().center());
+    assert_eq!(g.state().view.zoom, 2.5);
+    assert!((back - center).length() < 0.5, "{back:?} vs {center:?}");
+    // Switching pages and back keeps each page's view.
+    g.state_mut().doc.pages.push(crate::doc::Page { name: "Two".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None });
+    g.state_mut().select_page(1);
+    g.run_steps(2);
+    g.state_mut().select_page(0);
+    g.run_steps(2);
+    assert_eq!(g.state().view.zoom, 2.5);
+}
+
+#[test]
+fn vector_edit_panel_bends_and_moves_points() {
+    let mut h = harness();
+    let mut v = Node::vector(&[crate::doc::PathPoint { p: pos2(0., 0.), ..Default::default() }, crate::doc::PathPoint { p: pos2(100., 0.), ..Default::default() }, crate::doc::PathPoint { p: pos2(50., 80.), ..Default::default() }], true);
+    v.name = "Tri".into();
+    let id = h.state_mut().doc.insert(0, None, None, v);
+    h.state_mut().enter_vector_edit(id);
+    h.state_mut().vector_edit.as_mut().unwrap().selected = vec![(0, 2)];
+    h.run_steps(2);
+    assert!(h.query_by_label("Edit vector").is_some());
+    h.get_by_label("Bend").click();
+    h.run_steps(2);
+    let p = h.state().doc.node(id).paths[0].points[2];
+    assert!(p.h_in != vec2(0., 0.) && p.h_out != vec2(0., 0.), "smooth now");
+    h.get_by_label("Done").click();
+    h.run_steps(2);
+    assert!(h.state().vector_edit.is_none());
+}
+
+#[test]
+fn crop_mode_zooms_and_pans_the_image() {
+    let mut doc = crate::doc::Document::default();
+    // Left half red, right half blue.
+    let img = image::RgbaImage::from_fn(100, 50, |x, _| if x < 50 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) });
+    let mut png = vec![];
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    doc.images.insert("two".into(), std::sync::Arc::new(png));
+    let mut n = Node::new(Kind::Rectangle, r(0., 0., 100., 50.));
+    let mut p = crate::doc::Paint::solid(crate::doc::Rgba::WHITE);
+    p.kind = crate::doc::PaintKind::Image;
+    p.image = "two".into();
+    p.scale_mode = crate::doc::ScaleMode::Crop;
+    p.tile_scale = 2.0;
+    p.from = pos2(1.0, 0.0);
+    n.fills = vec![p];
+    let id = doc.insert(0, None, None, n);
+    let out = image::load_from_memory(&crate::export::to_png(&doc, &[id], 1.0).unwrap()).unwrap().to_rgba8();
+    assert_eq!(out.get_pixel(5, 25).0[..3], [0, 0, 255], "zoomed 2x to the right half: blue at the left edge");
+    assert_eq!(out.get_pixel(95, 25).0[..3], [0, 0, 255]);
+    // Through the plugin API: Figma's imageTransform round-trips.
+    let v = crate::plugin_doc::node_json(&doc, id);
+    let t = &v["fills"][0]["imageTransform"];
+    assert!((t[0][0].as_f64().unwrap() - 0.5).abs() < 1e-4 && (t[0][2].as_f64().unwrap() - 0.5).abs() < 1e-4, "{t}");
+    let back = crate::plugin_doc::paint_from(&v["fills"][0], &doc, Some(egui::vec2(100.0, 50.0))).unwrap();
+    assert_eq!(back.scale_mode, crate::doc::ScaleMode::Crop);
+    assert!((back.tile_scale - 2.0).abs() < 1e-4 && (back.from.x - 1.0).abs() < 1e-4);
+}
+
+#[test]
+fn quick_actions_run_commands_and_find_layers() {
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (40.0, 40.0));
+    let b = draw(&mut h, Key::R, (60.0, 0.0), (100.0, 40.0));
+    h.state_mut().sel = vec![a, b];
+    key(&mut h, Modifiers::COMMAND, Key::Slash);
+    assert!(h.state().quick.is_some(), "Cmd / opens it");
+    h.event(Event::Text("add auto".into()));
+    h.run_steps(2);
+    key(&mut h, Modifiers::NONE, Key::Enter);
+    assert!(h.state().quick.is_none());
+    let w = h.state().sel[0];
+    assert_eq!(h.state().doc.node(w).layout.mode, crate::doc::LayoutMode::Horizontal, "ran Add auto layout");
+    // Layers by name.
+    h.state_mut().doc.node_mut(b).name = "Checkout button".into();
+    key(&mut h, Modifiers::COMMAND, Key::K);
+    h.event(Event::Text("checkout".into()));
+    h.run_steps(2);
+    key(&mut h, Modifiers::NONE, Key::Enter);
+    assert_eq!(h.state().sel, vec![b]);
+}

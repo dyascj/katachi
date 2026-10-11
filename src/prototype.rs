@@ -153,23 +153,26 @@ impl App {
         }
     }
 
-    /// Deepest visible layer under `p` inside `root`, then bubble up to the first with a matching reaction.
+    /// The topmost layer under `p` inside `root` that (itself or a parent) reacts to the trigger.
+    /// Layers without interactions don't block the ones below, so a label over a linked button
+    /// still clicks the button.
     fn reaction_at(&self, root: NodeId, p: Pos2, want: impl Fn(&Trigger) -> bool) -> Option<(NodeId, Reaction)> {
-        fn deepest(doc: &Document, id: NodeId, p: Pos2) -> Option<NodeId> {
+        fn hits(doc: &Document, id: NodeId, p: Pos2, out: &mut Vec<NodeId>) {
             let n = doc.node(id);
-            if !n.visible || !n.aabb().contains(p) {
-                return None;
+            if !n.visible {
+                return;
             }
             for &c in n.children.iter().rev() {
-                if let Some(h) = deepest(doc, c, p) {
-                    return Some(h);
-                }
+                hits(doc, c, p, out);
             }
-            Some(id)
+            if n.aabb().contains(p) {
+                out.push(id);
+            }
         }
-        let hit = deepest(&self.doc, root, p)?;
-        std::iter::once(hit).chain(self.doc.ancestors(hit)).find_map(|id| {
-            self.doc.node(id).reactions.iter().find(|r| want(&r.trigger)).map(|r| (id, r.clone()))
+        let mut under = vec![];
+        hits(&self.doc, root, p, &mut under);
+        under.into_iter().find_map(|hit| {
+            std::iter::once(hit).chain(self.doc.ancestors(hit)).find_map(|id| self.doc.node(id).reactions.iter().find(|r| want(&r.trigger)).map(|r| (id, r.clone())))
         })
     }
 

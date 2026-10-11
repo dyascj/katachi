@@ -60,7 +60,7 @@ pub fn diff(base: &Document, doc: &Document) -> Vec<Op> {
     let mut ops = vec![];
     for (id, n) in &doc.nodes {
         if base.nodes.get(id) != Some(n) {
-            ops.push(Op::Upsert(Box::new(n.clone())));
+            ops.push(Op::Upsert(Box::new((**n).clone())));
         }
     }
     for id in base.nodes.keys() {
@@ -91,7 +91,7 @@ pub fn apply(doc: &mut Document, ops: &[Op]) {
                 if let Some(local) = doc.nodes.get(&n.id) {
                     n.lines = local.lines.clone();
                 }
-                doc.nodes.insert(n.id, n);
+                doc.nodes.insert(n.id, std::sync::Arc::new(n));
             }
             Op::Remove(id) => {
                 doc.nodes.remove(id);
@@ -122,11 +122,13 @@ pub fn repair(doc: &mut Document) {
         page.children.retain(|c| seen.insert(*c));
     }
     let parents: HashMap<NodeId, Option<NodeId>> = doc.nodes.iter().map(|(k, n)| (*k, n.parent)).collect();
-    for n in doc.nodes.values_mut() {
-        let me = n.id;
-        n.children.retain(|c| parents.get(c) == Some(&Some(me)));
+    for arc in doc.nodes.values_mut() {
+        let me = arc.id;
         let mut seen = HashSet::new();
-        n.children.retain(|c| seen.insert(*c));
+        let kids: Vec<NodeId> = arc.children.iter().copied().filter(|c| parents.get(c) == Some(&Some(me)) && seen.insert(*c)).collect();
+        if kids != arc.children {
+            std::sync::Arc::make_mut(arc).children = kids;
+        }
     }
     let mut ordered: Vec<NodeId> = doc.nodes.keys().copied().collect();
     ordered.sort();
@@ -304,8 +306,9 @@ impl Collab {
 
     /// Exchange changes: apply what arrived, send what changed locally (throttled).
     /// Returns ids of nodes this client changed in what it sent (for per-user undo).
-    pub fn tick(&mut self, doc: &mut Document, now: f64) -> Vec<NodeId> {
+    pub fn tick(&mut self, doc: &mut Document, now: f64) -> (Vec<NodeId>, Vec<Op>) {
         let mut remote = false;
+        let mut received: Vec<Op> = vec![];
         loop {
             match self.link.rx.try_recv() {
                 Ok(ToClient::Ops { ops, .. }) => {
@@ -315,6 +318,7 @@ impl Collab {
                     apply(doc, &ops);
                     apply(doc, &pending);
                     remote = true;
+                    received.extend(ops);
                 }
                 Ok(ToClient::Presence { from, presence }) => {
                     self.peers.insert(from, presence);
@@ -346,14 +350,17 @@ impl Collab {
                 }
                 let _ = self.link.tx.send(serde_json::to_string(&ToServer::Ops(ops)).unwrap_or_default());
                 self.base = doc.clone();
-                self.last_send = now;
+                // A forced send (undo checkpoints pass f64::MAX) mustn't stall the throttle forever.
+                if now < f64::MAX {
+                    self.last_send = now;
+                }
             }
             if self.last_presence.as_ref() != Some(&self.me) {
                 let _ = self.link.tx.send(serde_json::to_string(&ToServer::Presence(self.me.clone())).unwrap_or_default());
                 self.last_presence = Some(self.me.clone());
             }
         }
-        touched
+        (touched, received)
     }
 }
 

@@ -33,10 +33,11 @@ impl App {
         if !self.view_ready {
             self.view_ready = true;
             let kids = self.doc.pages[self.page].children.clone();
-            self.view = if kids.is_empty() {
-                View { zoom: 1.0, pan: rect.center().to_vec2() }
-            } else {
-                View::fit(self.doc.bounds(&kids), rect, 1.0)
+            self.view = match self.doc.pages[self.page].view {
+                // Back where this page was last viewed.
+                Some([x, y, zoom]) => View { zoom, pan: rect.center().to_vec2() - vec2(x, y) * zoom },
+                None if kids.is_empty() => View { zoom: 1.0, pan: rect.center().to_vec2() },
+                None => View::fit(self.doc.bounds(&kids), rect, 1.0),
             };
         }
         if let Some(t) = self.zoom_target.take().filter(|t| self.doc.nodes.contains_key(t)) {
@@ -127,11 +128,17 @@ impl App {
             && let Some(w) = world {
                 self.on_drag_end(w);
             }
-        if resp.clicked()
+        // The click that closed a pen path ends there (it could otherwise count as a
+        // double-click and select the frame under it).
+        let swallow = self.pen_closed && (resp.clicked() || resp.drag_stopped());
+        if swallow {
+            self.pen_closed = false;
+        }
+        if resp.clicked() && !swallow
             && let Some(w) = world {
                 self.on_click(w, mods);
             }
-        if resp.double_clicked() && self.tool == Tool::Move
+        if resp.double_clicked() && !swallow && self.tool == Tool::Move
             && let Some(w) = world {
                 self.on_double_click(w);
             }
@@ -420,6 +427,7 @@ impl App {
                 let close = self.pen.len() >= 2 && self.view.to_screen(self.pen[0].p).distance(s) < 8.0;
                 if close {
                     self.finish_pen(true);
+                    self.pen_closed = true;
                 } else {
                     let mut p = w;
                     if let (true, Some(last)) = (mods.shift, self.pen.last()) {
@@ -1444,6 +1452,10 @@ impl App {
             let node = self.doc.node_mut(id);
             node.spans = crate::doc::shift_spans(&node.spans, &n.text, &text);
             node.lists = crate::doc::shift_lists(&node.lists, &n.text, &text);
+            // Figma names a text layer after its text until it's renamed by hand.
+            if crate::doc::auto_text_name(&node.name, &n.text) {
+                node.name = crate::doc::text_layer_name(&text);
+            }
             node.text = text;
             self.dirty = true;
         }
@@ -1499,7 +1511,7 @@ impl App {
         true
     }
 
-    fn context_menu(&mut self, ui: &mut Ui) {
+    pub fn context_menu(&mut self, ui: &mut Ui) {
         let has = !self.sel.is_empty();
         let ctx = ui.ctx().clone();
         let item = |ui: &mut Ui, label: &str, short: &str, enabled: bool| {
@@ -1621,11 +1633,26 @@ impl App {
             self.create_component();
             ui.close();
         }
+        if kind == Some(Kind::Component) {
+            if item(ui, "Add variant", "", true) {
+                self.add_variant_to(one.unwrap());
+                ui.close();
+            }
+            if item(ui, "Create instance", "", true) {
+                self.duplicate_selection();
+                ui.close();
+            }
+        }
         if let Some(inst) = one.and_then(|id| self.owning_instance(id)) {
             if item(ui, "Go to main component", "", true) {
                 self.go_to_main(inst);
                 ui.close();
             }
+            ui.menu_button("Swap instance", |ui| {
+                if self.swap_menu(ui, inst) {
+                    ui.close();
+                }
+            });
             if item(ui, "Reset instance", "", true) {
                 self.checkpoint();
                 self.doc.reset_instance(inst);

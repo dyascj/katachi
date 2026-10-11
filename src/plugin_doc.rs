@@ -107,11 +107,12 @@ pub fn paint_json(p: &Paint, bound: Option<VarId>) -> Value {
         }),
         PaintKind::Image => {
             let a = p.adjust;
-            json!({
+            let v = json!({
                 "type": "IMAGE", "imageHash": p.image, "opacity": unit(p.color.a()), "scalingFactor": p.tile_scale,
-                "scaleMode": match p.scale_mode { ScaleMode::Fill => "FILL", ScaleMode::Fit => "FIT", ScaleMode::Stretch => "CROP", ScaleMode::Tile => "TILE" },
+                "scaleMode": match p.scale_mode { ScaleMode::Fill => "FILL", ScaleMode::Fit => "FIT", ScaleMode::Stretch | ScaleMode::Crop => "CROP", ScaleMode::Tile => "TILE" },
                 "filters": { "exposure": a.exposure, "contrast": a.contrast, "saturation": a.saturation, "temperature": a.temperature, "tint": a.tint, "highlights": a.highlights, "shadows": a.shadows },
-            })
+            });
+            v
         }
     };
     v["visible"] = json!(p.visible);
@@ -122,7 +123,7 @@ pub fn paint_json(p: &Paint, bound: Option<VarId>) -> Value {
     v
 }
 
-pub fn paint_from(v: &Value, doc: &Document) -> Option<Paint> {
+pub fn paint_from(v: &Value, doc: &Document, layer: Option<egui::Vec2>) -> Option<Paint> {
     let opacity = f(v, "opacity").unwrap_or(1.0);
     let mut p = match v.get("type")?.as_str()? {
         "SOLID" => Paint::solid(color_from(v.get("color")?, opacity)),
@@ -160,6 +161,16 @@ pub fn paint_from(v: &Value, doc: &Document) -> Option<Paint> {
                 _ => ScaleMode::Fill,
             };
             p.tile_scale = f(v, "scalingFactor").unwrap_or(1.0) as f32;
+            // CROP with a transform is Figma's crop; without one it stretches.
+            if let (Some("CROP"), Some(t)) = (v["scaleMode"].as_str(), v["imageTransform"].as_array()) {
+                let m = |r: usize, c: usize| t.get(r).and_then(|row| row.get(c)).and_then(|x| x.as_f64()).unwrap_or(if r == c { 1.0 } else { 0.0 }) as f32;
+                let t = [[m(0, 0), m(0, 1), m(0, 2)], [m(1, 0), m(1, 1), m(1, 2)]];
+                if t != [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+                    && let Some(img) = crate::doc::image_size(doc, hash)
+                {
+                    crate::doc::crop_from_transform(&mut p, t, layer.unwrap_or(img), img);
+                }
+            }
             if let Some(fl) = v.get("filters") {
                 let g = |k: &str| f(fl, k).unwrap_or(0.0) as f32;
                 p.adjust = ImageAdjust { exposure: g("exposure"), contrast: g("contrast"), saturation: g("saturation"), temperature: g("temperature"), tint: g("tint"), highlights: g("highlights"), shadows: g("shadows") };
@@ -400,6 +411,17 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
     let last = |len: usize, i: usize| i + 1 == len;
     let paints = |ps: &[Paint], b: Bindable| ps.iter().enumerate().map(|(i, p)| paint_json(p, bound(b).filter(|_| last(ps.len(), i)))).collect::<Vec<_>>();
     let corners = n.corner_radii.unwrap_or([n.radius; 4]);
+    let crop = |list: &mut Value, ps: &[Paint]| {
+        for (i, p) in ps.iter().enumerate() {
+            if p.kind == PaintKind::Image
+                && p.scale_mode == ScaleMode::Crop
+                && let Some(img) = crate::doc::image_size(doc, &p.image)
+            {
+                let (c, span) = crate::doc::crop_window(p, r.size(), img);
+                list[i]["imageTransform"] = json!([[span.x, 0.0, c.x - span.x / 2.0], [0.0, span.y, c.y - span.y / 2.0]]);
+            }
+        }
+    };
     let mut v = json!({
         "id": id.to_string(), "type": figma_type(n.kind), "name": n.name,
         "x": r.min.x - origin.x, "y": r.min.y - origin.y, "width": r.width(), "height": r.height(),
@@ -421,6 +443,8 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
         "strokeStyleId": n.stroke_style.map(|s| format!("S:{s}")).unwrap_or_default(),
         "effectStyleId": n.effect_style.map(|s| format!("S:{s}")).unwrap_or_default(),
     });
+    crop(&mut v["fills"], &n.fills);
+    crop(&mut v["strokes"], &n.strokes);
     // The child's sizing along its auto-layout parent's axes, in the older layoutGrow/layoutAlign terms.
     let parent_mode = parent.map_or(LayoutMode::None, |p| p.layout.mode);
     let (main, cross) = if parent_mode == LayoutMode::Horizontal { (0, 1) } else { (1, 0) };
@@ -521,6 +545,10 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
         v["textTruncation"] = json!(if n.truncate { "ENDING" } else { "DISABLED" });
         v["maxLines"] = if n.max_lines > 0 { json!(n.max_lines) } else { Value::Null };
         v["textStyleId"] = json!(n.text_style.map(|s| format!("S:{s}")).unwrap_or_default());
+    }
+    if n.kind == Kind::Ellipse {
+        let [start, sweep, ratio] = n.arc.unwrap_or([0.0, 360.0, 0.0]);
+        v["arcData"] = json!({ "startingAngle": start.to_radians(), "endingAngle": (start + sweep).to_radians(), "innerRadius": ratio });
     }
     if matches!(n.kind, Kind::Polygon | Kind::Star) {
         v["pointCount"] = json!(n.point_count);
@@ -693,7 +721,7 @@ fn apply_styles_and_variables(doc: &mut Document, out: &Value, refs: &mut Refs) 
     doc.styles.retain(|s| !gone.contains(&s.id));
     for s in out["styles"].as_array().into_iter().flatten() {
         let value = match s["type"].as_str() {
-            Some("PAINT") => StyleValue::Paint(s["paints"].as_array().into_iter().flatten().filter_map(|p| paint_from(p, doc)).collect()),
+            Some("PAINT") => StyleValue::Paint(s["paints"].as_array().into_iter().flatten().filter_map(|p| paint_from(p, doc, None)).collect()),
             Some("EFFECT") => StyleValue::Effect(s["effects"].as_array().into_iter().flatten().filter_map(effect_from).collect()),
             Some("TEXT") => {
                 let size = f(s, "fontSize").unwrap_or(12.0) as f32;
@@ -814,7 +842,8 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
     }
     let parent_mode = doc.node(id).parent.map_or(LayoutMode::None, |p| doc.node(p).layout.mode);
     // Paints read the image table, so parse them before borrowing the layer.
-    let paints = |k: &str| -> Option<Vec<Paint>> { changed(k).then(|| v[k].as_array().into_iter().flatten().filter_map(|p| paint_from(p, doc)).collect()) };
+    let layer = Some(doc.node(id).rect.size());
+    let paints = |k: &str| -> Option<Vec<Paint>> { changed(k).then(|| v[k].as_array().into_iter().flatten().filter_map(|p| paint_from(p, doc, layer)).collect()) };
     let (fills, strokes) = (paints("fills"), paints("strokes"));
     // Type changes the API allows: createComponentFromNode, and detaching an instance.
     if changed("type") {
@@ -1008,6 +1037,9 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
             let t = s("characters").to_string();
             n.spans.clear();
             n.lists = shift_lists(&n.lists, &n.text, &t);
+            if !changed("name") && crate::doc::auto_text_name(&n.name, &n.text) {
+                n.name = crate::doc::text_layer_name(&t);
+            }
             n.text = t;
         }
         if changed("fontSize") {
@@ -1089,6 +1121,14 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
             }
             n.spans = style_range(&n.spans, len, a.min(len), b.min(len), &st);
         }
+    }
+    if changed("arcData") && n.kind == Kind::Ellipse {
+        let a = &v["arcData"];
+        let f = |k: &str, d: f32| a[k].as_f64().map_or(d, |x| x as f32);
+        let start = f("startingAngle", 0.0).to_degrees();
+        let sweep = (f("endingAngle", std::f32::consts::TAU).to_degrees() - start).clamp(-360.0, 360.0);
+        let arc = [start.rem_euclid(360.0), sweep, f("innerRadius", 0.0).clamp(0.0, 0.99)];
+        n.arc = (arc != [0.0, 360.0, 0.0]).then_some(arc);
     }
     if changed("pointCount") {
         n.point_count = v["pointCount"].as_u64().unwrap_or(5).clamp(3, 60) as u32;
@@ -1199,7 +1239,7 @@ pub fn apply(doc: &mut Document, out: &Value) -> HashMap<String, NodeId> {
         let i = match p["id"].as_str().and_then(|s| s.strip_prefix("page:")).and_then(|s| s.parse::<usize>().ok()).filter(|i| *i < doc.pages.len()) {
             Some(i) => i,
             None => {
-                doc.pages.push(Page { name: name.clone(), children: vec![], background: PAGE_BG, flows: vec![] });
+                doc.pages.push(Page { name: name.clone(), children: vec![], background: PAGE_BG, flows: vec![], view: None });
                 doc.pages.len() - 1
             }
         };

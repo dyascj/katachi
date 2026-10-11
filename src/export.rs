@@ -25,6 +25,17 @@ fn esc(s: &str) -> String {
 fn shape(n: &Node, o: Vec2, grow: f32, attrs: &str) -> String {
     let r = n.rect.translate(-o).expand(grow);
     match n.kind {
+        Kind::Ellipse if n.is_arc() => {
+            let d: String = n
+                .arc_outline(grow)
+                .iter()
+                .map(|poly| {
+                    let pts: Vec<String> = poly.iter().map(|p| format!("{} {}", p.x - o.x, p.y - o.y)).collect();
+                    format!("M{}Z", pts.join("L"))
+                })
+                .collect();
+            format!(r#"<path d="{d}" fill-rule="evenodd" {attrs}/>"#)
+        }
         Kind::Ellipse => format!(
             r#"<ellipse cx="{}" cy="{}" rx="{}" ry="{}" {attrs}/>"#,
             r.center().x,
@@ -190,6 +201,7 @@ impl Svg<'_> {
                 let data = base64::engine::general_purpose::STANDARD.encode(bytes.as_slice());
                 let id = self.id("image");
                 use crate::doc::ScaleMode;
+                // Pattern content is laid out from the tile's own corner, so the image sits at 0, 0.
                 let (x, y, w, h) = (r.min.x, r.min.y, r.width(), r.height());
                 let href = format!("data:{mime};base64,{data}");
                 if p.scale_mode == ScaleMode::Tile {
@@ -199,6 +211,16 @@ impl Svg<'_> {
                         self.defs,
                         r#"<pattern id="{id}" patternUnits="userSpaceOnUse" x="{x}" y="{y}" width="{iw}" height="{ih}"><image href="{href}" x="0" y="0" width="{iw}" height="{ih}" preserveAspectRatio="none"/></pattern>"#
                     );
+                } else if p.scale_mode == ScaleMode::Crop {
+                    // The crop window, as a viewBox over the image at its own pixel size.
+                    let dims = image::ImageReader::new(std::io::Cursor::new(bytes.as_slice())).with_guessed_format().ok().and_then(|r| r.into_dimensions().ok());
+                    let (iw, ih) = dims.map_or((w, h), |(a, b)| (a as f32, b as f32));
+                    let (c, span) = crate::doc::crop_window(p, egui::vec2(w, h), egui::vec2(iw, ih));
+                    let (vx, vy, vw, vh) = ((c.x - span.x / 2.0) * iw, (c.y - span.y / 2.0) * ih, span.x * iw, span.y * ih);
+                    let _ = write!(
+                        self.defs,
+                        r#"<pattern id="{id}" patternUnits="userSpaceOnUse" x="{x}" y="{y}" width="{w}" height="{h}"><svg x="0" y="0" width="{w}" height="{h}" viewBox="{vx} {vy} {vw} {vh}" preserveAspectRatio="none"><image href="{href}" width="{iw}" height="{ih}"/></svg></pattern>"#
+                    );
                 } else {
                     let aspect = match p.scale_mode {
                         ScaleMode::Fit => "xMidYMid meet",
@@ -207,7 +229,7 @@ impl Svg<'_> {
                     };
                     let _ = write!(
                         self.defs,
-                        r#"<pattern id="{id}" patternUnits="userSpaceOnUse" x="{x}" y="{y}" width="{w}" height="{h}"><image href="{href}" x="{x}" y="{y}" width="{w}" height="{h}" preserveAspectRatio="{aspect}"/></pattern>"#
+                        r#"<pattern id="{id}" patternUnits="userSpaceOnUse" x="{x}" y="{y}" width="{w}" height="{h}"><image href="{href}" x="0" y="0" width="{w}" height="{h}" preserveAspectRatio="{aspect}"/></pattern>"#
                     );
                 }
                 format!(r#"{name}="url(#{id})" {name}-opacity="{:.3}""#, p.alpha())

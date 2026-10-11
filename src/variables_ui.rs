@@ -25,7 +25,7 @@ fn value_editor(ui: &mut Ui, id: egui::Id, v: &mut VarValue, names: &[(u64, Stri
             if changed {
                 *c = Rgba([rgb[0], rgb[1], rgb[2], c.0[3]]);
             }
-            changed |= crate::paint_ui::hex_field(ui, id, c, 56.0);
+            changed |= crate::paint_ui::hex_field(ui, id, c, 64.0);
             changed
         }
         VarValue::Number(n) => ui.add(DragValue::new(n).speed(0.5).custom_formatter(|x, _| num(x as f32))).changed(),
@@ -78,7 +78,7 @@ impl App {
             let names: Vec<(u64, String)> = self.doc.variables.iter().map(|v| (v.id, v.name.clone())).collect();
             let modes = self.doc.collections[ci].modes.len();
             egui::ScrollArea::both().max_height(300.0).show(ui, |ui| {
-                egui::Grid::new("vars").striped(true).min_col_width(80.0).show(ui, |ui| {
+                egui::Grid::new("vars").striped(true).min_col_width(140.0).show(ui, |ui| {
                     ui.label(RichText::new("Name").strong());
                     for m in 0..modes {
                         ui.add(egui::TextEdit::singleline(&mut self.doc.collections[ci].modes[m]).desired_width(90.0));
@@ -117,7 +117,9 @@ impl App {
                     if let Some(id) = delete {
                         self.doc.variables.retain(|v| v.id != id);
                         for n in self.doc.nodes.values_mut() {
-                            n.bindings.retain(|(_, v)| *v != id);
+                            if n.bindings.iter().any(|(_, v)| *v == id) {
+                                std::sync::Arc::make_mut(n).bindings.retain(|(_, v)| *v != id);
+                            }
                         }
                     }
                 });

@@ -341,6 +341,7 @@ pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
 
 pub fn icon_button(ui: &mut Ui, icon: Icon, selected: bool, size: f32, tip: &str) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, tip));
     let (bg, fg) = if selected {
         (BLUE, Color32::WHITE)
     } else if resp.hovered() {
@@ -499,6 +500,23 @@ fn section_title(ui: &mut Ui, title: &str) -> bool {
     add
 }
 
+/// Figma's frame presets: group, then (name, width, height).
+const FRAME_PRESETS: &[(&str, &[(&str, u32, u32)])] = &[
+    ("Phone", &[("iPhone 16", 393, 852), ("iPhone 16 Pro", 402, 874), ("iPhone 16 Pro Max", 440, 956), ("iPhone 16 Plus", 430, 932), ("iPhone 14", 390, 844), ("iPhone SE", 320, 568), ("Android Compact", 412, 917), ("Android Medium", 700, 840)]),
+    ("Tablet", &[("iPad mini 8.3", 744, 1133), ("iPad Pro 11\"", 834, 1194), ("iPad Pro 12.9\"", 1024, 1366), ("Surface Pro 8", 1440, 960)]),
+    ("Desktop", &[("MacBook Air", 1280, 832), ("MacBook Pro 14\"", 1512, 982), ("MacBook Pro 16\"", 1728, 1117), ("Desktop", 1440, 1024), ("Wireframe", 1440, 1024), ("TV", 1280, 720)]),
+    ("Presentation", &[("Slide 16:9", 1920, 1080), ("Slide 4:3", 1024, 768)]),
+    ("Watch", &[("Apple Watch 45mm", 198, 242), ("Apple Watch 41mm", 176, 215), ("Apple Watch Ultra", 205, 251)]),
+    ("Paper", &[("A4", 595, 842), ("A5", 420, 595), ("A6", 297, 420), ("Letter", 612, 792), ("Tabloid", 792, 1224)]),
+    ("Social media", &[("Twitter post", 1200, 675), ("Facebook post", 1200, 630), ("Instagram post", 1080, 1350), ("Instagram story", 1080, 1920), ("LinkedIn post", 1200, 1200), ("YouTube thumbnail", 1280, 720), ("Dribbble shot", 400, 300)]),
+];
+
+/// A dropdown inside a popover. egui's ComboBox opens its own popup, and a click there counts as
+/// outside the popover and closes it; a menu submenu belongs to the popover instead.
+fn dropdown(ui: &mut Ui, text: impl std::fmt::Display, add: impl FnOnce(&mut Ui)) {
+    ui.menu_button(text.to_string(), add);
+}
+
 fn heading(ui: &mut Ui, title: &str) {
     ui.add_space(4.0);
     ui.label(RichText::new(title).strong());
@@ -522,8 +540,8 @@ impl App {
             ui.horizontal(|ui| {
                 let menu = icon_button(ui, Icon::Menu, false, 28.0, "Main menu");
                 egui::Popup::menu(&menu).show(|ui| self.main_menu(ui));
-                let name = self.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned());
-                ui.label(RichText::new(name.unwrap_or_else(|| "Untitled".into())).strong());
+                // Truncated, so a long file name can't widen the panel.
+                ui.add(egui::Label::new(RichText::new(self.display_name()).strong()).truncate());
             });
             ui.horizontal(|ui| {
                 for (assets, label) in [(false, "File"), (true, "Assets")] {
@@ -568,14 +586,14 @@ impl App {
         let mut q: String = ui.data(|d| d.get_temp(search_id)).unwrap_or_default();
         ui.add(egui::TextEdit::singleline(&mut q).hint_text("Search assets").desired_width(f32::INFINITY));
         ui.data_mut(|d| d.insert_temp(search_id, q.clone()));
+        let q = q.to_lowercase();
         ui.add_space(4.0);
-        ui.label(RichText::new("Local components").strong());
+        // Sets appear once (placing their first variant); components inside sets don't.
         let mut comps: Vec<(usize, NodeId, String)> = self
             .doc
             .nodes
             .values()
-            .filter(|n| n.kind == Kind::Component && n.name.to_lowercase().contains(&q.to_lowercase()) || n.kind == Kind::ComponentSet)
-            // A set appears once and places its first variant.
+            .filter(|n| matches!(n.kind, Kind::Component | Kind::ComponentSet) && n.name.to_lowercase().contains(&q))
             .filter(|n| !n.parent.is_some_and(|p| self.doc.node(p).kind == Kind::ComponentSet))
             .filter_map(|n| match n.kind {
                 Kind::ComponentSet => n.children.first().map(|&v| (self.doc.page_of(n.id), v, n.name.clone())),
@@ -584,27 +602,106 @@ impl App {
             .collect();
         comps.sort_by(|a, b| (a.0, &a.2).cmp(&(b.0, &b.2)));
         if comps.is_empty() {
-            ui.label(RichText::new("Create components with ⌥⌘K to reuse them here.").color(theme::muted(ui.ctx())));
+            ui.label(RichText::new(if q.is_empty() { "Create components with ⌥⌘K to reuse them here." } else { "No components match." }).color(theme::muted(ui.ctx())));
+            return;
         }
+        ui.label(RichText::new("Local components").strong());
+        // Thumbnails are rendered a few per frame, so opening a big library doesn't stall.
+        let mut budget = 6;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for (page, id, name) in comps {
-                let r = ui.dnd_drag_source(ui.id().with(("asset", id)), AssetDrag(id), |ui| {
-                    ui.horizontal(|ui| {
-                        let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-                        paint_icon(ui.painter(), rect, Icon::Component, crate::canvas::PURPLE);
-                        ui.label(&name);
-                        ui.label(RichText::new(&self.doc.pages[page].name).color(theme::faint(ui.ctx())).small());
-                    });
-                });
-                if r.response.double_clicked() {
-                    let at = self.view_center_world();
-                    self.checkpoint();
-                    let size = self.doc.node(id).rect.size();
-                    let i = self.doc.instantiate(id, self.page, None, None, (at - size / 2.0).round());
-                    self.sel = vec![i];
+            for page in 0..self.doc.pages.len() {
+                let items: Vec<(NodeId, String)> = comps.iter().filter(|c| c.0 == page).map(|c| (c.1, c.2.clone())).collect();
+                if items.is_empty() {
+                    continue;
                 }
+                egui::CollapsingHeader::new(RichText::new(&self.doc.pages[page].name).color(theme::muted(ui.ctx())))
+                    .id_salt(("asset-page", page))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let tile = 70.0;
+                        let gap = 8.0;
+                        let cols = ((ui.available_width() + gap) / (tile + gap)).floor().max(1.0) as usize;
+                        for row in items.chunks(cols) {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = gap;
+                                for (id, name) in row {
+                                    self.asset_tile(ui, *id, name, tile, &mut budget);
+                                }
+                            });
+                        }
+                    });
             }
         });
+        if budget == 0 {
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// One component in the Assets grid: a preview over its name. Drag onto the canvas, or
+    /// double-click to place it mid-screen.
+    fn asset_tile(&mut self, ui: &mut Ui, id: NodeId, name: &str, size: f32, budget: &mut usize) {
+        let tex = self.asset_thumb(ui.ctx(), id, budget);
+        let r = ui.dnd_drag_source(ui.id().with(("asset", id)), AssetDrag(id), |ui| {
+            ui.vertical(|ui| {
+                ui.set_width(size);
+                let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
+                let p = ui.painter();
+                p.rect_filled(rect, 6.0, theme::subtle(ui.ctx()));
+                if resp.hovered() {
+                    p.rect_stroke(rect, 6.0, Stroke::new(1.0, BLUE), egui::StrokeKind::Inside);
+                }
+                if let Some(tex) = &tex {
+                    let s = tex.size_vec2();
+                    let fit = ((size - 12.0) / s.x).min((size - 12.0) / s.y);
+                    p.image(tex.id(), Rect::from_center_size(rect.center(), s * fit), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+                } else {
+                    paint_icon(p, Rect::from_center_size(rect.center(), vec2(18.0, 18.0)), Icon::Component, crate::canvas::PURPLE);
+                }
+                ui.add(egui::Label::new(RichText::new(name).small()).truncate());
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+            });
+        });
+        let r = r.response.on_hover_text(name);
+        if r.double_clicked() {
+            let at = self.view_center_world();
+            self.checkpoint();
+            let size = self.doc.node(id).rect.size();
+            let i = self.doc.instantiate(id, self.page, None, None, (at - size / 2.0).round());
+            self.sel = vec![i];
+        }
+    }
+
+    /// A component's preview, re-rendered when its content changes. Each tile re-checks its
+    /// content every 30 frames (staggered), so a big library costs little per frame.
+    fn asset_thumb(&mut self, ctx: &egui::Context, id: NodeId, budget: &mut usize) -> Option<egui::TextureHandle> {
+        use std::hash::{Hash, Hasher};
+        let due = (ctx.cumulative_frame_nr() + id) % 30 == 0;
+        if let Some((_, tex)) = self.asset_thumbs.get(&id)
+            && (!due || *budget == 0)
+        {
+            return Some(tex.clone());
+        }
+        let mut h = std::hash::DefaultHasher::new();
+        for n in std::iter::once(id).chain(self.doc.descendants(id)) {
+            serde_json::to_vec(&*self.doc.nodes[&n]).unwrap_or_default().hash(&mut h);
+        }
+        let key = h.finish();
+        if let Some((k, tex)) = self.asset_thumbs.get(&id)
+            && *k == key
+        {
+            return Some(tex.clone());
+        }
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        let b = crate::export::export_bounds(&self.doc, &[id]);
+        let scale = (128.0 / b.width().max(b.height()).max(1.0)).min(4.0);
+        let svg = crate::export::to_svg(&self.doc, &[id]);
+        let (px, [w, hgt]) = crate::export::rasterize(&svg, scale)?;
+        let tex = ctx.load_texture(format!("asset-{id}"), egui::ColorImage::from_rgba_premultiplied([w, hgt], &px), egui::TextureOptions::LINEAR);
+        self.asset_thumbs.insert(id, (key, tex.clone()));
+        Some(tex)
     }
 
     fn main_menu(&mut self, ui: &mut Ui) {
@@ -748,7 +845,7 @@ impl App {
                 if icon_button(ui, Icon::Plus, false, 22.0, "Add page").clicked() {
                     self.checkpoint();
                     let n = self.doc.pages.len() + 1;
-                    self.doc.pages.push(Page { name: format!("Page {n}"), children: vec![], background: crate::doc::PAGE_BG, flows: vec![] });
+                    self.doc.pages.push(Page { name: format!("Page {n}"), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None });
                     self.select_page(n - 1);
                 }
             });
@@ -756,6 +853,8 @@ impl App {
         let mut delete = None;
         for i in 0..self.doc.pages.len() {
             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+            let page_name = self.doc.pages[i].name.clone();
+            resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, i == self.page, &page_name));
             if i == self.page {
                 ui.painter().rect_filled(rect, 4.0, theme::subtle(ui.ctx()));
             } else if resp.hovered() {
@@ -764,9 +863,12 @@ impl App {
             if let Some((pi, buf)) = &mut self.renaming_page
                 && *pi == i {
                     let r = ui.put(rect.shrink2(vec2(6.0, 3.0)), egui::TextEdit::singleline(buf));
-                    r.request_focus();
-                    if r.lost_focus() {
-                        let name = buf.trim().to_string();
+                    let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    if !r.has_focus() && !r.lost_focus() && !cancel {
+                        r.request_focus();
+                    }
+                    if r.lost_focus() || cancel {
+                        let name = if cancel { String::new() } else { buf.trim().to_string() };
                         self.renaming_page = None;
                         if !name.is_empty() && name != self.doc.pages[i].name {
                             self.checkpoint();
@@ -819,7 +921,8 @@ impl App {
             fn walk(app: &App, list: &[NodeId], depth: usize, q: &str, out: &mut Vec<(NodeId, usize)>) {
                 for &id in list.iter().rev() {
                     let n = app.doc.node(id);
-                    if n.name.to_lowercase().contains(q) {
+                    // Like Figma, text layers match on what they say as well as their name.
+                    if n.name.to_lowercase().contains(q) || (n.kind == Kind::Text && n.text.to_lowercase().contains(q)) {
                         out.push((id, depth));
                     }
                     walk(app, &n.children, depth + 1, q, out);
@@ -850,6 +953,8 @@ impl App {
             rects.push((id, rect));
             let n = self.doc.node(id).clone();
             let selected = self.sel.contains(&id);
+            // Screen readers and computer-use agents see the row as a named, selectable item.
+            resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &n.name));
             let in_selected = !selected && self.sel.iter().any(|&s| self.doc.is_ancestor(s, id));
             let p = &ui.painter().clone();
             if selected {
@@ -871,18 +976,26 @@ impl App {
             if !n.children.is_empty() {
                 paint_icon(p, chev, Icon::Chevron(n.expanded), theme::muted(ui.ctx()));
             }
-            paint_icon(p, Rect::from_center_size(pos2(x + 22.0, rect.center().y), vec2(16.0, 16.0)), kind_icon(n.kind), fg);
+            paint_icon(p, Rect::from_center_size(pos2(x + 22.0, rect.center().y), vec2(16.0, 16.0)), if n.is_mask { Icon::Opacity } else { kind_icon(n.kind) }, fg);
             let name_pos = pos2(x + 36.0, rect.center().y);
             let renaming = matches!(&self.renaming, Some((r, _)) if *r == id);
             if renaming {
                 let mut buf = self.renaming.as_ref().unwrap().1.clone();
                 let edit_rect = Rect::from_min_max(pos2(name_pos.x - 2.0, rect.min.y + 3.0), rect.max - vec2(48.0, 3.0));
                 let r = ui.put(edit_rect, egui::TextEdit::singleline(&mut buf));
-                r.request_focus();
+                // Focus once; Enter or clicking away commits, Escape cancels, and either way the
+                // keyboard goes back to the canvas.
+                let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                if !r.has_focus() && !r.lost_focus() && !cancel {
+                    r.request_focus();
+                }
                 self.renaming = Some((id, buf.clone()));
-                if r.lost_focus() {
+                if r.lost_focus() || cancel {
                     self.renaming = None;
-                    let name = buf.trim().to_string();
+                    if r.has_focus() {
+                        r.surrender_focus();
+                    }
+                    let name = if cancel { String::new() } else { buf.trim().to_string() };
                     if !name.is_empty() && name != self.doc.node(id).name {
                         self.checkpoint();
                         self.doc.node_mut(id).name = name;
@@ -932,6 +1045,11 @@ impl App {
             if resp.drag_started() {
                 self.layer_drag = Some(id);
             }
+            // Right-click a row: select it (unless it's already in the selection) and show the canvas menu.
+            if resp.secondary_clicked() && !self.sel.contains(&id) {
+                self.sel = vec![id];
+            }
+            resp.context_menu(|ui| self.context_menu(ui));
         }
         self.layer_drop(ui, &rects);
     }
@@ -1032,6 +1150,9 @@ impl App {
                         if ui.add(egui::Button::new("Zoom to fit").shortcut_text("⇧1")).clicked() {
                             self.zoom_to(&ctx, None, false);
                         }
+                        if ui.add_enabled(!self.sel.is_empty(), egui::Button::new("Zoom to selection").shortcut_text("⇧2")).clicked() {
+                            self.zoom_to(&ctx, Some(self.sel.clone()), false);
+                        }
                         if ui.add(egui::Button::new("Zoom to 100%").shortcut_text("⇧0")).clicked() {
                             self.zoom_to(&ctx, None, true);
                         }
@@ -1052,8 +1173,17 @@ impl App {
                     self.comments_panel(ui);
                     return;
                 }
+                // Frame tool with nothing being drawn: Figma's frame presets.
+                if matches!(self.tool, Tool::Frame) && self.drag.is_none() && !self.prototype_tab {
+                    self.frame_presets(ui);
+                    return;
+                }
                 if self.prototype_tab {
                     self.prototype_props(ui);
+                    return;
+                }
+                if self.vector_edit.is_some() {
+                    self.vector_edit_panel(ui);
                     return;
                 }
                 if self.sel.is_empty() {
@@ -1065,6 +1195,102 @@ impl App {
                 self.export_props(ui);
             });
         });
+    }
+
+    /// One local style: preview, name (editable), edit and delete.
+    fn local_style_row(&mut self, ui: &mut Ui, st: &crate::doc::Style, delete: &mut Option<u64>) {
+        ui.horizontal(|ui| {
+            crate::paint_ui::style_preview(ui, &st.value);
+            // Inside a folder the field shows the last part; edits keep the folder.
+            let (folder, leaf) = match st.name.rsplit_once('/') {
+                Some((f, l)) => (Some(f.trim().to_string()), l.trim().to_string()),
+                None => (None, st.name.clone()),
+            };
+            let mut name = leaf;
+            let r = ui.add(egui::TextEdit::singleline(&mut name).frame(egui::Frame::NONE).desired_width(130.0));
+            if r.changed() {
+                self.begin_edit();
+                if let Some(x) = self.doc.styles.iter_mut().find(|x| x.id == st.id) {
+                    x.name = match &folder {
+                        Some(f) => format!("{f} / {name}"),
+                        None => name,
+                    };
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icon_button(ui, Icon::Minus, false, 22.0, "Delete style").clicked() {
+                    *delete = Some(st.id);
+                }
+                if let crate::doc::StyleValue::Paint(ps) = &st.value {
+                    let edit = icon_button(ui, Icon::Styles, false, 22.0, "Edit style");
+                    egui::Popup::menu(&edit).id(ui.id().with(("local-style", st.id))).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                        ui.set_width(240.0);
+                        let mut ps = ps.clone();
+                        let mut edited = false;
+                        for (i, p) in ps.iter_mut().enumerate().rev() {
+                            if !matches!(paint_row(ui, ui.id().with(("ls-paint", st.id, i)), p), PaintEvent::None) {
+                                edited = true;
+                            }
+                        }
+                        if edited {
+                            self.begin_edit();
+                            if let Some(x) = self.doc.styles.iter_mut().find(|x| x.id == st.id) {
+                                x.value = crate::doc::StyleValue::Paint(ps);
+                            }
+                            self.doc.reflow();
+                        }
+                    });
+                }
+            });
+        });
+    }
+
+    /// The Frame tool's sidebar: click a preset to add a frame that size.
+    fn frame_presets(&mut self, ui: &mut Ui) {
+        let muted = theme::muted(ui.ctx());
+        let mut pick: Option<(&str, f32, f32)> = None;
+        for (group, items) in FRAME_PRESETS {
+            egui::CollapsingHeader::new(RichText::new(*group).strong()).default_open(*group == "Phone" || *group == "Desktop").show(ui, |ui| {
+                for &(name, w, h) in *items {
+                    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+                    if resp.hovered() {
+                        ui.painter().rect_filled(r, 4.0, theme::subtle(ui.ctx()));
+                    }
+                    ui.painter().text(r.left_center() + vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, name, FontId::proportional(12.0), ui.visuals().text_color());
+                    ui.painter().text(r.right_center() - vec2(6.0, 0.0), egui::Align2::RIGHT_CENTER, format!("{w}×{h}"), FontId::proportional(11.5), muted);
+                    if resp.clicked() {
+                        pick = Some((name, w as f32, h as f32));
+                    }
+                }
+            });
+        }
+        if let Some((name, w, h)) = pick {
+            self.add_preset_frame(ui.ctx(), name, w, h);
+        }
+    }
+
+    /// A new frame to the right of what's on the page (or mid-screen on an empty page), selected.
+    pub fn add_preset_frame(&mut self, ctx: &egui::Context, name: &str, w: f32, h: f32) {
+        self.checkpoint();
+        let kids = self.doc.pages[self.page].children.clone();
+        let b = self.doc.bounds(&kids);
+        let at = if kids.is_empty() || !b.is_finite() { (self.view_center_world() - vec2(w, h) / 2.0).round() } else { pos2(b.max.x + 100.0, b.min.y).round() };
+        let mut n = crate::doc::Node::new(Kind::Frame, Rect::from_min_size(at, vec2(w, h)));
+        n.name = name.to_string();
+        let id = self.doc.insert(self.page, None, None, n);
+        self.sel = vec![id];
+        self.set_tool(Tool::Move);
+        // Bring it into view without changing the zoom unless it doesn't fit.
+        let screen = self.canvas_rect.unwrap_or(ctx.content_rect());
+        let r = self.doc.node(id).rect;
+        let on = Rect::from_min_max(self.view.to_screen(r.min), self.view.to_screen(r.max));
+        if !screen.contains_rect(on) {
+            if on.width() < screen.width() * 0.9 && on.height() < screen.height() * 0.9 {
+                self.view.pan += screen.center() - on.center();
+            } else {
+                self.zoom_target = Some(id);
+            }
+        }
     }
 
     fn prototype_props(&mut self, ui: &mut Ui) {
@@ -1106,7 +1332,21 @@ impl App {
         let mut reactions = self.doc.node(id).reactions.clone();
         let mut changed = false;
         if section_title(ui, "Interactions") {
-            let to = frames.iter().copied().find(|f| *f != top);
+            // A new link points at the next frame to the right (then below), not whatever is first in the layer list.
+            let here = self.doc.node(top).rect.min;
+            let to = frames
+                .iter()
+                .copied()
+                .filter(|f| *f != top)
+                .min_by(|a, b| {
+                    let key = |f: NodeId| {
+                        let r = self.doc.node(f).rect.min;
+                        let ahead = r.x > here.x + 1.0 || (r.y > here.y + 1.0 && (r.x - here.x).abs() <= 1.0);
+                        (!ahead, (r - here).length())
+                    };
+                    let (ka, kb) = (key(*a), key(*b));
+                    ka.0.cmp(&kb.0).then(ka.1.total_cmp(&kb.1))
+                });
             reactions.push(Reaction { action: to.map_or(Action::Back, Action::Navigate), ..Default::default() });
             changed = true;
         }
@@ -1127,7 +1367,7 @@ impl App {
                             Trigger::WhilePressed => "While pressing".into(),
                             Trigger::AfterDelay(ms) => format!("After delay {ms}ms"),
                         };
-                        egui::ComboBox::from_id_salt(pid.with("trig")).selected_text(t_label(&r.trigger)).show_ui(ui, |ui| {
+                        dropdown(ui, t_label(&r.trigger), |ui| {
                             for t in [Trigger::OnClick, Trigger::OnHover, Trigger::WhilePressed, Trigger::AfterDelay(800)] {
                                 let label = t_label(&t);
                                 ui.selectable_value(&mut r.trigger, t, label);
@@ -1149,7 +1389,7 @@ impl App {
                             Action::OpenUrl(_) => "Open link",
                         };
                         let first = frames.iter().copied().find(|f| *f != top).unwrap_or(top);
-                        egui::ComboBox::from_id_salt(pid.with("act")).selected_text(a_label).show_ui(ui, |ui| {
+                        dropdown(ui, a_label, |ui| {
                             ui.selectable_value(&mut r.action, Action::Navigate(first), "Navigate to");
                             ui.selectable_value(&mut r.action, Action::Back, "Back");
                             ui.selectable_value(&mut r.action, Action::OpenOverlay(first), "Open overlay");
@@ -1161,7 +1401,7 @@ impl App {
                         match &mut r.action {
                             Action::Navigate(dest) | Action::OpenOverlay(dest) => {
                                 ui.label("Destination");
-                                egui::ComboBox::from_id_salt(pid.with("dest")).selected_text(name(&self.doc, *dest)).show_ui(ui, |ui| {
+                                dropdown(ui, name(&self.doc, *dest), |ui| {
                                     for &f in &frames {
                                         ui.selectable_value(dest, f, name(&self.doc, f));
                                     }
@@ -1185,7 +1425,7 @@ impl App {
                                 TransitionKind::Push => "Push",
                                 TransitionKind::SlideIn => "Slide in",
                             };
-                            egui::ComboBox::from_id_salt(pid.with("kind")).selected_text(k_label(r.transition.kind)).show_ui(ui, |ui| {
+                            dropdown(ui, k_label(r.transition.kind), |ui| {
                                 for k in [TransitionKind::Instant, TransitionKind::Dissolve, TransitionKind::SmartAnimate, TransitionKind::MoveIn, TransitionKind::Push, TransitionKind::SlideIn] {
                                     ui.selectable_value(&mut r.transition.kind, k, k_label(k));
                                 }
@@ -1237,6 +1477,28 @@ impl App {
             ui.label(RichText::new("Select a layer to inspect its code and properties.").color(theme::muted(ui.ctx())));
             return;
         };
+        // Several layers: list them; Dev Mode inspects one at a time, so a click picks one.
+        if self.sel.len() > 1 {
+            ui.label(RichText::new(format!("{} layers selected", self.sel.len())).strong().size(14.0));
+            ui.label(RichText::new("Pick one to inspect its code.").color(theme::muted(ui.ctx())));
+            ui.add_space(4.0);
+            let mut pick = None;
+            for &s in &self.sel {
+                let n = self.doc.node(s);
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                    paint_icon(ui.painter(), r, kind_icon(n.kind), theme::icon(ui.ctx()));
+                    if ui.add(egui::Button::new(&n.name).frame(false)).clicked() {
+                        pick = Some(s);
+                    }
+                });
+            }
+            if let Some(s) = pick {
+                self.sel = vec![s];
+            }
+            ui.separator();
+            return;
+        }
         let n = self.doc.node(id).clone();
         ui.label(RichText::new(&n.name).strong().size(14.0));
         ui.label(RichText::new(format!("{}  ·  {} × {}", n.kind.label(), num(n.rect.width()), num(n.rect.height()))).color(theme::muted(ui.ctx())));
@@ -1343,43 +1605,34 @@ impl App {
                 continue;
             }
             ui.label(RichText::new(label).color(theme::muted(ui.ctx())).small());
-            for st in list {
-                ui.horizontal(|ui| {
-                    crate::paint_ui::style_preview(ui, &st.value);
-                    let mut name = st.name.clone();
-                    let r = ui.add(egui::TextEdit::singleline(&mut name).frame(egui::Frame::NONE).desired_width(130.0));
-                    if r.changed() {
-                        self.begin_edit();
-                        if let Some(x) = self.doc.styles.iter_mut().find(|x| x.id == st.id) {
-                            x.name = name;
+            // Slash names make folders, as in Figma: "HUD / Title" sits in a HUD folder.
+            let mut list = list;
+            list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            let folder_of = |n: &str| n.rsplit_once('/').map(|(f, _)| f.trim().to_string());
+            let mut folders: Vec<Option<String>> = vec![];
+            for st in &list {
+                let f = folder_of(&st.name);
+                if !folders.contains(&f) {
+                    folders.push(f);
+                }
+            }
+            folders.sort_by_key(|f| f.is_some());
+            for f in folders {
+                let items: Vec<crate::doc::Style> = list.iter().filter(|st| folder_of(&st.name) == f).cloned().collect();
+                match &f {
+                    None => {
+                        for st in items {
+                            self.local_style_row(ui, &st, &mut delete);
                         }
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if icon_button(ui, Icon::Minus, false, 22.0, "Delete style").clicked() {
-                            delete = Some(st.id);
-                        }
-                        if let StyleValue::Paint(ps) = &st.value {
-                            let edit = icon_button(ui, Icon::Styles, false, 22.0, "Edit style");
-                            egui::Popup::menu(&edit).id(ui.id().with(("local-style", st.id))).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-                                ui.set_width(240.0);
-                                let mut ps = ps.clone();
-                                let mut edited = false;
-                                for (i, p) in ps.iter_mut().enumerate().rev() {
-                                    if !matches!(paint_row(ui, ui.id().with(("ls-paint", st.id, i)), p), PaintEvent::None) {
-                                        edited = true;
-                                    }
-                                }
-                                if edited {
-                                    self.begin_edit();
-                                    if let Some(x) = self.doc.styles.iter_mut().find(|x| x.id == st.id) {
-                                        x.value = StyleValue::Paint(ps);
-                                    }
-                                    self.doc.reflow();
-                                }
-                            });
-                        }
-                    });
-                });
+                    Some(name) => {
+                        egui::CollapsingHeader::new(name).id_salt(("style-folder", label, name)).default_open(true).show(ui, |ui| {
+                            for st in items {
+                                self.local_style_row(ui, &st, &mut delete);
+                            }
+                        });
+                    }
+                }
             }
         }
         if let Some(id) = delete {
@@ -1427,6 +1680,27 @@ impl App {
         if roots.len() == 1 && n.kind.is_frame() {
             ui.separator();
             self.layout_guides(ui, n.id);
+        }
+        if n.kind == Kind::Ellipse {
+            // Figma's arc controls: start angle, sweep (as a percentage of a full turn), ratio.
+            let [mut start, sweep, ratio] = n.arc.unwrap_or([0.0, 360.0, 0.0]);
+            let (mut sweep_pct, mut ratio_pct) = (sweep / 3.6, ratio * 100.0);
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                ui.label("Arc");
+                changed |= ui.add(DragValue::new(&mut start).speed(1.0).suffix("°")).on_hover_text("Start").changed();
+                changed |= ui.add(DragValue::new(&mut sweep_pct).range(-100.0..=100.0).speed(0.5).suffix("%")).on_hover_text("Sweep").changed();
+                changed |= ui.add(DragValue::new(&mut ratio_pct).range(0.0..=99.0).speed(0.5).suffix("%")).on_hover_text("Ratio").changed();
+            });
+            if changed {
+                self.begin_edit();
+                let arc = [start.rem_euclid(360.0), sweep_pct * 3.6, ratio_pct / 100.0];
+                for &id in &self.sel.clone() {
+                    if self.doc.node(id).kind == Kind::Ellipse {
+                        self.doc.node_mut(id).arc = (arc != [0.0, 360.0, 0.0]).then_some(arc);
+                    }
+                }
+            }
         }
         if matches!(n.kind, Kind::Polygon | Kind::Star) {
             let (mut count, mut ratio) = (n.point_count as f32, n.inner_ratio * 100.0);
@@ -1518,6 +1792,55 @@ impl App {
         }
     }
 
+    /// Components to swap an instance to, by page, with a filter. True once swapped.
+    pub fn swap_menu(&mut self, ui: &mut Ui, inst: NodeId) -> bool {
+        let fid = ui.id().with(("swap-filter", inst));
+        let mut q: String = ui.data(|d| d.get_temp(fid)).unwrap_or_default();
+        ui.add(egui::TextEdit::singleline(&mut q).hint_text("Search components").desired_width(200.0));
+        ui.data_mut(|d| d.insert_temp(fid, q.clone()));
+        let q = q.to_lowercase();
+        let current = self.doc.node(inst).component;
+        let mut pick = None;
+        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+            for (pi, page) in self.doc.pages.iter().enumerate() {
+                // Sets swap to their first variant; components inside sets are reached through them.
+                let mut items: Vec<(NodeId, String)> = vec![];
+                let mut stack = page.children.clone();
+                while let Some(id) = stack.pop() {
+                    let n = self.doc.node(id);
+                    match n.kind {
+                        Kind::ComponentSet => {
+                            if let Some(&first) = n.children.first() {
+                                items.push((first, n.name.clone()));
+                            }
+                        }
+                        Kind::Component => items.push((id, n.name.clone())),
+                        _ => stack.extend(n.children.iter().copied()),
+                    }
+                }
+                items.retain(|(_, name)| q.is_empty() || name.to_lowercase().contains(&q));
+                if items.is_empty() {
+                    continue;
+                }
+                items.sort_by(|a, b| a.1.cmp(&b.1));
+                ui.label(RichText::new(&self.doc.pages[pi].name).small().color(theme::muted(ui.ctx())));
+                for (cid, name) in items {
+                    let on = current == Some(cid) || current.and_then(|c| self.doc.nodes.get(&c)).and_then(|c| c.parent) == self.doc.node(cid).parent.filter(|p| self.doc.node(*p).kind == Kind::ComponentSet);
+                    if ui.add(egui::Button::selectable(on, name)).clicked() && !on {
+                        pick = Some(cid);
+                    }
+                }
+            }
+        });
+        if let Some(c) = pick {
+            self.checkpoint();
+            self.doc.swap_component(inst, c);
+            self.doc.reflow();
+            return true;
+        }
+        false
+    }
+
     fn component_section(&mut self, ui: &mut Ui, id: NodeId) {
         use crate::doc::{CompProp, PropTarget, PropValue};
         let n = self.doc.node(id).clone();
@@ -1535,11 +1858,26 @@ impl App {
             let title = match inst {
                 Some(i) => {
                     let main = self.doc.node(i).component.and_then(|c| self.doc.nodes.get(&c)).map_or("Missing component".into(), |c| c.name.clone());
-                    format!("Instance of {main}")
+                    let others = self.sel.len() - 1;
+                    if others > 0 { format!("{} instances, {main} and others", others + 1) } else { format!("Instance of {main}") }
                 }
                 None => self.doc.node(owner.unwrap()).name.clone(),
             };
-            ui.label(RichText::new(title).strong().color(purple));
+            // An instance's title is its swap picker, as in Figma.
+            match inst.filter(|i| *i == id) {
+                Some(i) => {
+                    ui.menu_button(RichText::new(title).strong().color(purple), |ui| {
+                        if self.swap_menu(ui, i) {
+                            ui.close();
+                        }
+                    })
+                    .response
+                    .on_hover_text("Swap instance");
+                }
+                None => {
+                    ui.label(RichText::new(title).strong().color(purple));
+                }
+            }
         });
         if let Some(i) = inst.filter(|i| *i == id) {
             let comp = self.doc.node(i).component.filter(|c| self.doc.nodes.contains_key(c));
@@ -1559,14 +1897,19 @@ impl App {
                             });
                         });
                         if pick != cur {
-                            let mut want = current.clone();
-                            want.retain(|(k, _)| *k != prop);
-                            want.push((prop.clone(), pick));
-                            if let Some(v) = self.doc.find_variant(set, &want) {
-                                self.checkpoint();
-                                self.doc.swap_component(i, v);
-                                self.doc.reflow();
+                            // Every selected instance of this set switches, each keeping its other properties.
+                            self.checkpoint();
+                            let targets: Vec<NodeId> = self.sel.iter().copied().filter(|&s| self.doc.node(s).component.and_then(|c| self.doc.nodes.get(&c)).and_then(|c| c.parent) == Some(set)).collect();
+                            for t in targets {
+                                let Some(tc) = self.doc.node(t).component else { continue };
+                                let mut want = crate::doc::variant_pairs(&self.doc.node(tc).name);
+                                want.retain(|(k, _)| *k != prop);
+                                want.push((prop.clone(), pick.clone()));
+                                if let Some(v) = self.doc.find_variant(set, &want) {
+                                    self.doc.swap_component(t, v);
+                                }
                             }
+                            self.doc.reflow();
                         }
                     }
                 }
@@ -1605,7 +1948,11 @@ impl App {
                 }
                 if changed {
                     self.begin_edit();
-                    self.doc.node_mut(i).prop_values = values;
+                    // Selected instances of the same component take the same values.
+                    let targets: Vec<NodeId> = self.sel.iter().copied().filter(|&s| s == i || self.doc.node(s).component == Some(c)).collect();
+                    for t in targets {
+                        self.doc.node_mut(t).prop_values = values.clone();
+                    }
                     self.doc.reflow();
                 }
             }
@@ -1632,6 +1979,8 @@ impl App {
             if id == o || id == def {
                 let mut props = self.doc.node(def).comp_props.clone();
                 let mut changed = false;
+                let mut add_variant_prop = false;
+                let mut bind_texts: Vec<(NodeId, String)> = vec![];
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Properties").strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1640,17 +1989,39 @@ impl App {
                             let fresh = |props: &[CompProp], base: &str| {
                                 (1..).map(|k| format!("{base} {k}")).find(|nm| !props.iter().any(|p| &p.name == nm)).unwrap()
                             };
+                            if ui.button("Variant").clicked() {
+                                add_variant_prop = true;
+                                ui.close();
+                            }
                             if ui.button("Boolean").clicked() {
                                 props.push(CompProp { name: fresh(&props, "Show"), default: PropValue::Bool(true) });
                                 changed = true;
+                                ui.close();
                             }
                             if ui.button("Text").clicked() {
-                                props.push(CompProp { name: fresh(&props, "Text"), default: PropValue::Text("Text".into()) });
+                                let name = fresh(&props, "Text");
+                                // Like Figma's "Create property" from a text layer: when the component
+                                // has one unbound text layer per variant, the property drives it.
+                                let variants: Vec<NodeId> = if self.doc.node(def).kind == Kind::ComponentSet { self.doc.node(def).children.clone() } else { vec![def] };
+                                let texts: Vec<Vec<NodeId>> = variants
+                                    .iter()
+                                    .map(|v| self.doc.descendants(*v).into_iter().filter(|d| self.doc.node(*d).kind == Kind::Text && !self.doc.node(*d).prop_bind.iter().any(|(_, t)| *t == PropTarget::Text)).collect())
+                                    .collect();
+                                let default = if texts.iter().all(|t| t.len() == 1) {
+                                    let first = self.doc.node(texts[0][0]).text.clone();
+                                    bind_texts = texts.into_iter().map(|t| (t[0], name.clone())).collect();
+                                    first
+                                } else {
+                                    "Text".into()
+                                };
+                                props.push(CompProp { name, default: PropValue::Text(default) });
                                 changed = true;
+                                ui.close();
                             }
                             if ui.button("Instance swap").clicked() {
                                 props.push(CompProp { name: fresh(&props, "Icon"), default: PropValue::Swap(o) });
                                 changed = true;
+                                ui.close();
                             }
                         });
                     });
@@ -1680,10 +2051,29 @@ impl App {
                 if changed {
                     self.begin_edit();
                     self.doc.node_mut(def).comp_props = props;
+                    for (t, name) in bind_texts {
+                        self.doc.node_mut(t).prop_bind.push((name, PropTarget::Text));
+                    }
                     self.doc.reflow();
+                }
+                if add_variant_prop {
+                    if self.doc.node(def).kind == Kind::ComponentSet {
+                        // A new variant property on every variant.
+                        self.checkpoint();
+                        let existing: Vec<String> = self.doc.variant_props(def).into_iter().map(|(k, _)| k).collect();
+                        let name = (1..).map(|k| format!("Property {k}")).find(|nm| !existing.contains(nm)).unwrap();
+                        for v in self.doc.node(def).children.clone() {
+                            let n = self.doc.node_mut(v);
+                            n.name = if crate::doc::variant_pairs(&n.name).is_empty() { format!("{name}=Default") } else { format!("{}, {name}=Default", n.name) };
+                        }
+                    } else {
+                        self.add_variant_to(o);
+                    }
                 }
                 if self.doc.node(def).kind == Kind::ComponentSet && ui.button("Add variant").clicked() {
                     self.add_variant(def);
+                } else if on.kind == Kind::Component && def == o && ui.button("Add variant").clicked() {
+                    self.add_variant_to(o);
                 }
                 if on.kind == Kind::Component && self.doc.node(def).kind != Kind::ComponentSet && ui.button("Create instance").clicked() {
                     self.checkpoint();
@@ -1807,7 +2197,7 @@ impl App {
         let is_frame = roots.len() == 1 && n.kind.is_frame();
         let al = is_frame && n.layout.mode != LayoutMode::None;
         ui.horizontal(|ui| {
-            ui.label(RichText::new(if is_frame { "Auto layout" } else { "Layout" }).strong());
+            ui.label(RichText::new(if al { "Auto layout" } else { "Layout" }).strong());
             if is_frame {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (icon, tip) = if al { (Icon::Minus, "Remove auto layout (⌥⇧A)") } else { (Icon::Plus, "Add auto layout (⇧A)") };
@@ -1834,7 +2224,8 @@ impl App {
         let mut sizing_changed = false;
         ui.horizontal(|ui| {
             let menus = roots.len() == 1 && (can_hug || parent_al);
-            let wide = if menus { half(ui) - 22.0 } else { half(ui) };
+            // Two fields and two 18-point menu buttons, with the gaps between them, fill the row exactly.
+            let wide = if menus { (ui.max_rect().width() - 2.0 * 18.0 - 3.0 * ui.spacing().item_spacing.x) / 2.0 } else { half(ui) };
             for (axis, v, label) in [(0usize, &mut w, "W"), (1, &mut h, "H")] {
                 let shown = match (menus, sizing[axis]) {
                     (true, Sizing::Hug) => "W Hug",
@@ -2594,7 +2985,7 @@ impl App {
                             ui.add(DragValue::new(&mut g.count).range(1..=100));
                             ui.end_row();
                             ui.label("Type");
-                            egui::ComboBox::from_id_salt(("grid-align", id, i)).selected_text(format!("{:?}", g.align)).show_ui(ui, |ui| {
+                            dropdown(ui, format!("{:?}", g.align), |ui| {
                                 for a in [GridAlign::Stretch, GridAlign::Min, GridAlign::Center, GridAlign::Max] {
                                     ui.selectable_value(&mut g.align, a, format!("{a:?}"));
                                 }

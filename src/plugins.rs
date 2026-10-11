@@ -563,8 +563,7 @@ mod prototype_tests {
 #[ignore]
 fn plugin_bench() {
     let (Some(doc), Some(js)) = (std::env::var_os("KATACHI_DOC"), std::env::var_os("KATACHI_JS")) else { return };
-    let v: Value = serde_json::from_str(&std::fs::read_to_string(doc).unwrap()).unwrap();
-    let mut d: Document = serde_json::from_value(v["document"].clone()).unwrap();
+    let mut d = crate::doc::parse_file(&std::fs::read_to_string(doc).unwrap()).unwrap();
     let t = std::time::Instant::now();
     d.reflow();
     eprintln!("load reflow: {:?} ({} nodes)", t.elapsed(), d.nodes.len());

@@ -66,6 +66,16 @@ pub enum Drag {
     Connect { from: NodeId },
 }
 
+impl Drag {
+    /// The document as it was when the drag began (drags re-apply themselves to it each frame).
+    pub fn base_mut(&mut self) -> Option<&mut Document> {
+        match self {
+            Drag::Move { base, .. } | Drag::Resize { base, .. } | Drag::Rotate { base, .. } | Drag::Create { base, .. } | Drag::Vector { base, .. } => Some(base),
+            _ => None,
+        }
+    }
+}
+
 /// What the pointer grabbed on the selection frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Grip {
@@ -128,6 +138,8 @@ pub struct App {
     pub drag: Option<Drag>,
     pub press: Option<Press>,
     pub pen: Vec<crate::doc::PathPoint>,
+    /// The press that closed the pen path; its release isn't a click.
+    pub pen_closed: bool,
     pub editing_text: Option<NodeId>,
     pub focus_text: bool,
     pub renaming: Option<(NodeId, String)>,
@@ -142,6 +154,8 @@ pub struct App {
     /// Zoom to this layer on the next frame (after page switches settle).
     pub zoom_target: Option<NodeId>,
     pub left_tab_assets: bool,
+    /// Assets panel previews: component -> (content key, texture).
+    pub asset_thumbs: std::collections::HashMap<NodeId, (u64, egui::TextureHandle)>,
     /// Last tool used in each toolbar group (move, frame, shape, pen, text).
     pub tool_groups: [Tool; 6],
     pub presenting: Option<crate::prototype::Presentation>,
@@ -177,6 +191,8 @@ pub struct App {
     pub find: (bool, String, String, bool),
     /// Plugins > Run script console.
     pub show_console: bool,
+    /// Quick actions (Cmd / or Cmd K): query and highlighted row.
+    pub quick: Option<(String, usize)>,
     pub console_code: String,
     pub show_variables: bool,
     /// Dev Mode: inspect and code instead of design controls.
@@ -195,6 +211,8 @@ pub struct App {
     /// This session's crash-recovery autosave.
     recovery: PathBuf,
     last_autosave: f64,
+    /// Bumped when the autosave is cleared, so a background autosave that finishes late is dropped.
+    autosave_gen: std::sync::Arc<std::sync::Mutex<u64>>,
     /// Autosaves from sessions that crashed, offered on launch.
     pub recoverable: Vec<PathBuf>,
     undo: Vec<Document>,
@@ -240,6 +258,7 @@ impl App {
             drag: None,
             press: None,
             pen: vec![],
+            pen_closed: false,
             editing_text: None,
             focus_text: false,
             renaming: None,
@@ -252,6 +271,7 @@ impl App {
             pending_frame: None,
             zoom_target: None,
             left_tab_assets: false,
+            asset_thumbs: Default::default(),
             tool_groups: [Tool::Move, Tool::Frame, Tool::Rectangle, Tool::Pen, Tool::Text, Tool::Comment],
             presenting: None,
             prototype_tab: false,
@@ -275,6 +295,7 @@ impl App {
             mcp_tried: cfg!(test),
             debug_plugin: std::env::var_os("KATACHI_PLUGIN").map(PathBuf::from),
             show_console: false,
+            quick: None,
             console_code: "for (const n of figma.currentPage.selection) {\n  n.rotation += 15;\n}\nfigma.notify(`Rotated ${figma.currentPage.selection.length} layers`);\n".into(),
             show_variables: false,
             dev_mode: false,
@@ -299,6 +320,7 @@ impl App {
                 ))
             },
             last_autosave: 0.0,
+            autosave_gen: Default::default(),
             recoverable: vec![],
             undo: vec![],
             redo: vec![],
@@ -364,19 +386,31 @@ impl App {
     }
 
     fn document_json(&self) -> String {
-        serde_json::json!({ "katachi": 1, "document": self.doc }).to_string()
+        crate::doc::file_json(&self.doc)
     }
 
-    /// Every 30 s while there are unsaved changes, snapshot to the recovery folder.
+    /// Every 30 s while there are unsaved changes, snapshot to the recovery folder. The copy is
+    /// written on another thread so big files don't stall the canvas.
     pub fn autosave(&mut self, now: f64) {
         if self.dirty && now - self.last_autosave > 30.0 {
             self.last_autosave = now;
-            let _ = crate::files::write_atomic(&self.recovery, self.document_json().as_bytes());
+            let (doc, path, gen_lock) = (self.doc.clone(), self.recovery.clone(), self.autosave_gen.clone());
+            let generation = *gen_lock.lock().unwrap();
+            std::thread::spawn(move || {
+                let json = crate::doc::file_json(&doc);
+                // Skip the write if the work was saved or discarded meanwhile.
+                let g = gen_lock.lock().unwrap();
+                if *g == generation {
+                    let _ = crate::files::write_atomic(&path, json.as_bytes());
+                }
+            });
         }
     }
 
     /// The work is saved or deliberately discarded: drop this session's autosave.
     pub fn clear_recovery(&self) {
+        let mut g = self.autosave_gen.lock().unwrap();
+        *g += 1;
         let _ = std::fs::remove_file(&self.recovery);
     }
 
@@ -414,7 +448,14 @@ impl App {
         c.me.page = self.page;
         c.me.selection = self.sel.clone();
         c.me.cursor = self.pointer_world;
-        let touched = c.tick(&mut self.doc, now);
+        let (touched, remote) = c.tick(&mut self.doc, now);
+        // A drag rebuilds the document from its starting copy every frame; that copy needs
+        // others' changes too, or they'd vanish (and go out as deletions) mid-drag.
+        if !remote.is_empty()
+            && let Some(base) = self.drag.as_mut().and_then(|d| d.base_mut())
+        {
+            crate::collab::apply(base, &remote);
+        }
         if !c.connected {
             self.collab = None;
             self.toast("Disconnected from the session".into());
@@ -515,8 +556,19 @@ impl App {
         }
     }
 
+    /// Remember the current page's viewport (pages reopen where they were left).
+    pub fn remember_view(&mut self) {
+        if let Some(r) = self.canvas_rect
+            && self.view_ready
+        {
+            let c = self.view.to_world(r.center());
+            self.doc.pages[self.page].view = Some([c.x, c.y, self.view.zoom]);
+        }
+    }
+
     pub fn select_page(&mut self, i: usize) {
         if i != self.page {
+            self.remember_view();
             self.end_text_edit();
             self.page = i;
             self.sel.clear();
@@ -576,7 +628,8 @@ impl App {
                 let r = self.doc.node(g).rect;
                 let name = self.doc.auto_name("Frame");
                 let n = self.doc.node_mut(g);
-                *n = Node { id: n.id, parent: n.parent, children: n.children.clone(), name, ..Node::new(Kind::Frame, r) };
+                // Like Figma, a frame wrapped around a selection has no fill and doesn't clip.
+                *n = Node { id: n.id, parent: n.parent, children: n.children.clone(), name, fills: vec![], clip: false, ..Node::new(Kind::Frame, r) };
             }
             self.sel = vec![g];
         }
@@ -698,13 +751,27 @@ impl App {
         if roots.is_empty() {
             return;
         }
+        // A group gets auto layout by becoming a frame, as in Figma (its children lay out directly).
+        let converted = matches!(roots[..], [g] if self.doc.node(g).kind == Kind::Group);
+        if let [g] = roots[..]
+            && converted
+        {
+            self.checkpoint();
+            let n = self.doc.node_mut(g);
+            n.kind = Kind::Frame;
+            n.fills.clear();
+            n.clip = false;
+            n.name = n.name.replacen("Group", "Frame", 1);
+            self.sel = vec![g];
+        }
+        let roots = self.sel_roots();
         let frames_only = roots.iter().all(|&id| {
             let n = self.doc.node(id);
             n.kind.is_frame() && n.layout.mode == LayoutMode::None
         });
         if !frames_only {
             self.group_selection(true);
-        } else {
+        } else if !converted {
             self.checkpoint();
         }
         for id in self.sel.clone() {
@@ -1027,6 +1094,23 @@ impl App {
         }
     }
 
+    /// Figma's "Add variant" on a component: a variant gets a sibling in its set; a lone
+    /// component becomes a set with a second variant.
+    pub fn add_variant_to(&mut self, c: NodeId) {
+        if self.doc.node(c).kind != Kind::Component {
+            return;
+        }
+        if let Some(set) = self.doc.node(c).parent.filter(|p| self.doc.node(*p).kind == Kind::ComponentSet) {
+            return self.add_variant(set);
+        }
+        self.checkpoint();
+        let Some(&dup) = self.doc.duplicate(&[c]).first() else { return };
+        if self.doc.combine_as_variants(&[c, dup]).is_some() {
+            self.sel = vec![dup];
+            self.doc.reflow();
+        }
+    }
+
     pub fn combine_as_variants(&mut self) {
         let roots = self.sel_roots();
         if roots.len() < 2 || roots.iter().any(|&r| self.doc.node(r).kind != Kind::Component) {
@@ -1119,7 +1203,10 @@ impl App {
             let parent = self.frame_at(pts[0].p, &[]);
             let id = self.doc.insert(self.page, parent, None, Node::vector(&pts, closed));
             self.sel = vec![id];
-            self.tool = Tool::Move;
+            // Closing a path keeps the pen, as in Figma: Escape then leaves it with the path selected.
+            if !closed {
+                self.tool = Tool::Move;
+            }
         }
     }
 
@@ -1152,8 +1239,7 @@ impl App {
         }
         let parsed = std::fs::read_to_string(&p)
             .map_err(|e| e.to_string())
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).map_err(|e| e.to_string()))
-            .and_then(|v| serde_json::from_value::<Document>(v["document"].clone()).map_err(|e| e.to_string()));
+            .and_then(|s| crate::doc::parse_file(&s));
         match parsed {
             Ok(doc) => {
                 self.reset_to(App::new(None));
@@ -1184,7 +1270,7 @@ impl App {
     pub fn save(&mut self, save_as: bool) -> bool {
         let path = match (&self.path, save_as) {
             (Some(p), false) => p.clone(),
-            _ => match rfd::FileDialog::new().add_filter("Katachi", &["katachi"]).set_file_name("Untitled.katachi").save_file() {
+            _ => match rfd::FileDialog::new().add_filter("Katachi", &["katachi"]).set_file_name(format!("{}.katachi", self.display_name())).save_file() {
                 Some(p) => p,
                 None => return false,
             },
@@ -1193,6 +1279,7 @@ impl App {
     }
 
     pub fn save_to(&mut self, path: PathBuf) -> bool {
+        self.remember_view();
         let json = self.document_json();
         match crate::files::write_atomic(&path, json.as_bytes()) {
             Ok(()) => {
@@ -1290,8 +1377,7 @@ impl App {
     pub fn recover(&mut self, p: &std::path::Path) {
         let parsed = std::fs::read_to_string(p)
             .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| serde_json::from_value::<Document>(v["document"].clone()).ok());
+            .and_then(|s| crate::doc::parse_file(&s).ok());
         if let Some(doc) = parsed {
             self.reset_to(App::new(None));
             self.doc = doc;
@@ -1342,8 +1428,7 @@ impl App {
         if let Some(p) = restore {
             let doc = std::fs::read_to_string(&p)
                 .ok()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                .and_then(|v| serde_json::from_value::<Document>(v["document"].clone()).ok());
+                .and_then(|s| crate::doc::parse_file(&s).ok());
             if let Some(doc) = doc {
                 self.checkpoint();
                 self.doc = doc;
@@ -1982,6 +2067,7 @@ impl App {
         let cmd = m.command;
         // Global shortcuts that work even while a field has focus.
         match (cmd, m.shift, key) {
+            (true, false, Key::Slash | Key::K) if !m.alt => return self.toggle_quick_actions(),
             (true, false, Key::S) => return void(self.save(false)),
             (true, true, Key::S) => return void(self.save(true)),
             (true, false, Key::O) => return self.request_open(),
@@ -2050,7 +2136,9 @@ impl App {
             (false, true, false, Key::D) => self.dev_mode = !self.dev_mode,
             (false, false, true, Key::L) => {
                 for n in self.doc.nodes.values_mut() {
-                    n.expanded = false;
+                    if n.expanded {
+                        std::sync::Arc::make_mut(n).expanded = false;
+                    }
                 }
             }
             (false, true, false, Key::H) => self.flip_selection(true),
@@ -2202,6 +2290,7 @@ impl eframe::App for App {
         self.history_window(&ctx);
         self.console_window(&ctx);
         self.find_window(&ctx);
+        self.quick_actions(&ctx);
         self.plugin_frame(&ctx, frame);
         self.appearance_frame(&ctx, frame);
         self.mcp_frame(&ctx);
