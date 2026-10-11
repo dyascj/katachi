@@ -1046,6 +1046,23 @@ impl App {
         }
     }
 
+    /// Figma's "Add variant" on a component: a variant gets a sibling in its set; a lone
+    /// component becomes a set with a second variant.
+    pub fn add_variant_to(&mut self, c: NodeId) {
+        if self.doc.node(c).kind != Kind::Component {
+            return;
+        }
+        if let Some(set) = self.doc.node(c).parent.filter(|p| self.doc.node(*p).kind == Kind::ComponentSet) {
+            return self.add_variant(set);
+        }
+        self.checkpoint();
+        let Some(&dup) = self.doc.duplicate(&[c]).first() else { return };
+        if self.doc.combine_as_variants(&[c, dup]).is_some() {
+            self.sel = vec![dup];
+            self.doc.reflow();
+        }
+    }
+
     pub fn combine_as_variants(&mut self) {
         let roots = self.sel_roots();
         if roots.len() < 2 || roots.iter().any(|&r| self.doc.node(r).kind != Kind::Component) {

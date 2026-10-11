@@ -1608,3 +1608,23 @@ fn instance_overrides_survive_styles_and_variables_on_the_main_component() {
         assert_eq!(color(true), crate::doc::Rgba::rgb(0, 0, 255), "the instance keeps its override (style: {via_style})");
     }
 }
+
+#[test]
+fn add_variant_turns_a_component_into_a_set() {
+    let mut h = harness();
+    let f = draw(&mut h, Key::F, (0.0, 0.0), (120.0, 40.0));
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::K);
+    let c = h.state().sel[0];
+    assert_eq!(h.state().doc.node(c).kind, Kind::Component);
+    let _ = f;
+    h.state_mut().add_variant_to(c);
+    let v2 = h.state().sel[0];
+    let set = h.state().doc.node(c).parent.expect("in a set");
+    assert_eq!(h.state().doc.node(set).kind, Kind::ComponentSet);
+    assert_eq!(h.state().doc.node(set).children.len(), 2);
+    assert_eq!(h.state().doc.node(c).name, "Property 1=Default");
+    assert_eq!(h.state().doc.node(v2).name, "Property 1=Variant2");
+    // Again on a variant: a third one in the same set.
+    h.state_mut().add_variant_to(v2);
+    assert_eq!(h.state().doc.node(set).children.len(), 3);
+}

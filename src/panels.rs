@@ -960,6 +960,11 @@ impl App {
             if resp.drag_started() {
                 self.layer_drag = Some(id);
             }
+            // Right-click a row: select it (unless it's already in the selection) and show the canvas menu.
+            if resp.secondary_clicked() && !self.sel.contains(&id) {
+                self.sel = vec![id];
+            }
+            resp.context_menu(|ui| self.context_menu(ui));
         }
         self.layer_drop(ui, &rects);
     }
@@ -1602,6 +1607,55 @@ impl App {
         }
     }
 
+    /// Components to swap an instance to, by page, with a filter. True once swapped.
+    pub fn swap_menu(&mut self, ui: &mut Ui, inst: NodeId) -> bool {
+        let fid = ui.id().with(("swap-filter", inst));
+        let mut q: String = ui.data(|d| d.get_temp(fid)).unwrap_or_default();
+        ui.add(egui::TextEdit::singleline(&mut q).hint_text("Search components").desired_width(200.0));
+        ui.data_mut(|d| d.insert_temp(fid, q.clone()));
+        let q = q.to_lowercase();
+        let current = self.doc.node(inst).component;
+        let mut pick = None;
+        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+            for (pi, page) in self.doc.pages.iter().enumerate() {
+                // Sets swap to their first variant; components inside sets are reached through them.
+                let mut items: Vec<(NodeId, String)> = vec![];
+                let mut stack = page.children.clone();
+                while let Some(id) = stack.pop() {
+                    let n = self.doc.node(id);
+                    match n.kind {
+                        Kind::ComponentSet => {
+                            if let Some(&first) = n.children.first() {
+                                items.push((first, n.name.clone()));
+                            }
+                        }
+                        Kind::Component => items.push((id, n.name.clone())),
+                        _ => stack.extend(n.children.iter().copied()),
+                    }
+                }
+                items.retain(|(_, name)| q.is_empty() || name.to_lowercase().contains(&q));
+                if items.is_empty() {
+                    continue;
+                }
+                items.sort_by(|a, b| a.1.cmp(&b.1));
+                ui.label(RichText::new(&self.doc.pages[pi].name).small().color(theme::muted(ui.ctx())));
+                for (cid, name) in items {
+                    let on = current == Some(cid) || current.and_then(|c| self.doc.nodes.get(&c)).and_then(|c| c.parent) == self.doc.node(cid).parent.filter(|p| self.doc.node(*p).kind == Kind::ComponentSet);
+                    if ui.add(egui::Button::selectable(on, name)).clicked() && !on {
+                        pick = Some(cid);
+                    }
+                }
+            }
+        });
+        if let Some(c) = pick {
+            self.checkpoint();
+            self.doc.swap_component(inst, c);
+            self.doc.reflow();
+            return true;
+        }
+        false
+    }
+
     fn component_section(&mut self, ui: &mut Ui, id: NodeId) {
         use crate::doc::{CompProp, PropTarget, PropValue};
         let n = self.doc.node(id).clone();
@@ -1623,7 +1677,21 @@ impl App {
                 }
                 None => self.doc.node(owner.unwrap()).name.clone(),
             };
-            ui.label(RichText::new(title).strong().color(purple));
+            // An instance's title is its swap picker, as in Figma.
+            match inst.filter(|i| *i == id) {
+                Some(i) => {
+                    ui.menu_button(RichText::new(title).strong().color(purple), |ui| {
+                        if self.swap_menu(ui, i) {
+                            ui.close();
+                        }
+                    })
+                    .response
+                    .on_hover_text("Swap instance");
+                }
+                None => {
+                    ui.label(RichText::new(title).strong().color(purple));
+                }
+            }
         });
         if let Some(i) = inst.filter(|i| *i == id) {
             let comp = self.doc.node(i).component.filter(|c| self.doc.nodes.contains_key(c));
@@ -1716,6 +1784,8 @@ impl App {
             if id == o || id == def {
                 let mut props = self.doc.node(def).comp_props.clone();
                 let mut changed = false;
+                let mut add_variant_prop = false;
+                let mut bind_texts: Vec<(NodeId, String)> = vec![];
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Properties").strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1724,17 +1794,39 @@ impl App {
                             let fresh = |props: &[CompProp], base: &str| {
                                 (1..).map(|k| format!("{base} {k}")).find(|nm| !props.iter().any(|p| &p.name == nm)).unwrap()
                             };
+                            if ui.button("Variant").clicked() {
+                                add_variant_prop = true;
+                                ui.close();
+                            }
                             if ui.button("Boolean").clicked() {
                                 props.push(CompProp { name: fresh(&props, "Show"), default: PropValue::Bool(true) });
                                 changed = true;
+                                ui.close();
                             }
                             if ui.button("Text").clicked() {
-                                props.push(CompProp { name: fresh(&props, "Text"), default: PropValue::Text("Text".into()) });
+                                let name = fresh(&props, "Text");
+                                // Like Figma's "Create property" from a text layer: when the component
+                                // has one unbound text layer per variant, the property drives it.
+                                let variants: Vec<NodeId> = if self.doc.node(def).kind == Kind::ComponentSet { self.doc.node(def).children.clone() } else { vec![def] };
+                                let texts: Vec<Vec<NodeId>> = variants
+                                    .iter()
+                                    .map(|v| self.doc.descendants(*v).into_iter().filter(|d| self.doc.node(*d).kind == Kind::Text && !self.doc.node(*d).prop_bind.iter().any(|(_, t)| *t == PropTarget::Text)).collect())
+                                    .collect();
+                                let default = if texts.iter().all(|t| t.len() == 1) {
+                                    let first = self.doc.node(texts[0][0]).text.clone();
+                                    bind_texts = texts.into_iter().map(|t| (t[0], name.clone())).collect();
+                                    first
+                                } else {
+                                    "Text".into()
+                                };
+                                props.push(CompProp { name, default: PropValue::Text(default) });
                                 changed = true;
+                                ui.close();
                             }
                             if ui.button("Instance swap").clicked() {
                                 props.push(CompProp { name: fresh(&props, "Icon"), default: PropValue::Swap(o) });
                                 changed = true;
+                                ui.close();
                             }
                         });
                     });
@@ -1764,10 +1856,29 @@ impl App {
                 if changed {
                     self.begin_edit();
                     self.doc.node_mut(def).comp_props = props;
+                    for (t, name) in bind_texts {
+                        self.doc.node_mut(t).prop_bind.push((name, PropTarget::Text));
+                    }
                     self.doc.reflow();
+                }
+                if add_variant_prop {
+                    if self.doc.node(def).kind == Kind::ComponentSet {
+                        // A new variant property on every variant.
+                        self.checkpoint();
+                        let existing: Vec<String> = self.doc.variant_props(def).into_iter().map(|(k, _)| k).collect();
+                        let name = (1..).map(|k| format!("Property {k}")).find(|nm| !existing.contains(nm)).unwrap();
+                        for v in self.doc.node(def).children.clone() {
+                            let n = self.doc.node_mut(v);
+                            n.name = if crate::doc::variant_pairs(&n.name).is_empty() { format!("{name}=Default") } else { format!("{}, {name}=Default", n.name) };
+                        }
+                    } else {
+                        self.add_variant_to(o);
+                    }
                 }
                 if self.doc.node(def).kind == Kind::ComponentSet && ui.button("Add variant").clicked() {
                     self.add_variant(def);
+                } else if on.kind == Kind::Component && def == o && ui.button("Add variant").clicked() {
+                    self.add_variant_to(o);
                 }
                 if on.kind == Kind::Component && self.doc.node(def).kind != Kind::ComponentSet && ui.button("Create instance").clicked() {
                     self.checkpoint();

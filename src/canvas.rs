@@ -1510,7 +1510,7 @@ impl App {
         true
     }
 
-    fn context_menu(&mut self, ui: &mut Ui) {
+    pub fn context_menu(&mut self, ui: &mut Ui) {
         let has = !self.sel.is_empty();
         let ctx = ui.ctx().clone();
         let item = |ui: &mut Ui, label: &str, short: &str, enabled: bool| {
@@ -1632,11 +1632,26 @@ impl App {
             self.create_component();
             ui.close();
         }
+        if kind == Some(Kind::Component) {
+            if item(ui, "Add variant", "", true) {
+                self.add_variant_to(one.unwrap());
+                ui.close();
+            }
+            if item(ui, "Create instance", "", true) {
+                self.duplicate_selection();
+                ui.close();
+            }
+        }
         if let Some(inst) = one.and_then(|id| self.owning_instance(id)) {
             if item(ui, "Go to main component", "", true) {
                 self.go_to_main(inst);
                 ui.close();
             }
+            ui.menu_button("Swap instance", |ui| {
+                if self.swap_menu(ui, inst) {
+                    ui.close();
+                }
+            });
             if item(ui, "Reset instance", "", true) {
                 self.checkpoint();
                 self.doc.reset_instance(inst);
