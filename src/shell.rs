@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-pub const STRIP_H: f32 = 38.0;
+/// Matches where macOS centers the traffic lights (16 points down), so they sit mid-strip.
+pub const STRIP_H: f32 = 32.0;
 const BLUE: Color32 = Color32::from_rgb(0x0D, 0x99, 0xFF);
 
 pub struct Shell {
@@ -218,7 +219,7 @@ impl Shell {
             // Update now.
             if let Some(label) = self.update.button_label() {
                 let g = p.layout_no_wrap(label.into(), FontId::proportional(13.0), Color32::WHITE);
-                let b = Rect::from_min_size(pos2(x, r.center().y - 13.0), vec2(g.size().x + 22.0, 26.0));
+                let b = Rect::from_min_size(pos2(x, r.center().y - 11.0), vec2(g.size().x + 20.0, 22.0));
                 let resp = ui.interact(b, egui::Id::new("update-now"), Sense::click());
                 resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
                 let busy = self.update.busy();
@@ -295,7 +296,7 @@ impl Shell {
                 p.vline(x, r.y_range(), Stroke::new(1.0, line));
             }
             // New tab.
-            let plus = Rect::from_min_size(pos2(x + 6.0, r.center().y - 13.0), vec2(26.0, 26.0));
+            let plus = Rect::from_min_size(pos2(x + 6.0, r.center().y - 12.0), vec2(24.0, 24.0));
             if plus.max.x < r.max.x {
                 let resp = ui.interact(plus, egui::Id::new("tab-new"), Sense::click());
                 resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "New design file"));
