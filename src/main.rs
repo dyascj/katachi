@@ -20,8 +20,10 @@ mod plugins;
 mod panels;
 mod prototype;
 mod render;
+mod shell;
 mod svg_import;
 mod text;
+mod update;
 mod variables_ui;
 mod vector_edit;
 #[cfg(test)]
@@ -66,7 +68,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             setup_style(&cc.egui_ctx);
-            Ok(Box::new(app::App::new(path)))
+            Ok(Box::new(shell::Shell::new(path)))
         }),
     )
 }

@@ -36,7 +36,16 @@ katachi [file.katachi]
 Tagged releases (`v*`) build a universal macOS `.dmg`, a Windows `.zip`, and a Linux `.tar.gz` through
 GitHub Actions. Building from source needs Rust 1.92 or newer.
 
+**Updates.** Installed release builds check GitHub for a newer release at launch. When there is one,
+**Update now** appears in the tab strip: it downloads your platform's build, checks its signature
+against the release key built into the app, swaps it in, and restarts. Set `KATACHI_NO_UPDATE=1` to
+turn the check off.
+
 ## Features
+
+**Files and tabs**
+- Home: recent files as thumbnails, with search, New design file, and Open (Katachi or Figma `.fig`)
+- Each file opens in its own tab, as in Figma's desktop app; Ctrl Tab switches, Cmd W closes
 
 **Canvas and tools**
 - Infinite canvas with pan, zoom, pixel grid at 800%+, rulers (Shift R), and smart guides
@@ -135,6 +144,7 @@ GitHub Actions. Building from source needs Rust 1.92 or newer.
 | Dev Mode, present | Shift D, Alt Cmd Enter |
 | Save, open, place image, export | Cmd S, Cmd O, Shift Cmd K, Shift Cmd E |
 | Find and replace | Cmd F |
+| Next and previous tab, close tab | Ctrl Tab, Ctrl Shift Tab, Cmd W |
 | Copy as PNG, paste to replace, select matching layers | Shift Cmd C, Shift Cmd R, Alt Cmd A |
 | Copy and paste properties | Alt Cmd C, Alt Cmd V |
 | Numbered, bulleted list | Shift Cmd 7, Shift Cmd 8 |

@@ -182,14 +182,12 @@ impl App {
             let stem = f.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned());
             let name = stem.unwrap_or_else(|| f.name.clone());
             let w = self.view.to_world(at) + vec2(offset, offset);
-            let is_fig = f.name.to_lowercase().ends_with(".fig") || f.path.as_ref().is_some_and(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("fig")));
+            // Design files open in their own tab.
+            let is_fig = [".fig", ".katachi"].iter().any(|x| f.name.to_lowercase().ends_with(x))
+                || f.path.as_ref().is_some_and(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("fig") || e.eq_ignore_ascii_case("katachi")));
             if is_fig {
                 if let Some(p) = &f.path {
-                    if self.dirty {
-                        self.toast("Save or discard your changes before importing".into());
-                    } else {
-                        self.import_fig(p);
-                    }
+                    self.want = Some(crate::app::Want::Open(p.clone()));
                 }
                 return;
             }

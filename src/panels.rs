@@ -610,7 +610,12 @@ impl App {
     fn main_menu(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         let item = |ui: &mut Ui, label: &str, short: &str| ui.add(egui::Button::new(label).shortcut_text(short)).clicked();
-        if item(ui, "New file", "⌘N") {
+        if item(ui, "Back to files", "") {
+            self.want = Some(crate::app::Want::Home);
+            ui.close();
+        }
+        ui.separator();
+        if item(ui, "New design file", "⌘N") {
             self.request_new();
             ui.close();
         }

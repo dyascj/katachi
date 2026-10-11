@@ -2544,6 +2544,7 @@ dependencies = [
  "i_overlay",
  "image",
  "lyon",
+ "minisign-verify",
  "miniz_oxide 0.9.1",
  "objc2 0.6.5",
  "raw-window-handle",
@@ -2774,6 +2775,12 @@ checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
 ]
+
+[[package]]
+name = "minisign-verify"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "871285dc19d8d0ebe0eef3d0e99a205f2a71363b122632cbbfa4a6c370a960ce"
 
 [[package]]
 name = "miniz_oxide"
