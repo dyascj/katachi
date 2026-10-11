@@ -21,9 +21,12 @@ jobs:
           lipo -create target/aarch64-apple-darwin/release/katachi target/x86_64-apple-darwin/release/katachi \
             -output target/Katachi.app/Contents/MacOS/katachi
           codesign --force --deep --sign - target/Katachi.app
-          hdiutil create -volname Katachi -srcfolder target/Katachi.app -ov -format UDZO Katachi-macos.dmg
+          # Two full builds nearly fill the runner's disk; keep only the app before packaging.
+          mkdir -p "$RUNNER_TEMP/stage" && cp -R target/Katachi.app "$RUNNER_TEMP/stage/"
+          rm -rf target
+          hdiutil create -volname Katachi -srcfolder "$RUNNER_TEMP/stage/Katachi.app" -ov -format UDZO Katachi-macos.dmg
           # What the in-app updater downloads.
-          tar -czf Katachi-macos.app.tar.gz -C target Katachi.app
+          tar -czf Katachi-macos.app.tar.gz -C "$RUNNER_TEMP/stage" Katachi.app
       - uses: softprops/action-gh-release@v2
         with:
           files: |
