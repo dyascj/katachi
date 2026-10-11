@@ -33,10 +33,11 @@ impl App {
         if !self.view_ready {
             self.view_ready = true;
             let kids = self.doc.pages[self.page].children.clone();
-            self.view = if kids.is_empty() {
-                View { zoom: 1.0, pan: rect.center().to_vec2() }
-            } else {
-                View::fit(self.doc.bounds(&kids), rect, 1.0)
+            self.view = match self.doc.pages[self.page].view {
+                // Back where this page was last viewed.
+                Some([x, y, zoom]) => View { zoom, pan: rect.center().to_vec2() - vec2(x, y) * zoom },
+                None if kids.is_empty() => View { zoom: 1.0, pan: rect.center().to_vec2() },
+                None => View::fit(self.doc.bounds(&kids), rect, 1.0),
             };
         }
         if let Some(t) = self.zoom_target.take().filter(|t| self.doc.nodes.contains_key(t)) {

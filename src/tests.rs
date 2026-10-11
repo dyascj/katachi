@@ -1839,3 +1839,29 @@ fn slash_named_styles_group_into_folders() {
     assert!(h.query_by_label("HUD").is_some(), "a HUD folder");
     assert!(h.query_by_label("HUD / Title").is_none(), "names show without the folder");
 }
+
+#[test]
+fn files_and_pages_reopen_where_they_were_viewed() {
+    let mut h = harness();
+    draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    h.state_mut().view.zoom = 2.5;
+    h.state_mut().view.pan += vec2(-300.0, 120.0);
+    h.run_steps(1);
+    let r = h.state().canvas_rect.unwrap();
+    let center = h.state().view.to_world(r.center());
+    let path = std::env::temp_dir().join(format!("katachi-view-{}.katachi", std::process::id()));
+    assert!(h.state_mut().save_to(path.clone()));
+    let mut g = harness();
+    g.state_mut().open_path(path);
+    g.run_steps(2);
+    let back = g.state().view.to_world(g.state().canvas_rect.unwrap().center());
+    assert_eq!(g.state().view.zoom, 2.5);
+    assert!((back - center).length() < 0.5, "{back:?} vs {center:?}");
+    // Switching pages and back keeps each page's view.
+    g.state_mut().doc.pages.push(crate::doc::Page { name: "Two".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None });
+    g.state_mut().select_page(1);
+    g.run_steps(2);
+    g.state_mut().select_page(0);
+    g.run_steps(2);
+    assert_eq!(g.state().view.zoom, 2.5);
+}

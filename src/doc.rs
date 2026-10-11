@@ -1590,6 +1590,9 @@ pub struct Page {
     /// Prototype starting frames, in order.
     #[serde(default)]
     pub flows: Vec<NodeId>,
+    /// Where the page was last viewed: world center x, y and zoom (saved in the file, as Figma does).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<[f32; 3]>,
 }
 
 pub const PAGE_BG: Rgba = Rgba::rgb(0xF5, 0xF5, 0xF5);
@@ -1711,7 +1714,7 @@ pub enum Order {
 impl Default for Document {
     fn default() -> Self {
         Self {
-            pages: vec![Page { name: "Page 1".into(), children: vec![], background: PAGE_BG, flows: vec![] }],
+            pages: vec![Page { name: "Page 1".into(), children: vec![], background: PAGE_BG, flows: vec![], view: None }],
             nodes: HashMap::new(),
             next_id: 1,
             images: HashMap::new(),

@@ -553,8 +553,19 @@ impl App {
         }
     }
 
+    /// Remember the current page's viewport (pages reopen where they were left).
+    pub fn remember_view(&mut self) {
+        if let Some(r) = self.canvas_rect
+            && self.view_ready
+        {
+            let c = self.view.to_world(r.center());
+            self.doc.pages[self.page].view = Some([c.x, c.y, self.view.zoom]);
+        }
+    }
+
     pub fn select_page(&mut self, i: usize) {
         if i != self.page {
+            self.remember_view();
             self.end_text_edit();
             self.page = i;
             self.sel.clear();
@@ -1265,6 +1276,7 @@ impl App {
     }
 
     pub fn save_to(&mut self, path: PathBuf) -> bool {
+        self.remember_view();
         let json = self.document_json();
         match crate::files::write_atomic(&path, json.as_bytes()) {
             Ok(()) => {
