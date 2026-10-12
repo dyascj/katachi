@@ -172,7 +172,7 @@ pub struct App {
     pub outline_mode: bool,
     pub show_grids: bool,
     pub show_history: bool,
-    /// A bare title strip over the app (the promo film); the window's tab strip replaces it normally.
+    /// A bare title strip over the app (headless renders); the window's tab strip replaces it normally.
     pub own_title_bar: bool,
     /// Theme and glass settings, and the glass state last given to the window.
     pub appearance: crate::appearance::Appearance,
