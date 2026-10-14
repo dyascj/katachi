@@ -2050,6 +2050,20 @@ fn color_picker_drags_and_escape_from_find_keeps_selection() {
 }
 
 #[test]
+fn huge_text_draws_and_edits_without_overflowing_the_font_atlas() {
+    let mut h = harness();
+    let mut n = Node::new(Kind::Text, r(0., 0., 100., 100.));
+    n.text = "W".into();
+    n.font_size = 20000.;
+    let id = h.state_mut().doc.insert(0, None, None, n);
+    h.state_mut().doc.reflow();
+    h.run_steps(2);
+    h.state_mut().editing_text = Some(id);
+    h.run_steps(2);
+    assert!(h.state().doc.node(id).rect.width() > 10000., "laid out at its true size");
+}
+
+#[test]
 fn serve_refuses_a_file_it_cannot_read() {
     let dir = std::env::temp_dir().join(format!("katachi-serve-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
