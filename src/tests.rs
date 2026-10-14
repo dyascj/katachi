@@ -2076,3 +2076,24 @@ fn snaps_to_equal_spacing_and_marks_gaps() {
     drag(&mut h, a, b, Modifiers::NONE);
     assert_eq!(rect(&h, c), r(150., 0., 100., 100.));
 }
+
+#[test]
+fn smart_selection_spacing_handle_and_swap() {
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    let b = draw(&mut h, Key::R, (150.0, 0.0), (250.0, 100.0));
+    let c = draw(&mut h, Key::R, (300.0, 0.0), (400.0, 100.0));
+    key(&mut h, Modifiers::COMMAND, Key::A);
+    assert!(h.state().smart_selection().is_some_and(|(axis, _)| axis == 0));
+    // The handle mid-gap widens every gap together.
+    let (p, q) = (s(&h, 125., 50.), s(&h, 145., 50.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    assert_eq!((rect(&h, a).min.x, rect(&h, b).min.x, rect(&h, c).min.x), (0., 170., 340.));
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!((rect(&h, b).min.x, rect(&h, c).min.x), (150., 300.), "one undo step");
+    // Dragging a's center knob onto c's slot swaps them.
+    let (p, q) = (s(&h, 50., 50.), s(&h, 350., 50.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    assert_eq!((rect(&h, a).min.x, rect(&h, b).min.x, rect(&h, c).min.x), (300., 150., 0.));
+    assert_eq!(h.state().sel.len(), 3, "selection kept");
+}

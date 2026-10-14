@@ -64,13 +64,23 @@ pub enum Drag {
     Pencil { points: Vec<Pos2> },
     /// Prototype tab: dragging a connection from a layer to a frame.
     Connect { from: NodeId },
+    /// Smart selection: a spacing handle sets every gap along `axis` (0 = row) at once.
+    Spacing { base: Document, axis: usize, items: Vec<(NodeId, Rect)>, gap: f32, start: Pos2 },
+    /// Smart selection: one layer dragged by its center knob onto another's slot swaps them.
+    Swap { base: Document, id: NodeId, axis: usize, items: Vec<(NodeId, Rect)>, start: Pos2 },
 }
 
 impl Drag {
     /// The document as it was when the drag began (drags re-apply themselves to it each frame).
     pub fn base_mut(&mut self) -> Option<&mut Document> {
         match self {
-            Drag::Move { base, .. } | Drag::Resize { base, .. } | Drag::Rotate { base, .. } | Drag::Create { base, .. } | Drag::Vector { base, .. } => Some(base),
+            Drag::Move { base, .. }
+            | Drag::Resize { base, .. }
+            | Drag::Rotate { base, .. }
+            | Drag::Create { base, .. }
+            | Drag::Vector { base, .. }
+            | Drag::Spacing { base, .. }
+            | Drag::Swap { base, .. } => Some(base),
             _ => None,
         }
     }
@@ -83,6 +93,10 @@ pub enum Grip {
     Resize(i8, i8),
     /// Just outside a corner.
     Rotate,
+    /// Smart selection: a gap's spacing handle along this axis (0 = row).
+    Spacing(usize),
+    /// Smart selection: a layer's center knob.
+    Swap(NodeId),
 }
 
 /// Mouse-down state for the move tool, resolved into a click or a drag.

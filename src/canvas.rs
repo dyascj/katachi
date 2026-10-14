@@ -360,6 +360,9 @@ impl App {
             (x, y) if x != 0 && y != 0 => return Some(Grip::Resize(x, y)),
             _ => {}
         }
+        if let Some(g) = self.smart_grip_at(s) {
+            return Some(g);
+        }
         let corner = [b.left_top(), b.right_top(), b.left_bottom(), b.right_bottom()]
             .iter()
             .any(|c| c.distance(s) < 20.0);
@@ -472,6 +475,14 @@ impl App {
                             let c = bounds.center();
                             let a = (start - c).angle();
                             Some(Drag::Rotate { base, center: c, start_angle: a, start_rot: rot, deg: 0.0 })
+                        }
+                        Grip::Spacing(_) | Grip::Swap(_) => {
+                            let (axis, items) = self.smart_selection().unwrap_or_default();
+                            match grip {
+                                Grip::Spacing(_) => Some(Drag::Spacing { base, axis, gap: gap_of(&items, axis), items, start }),
+                                Grip::Swap(id) => Some(Drag::Swap { base, id, axis, items, start }),
+                                _ => None,
+                            }
                         }
                     }
                 } else if press.target.is_some() && !self.sel.is_empty() {
@@ -699,6 +710,16 @@ impl App {
                     }
                 }
             }
+            Drag::Spacing { base, axis, items, gap, start } => {
+                self.doc = base.clone();
+                let g = self.px1((*gap + (w - *start)[*axis]).max(0.0));
+                lay_out(&mut self.doc, *axis, items, items[0].1.min[*axis], g);
+            }
+            Drag::Swap { base, id, start, .. } => {
+                self.doc = base.clone();
+                let d = w - *start;
+                self.doc.translate(*id, vec2(self.px1(d.x), self.px1(d.y)));
+            }
             Drag::Pan | Drag::Connect { .. } => {}
         }
         self.drag = Some(drag);
@@ -719,6 +740,18 @@ impl App {
                 if let Some(t) = target {
                     self.checkpoint();
                     self.doc.node_mut(from).reactions.push(crate::doc::Reaction { action: crate::doc::Action::Navigate(t), ..Default::default() });
+                }
+            }
+            Some(Drag::Swap { base, id, axis, mut items, .. }) => {
+                // Dropped on another layer's slot: trade places. Anywhere else: snap back.
+                self.doc = base;
+                let i = items.iter().position(|(n, _)| *n == id);
+                let j = items.iter().position(|(n, r)| *n != id && r.contains(w));
+                if let (Some(i), Some(j)) = (i, j) {
+                    let g = gap_of(&items, axis);
+                    let first = items[0].1.min[axis];
+                    items.swap(i, j);
+                    lay_out(&mut self.doc, axis, &items, first, g);
                 }
             }
             Some(Drag::Pencil { points }) => {
@@ -1095,6 +1128,81 @@ impl App {
         p + self.snap(r, exclude, [true, false, true], [true, false, true])
     }
 
+    // ---------- smart selection ----------
+
+    /// Figma's smart selection: 2+ selected layers in a row or column with equal gaps (within
+    /// 1px). Returns the axis (0 = row) and the layers in order along it.
+    pub fn smart_selection(&self) -> Option<(usize, Vec<(NodeId, Rect)>)> {
+        let roots = self.sel_roots();
+        if roots.len() < 2 || self.vector_edit.is_some() {
+            return None;
+        }
+        (0..2).find_map(|a| {
+            let mut items: Vec<(NodeId, Rect)> = roots.iter().map(|&i| (i, self.doc.node(i).aabb())).collect();
+            items.sort_by(|x, y| x.1.min[a].total_cmp(&y.1.min[a]));
+            let gaps: Vec<f32> = items.windows(2).map(|w| w[1].1.min[a] - w[0].1.max[a]).collect();
+            gaps.iter().all(|g| *g >= 0.0 && (g - gaps[0]).abs() <= 1.0).then_some((a, items))
+        })
+    }
+
+    /// Screen rects of the gaps between smart-selected layers, spanning the selection across.
+    fn smart_gaps(&self, a: usize, items: &[(NodeId, Rect)]) -> Vec<Rect> {
+        let b = self.doc.bounds(&items.iter().map(|(i, _)| *i).collect::<Vec<_>>());
+        items
+            .windows(2)
+            .map(|w| {
+                let (mut lo, mut hi) = (b.min, b.max);
+                lo[a] = w[0].1.max[a];
+                hi[a] = w[1].1.min[a];
+                self.view.rect_to_screen(Rect::from_min_max(lo, hi))
+            })
+            .collect()
+    }
+
+    /// The spacing handle mid-gap, or a layer's center knob, under screen point `s`.
+    fn smart_grip_at(&self, s: Pos2) -> Option<Grip> {
+        let (a, items) = self.smart_selection()?;
+        for g in self.smart_gaps(a, &items) {
+            let d = s - g.center();
+            if d[a].abs() <= 4.0 && d[1 - a].abs() <= 10.0 {
+                return Some(Grip::Spacing(a));
+            }
+        }
+        items.iter().find(|(_, r)| self.view.to_screen(r.center()).distance(s) <= 6.0).map(|(id, _)| Grip::Swap(*id))
+    }
+
+    /// With the pointer over a smart selection: knobs on each layer and a pink handle in each
+    /// gap; the hovered or dragged gaps light up with their size.
+    fn draw_smart_selection(&self, painter: &Painter, ptr: Option<Pos2>) {
+        let Some((a, items)) = self.smart_selection() else { return };
+        let gaps = self.smart_gaps(a, &items);
+        let b = self.view.rect_to_screen(self.doc.bounds(&self.sel_roots()));
+        let dragging = matches!(self.drag, Some(Drag::Spacing { .. }));
+        if !dragging && !ptr.is_some_and(|p| b.expand(4.0).contains(p)) {
+            return;
+        }
+        let hot = dragging || ptr.is_some_and(|p| gaps.iter().any(|g| g.expand(2.0).contains(p)));
+        for g in &gaps {
+            if hot {
+                painter.rect_filled(*g, 0.0, GAP.gamma_multiply(0.2));
+                let mut at = g.center();
+                at[1 - a] = g.max[1 - a] + 12.0;
+                pill(painter, at, num(g.size()[a] / self.view.zoom), GAP);
+            }
+            let mut half = Vec2::ZERO;
+            half[1 - a] = 6.0;
+            painter.line_segment([g.center() - half, g.center() + half], Stroke::new(2.0, GAP));
+        }
+        for (_, r) in &items {
+            painter.circle(self.view.to_screen(r.center()), 3.5, Color32::WHITE, Stroke::new(1.5, GAP));
+        }
+    }
+
+    /// `v` rounded to whole pixels when snapping to the pixel grid.
+    fn px1(&self, v: f32) -> f32 {
+        v.round()
+    }
+
     // ---------- overlays ----------
 
     /// Purple for components, instances, and anything inside them; blue otherwise.
@@ -1249,6 +1357,9 @@ impl App {
                 painter.rect_filled(pill, 2.0, accent);
                 painter.galley(pill.min + vec2(4.0, 2.0), g, Color32::WHITE);
             }
+        }
+        if self.editing_text.is_none() && self.tool.selects() && matches!(self.drag, None | Some(Drag::Spacing { .. } | Drag::Swap { .. })) {
+            self.draw_smart_selection(painter, ptr);
         }
         for g in &self.guides {
             painter.line_segment([self.view.to_screen(g[0]), self.view.to_screen(g[1])], Stroke::new(1.0, SNAP));
@@ -1416,6 +1527,9 @@ impl App {
                     Some(Grip::Resize(_, 0)) => CursorIcon::ResizeHorizontal,
                     Some(Grip::Resize(0, _)) => CursorIcon::ResizeVertical,
                     Some(Grip::Rotate) => CursorIcon::Alias,
+                    Some(Grip::Spacing(0)) => CursorIcon::ResizeHorizontal,
+                    Some(Grip::Spacing(_)) => CursorIcon::ResizeVertical,
+                    Some(Grip::Swap(_)) => CursorIcon::Grab,
                     _ => CursorIcon::Default,
                 },
                 Tool::Text => CursorIcon::Text,
@@ -1807,6 +1921,28 @@ pub fn smooth_stroke(points: &[Pos2], tol: f32) -> Vec<PathPoint> {
             PathPoint { p, h_in: -t, h_out: t }
         })
         .collect()
+}
+
+/// The (first) gap between consecutive `items` along axis `a`.
+fn gap_of(items: &[(NodeId, Rect)], a: usize) -> f32 {
+    items.get(1).map_or(0.0, |n| n.1.min[a] - items[0].1.max[a])
+}
+
+/// A vector of length `v` along axis `a`.
+fn axis_vec(a: usize, v: f32) -> Vec2 {
+    let mut d = Vec2::ZERO;
+    d[a] = v;
+    d
+}
+
+/// Space `items` (in order, from their recorded rects) `g` apart along axis `a`, starting at `from`.
+fn lay_out(doc: &mut crate::doc::Document, a: usize, items: &[(NodeId, Rect)], from: f32, g: f32) {
+    let mut cursor = from;
+    for (id, r) in items {
+        doc.translate(*id, axis_vec(a, cursor - r.min[a]));
+        cursor += r.max[a] - r.min[a] + g;
+    }
+    doc.reflow();
 }
 
 /// Whether `r` and `s` overlap across axis `a`: in the same row (a = 0) or column (a = 1).
