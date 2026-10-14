@@ -2125,3 +2125,77 @@ fn eyedropper_picks_fills_and_picker_colors() {
     assert_eq!(h.state().doc.node(id).fills[0].color, Rgba::rgb(200, 20, 90));
     assert!(egui::Popup::is_any_open(&h.ctx), "picker still open");
 }
+
+#[test]
+fn color_picker_formats_and_page_swatches() {
+    use crate::doc::Rgba;
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (40.0, 40.0));
+    let b = draw(&mut h, Key::R, (60.0, 0.0), (100.0, 40.0));
+    h.state_mut().doc.node_mut(a).fills[0].color = Rgba::rgb(0x12, 0x34, 0x56);
+    h.state_mut().sel = vec![b];
+    h.run_steps(2);
+    h.get_all_by_label("Color swatch").next().unwrap().click();
+    h.run_steps(3);
+    // The other layer's color is offered under "On this page"; a click applies it.
+    assert!(h.query_by_label("On this page").is_some());
+    h.get_by_label("#123456").click();
+    h.run_steps(2);
+    assert_eq!(h.state().doc.node(b).fills[0].color, Rgba::rgb(0x12, 0x34, 0x56));
+    // The format dropdown switches the fields.
+    // (Menus inside a popover open to the side: their buttons end in an arrow.)
+    h.get_by_label("Hex \u{23F5}").click();
+    h.run_steps(2);
+    h.get_by_label("HSL").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("HSL \u{23F5}").is_some() && h.query_by_label("Hex \u{23F5}").is_none(), "HSL fields now");
+    assert!(h.query_by_label("HSB").is_none(), "the format menu closed, the picker stayed open");
+}
+
+/// Visual check of the paint tools: `cargo test paint_look -- --ignored` writes target/look-*.png.
+#[test]
+#[ignore]
+fn paint_look() {
+    use crate::doc::{Paint, PaintKind, Rgba};
+    isolate_data();
+    let mut h = Harness::builder().with_size(vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).wgpu().build_eframe(|cc| {
+        crate::setup_style(&cc.egui_ctx);
+        let mut app = App::new(None);
+        app.recoverable.clear();
+        app
+    });
+    h.run_steps(2);
+    let mut ids = vec![];
+    for (i, kind) in [PaintKind::Angular, PaintKind::Diamond, PaintKind::Radial].into_iter().enumerate() {
+        let mut g = Paint::solid(Rgba::rgb(13, 153, 255));
+        g.convert(kind);
+        g.stops = vec![(0.0, Rgba::rgb(13, 153, 255)), (0.5, Rgba::rgb(255, 199, 0)), (1.0, Rgba::rgb(151, 71, 255))];
+        if kind == PaintKind::Radial {
+            g.width_to = Some(pos2(0.5, 0.75));
+        }
+        let mut n = Node::new(Kind::Rectangle, r(-560. + i as f32 * 220., -100., 200., 200.));
+        n.fills = vec![g];
+        ids.push(h.state_mut().doc.insert(0, None, None, n));
+    }
+    h.state_mut().sel = vec![ids[2]];
+    h.run_steps(2);
+    h.get_all_by_label("Color swatch").next().unwrap().click();
+    h.run_steps(4);
+    assert!(egui::Popup::is_any_open(&h.ctx));
+    h.render().unwrap().save("target/look-gradient.png").unwrap();
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    h.state_mut().doc.node_mut(ids[2]).fills = vec![Paint::solid(Rgba::rgb(0x8E, 0x72, 0xFF))];
+    h.run_steps(2);
+    h.get_all_by_label("Color swatch").next().unwrap().click();
+    h.run_steps(4);
+    h.render().unwrap().save("target/look-picker.png").unwrap();
+    h.get_by_label("Pick color  I").click();
+    h.run_steps(3);
+    let size = h.ctx.content_rect().size() * h.ctx.pixels_per_point();
+    let image = std::sync::Arc::new(egui::ColorImage::new([size.x as usize, size.y as usize], (0..(size.x * size.y) as usize).map(|i| egui::Color32::from_gray((i % 7 * 30) as u8)).collect()));
+    h.event(Event::Screenshot { viewport_id: egui::ViewportId::ROOT, user_data: Default::default(), image });
+    let p = s(&h, 0.0, 0.0);
+    move_to(&mut h, p, Modifiers::NONE);
+    h.run_steps(2);
+    h.render().unwrap().save("target/look-eyedropper.png").unwrap();
+}

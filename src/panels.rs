@@ -1833,13 +1833,11 @@ impl App {
         heading(ui, "Page");
         let mut bg = self.doc.pages[self.page].background;
         ui.horizontal(|ui| {
-            let mut c = [bg.0[0], bg.0[1], bg.0[2]];
-            let mut changed = egui::color_picker::color_edit_button_srgb(ui, &mut c).changed();
-            bg = Rgba::rgb(c[0], c[1], c[2]);
+            let mut changed = crate::paint_ui::color_swatch(ui, ui.id().with("page-bg-swatch"), &mut bg);
             changed |= hex_field(ui, ui.id().with("page-bg"), &mut bg, 56.0);
             if changed {
                 self.begin_edit();
-                self.doc.pages[self.page].background = bg;
+                self.doc.pages[self.page].background = bg.with_alpha(255);
             }
         });
         self.local_styles(ui);

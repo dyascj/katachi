@@ -148,23 +148,25 @@ pub fn parse_hex(s: &str) -> Option<Rgba> {
     Some(Rgba::rgb((v >> 16) as u8, (v >> 8) as u8, v as u8))
 }
 
-/// Hex text field that commits on Enter / focus loss, keeping alpha.
-pub fn hex_field(ui: &mut Ui, id: egui::Id, color: &mut Rgba, width: f32) -> bool {
-    let mut buf = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_else(|| color.hex());
+/// A text field showing `shown` that commits a parse of its text on Enter or focus loss.
+fn commit_field<T>(ui: &mut Ui, id: egui::Id, shown: String, width: f32, parse: impl Fn(&str) -> Option<T>) -> Option<T> {
+    let mut buf = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or(shown);
     let resp = ui.add(egui::TextEdit::singleline(&mut buf).id(id).desired_width(width).font(FontId::monospace(11.0)));
-    let mut changed = false;
+    let mut out = None;
     if resp.lost_focus() {
-        if let Some(c) = parse_hex(&buf) {
-            *color = c.with_alpha(color.a());
-            changed = true;
-        }
+        out = parse(&buf);
         ui.data_mut(|d| d.remove::<String>(id));
     } else if resp.has_focus() {
         ui.data_mut(|d| d.insert_temp(id, buf));
     } else {
         ui.data_mut(|d| d.remove::<String>(id));
     }
-    changed
+    out
+}
+
+/// Hex text field that commits on Enter / focus loss, keeping alpha.
+pub fn hex_field(ui: &mut Ui, id: egui::Id, color: &mut Rgba, width: f32) -> bool {
+    commit_field(ui, id, color.hex(), width, parse_hex).map(|c| *color = c.with_alpha(color.a())).is_some()
 }
 
 /// Opacity percentage field for a color's alpha.
@@ -177,10 +179,148 @@ pub fn alpha_field(ui: &mut Ui, color: &mut Rgba) -> bool {
     changed
 }
 
-/// Figma's color picker: a saturation and brightness square, then thin hue and opacity sliders
-/// with round knobs, then hex and opacity.
+/// sRGB to hue, saturation, and brightness, each 0..=1 (Figma's HSB).
+pub fn to_hsb(c: Rgba) -> [f32; 3] {
+    let [r, g, b] = [c.0[0], c.0[1], c.0[2]].map(|v| v as f32 / 255.0);
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    let d = max - min;
+    let h = if d == 0.0 {
+        0.0
+    } else if max == r {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if max == g {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+    [h / 6.0, if max == 0.0 { 0.0 } else { d / max }, max]
+}
+
+pub fn from_hsb([h, s, v]: [f32; 3], a: u8) -> Rgba {
+    let f = |n: f32| {
+        let k = (n + h.rem_euclid(1.0) * 6.0) % 6.0;
+        ((v - v * s * k.min(4.0 - k).clamp(0.0, 1.0)) * 255.0).round().clamp(0.0, 255.0) as u8
+    };
+    Rgba([f(5.0), f(3.0), f(1.0), a])
+}
+
+/// HSB to HSL (hue kept), and back.
+pub fn hsb_to_hsl([h, s, v]: [f32; 3]) -> [f32; 3] {
+    let l = v * (1.0 - s / 2.0);
+    let m = l.min(1.0 - l);
+    [h, if m <= 0.0 { 0.0 } else { (v - l) / m }, l]
+}
+
+pub fn hsl_to_hsb([h, s, l]: [f32; 3]) -> [f32; 3] {
+    let v = l + s * l.min(1.0 - l);
+    [h, if v <= 0.0 { 0.0 } else { 2.0 * (1.0 - l / v) }, v]
+}
+
+/// `rgb(...)`, or `rgba(...)` when translucent.
+pub fn css_rgba(c: Rgba) -> String {
+    let [r, g, b, a] = c.0;
+    if a == 255 { format!("rgb({r}, {g}, {b})") } else { format!("rgba({r}, {g}, {b}, {})", num(a as f32 / 255.0)) }
+}
+
+/// A CSS color: hex, `rgb()`, or `rgba()`.
+pub fn parse_css(s: &str) -> Option<Rgba> {
+    let s = s.trim();
+    let Some(body) = s.strip_prefix("rgba(").or_else(|| s.strip_prefix("rgb(")).and_then(|b| b.strip_suffix(')')) else {
+        return parse_hex(s);
+    };
+    let v: Vec<f32> = body.split([',', ' ', '/']).filter(|t| !t.is_empty()).map(|t| t.parse().ok()).collect::<Option<_>>()?;
+    let ch = |x: f32| x.round().clamp(0.0, 255.0) as u8;
+    match v[..] {
+        [r, g, b] => Some(Rgba::rgb(ch(r), ch(g), ch(b))),
+        [r, g, b, a] => Some(Rgba([ch(r), ch(g), ch(b), ch(a * 255.0)])),
+        _ => None,
+    }
+}
+
+/// The picker's number formats, as in Figma's dropdown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ColorFormat {
+    #[default]
+    Hex,
+    Rgb,
+    Css,
+    Hsl,
+    Hsb,
+}
+
+impl ColorFormat {
+    const ALL: [ColorFormat; 5] = [ColorFormat::Hex, ColorFormat::Rgb, ColorFormat::Css, ColorFormat::Hsl, ColorFormat::Hsb];
+    fn label(self) -> &'static str {
+        match self {
+            ColorFormat::Hex => "Hex",
+            ColorFormat::Rgb => "RGB",
+            ColorFormat::Css => "CSS",
+            ColorFormat::Hsl => "HSL",
+            ColorFormat::Hsb => "HSB",
+        }
+    }
+}
+
+/// Colors the picker offers below its fields: the current page's, then color styles.
+#[derive(Clone, Debug, Default)]
+pub struct Swatches {
+    pub page: Vec<Rgba>,
+    pub styles: Vec<(String, Rgba)>,
+}
+
+const SWATCHES: &str = "picker-swatches";
+
+impl App {
+    /// Every solid color on the current page, and the solid color styles.
+    pub fn swatches(&self) -> Swatches {
+        let mut page = vec![];
+        for &r in &self.doc.pages[self.page].children {
+            for id in std::iter::once(r).chain(self.doc.descendants(r)) {
+                let n = self.doc.node(id);
+                for p in n.fills.iter().chain(&n.strokes).filter(|p| p.visible && p.kind == PaintKind::Solid) {
+                    if !page.contains(&p.color) {
+                        page.push(p.color);
+                    }
+                }
+            }
+        }
+        let styles = self
+            .doc
+            .styles
+            .iter()
+            .filter_map(|s| match &s.value {
+                crate::doc::StyleValue::Paint(ps) => ps.last().filter(|p| p.kind == PaintKind::Solid).map(|p| (s.name.clone(), p.color)),
+                _ => None,
+            })
+            .collect();
+        Swatches { page, styles }
+    }
+
+    /// Hand the swatches to any color picker drawn this frame (only while a popover is open).
+    pub fn offer_swatches(&self, ctx: &egui::Context) {
+        if egui::Popup::is_any_open(ctx) {
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new(SWATCHES), std::sync::Arc::new(self.swatches())));
+        }
+    }
+}
+
+/// A small clickable color chip.
+fn chip(ui: &mut Ui, c: Rgba, tip: &str) -> egui::Response {
+    let (r, resp) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tip));
+    if c.a() < 255 {
+        ui.painter().rect_filled(r, 3.0, Color32::WHITE);
+        ui.painter().rect_filled(Rect::from_min_size(r.min, r.size() / 2.0), 0.0, Color32::from_gray(0xD8));
+        ui.painter().rect_filled(Rect::from_min_size(r.center(), r.size() / 2.0), 0.0, Color32::from_gray(0xD8));
+    }
+    ui.painter().rect_filled(r, 3.0, c.to32());
+    ui.painter().rect_stroke(r, 3.0, Stroke::new(1.0, Color32::from_black_alpha(30)), StrokeKind::Inside);
+    resp.on_hover_text(tip)
+}
+
+/// Figma's color picker: a saturation and brightness square, the eyedropper beside thin hue and
+/// opacity sliders, the color in a chosen format, then swatches from the page and color styles.
 fn rgb_picker(ui: &mut Ui, color: &mut Rgba) -> bool {
-    use egui::ecolor::Hsva;
     use egui::epaint::{Mesh, Vertex, WHITE_UV};
     let id = ui.id().with("figma-picker");
     let mut changed = false;
@@ -188,15 +328,12 @@ fn rgb_picker(ui: &mut Ui, color: &mut Rgba) -> bool {
         *color = c.with_alpha(color.a());
         changed = true;
     }
-    let rgb = Color32::from_rgb(color.0[0], color.0[1], color.0[2]);
-    let mut hsv = Hsva::from(rgb);
-    // Grays and black have no hue: keep the last one so the square doesn't jump to red.
-    let kept: Option<(Color32, f32)> = ui.data(|d| d.get_temp(id));
-    if let Some((c, h)) = kept
-        && c == rgb
-    {
-        hsv.h = h;
-    }
+    // Grays have no hue and black no saturation: keep the last ones so the knobs don't jump.
+    let mut hsb = match ui.data(|d| d.get_temp::<(Rgba, [f32; 3])>(id)) {
+        Some((c, k)) if c == color.with_alpha(255) => k,
+        _ => to_hsb(*color),
+    };
+    let solid = |k: [f32; 3]| from_hsb(k, 255).to32();
     let w = ui.available_width();
     let quad = |m: &mut Mesh, r: Rect, [tl, tr, br, bl]: [Color32; 4]| {
         let base = m.vertices.len() as u32;
@@ -212,70 +349,147 @@ fn rgb_picker(ui: &mut Ui, color: &mut Rgba) -> bool {
     // Saturation (x) and brightness (y).
     let (sq, resp) = ui.allocate_exact_size(vec2(w, w), Sense::click_and_drag());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Slider, true, "Saturation and brightness"));
-    let pure = Color32::from(Hsva::new(hsv.h, 1.0, 1.0, 1.0));
+    let pure = solid([hsb[0], 1.0, 1.0]);
     let mut m = Mesh::default();
     quad(&mut m, sq, [Color32::WHITE, pure, pure, Color32::WHITE]);
     quad(&mut m, sq, [Color32::TRANSPARENT, Color32::TRANSPARENT, Color32::BLACK, Color32::BLACK]);
     ui.painter().add(m);
     ui.painter().rect_stroke(sq, 4.0, Stroke::new(1.0, Color32::from_black_alpha(25)), StrokeKind::Inside);
     if let Some(p) = resp.interact_pointer_pos() {
-        hsv.s = ((p.x - sq.min.x) / sq.width()).clamp(0.0, 1.0);
-        hsv.v = 1.0 - ((p.y - sq.min.y) / sq.height()).clamp(0.0, 1.0);
+        hsb[1] = ((p.x - sq.min.x) / sq.width()).clamp(0.0, 1.0);
+        hsb[2] = 1.0 - ((p.y - sq.min.y) / sq.height()).clamp(0.0, 1.0);
         changed = true;
     }
-    knob(ui, egui::pos2(sq.min.x + hsv.s * sq.width(), sq.min.y + (1.0 - hsv.v) * sq.height()), Color32::from(Hsva::new(hsv.h, hsv.s, hsv.v, 1.0)));
-    ui.add_space(6.0);
-    // Hue.
-    let (bar, resp) = ui.allocate_exact_size(vec2(w, 12.0), Sense::click_and_drag());
-    let mut m = Mesh::default();
-    for i in 0..6 {
-        let (a, b) = (i as f32 / 6.0, (i + 1) as f32 / 6.0);
-        let r = Rect::from_min_max(egui::pos2(bar.min.x + a * bar.width(), bar.min.y), egui::pos2(bar.min.x + b * bar.width(), bar.max.y));
-        let (ca, cb) = (Color32::from(Hsva::new(a, 1.0, 1.0, 1.0)), Color32::from(Hsva::new(b, 1.0, 1.0, 1.0)));
-        quad(&mut m, r, [ca, cb, cb, ca]);
-    }
-    ui.painter().add(m);
-    if let Some(p) = resp.interact_pointer_pos() {
-        hsv.h = ((p.x - bar.min.x) / bar.width()).clamp(0.0, 0.9999);
-        changed = true;
-    }
-    knob(ui, egui::pos2(bar.min.x + hsv.h * bar.width(), bar.center().y), pure);
-    ui.add_space(6.0);
-    // Opacity.
-    let (bar, resp) = ui.allocate_exact_size(vec2(w, 12.0), Sense::click_and_drag());
-    for i in 0..(bar.width() / 6.0) as usize {
-        for j in 0..2 {
-            if (i + j) % 2 == 0 {
-                let r = Rect::from_min_size(egui::pos2(bar.min.x + i as f32 * 6.0, bar.min.y + j as f32 * 6.0), vec2(6.0, 6.0)).intersect(bar);
-                ui.painter().rect_filled(r, 0.0, Color32::from_gray(0xD8));
-            }
-        }
-    }
-    let solid = Color32::from(Hsva::new(hsv.h, hsv.s, hsv.v, 1.0));
-    let mut m = Mesh::default();
-    quad(&mut m, bar, [Color32::TRANSPARENT, solid, solid, Color32::TRANSPARENT]);
-    ui.painter().add(m);
-    let mut a = color.a() as f32 / 255.0;
-    if let Some(p) = resp.interact_pointer_pos() {
-        a = ((p.x - bar.min.x) / bar.width()).clamp(0.0, 1.0);
-        changed = true;
-    }
-    knob(ui, egui::pos2(bar.min.x + a * bar.width(), bar.center().y), solid);
-    if changed {
-        let c = Color32::from(Hsva::new(hsv.h, hsv.s, hsv.v, 1.0));
-        *color = Rgba([c.r(), c.g(), c.b(), (a * 255.0).round() as u8]);
-        ui.data_mut(|d| d.insert_temp(id, (c, hsv.h)));
-    }
+    knob(ui, egui::pos2(sq.min.x + hsb[1] * sq.width(), sq.min.y + (1.0 - hsb[2]) * sq.height()), solid(hsb));
     ui.add_space(8.0);
-    // Hex and opacity, as Figma shows under the sliders.
+    let mut a = color.a() as f32 / 255.0;
     ui.horizontal(|ui| {
-        if icon_button(ui, Icon::Eyedropper, false, 22.0, "Pick color  I").clicked() {
+        if icon_button(ui, Icon::Eyedropper, false, 24.0, "Pick color  I").clicked() {
             ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(EYEDROP_REQUEST), Some(id)));
         }
-        ui.label(egui::RichText::new("Hex").color(crate::appearance::muted(ui.ctx())));
-        changed |= hex_field(ui, id.with("hex"), color, 80.0);
-        changed |= alpha_field(ui, color);
+        ui.add_space(4.0);
+        ui.vertical(|ui| {
+            let w = ui.available_width();
+            // Hue.
+            let (bar, resp) = ui.allocate_exact_size(vec2(w, 12.0), Sense::click_and_drag());
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Slider, true, "Hue"));
+            let mut m = Mesh::default();
+            for i in 0..6 {
+                let (x0, x1) = (i as f32 / 6.0, (i + 1) as f32 / 6.0);
+                let r = Rect::from_min_max(egui::pos2(bar.min.x + x0 * bar.width(), bar.min.y), egui::pos2(bar.min.x + x1 * bar.width(), bar.max.y));
+                let (ca, cb) = (solid([x0, 1.0, 1.0]), solid([x1 % 1.0, 1.0, 1.0]));
+                quad(&mut m, r, [ca, cb, cb, ca]);
+            }
+            ui.painter().add(m);
+            if let Some(p) = resp.interact_pointer_pos() {
+                hsb[0] = ((p.x - bar.min.x) / bar.width()).clamp(0.0, 0.9999);
+                changed = true;
+            }
+            knob(ui, egui::pos2(bar.min.x + hsb[0] * bar.width(), bar.center().y), solid([hsb[0], 1.0, 1.0]));
+            ui.add_space(4.0);
+            // Opacity.
+            let (bar, resp) = ui.allocate_exact_size(vec2(w, 12.0), Sense::click_and_drag());
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Slider, true, "Opacity"));
+            for i in 0..(bar.width() / 6.0).ceil() as usize {
+                for j in 0..2 {
+                    if (i + j) % 2 == 0 {
+                        let r = Rect::from_min_size(egui::pos2(bar.min.x + i as f32 * 6.0, bar.min.y + j as f32 * 6.0), vec2(6.0, 6.0)).intersect(bar);
+                        ui.painter().rect_filled(r, 0.0, Color32::from_gray(0xD8));
+                    }
+                }
+            }
+            let mut m = Mesh::default();
+            quad(&mut m, bar, [Color32::TRANSPARENT, solid(hsb), solid(hsb), Color32::TRANSPARENT]);
+            ui.painter().add(m);
+            if let Some(p) = resp.interact_pointer_pos() {
+                a = ((p.x - bar.min.x) / bar.width()).clamp(0.0, 1.0);
+                changed = true;
+            }
+            knob(ui, egui::pos2(bar.min.x + a * bar.width(), bar.center().y), solid(hsb));
+        });
     });
+    if changed {
+        *color = from_hsb(hsb, (a * 255.0).round() as u8);
+    }
+    ui.add_space(8.0);
+    // The color in the chosen format (remembered across pickers, as in Figma).
+    let fmt_id = egui::Id::new("color-format");
+    let mut fmt: ColorFormat = ui.data(|d| d.get_temp(fmt_id)).unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        crate::chrome::menu_button(ui, fmt.label(), |ui| {
+            for f in ColorFormat::ALL {
+                if ui.selectable_label(fmt == f, f.label()).clicked() {
+                    fmt = f;
+                }
+            }
+        });
+        let small = |ui: &mut Ui, v: &mut f32, max: f32| ui.add_sized([34.0, 20.0], DragValue::new(v).range(0.0..=max).speed(0.5).max_decimals(0)).changed();
+        match fmt {
+            ColorFormat::Hex => changed |= hex_field(ui, id.with("hex"), color, 64.0),
+            ColorFormat::Css => {
+                if let Some(c) = commit_field(ui, id.with("css"), css_rgba(*color), ui.available_width(), parse_css) {
+                    *color = c;
+                    changed = true;
+                }
+            }
+            ColorFormat::Rgb => {
+                let mut ch = color.0.map(|v| v as f32);
+                let mut edit = false;
+                for v in &mut ch[..3] {
+                    edit |= small(ui, v, 255.0);
+                }
+                if edit {
+                    *color = Rgba(ch.map(|v| v.round() as u8));
+                    changed = true;
+                }
+            }
+            ColorFormat::Hsl | ColorFormat::Hsb => {
+                let hsl = fmt == ColorFormat::Hsl;
+                let k = if hsl { hsb_to_hsl(hsb) } else { hsb };
+                let mut v = [k[0] * 360.0, k[1] * 100.0, k[2] * 100.0].map(f32::round);
+                let mut edit = small(ui, &mut v[0], 360.0);
+                edit |= small(ui, &mut v[1], 100.0);
+                edit |= small(ui, &mut v[2], 100.0);
+                if edit {
+                    let k = [(v[0] / 360.0).min(0.9999), v[1] / 100.0, v[2] / 100.0];
+                    hsb = if hsl { hsl_to_hsb(k) } else { k };
+                    *color = from_hsb(hsb, color.a());
+                    changed = true;
+                }
+            }
+        }
+        if fmt != ColorFormat::Css {
+            changed |= alpha_field(ui, color);
+        }
+    });
+    ui.data_mut(|d| d.insert_temp(fmt_id, fmt));
+    if changed {
+        // Keep the knobs where they were dragged unless the color moved away from them.
+        let k = if *color == from_hsb(hsb, color.a()) { hsb } else { to_hsb(*color) };
+        ui.data_mut(|d| d.insert_temp(id, (color.with_alpha(255), k)));
+    }
+    // Swatches: colors on this page, then color styles. A click applies one.
+    let sw: Option<std::sync::Arc<Swatches>> = ui.data(|d| d.get_temp(egui::Id::new(SWATCHES)));
+    if let Some(sw) = sw {
+        let page: Vec<(String, Rgba)> = sw.page.iter().take(40).map(|c| (format!("#{}", c.hex()), *c)).collect();
+        for (title, list) in [("On this page", &page), ("Color styles", &sw.styles)] {
+            if list.is_empty() {
+                continue;
+            }
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(title).small().color(crate::appearance::muted(ui.ctx())));
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                for (tip, c) in list {
+                    if chip(ui, *c, tip).clicked() {
+                        *color = *c;
+                        changed = true;
+                    }
+                }
+            });
+        }
+    }
     changed
 }
 
@@ -311,14 +525,17 @@ fn swatch(ui: &mut Ui, p: &Paint) -> egui::Response {
     resp
 }
 
+/// A color swatch that opens the color picker.
+pub fn color_swatch(ui: &mut Ui, id: egui::Id, color: &mut Rgba) -> bool {
+    let sw = swatch(ui, &Paint::solid(*color));
+    crate::chrome::popover(&sw, id.with("popup"), "Color", 240.0, |ui| rgb_picker(ui, color)).unwrap_or(false)
+}
+
 /// A bare color row: swatch with picker, hex, and opacity.
 pub fn color_row(ui: &mut Ui, id: egui::Id, color: &mut Rgba) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
-        let sw = swatch(ui, &Paint::solid(*color));
-        crate::chrome::popover(&sw, id.with("popup"), "Color", 240.0, |ui| {
-            changed |= rgb_picker(ui, color);
-        });
+        changed |= color_swatch(ui, id, color);
         changed |= hex_field(ui, id.with("hex"), color, 56.0);
         changed |= alpha_field(ui, color);
     });
@@ -658,4 +875,24 @@ pub fn style_menu(ui: &mut Ui, id: egui::Id, styles: &[crate::doc::Style], same_
         ui.data_mut(|d| d.insert_temp(name_id, name));
     });
     pick
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn color_formats_convert_both_ways() {
+        let c = Rgba([200, 80, 40, 255]);
+        assert_eq!(from_hsb(to_hsb(c), 255), c);
+        let red = to_hsb(Rgba::rgb(255, 0, 0));
+        assert_eq!(red, [0.0, 1.0, 1.0]);
+        let hsl = hsb_to_hsl(red);
+        assert!((hsl[1] - 1.0).abs() < 1e-6 && (hsl[2] - 0.5).abs() < 1e-6, "red is 0, 100%, 50% in HSL");
+        assert_eq!(from_hsb(hsl_to_hsb(hsl), 255), Rgba::rgb(255, 0, 0));
+        assert_eq!(parse_css("rgba(10, 20, 30, 0.5)"), Some(Rgba([10, 20, 30, 128])));
+        assert_eq!(parse_css(&css_rgba(c.with_alpha(51))), Some(c.with_alpha(51)));
+        assert_eq!(parse_css("#FFF"), Some(Rgba::WHITE));
+        assert_eq!(parse_css("rgb(1, 2)"), None);
+    }
 }

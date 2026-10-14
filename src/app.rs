@@ -2349,6 +2349,7 @@ impl eframe::App for App {
         self.title_bar(ui);
         // The fill and stroke rows say which gradient editor is open, if any.
         self.gradient_edit = None;
+        self.offer_swatches(&ctx);
         if !self.ui_hidden {
             self.left_panel(ui);
             self.right_panel(ui);

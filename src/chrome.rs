@@ -113,7 +113,7 @@ pub fn context_menu(resp: &Response, add: impl FnOnce(&mut Ui)) {
 
 /// `ui.menu_button`, styled as a Figma menu (submenus of it inherit the style).
 pub fn menu_button<'a, R>(ui: &mut Ui, atoms: impl egui::IntoAtoms<'a>, add: impl FnOnce(&mut Ui) -> R) -> Response {
-    use egui::containers::menu::{MenuButton, MenuConfig, SubMenu, SubMenuButton, is_in_menu};
+    use egui::containers::menu::{MenuButton, MenuConfig, MenuState, SubMenu, SubMenuButton, is_in_menu};
     let config = MenuConfig::new().style(menu_style);
     if !is_in_menu(ui) {
         return MenuButton::new(atoms).config(config).ui(ui, add).0;
@@ -122,24 +122,33 @@ pub fn menu_button<'a, R>(ui: &mut Ui, atoms: impl egui::IntoAtoms<'a>, add: imp
     // the submenu's own, which gives white text on a white menu. Draw the button normally,
     // then open the submenu from a dark-styled scope.
     let resp = ui.add(egui::Button::new(atoms).right_text(SubMenuButton::RIGHT_ARROW));
-    ui.scope(|ui| {
+    // A pick closes just the submenu, a frame later (closing it during the click would let the
+    // popover take the click as one outside it), so the popover stays open as in Figma.
+    let sub = SubMenu::id_from_widget_id(resp.id);
+    if ui.data_mut(|d| d.remove_temp::<bool>(sub.with("picked"))).unwrap_or(false) {
+        MenuState::from_ui(ui, |s, _| s.open_item = s.open_item.filter(|o| *o != sub));
+    }
+    let shown = ui.scope(|ui| {
         menu_style(ui.style_mut());
-        SubMenu::new().config(config).show(ui, &resp, add);
+        SubMenu::new().config(config.close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)).show(ui, &resp, add)
     });
+    if shown.inner.is_some_and(|r| r.response.contains_pointer()) && ui.input(|i| i.pointer.any_click()) {
+        ui.data_mut(|d| d.insert_temp(sub.with("picked"), true));
+    }
     resp
 }
 
 /// Width of the right panel; popovers from it open just left of it, as in Figma.
 const RIGHT_PANEL: f32 = 248.0;
 
-/// A Figma popover toggled by `button`: solid, titled, with a close button, opening to the left
-/// of the right panel (or below the button elsewhere), and closing on a click outside or Escape.
 /// Keep open popovers open through the next click: it edits what they show (a gradient
 /// handle on the canvas, a color picked with the eyedropper).
 pub fn pin_popovers(ctx: &egui::Context, on: bool) {
     ctx.data_mut(|d| d.insert_temp(egui::Id::new("pin-popovers"), on));
 }
 
+/// A Figma popover toggled by `button`: solid, titled, with a close button, opening to the left
+/// of the right panel (or below the button elsewhere), and closing on a click outside or Escape.
 pub fn popover<R>(button: &Response, id: egui::Id, title: &str, width: f32, add: impl FnOnce(&mut Ui) -> R) -> Option<R> {
     let ctx = button.ctx.clone();
     let pinned = ctx.data(|d| d.get_temp(egui::Id::new("pin-popovers"))).unwrap_or(false);

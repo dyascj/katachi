@@ -20,13 +20,8 @@ fn type_name(v: &VarValue) -> &'static str {
 fn value_editor(ui: &mut Ui, id: egui::Id, v: &mut VarValue, names: &[(u64, String)]) -> bool {
     match v {
         VarValue::Color(c) => {
-            let mut rgb = [c.0[0], c.0[1], c.0[2]];
-            let mut changed = egui::color_picker::color_edit_button_srgb(ui, &mut rgb).changed();
-            if changed {
-                *c = Rgba([rgb[0], rgb[1], rgb[2], c.0[3]]);
-            }
-            changed |= crate::paint_ui::hex_field(ui, id, c, 64.0);
-            changed
+            let changed = crate::paint_ui::color_swatch(ui, id.with("swatch"), c);
+            changed | crate::paint_ui::hex_field(ui, id, c, 64.0)
         }
         VarValue::Number(n) => ui.add(DragValue::new(n).speed(0.5).custom_formatter(|x, _| num(x as f32))).changed(),
         VarValue::Text(t) => ui.add(egui::TextEdit::singleline(t).desired_width(90.0)).changed(),
