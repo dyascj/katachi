@@ -53,6 +53,7 @@ pub enum Icon {
     Detach,
     Comment,
     Close,
+    Eyedropper,
 }
 
 use crate::appearance as theme;
@@ -298,6 +299,12 @@ pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
             p.line_segment([at(-1., 1.), at(6., -6.)], s);
             p.line_segment([at(6., -6.), at(2., -6.)], s);
             p.line_segment([at(6., -6.), at(6., -2.)], s);
+        }
+        Icon::Eyedropper => {
+            p.line_segment([at(-5., 5.), at(2.5, -2.5)], Stroke::new(2.0, color));
+            p.line_segment([at(-6., 6.), at(-5., 5.)], s);
+            p.circle_filled(at(3.8, -3.8), 2.4, color);
+            p.line_segment([at(0.5, -4.5), at(4.5, -0.5)], s);
         }
         Icon::Close => {
             p.line_segment([at(-4., -4.), at(4., 4.)], s);

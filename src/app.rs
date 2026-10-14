@@ -268,6 +268,7 @@ pub struct App {
     pub confirm: Option<After>,
     pub prev_sel: Vec<NodeId>,
     pub gradient_edit: Option<GradientEdit>,
+    pub eyedrop: Option<crate::paint_ui::Eyedrop>,
     pub allow_close: bool,
     pub toast: Option<(String, f64)>,
     title: String,
@@ -376,6 +377,7 @@ impl App {
             toast: None,
             title: String::new(),
             gradient_edit: None,
+            eyedrop: None,
             screenshot: std::env::var_os("KATACHI_SCREENSHOT").map(|p| (PathBuf::from(p), 0)),
         };
         app.recoverable = crate::files::orphaned_recoveries(&app.recovery);
@@ -2301,6 +2303,7 @@ impl App {
             (false, false, false, Key::P) => self.set_tool(Tool::Pen),
             (false, false, false, Key::T) => self.set_tool(Tool::Text),
             (false, false, false, Key::C) => self.set_tool(Tool::Comment),
+            (false, false, false, Key::I) if !self.sel.is_empty() => self.start_eyedrop(crate::paint_ui::EyeTarget::Fill),
             (false, true, false, Key::C) => self.show_comments = !self.show_comments,
             _ => {}
         }
@@ -2341,6 +2344,7 @@ impl eframe::App for App {
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.presentation_ui(ui));
             return;
         }
+        self.eyedropper(&ctx);
         self.shortcuts(&ctx);
         self.title_bar(ui);
         // The fill and stroke rows say which gradient editor is open, if any.

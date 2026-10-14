@@ -2087,3 +2087,41 @@ fn gradient_handles_edit_on_canvas_while_the_editor_is_open() {
     key(&mut h, Modifiers::COMMAND, Key::Z);
     assert!((h.state().doc.node(id).fills[0].stops[1].0 - 0.4).abs() < 0.02, "undo puts the stop back");
 }
+
+/// What the eyedropper's window screenshot would show: one color everywhere.
+fn fake_screenshot(h: &mut Harness<App>, c: egui::Color32) {
+    let size = h.ctx.content_rect().size() * h.ctx.pixels_per_point();
+    let image = std::sync::Arc::new(egui::ColorImage::filled([size.x as usize, size.y as usize], c));
+    h.event(Event::Screenshot { viewport_id: egui::ViewportId::ROOT, user_data: Default::default(), image });
+    h.run_steps(2);
+}
+
+#[test]
+fn eyedropper_picks_fills_and_picker_colors() {
+    use crate::doc::Rgba;
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (80.0, 80.0));
+    // I with a layer selected picks its fill; Escape cancels and keeps the selection.
+    key(&mut h, Modifiers::NONE, Key::I);
+    assert!(h.state().eyedrop.is_some());
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    assert!(h.state().eyedrop.is_none());
+    assert_eq!(h.state().sel, vec![id]);
+    key(&mut h, Modifiers::NONE, Key::I);
+    fake_screenshot(&mut h, egui::Color32::from_rgb(10, 200, 30));
+    let far = s(&h, 400.0, 300.0);
+    click(&mut h, far, Modifiers::NONE);
+    assert!(h.state().eyedrop.is_none());
+    assert_eq!(h.state().doc.node(id).fills[0].color, Rgba::rgb(10, 200, 30));
+    assert_eq!(h.state().sel, vec![id], "the click picked, it didn't deselect");
+    // From the color picker: the pick lands in the picker, which stays open.
+    h.get_all_by_label("Color swatch").next().unwrap().click();
+    h.run_steps(3);
+    h.get_by_label("Pick color  I").click();
+    h.run_steps(3);
+    assert!(h.state().eyedrop.is_some());
+    fake_screenshot(&mut h, egui::Color32::from_rgb(200, 20, 90));
+    click(&mut h, far, Modifiers::NONE);
+    assert_eq!(h.state().doc.node(id).fills[0].color, Rgba::rgb(200, 20, 90));
+    assert!(egui::Popup::is_any_open(&h.ctx), "picker still open");
+}

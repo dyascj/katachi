@@ -159,7 +159,7 @@ impl App {
         self.draw_overlays(&painter, ptr);
         // Gradient handles edit what the open paint popover shows, so pressing one keeps it open.
         let on_gradient = matches!(self.drag, Some(Drag::Gradient { .. })) || hover_pos.filter(|_| resp.hovered()).and_then(|p| self.gradient_hit(p)).is_some();
-        crate::chrome::pin_popovers(ui.ctx(), on_gradient);
+        crate::chrome::pin_popovers(ui.ctx(), on_gradient || self.eyedrop.is_some());
         if let Some(g) = self.gradient_edit {
             ui.data_mut(|d| d.insert_temp(g.ui.with("stop"), g.stop));
         }

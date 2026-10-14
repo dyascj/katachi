@@ -1,9 +1,141 @@
 //! Fill, stroke, and effect editors for the design panel (Figma-style rows with popovers).
 
+use crate::app::App;
 use crate::canvas::num;
 use crate::doc::{Paint, PaintKind, Rgba, Shadow};
 use crate::panels::{Icon, icon_button};
-use egui::{Color32, DragValue, FontId, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+use egui::{Color32, DragValue, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+
+/// A color picker asks for the eyedropper under this key; the pick comes back to it under
+/// its own id `.with("eyedropped")`.
+const EYEDROP_REQUEST: &str = "eyedrop-request";
+
+/// Where an eyedropper pick goes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EyeTarget {
+    /// A color picker, by id.
+    Picker(egui::Id),
+    /// The selection's top fill (I on the canvas).
+    Fill,
+}
+
+/// Figma's eyedropper: a loupe over a screenshot of the window, taken once when it starts.
+pub struct Eyedrop {
+    pub target: EyeTarget,
+    pub shot: Option<std::sync::Arc<egui::ColorImage>>,
+    /// The screenshot is requested on the first frame, before the loupe is drawn, so it isn't in it.
+    asked: bool,
+}
+
+impl App {
+    pub fn start_eyedrop(&mut self, target: EyeTarget) {
+        self.eyedrop = Some(Eyedrop { target, shot: None, asked: false });
+    }
+
+    /// Runs before the panels each frame: starts, feeds, and draws the eyedropper.
+    pub fn eyedropper(&mut self, ctx: &egui::Context) {
+        if let Some(id) = ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(egui::Id::new(EYEDROP_REQUEST)).flatten()) {
+            self.start_eyedrop(EyeTarget::Picker(id));
+        }
+        let Some(e) = &mut self.eyedrop else { return };
+        // Escape cancels, and is used up here so it doesn't also close the picker.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.eyedrop = None;
+            return;
+        }
+        if !e.asked {
+            e.asked = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+            ctx.request_repaint();
+            return;
+        }
+        let shot = ctx.input(|i| {
+            i.raw.events.iter().find_map(|ev| match ev {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        if shot.is_some() {
+            e.shot = shot;
+        }
+        // The screenshot is in physical pixels.
+        let ppp = ctx.pixels_per_point();
+        let sample = |p: Pos2| -> Option<Rgba> {
+            let img = e.shot.as_ref()?;
+            let (x, y) = ((p.x * ppp).floor(), (p.y * ppp).floor());
+            let [w, h] = img.size;
+            let inside = x >= 0.0 && y >= 0.0 && (x as usize) < w && (y as usize) < h;
+            inside.then(|| img.pixels[y as usize * w + x as usize]).map(|c| Rgba::rgb(c.r(), c.g(), c.b()))
+        };
+        let screen = ctx.content_rect();
+        let resp = egui::Area::new(egui::Id::new("eyedropper"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let (_, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+                let Some(p) = resp.hover_pos() else { return resp };
+                ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+                let painter = ui.painter();
+                // A magnified ring of the pixels around the pointer, the center one framed.
+                const N: i32 = 6;
+                const CELL: f32 = 10.0;
+                let radius = (N as f32 + 0.5) * CELL;
+                for dy in -N..=N {
+                    for dx in -N..=N {
+                        let off = vec2(dx as f32, dy as f32);
+                        if off.length() * CELL > radius - CELL * 0.4 {
+                            continue;
+                        }
+                        if let Some(c) = sample(p + off / ppp) {
+                            painter.rect_filled(Rect::from_center_size(p + off * CELL, vec2(CELL, CELL)), 0.0, c.to32());
+                        }
+                    }
+                }
+                painter.circle_stroke(p, radius, Stroke::new(4.0, Color32::WHITE));
+                painter.circle_stroke(p, radius + 2.5, Stroke::new(1.0, Color32::from_black_alpha(90)));
+                let mid = Rect::from_center_size(p, vec2(CELL, CELL));
+                painter.rect_stroke(mid, 0.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Outside);
+                painter.rect_stroke(mid.expand(1.0), 0.0, Stroke::new(1.0, Color32::BLACK), StrokeKind::Outside);
+                if let Some(c) = sample(p) {
+                    let g = painter.layout_no_wrap(format!("#{}", c.hex()), FontId::monospace(11.0), Color32::WHITE);
+                    let pill = Rect::from_center_size(p + vec2(0.0, radius + 16.0), g.size() + vec2(12.0, 6.0));
+                    painter.rect_filled(pill, 4.0, Color32::from_black_alpha(200));
+                    painter.galley(pill.min + vec2(6.0, 3.0), g, Color32::WHITE);
+                }
+                resp
+            })
+            .inner;
+        let pick = resp.clicked().then(|| resp.interact_pointer_pos()).flatten().and_then(sample);
+        if let Some(c) = pick {
+            let target = e.target;
+            self.eyedrop = None;
+            match target {
+                EyeTarget::Picker(id) => ctx.data_mut(|d| {
+                    d.insert_temp(id.with("eyedropped"), Some(c));
+                }),
+                EyeTarget::Fill => self.fill_selection(c),
+            }
+        }
+    }
+
+    /// Set the selection's top fill to `c`, keeping its opacity (a non-solid top fill is replaced).
+    pub fn fill_selection(&mut self, c: Rgba) {
+        self.checkpoint();
+        for id in self.sel.clone() {
+            let n = self.doc.node_mut(id);
+            if n.kind == crate::doc::Kind::Group {
+                continue;
+            }
+            match n.fills.last_mut() {
+                Some(p) if p.kind == PaintKind::Solid => p.color = c.with_alpha(p.color.a()),
+                _ => n.fills = vec![Paint::solid(c)],
+            }
+            // A recolored fill no longer follows its style or variable.
+            n.fill_style = None;
+            n.bindings.retain(|(b, _)| *b != crate::doc::Bindable::Fill);
+        }
+    }
+}
 
 pub fn parse_hex(s: &str) -> Option<Rgba> {
     let s = s.trim().trim_start_matches('#');
@@ -51,6 +183,11 @@ fn rgb_picker(ui: &mut Ui, color: &mut Rgba) -> bool {
     use egui::ecolor::Hsva;
     use egui::epaint::{Mesh, Vertex, WHITE_UV};
     let id = ui.id().with("figma-picker");
+    let mut changed = false;
+    if let Some(c) = ui.data_mut(|d| d.remove_temp::<Option<Rgba>>(id.with("eyedropped")).flatten()) {
+        *color = c.with_alpha(color.a());
+        changed = true;
+    }
     let rgb = Color32::from_rgb(color.0[0], color.0[1], color.0[2]);
     let mut hsv = Hsva::from(rgb);
     // Grays and black have no hue: keep the last one so the square doesn't jump to red.
@@ -60,7 +197,6 @@ fn rgb_picker(ui: &mut Ui, color: &mut Rgba) -> bool {
     {
         hsv.h = h;
     }
-    let mut changed = false;
     let w = ui.available_width();
     let quad = |m: &mut Mesh, r: Rect, [tl, tr, br, bl]: [Color32; 4]| {
         let base = m.vertices.len() as u32;
@@ -133,6 +269,9 @@ fn rgb_picker(ui: &mut Ui, color: &mut Rgba) -> bool {
     ui.add_space(8.0);
     // Hex and opacity, as Figma shows under the sliders.
     ui.horizontal(|ui| {
+        if icon_button(ui, Icon::Eyedropper, false, 22.0, "Pick color  I").clicked() {
+            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(EYEDROP_REQUEST), Some(id)));
+        }
         ui.label(egui::RichText::new("Hex").color(crate::appearance::muted(ui.ctx())));
         changed |= hex_field(ui, id.with("hex"), color, 80.0);
         changed |= alpha_field(ui, color);
