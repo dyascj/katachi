@@ -212,7 +212,7 @@ impl App {
         theme_row(ui, &mut self.appearance);
         section(ui, "Files");
         row(ui, "Data folder", "Autosaves, recent files, thumbnails and plugins", |ui| {
-            if ui.button("Show in Finder").clicked() {
+            if ui.button(if cfg!(target_os = "macos") { "Show in Finder" } else { "Show in folder" }).clicked() {
                 crate::plugin_view::open_url(&crate::files::data_dir().display().to_string());
             }
         });
@@ -328,6 +328,9 @@ fn appearance_tab(ui: &mut Ui, a: &mut crate::appearance::Appearance) {
     row(ui, "Glass panels", "Translucent side panels over a blurred desktop. The canvas and popovers stay solid.", |ui| {
         toggle(ui, &mut a.glass);
     });
+    if a.glass && !a.glass_on() {
+        ui.label(RichText::new("Restart Katachi to turn glass on.").color(crate::appearance::muted(ui.ctx())));
+    }
     ui.add_enabled_ui(a.glass, |ui| {
         let mut pct = (a.panel_opacity * 100.0).round();
         row(ui, "Panel opacity", "", |ui| {
@@ -385,7 +388,7 @@ fn shortcuts_tab(ui: &mut Ui) {
     let muted = crate::appearance::muted(ui.ctx());
     for (what, keys) in SHORTCUTS {
         row(ui, what, "", |ui| {
-            ui.label(RichText::new(*keys).color(muted).monospace());
+            ui.label(RichText::new(crate::chrome::keys(keys)).color(muted));
         });
     }
 }

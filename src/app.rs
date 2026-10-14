@@ -1443,7 +1443,7 @@ impl App {
                 self.sel.clear();
                 self.page = 0;
                 self.view_ready = false;
-                self.toast("Version restored (undo with ⌘Z)".into());
+                self.toast(crate::chrome::keys("Version restored (undo with ⌘Z)"));
             }
         }
         self.show_history = open;
@@ -1534,7 +1534,7 @@ impl App {
     /// The appearance window, and keeping the window's desktop blur in step with glass.
     fn appearance_frame(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         self.settings_window(ctx);
-        let want = (self.appearance.glass, self.appearance.blur);
+        let want = (self.appearance.glass_on(), self.appearance.blur);
         if self.glass_applied != Some(want) {
             crate::appearance::set_window_glass(frame, want.0, want.1);
             self.glass_applied = Some(want);
@@ -2121,17 +2121,22 @@ impl App {
             return;
         }
         let step = if m.shift { self.prefs.big_nudge } else { self.prefs.nudge };
-        // Ctrl+G: show/hide layout guides.
-        if m.ctrl && !m.mac_cmd && !m.alt && key == Key::G {
+        // Figma binds a few commands to the Control key on macOS and to other chords elsewhere.
+        // The Control key alone only reads as `ctrl && !command` on a Mac (elsewhere Ctrl is Cmd).
+        let mac_ctrl = m.ctrl && !m.command;
+        let pc = !cfg!(target_os = "macos");
+        // Layout guides: Ctrl G on macOS, Ctrl Shift 4 elsewhere.
+        if (mac_ctrl && !m.alt && !m.shift && key == Key::G) || (pc && cmd && m.shift && !m.alt && key == Key::Num4) {
             self.show_grids = !self.show_grids;
             return;
         }
-        // Ctrl+Cmd+M: use as mask.
-        if m.ctrl && m.mac_cmd && key == Key::M {
+        // Use as mask: Ctrl Cmd M on macOS, Ctrl Alt M elsewhere.
+        if key == Key::M && ((m.ctrl && m.mac_cmd) || (pc && cmd && m.alt && !m.shift)) {
             return self.toggle_mask();
         }
-        // Ctrl+Alt arrangement shortcuts (Figma on macOS).
-        if m.ctrl && m.alt && !m.mac_cmd {
+        // Distribute and tidy up: Ctrl Alt on macOS, Alt Shift elsewhere (Ctrl Alt T opens a
+        // terminal on many Linux desktops, so it isn't used there).
+        if (mac_ctrl && m.alt) || (pc && m.alt && m.shift && !cmd) {
             match key {
                 Key::H => return self.distribute_selection(true),
                 Key::V => return self.distribute_selection(false),
@@ -2299,7 +2304,7 @@ fn void(_: bool) {}
 impl eframe::App for App {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         // Glass lets the (blurred) desktop through wherever panels are translucent.
-        if self.appearance.glass { [0.0; 4] } else { visuals.panel_fill.to_normalized_gamma_f32() }
+        if self.appearance.glass_on() { [0.0; 4] } else { visuals.panel_fill.to_normalized_gamma_f32() }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {

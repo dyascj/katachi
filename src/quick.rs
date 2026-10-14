@@ -114,7 +114,7 @@ impl App {
         if tab == 0 {
             for (i, (label, short, _)) in COMMANDS.iter().enumerate() {
                 if matches(label, &q) {
-                    hits.push((Hit::Command(i), label.to_string(), short.to_string()));
+                    hits.push((Hit::Command(i), label.to_string(), crate::chrome::keys(short)));
                 }
             }
         }

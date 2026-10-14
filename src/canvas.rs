@@ -1529,7 +1529,7 @@ impl App {
         let has = !self.sel.is_empty();
         let ctx = ui.ctx().clone();
         let item = |ui: &mut Ui, label: &str, short: &str, enabled: bool| {
-            ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(short)).clicked()
+            ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(crate::chrome::keys(short))).clicked()
         };
         if item(ui, "Copy", "⌘C", has) {
             self.copy(&ctx);
@@ -1543,21 +1543,21 @@ impl App {
         ui.add_enabled_ui(has, |ui| {
             ui.menu_button("Copy/Paste as", |ui| {
                 for (label, short, what) in [("Copy as PNG", "⇧⌘C", "png"), ("Copy as SVG", "", "svg"), ("Copy as CSS", "", "css")] {
-                    if ui.add(egui::Button::new(label).shortcut_text(short)).clicked() {
+                    if ui.add(egui::Button::new(label).shortcut_text(crate::chrome::keys(short))).clicked() {
                         self.copy_as(&ctx, what);
                         ui.close();
                     }
                 }
                 ui.separator();
-                if ui.add(egui::Button::new("Copy properties").shortcut_text("⌥⌘C")).clicked() {
+                if ui.add(egui::Button::new("Copy properties").shortcut_text(crate::chrome::keys("⌥⌘C"))).clicked() {
                     self.style_clip = self.sel.first().map(|&id| self.doc.node(id).clone());
                     ui.close();
                 }
-                if ui.add_enabled(self.style_clip.is_some(), egui::Button::new("Paste properties").shortcut_text("⌥⌘V")).clicked() {
+                if ui.add_enabled(self.style_clip.is_some(), egui::Button::new("Paste properties").shortcut_text(crate::chrome::keys("⌥⌘V"))).clicked() {
                     self.paste_style();
                     ui.close();
                 }
-                if ui.add_enabled(self.clip_frag.is_some(), egui::Button::new("Paste to replace").shortcut_text("⇧⌘R")).clicked() {
+                if ui.add_enabled(self.clip_frag.is_some(), egui::Button::new("Paste to replace").shortcut_text(crate::chrome::keys("⇧⌘R"))).clicked() {
                     self.paste_to_replace();
                     ui.close();
                 }
@@ -1606,7 +1606,7 @@ impl App {
                     (crate::doc::BoolOp::Intersect, "⌥⇧I"),
                     (crate::doc::BoolOp::Exclude, "⌥⇧E"),
                 ] {
-                    if ui.add(egui::Button::new(format!("{op:?} selection")).shortcut_text(short)).clicked() {
+                    if ui.add(egui::Button::new(format!("{op:?} selection")).shortcut_text(crate::chrome::keys(short))).clicked() {
                         self.boolean_selection(op);
                         ui.close();
                     }

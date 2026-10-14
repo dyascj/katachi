@@ -55,13 +55,19 @@ fn main() -> eframe::Result {
     }
     let path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
     macos_open::install();
+    let transparent = !cfg!(target_os = "linux") || appearance::load().glass;
+    appearance::TRANSPARENT_WINDOW.store(transparent, std::sync::atomic::Ordering::Relaxed);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Katachi")
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([800.0, 500.0])
-            // Always transparent so glass can switch on without a restart; opaque otherwise.
-            .with_transparent(true)
+            // macOS and Windows: always transparent, so glass can switch on without a restart.
+            // Linux: only with glass on at launch. Transparent windows draw black or garbled
+            // without a compositor and on some drivers, so the default window stays opaque.
+            .with_transparent(transparent)
+            // Wayland and X11 match the window to katachi.desktop by this id (taskbar icon, pinning).
+            .with_app_id("katachi")
             // macOS: Katachi draws its own title bar (so it can be glass too); the traffic lights sit on it.
             .with_fullsize_content_view(true)
             .with_titlebar_shown(false)
@@ -104,6 +110,8 @@ fn setup_style(ctx: &egui::Context) {
             break;
         }
     }
+    // Monospace text (code in Dev Mode) falls back to Inter for glyphs its fonts lack.
+    fonts.families.get_mut(&FontFamily::Monospace).unwrap().push("Inter".into());
     ctx.set_fonts(fonts);
     ctx.options_mut(|o| o.zoom_with_keyboard = false);
     appearance::apply(ctx, &appearance::load());

@@ -230,3 +230,92 @@ pub fn dialog(ctx: &egui::Context, id: &str, title: &str, width: f32, body: impl
     }
     pick
 }
+
+/// Shortcut text for this platform. Labels are written with macOS glyphs ("⌥⌘K"); off macOS
+/// they read "Ctrl+Alt+K", and the few chords Figma binds to the Control key on a Mac use
+/// their Windows and Linux equivalents.
+pub fn keys(s: &str) -> String {
+    if cfg!(target_os = "macos") { s.to_string() } else { keys_pc(s) }
+}
+
+fn keys_pc(s: &str) -> String {
+    const MODS: [char; 4] = ['⌃', '⌥', '⇧', '⌘'];
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if !MODS.contains(&c) {
+            match c {
+                '⌫' => out.push_str("Backspace"),
+                '↵' => out.push_str("Enter"),
+                _ => out.push(c),
+            }
+            i += 1;
+            continue;
+        }
+        // A chord: modifiers (maybe space-separated), then the key up to a space, comma or paren.
+        let mut mods = vec![];
+        while i < chars.len() && (MODS.contains(&chars[i]) || (chars[i] == ' ' && chars.get(i + 1).is_some_and(|n| MODS.contains(n)))) {
+            if chars[i] != ' ' {
+                mods.push(chars[i]);
+            }
+            i += 1;
+        }
+        while chars.get(i) == Some(&' ') {
+            i += 1;
+        }
+        let start = i;
+        while i < chars.len() && (i == start || ![' ', ',', ')'].contains(&chars[i])) {
+            i += 1;
+        }
+        let key: String = chars[start..i].iter().collect();
+        let key = match key.as_str() {
+            "⌫" => "Backspace".to_string(),
+            "↵" => "Enter".to_string(),
+            _ => key,
+        };
+        let has = |m: char| mods.contains(&m);
+        let special = match (has('⌃'), has('⌥'), has('⌘'), key.as_str()) {
+            (true, false, false, "G") => Some("Ctrl+Shift+4".to_string()),
+            (true, false, true, "M") => Some("Ctrl+Alt+M".to_string()),
+            (true, true, false, "H" | "V" | "T") => Some(format!("Alt+Shift+{key}")),
+            _ => None,
+        };
+        out.push_str(&special.unwrap_or_else(|| {
+            let mut parts = vec![];
+            if has('⌃') || has('⌘') {
+                parts.push("Ctrl");
+            }
+            if has('⌥') {
+                parts.push("Alt");
+            }
+            if has('⇧') {
+                parts.push("Shift");
+            }
+            parts.push(&key);
+            parts.join("+")
+        }));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shortcut_labels_off_macos() {
+        let k = super::keys_pc;
+        assert_eq!(k("⌥⇧⌘K"), "Ctrl+Alt+Shift+K");
+        assert_eq!(k("⇧⌘S"), "Ctrl+Shift+S");
+        assert_eq!(k("⌃G"), "Ctrl+Shift+4");
+        assert_eq!(k("⌃⌘M"), "Ctrl+Alt+M");
+        assert_eq!(k("Distribute horizontal spacing (⌃⌥H)"), "Distribute horizontal spacing (Alt+Shift+H)");
+        assert_eq!(k("⌘ /  or  ⌘ K"), "Ctrl+/  or  Ctrl+K");
+        assert_eq!(k("⌘ E, ⌃ ⌘ M"), "Ctrl+E, Ctrl+Alt+M");
+        assert_eq!(k("Tab, ⇧ Tab, ⇧ ↵"), "Tab, Shift+Tab, Shift+Enter");
+        assert_eq!(k("⌃ Tab, ⌃ ⇧ Tab, ⌘ W"), "Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+W");
+        assert_eq!(k("Section  ⇧S"), "Section  Shift+S");
+        assert_eq!(k("⌘+"), "Ctrl++");
+        assert_eq!(k("V, K, H"), "V, K, H");
+    }
+}

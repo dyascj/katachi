@@ -351,7 +351,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, selected: bool, size: f32, tip: &str
     };
     ui.painter().rect_filled(rect, 5.0, bg);
     paint_icon(ui.painter(), rect, icon, fg);
-    if tip.is_empty() { resp } else { resp.on_hover_text(tip) }
+    if tip.is_empty() { resp } else { resp.on_hover_text(crate::chrome::keys(tip)) }
 }
 
 fn kind_icon(k: Kind) -> Icon {
@@ -606,7 +606,7 @@ impl App {
             .collect();
         comps.sort_by(|a, b| (a.0, &a.2).cmp(&(b.0, &b.2)));
         if comps.is_empty() {
-            ui.label(RichText::new(if q.is_empty() { "Create components with ⌥⌘K to reuse them here." } else { "No components match." }).color(theme::muted(ui.ctx())));
+            ui.label(RichText::new(crate::chrome::keys(if q.is_empty() { "Create components with ⌥⌘K to reuse them here." } else { "No components match." })).color(theme::muted(ui.ctx())));
             return;
         }
         ui.label(RichText::new("Local components").strong());
@@ -714,9 +714,9 @@ impl App {
         use crate::settings::Tab;
         let ctx = ui.ctx().clone();
         ui.set_min_width(220.0);
-        let item = |ui: &mut Ui, label: &str, short: &str| ui.add(egui::Button::new(label).shortcut_text(short)).clicked();
+        let item = |ui: &mut Ui, label: &str, short: &str| ui.add(egui::Button::new(label).shortcut_text(crate::chrome::keys(short))).clicked();
         let has = !self.sel.is_empty();
-        let enabled = |ui: &mut Ui, on: bool, label: &str, short: &str| ui.add_enabled(on, egui::Button::new(label).shortcut_text(short)).clicked();
+        let enabled = |ui: &mut Ui, on: bool, label: &str, short: &str| ui.add_enabled(on, egui::Button::new(label).shortcut_text(crate::chrome::keys(short))).clicked();
         if item(ui, "Back to files", "") {
             self.want = Some(crate::app::Want::Home);
             ui.close();
@@ -826,7 +826,7 @@ impl App {
             }
         });
         ui.menu_button("View", |ui| {
-            let check = |ui: &mut Ui, on: bool, label: &str, short: &str| ui.add(egui::Button::new(format!("{}{label}", if on { "✓  " } else { "     " })).shortcut_text(short)).clicked();
+            let check = |ui: &mut Ui, on: bool, label: &str, short: &str| ui.add(egui::Button::new(format!("{}{label}", if on { "✓  " } else { "     " })).shortcut_text(crate::chrome::keys(short))).clicked();
             if check(ui, self.show_grids, "Layout guides", "⌃G") {
                 self.show_grids = !self.show_grids;
                 ui.close();
@@ -1347,7 +1347,7 @@ impl App {
                 if self.dev_mode {
                     let green = Color32::from_rgb(0x14, 0xAE, 0x5C);
                     let pill = egui::Button::new(RichText::new("Dev Mode").color(Color32::WHITE).strong()).fill(green);
-                    if ui.add(pill).on_hover_text("Leave Dev Mode (⇧D)").clicked() {
+                    if ui.add(pill).on_hover_text(crate::chrome::keys("Leave Dev Mode (⇧D)")).clicked() {
                         self.dev_mode = false;
                     }
                     return;
@@ -1387,25 +1387,25 @@ impl App {
                             self.view.zoom_at(c, pct / 100.0 / self.view.zoom);
                         }
                         ui.separator();
-                        if ui.add(egui::Button::new("Zoom in").shortcut_text("⌘+")).clicked() {
+                        if ui.add(egui::Button::new("Zoom in").shortcut_text(crate::chrome::keys("⌘+"))).clicked() {
                             self.zoom_step(&ctx, 2.0);
                         }
-                        if ui.add(egui::Button::new("Zoom out").shortcut_text("⌘-")).clicked() {
+                        if ui.add(egui::Button::new("Zoom out").shortcut_text(crate::chrome::keys("⌘-"))).clicked() {
                             self.zoom_step(&ctx, 0.5);
                         }
-                        if ui.add(egui::Button::new("Zoom to fit").shortcut_text("⇧1")).clicked() {
+                        if ui.add(egui::Button::new("Zoom to fit").shortcut_text(crate::chrome::keys("⇧1"))).clicked() {
                             self.zoom_to(&ctx, None, false);
                         }
-                        if ui.add_enabled(!self.sel.is_empty(), egui::Button::new("Zoom to selection").shortcut_text("⇧2")).clicked() {
+                        if ui.add_enabled(!self.sel.is_empty(), egui::Button::new("Zoom to selection").shortcut_text(crate::chrome::keys("⇧2"))).clicked() {
                             self.zoom_to(&ctx, Some(self.sel.clone()), false);
                         }
-                        if ui.add(egui::Button::new("Zoom to 100%").shortcut_text("⇧0")).clicked() {
+                        if ui.add(egui::Button::new("Zoom to 100%").shortcut_text(crate::chrome::keys("⇧0"))).clicked() {
                             self.zoom_to(&ctx, None, true);
                         }
                         ui.separator();
                         // View options with checks, as in Figma's zoom menu.
                         for (on, label, short, which) in [(self.show_grids, "Layout guides", "⌃G", 0), (self.rulers, "Rulers", "⇧R", 1), (self.outline_mode, "Outlines", "⌘Y", 2), (self.show_comments, "Comments", "⇧C", 3)] {
-                            if ui.add(egui::Button::new(format!("{}{label}", if on { "✓  " } else { "     " })).shortcut_text(short)).clicked() {
+                            if ui.add(egui::Button::new(format!("{}{label}", if on { "✓  " } else { "     " })).shortcut_text(crate::chrome::keys(short))).clicked() {
                                 match which {
                                     0 => self.show_grids = !self.show_grids,
                                     1 => self.rulers = !self.rulers,
@@ -2916,7 +2916,7 @@ impl App {
         ui.horizontal(|ui| {
             for (kind, label, tip) in [(crate::doc::ListKind::Bullet, " • ", "Bulleted list (⇧⌘8)"), (crate::doc::ListKind::Number, " 1. ", "Numbered list (⇧⌘7)")] {
                 let on = !n.lists.is_empty() && n.lists.iter().all(|l| l.kind == kind);
-                if ui.selectable_label(on, label).on_hover_text(tip).clicked() {
+                if ui.selectable_label(on, label).on_hover_text(crate::chrome::keys(tip)).clicked() {
                     self.toggle_list(ui.ctx(), kind);
                     return;
                 }
@@ -3486,7 +3486,7 @@ impl App {
                                                 // The menu's own text color (menus are dark in both themes).
                                                 paint_icon(ui.painter(), r, icon, ui.visuals().text_color());
                                                 let (name, key) = label.split_once("  ").unwrap_or((label, ""));
-                                                if ui.add(egui::Button::new(name).shortcut_text(key).frame(false).min_size(vec2(140.0, 0.0))).clicked() {
+                                                if ui.add(egui::Button::new(name).shortcut_text(crate::chrome::keys(key)).frame(false).min_size(vec2(140.0, 0.0))).clicked() {
                                                     self.set_tool(t);
                                                     ui.close();
                                                 }

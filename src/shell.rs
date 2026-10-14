@@ -196,7 +196,7 @@ impl Shell {
     fn strip(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let dark = ui.visuals().dark_mode;
-        let glass = self.holder().appearance.glass;
+        let glass = self.holder().appearance.glass_on();
         let bar = if dark { Color32::from_gray(0x1A) } else { Color32::from_gray(0xE6) };
         let bar = if glass { bar.gamma_multiply(0.55) } else { bar };
         let face = ui.visuals().panel_fill;
@@ -644,7 +644,7 @@ fn write_thumb(file: &Path) -> Result<(), String> {
 impl eframe::App for Shell {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         let holder = self.held.map_or(&self.idle, |i| &self.tabs[i]);
-        if holder.appearance.glass { [0.0; 4] } else { visuals.panel_fill.to_normalized_gamma_f32() }
+        if holder.appearance.glass_on() { [0.0; 4] } else { visuals.panel_fill.to_normalized_gamma_f32() }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
