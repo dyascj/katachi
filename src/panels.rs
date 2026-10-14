@@ -523,6 +523,28 @@ fn heading(ui: &mut Ui, title: &str) {
     ui.add_space(2.0);
 }
 
+/// Cmd R with several layers selected: Figma's batch rename.
+pub struct BatchRename {
+    /// `$&` is the current name, `$n` an ascending number, `$N` a descending one. Empty keeps the name.
+    pub to: String,
+    pub start: usize,
+    pub find: String,
+    pub with: String,
+    focus: bool,
+}
+
+impl BatchRename {
+    /// The new name of the `i`th of `count` layers: Match / Replace with first, then Rename to.
+    pub fn name(&self, old: &str, i: usize, count: usize) -> String {
+        let name = if self.find.is_empty() { old.to_string() } else { old.replace(&self.find, &self.with) };
+        if self.to.is_empty() {
+            return name;
+        }
+        // Numbers first, so a name that happens to contain "$n" stays as it is.
+        self.to.replace("$n", &(self.start + i).to_string()).replace("$N", &(self.start + count - 1 - i).to_string()).replace("$&", &name)
+    }
+}
+
 impl App {
     // ---------- left: menu, pages, layers ----------
 
@@ -839,6 +861,10 @@ impl App {
                     self.select_same(what);
                     ui.close();
                 }
+            }
+            if enabled(ui, has, "Rename…", "⌘R") {
+                self.rename_selection();
+                ui.close();
             }
             if item(ui, "Find and replace…", "⌘F") {
                 self.find.0 = true;
@@ -1370,6 +1396,76 @@ impl App {
         }
         if released {
             self.layer_drag = None;
+        }
+    }
+
+    /// Cmd R: rename one layer in its row, or several at once in the batch rename window.
+    pub fn rename_selection(&mut self) {
+        match self.sel[..] {
+            [] => {}
+            [id] => {
+                self.left_tab_assets = false;
+                self.renaming = Some((id, self.doc.node(id).name.clone()));
+            }
+            _ => self.batch_rename = Some(BatchRename { to: String::new(), start: 1, find: String::new(), with: String::new(), focus: true }),
+        }
+    }
+
+    /// The batch rename window, with a preview of the first few names. Layers are numbered
+    /// bottom to top, so they count up in the order they were made.
+    pub fn batch_rename_window(&mut self, ctx: &egui::Context) {
+        let Some(mut b) = self.batch_rename.take() else { return };
+        let targets = self.doc.sort_by_z(&self.sel);
+        if targets.len() < 2 {
+            return;
+        }
+        let (mut open, mut apply, mut cancel) = (true, false, false);
+        crate::chrome::window(ctx, "Rename layers", &mut open, 300.0, |ui| {
+            let muted = theme::muted(ui.ctx());
+            let field = |ui: &mut Ui, label: &str, buf: &mut String, hint: &str| {
+                ui.label(label);
+                let r = ui.add(egui::TextEdit::singleline(buf).hint_text(hint).desired_width(f32::INFINITY));
+                ui.add_space(4.0);
+                r
+            };
+            let r = field(ui, "Rename to", &mut b.to, "$& keeps the current name");
+            if std::mem::take(&mut b.focus) {
+                r.request_focus();
+            }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("$& name, $n number, $N number descending").small().color(muted));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(egui::DragValue::new(&mut b.start).range(0..=99999)).on_hover_text("Start number");
+                });
+            });
+            ui.add_space(4.0);
+            let f = field(ui, "Match", &mut b.find, "Text to find in names");
+            let w = field(ui, "Replace with", &mut b.with, "");
+            ui.separator();
+            for (i, &id) in targets.iter().take(3).enumerate() {
+                let old = &self.doc.node(id).name;
+                ui.add(egui::Label::new(RichText::new(format!("{old}  \u{2192}  {}", b.name(old, i, targets.len()))).small()).truncate());
+            }
+            if targets.len() > 3 {
+                ui.label(RichText::new(format!("and {} more", targets.len() - 3)).small().color(muted));
+            }
+            ui.add_space(6.0);
+            let enter = [&r, &f, &w].iter().any(|r| r.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), 26.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                apply = enter || ui.add(egui::Button::new(RichText::new("Rename").color(Color32::WHITE)).fill(BLUE).corner_radius(6)).clicked();
+            });
+        });
+        if apply {
+            self.checkpoint();
+            for (i, &id) in targets.iter().enumerate() {
+                let name = b.name(&self.doc.node(id).name, i, targets.len());
+                if !name.trim().is_empty() {
+                    self.doc.node_mut(id).name = name;
+                }
+            }
+        } else if open && !cancel {
+            self.batch_rename = Some(b);
         }
     }
 

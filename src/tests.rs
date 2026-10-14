@@ -2146,3 +2146,28 @@ fn select_all_inverse_and_same_properties() {
     h.state_mut().select_same(Same::Font);
     assert_eq!(h.state().sel, vec![t1, t3]);
 }
+
+#[test]
+fn batch_rename_numbers_and_replaces_as_one_undo_step() {
+    let mut h = harness();
+    let ids: Vec<NodeId> = (0..3).map(|i| draw(&mut h, Key::R, (i as f32 * 60.0, 0.0), (i as f32 * 60.0 + 40.0, 40.0))).collect();
+    // One layer: inline rename in its row.
+    key(&mut h, Modifiers::COMMAND, Key::R);
+    assert!(h.state().renaming.is_some() && h.state().batch_rename.is_none());
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    h.state_mut().sel = ids.clone();
+    h.run_steps(2);
+    key(&mut h, Modifiers::COMMAND, Key::R);
+    let b = h.state_mut().batch_rename.as_mut().expect("batch rename open");
+    b.to = "Card $n of $N ($&)".into();
+    (b.find, b.with) = ("Rectangle".into(), "Box".into());
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("Card 1 of 3 (Box 1)").is_some(), "live preview");    h.get_by_label("Rename").click();
+    h.run_steps(2);
+    let names: Vec<String> = ids.iter().map(|&id| h.state().doc.node(id).name.clone()).collect();
+    assert_eq!(names, ["Card 1 of 3 (Box 1)", "Card 2 of 2 (Box 2)", "Card 3 of 1 (Box 3)"]);
+    assert!(h.state().batch_rename.is_none());
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().doc.node(ids[2]).name, "Rectangle 3", "one undo step");
+    assert_eq!(h.state().doc.node(ids[0]).name, "Rectangle 1");
+}

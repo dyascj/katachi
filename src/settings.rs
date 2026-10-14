@@ -79,6 +79,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Flip horizontal, vertical", "⇧ H, ⇧ V"),
     ("Distribute, tidy up", "⌃ ⌥ H / V, ⌃ ⌥ T"),
     ("Show or hide, lock", "⇧ ⌘ H, ⇧ ⌘ L"),
+    ("Rename layers (several: batch rename)", "⌘ R"),
     ("Next and previous layer, select parent", "Tab, ⇧ Tab, ⇧ ↵"),
     ("Zoom to fit, 100%, selection", "⇧ 1, ⇧ 0, ⇧ 2"),
     ("Rulers, layout guides, hide UI, outline", "⇧ R, ⌃ G, ⌘ \\, ⌘ Y"),

@@ -58,6 +58,7 @@ const COMMANDS: &[(&str, &str, Run)] = &[
     ("Select all with same effect", "", |a, _| a.select_same(Same::Effect)),
     ("Select all with same font", "", |a, _| a.select_same(Same::Font)),
     ("Select all with same instance", "", |a, _| a.select_same(Same::Instance)),
+    ("Rename selection", "⌘R", |a, _| a.rename_selection()),
     ("Show/Hide selection", "⇧⌘H", |a, _| a.toggle_visible()),
     ("Lock/Unlock selection", "⇧⌘L", |a, _| a.toggle_locked()),
     ("Rulers", "⇧R", |a, _| a.rulers = !a.rulers),

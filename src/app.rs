@@ -218,6 +218,7 @@ pub struct App {
     /// Properties copied with Cmd+Alt+C.
     pub style_clip: Option<Node>,
     pub layer_search: Option<String>,
+    pub batch_rename: Option<crate::panels::BatchRename>,
     /// This session's crash-recovery autosave.
     recovery: PathBuf,
     last_autosave: f64,
@@ -320,6 +321,7 @@ impl App {
             var_collection: None,
             style_clip: None,
             layer_search: None,
+            batch_rename: None,
             recovery: {
                 // Unique per window, even for two opened in the same millisecond.
                 static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2208,12 +2210,7 @@ impl App {
             (true, false, true, Key::A) => self.select_matching(),
             (true, true, false, Key::A) => self.select_inverse(),
             (true, true, false, Key::C) => self.copy_as(ctx, "png"),
-            (true, false, false, Key::R) => {
-                if let Some(&id) = self.sel.first() {
-                    self.left_tab_assets = false;
-                    self.renaming = Some((id, self.doc.node(id).name.clone()));
-                }
-            }
+            (true, false, false, Key::R) => self.rename_selection(),
             (true, false, false, Key::Backslash) => self.ui_hidden = !self.ui_hidden,
             (false, true, false, Key::R) => self.rulers = !self.rulers,
             (false, true, false, Key::D) => self.dev_mode = !self.dev_mode,
@@ -2406,6 +2403,7 @@ impl eframe::App for App {
         self.collab_window(&ctx);
         self.recovery_prompt(&ctx);
         self.console_window(&ctx);
+        self.batch_rename_window(&ctx);
         self.quick_actions(&ctx);
         self.plugin_frame(&ctx, frame);
         self.appearance_frame(&ctx, frame);
