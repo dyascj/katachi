@@ -1740,9 +1740,37 @@ pub fn parse_file(text: &str) -> Result<Document, String> {
     Ok(doc)
 }
 
-/// A .katachi file's text.
+/// A .katachi file's text. Images no paint uses any more (deleted or replaced) are left out.
 pub fn file_json(doc: &Document) -> String {
-    format!(r#"{{"katachi":1,"document":{}}}"#, to_json(doc))
+    let used = used_images(doc);
+    let json = if doc.images.keys().all(|k| used.contains(k.as_str())) {
+        to_json(doc)
+    } else {
+        let mut pruned = doc.clone();
+        pruned.images.retain(|k, _| used.contains(k.as_str()));
+        to_json(&pruned)
+    };
+    format!(r#"{{"katachi":1,"document":{json}}}"#)
+}
+
+/// Image keys that paints refer to: on layers, their instance snapshots, and paint styles.
+fn used_images(doc: &Document) -> std::collections::HashSet<&str> {
+    fn add<'a>(n: &'a Node, out: &mut std::collections::HashSet<&'a str>) {
+        out.extend(n.fills.iter().chain(&n.strokes).map(|p| p.image.as_str()));
+        if let Some(s) = &n.synced {
+            add(s, out);
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    for n in doc.nodes.values() {
+        add(n, &mut out);
+    }
+    for s in &doc.styles {
+        if let StyleValue::Paint(ps) = &s.value {
+            out.extend(ps.iter().map(|p| p.image.as_str()));
+        }
+    }
+    out
 }
 
 /// JSON for files, the clipboard and multiplayer. serde_json writes NaN and infinity as `null`,
@@ -3534,6 +3562,22 @@ mod tests {
         assert!(json.contains("AQID+g=="), "{json}");
         let back: Document = serde_json::from_str(&json).unwrap();
         assert_eq!(back.images["abc"].as_slice(), &[1, 2, 3, 250]);
+    }
+
+    #[test]
+    fn saving_drops_images_no_paint_uses() {
+        let mut d = Document::default();
+        d.images.insert("gone".into(), std::sync::Arc::new(vec![1]));
+        d.images.insert("kept".into(), std::sync::Arc::new(vec![2]));
+        let mut p = Paint::solid(Rgba::WHITE);
+        (p.kind, p.image) = (PaintKind::Image, "kept".into());
+        // Only an instance's snapshot of its component still shows it.
+        let mut n = Node::new(Kind::Rectangle, r(0., 0., 1., 1.));
+        n.synced = Some(Box::new(Node { fills: vec![p], ..Node::default() }));
+        d.insert(0, None, None, n);
+        let back = parse_file(&file_json(&d)).unwrap();
+        assert!(back.images.contains_key("kept") && !back.images.contains_key("gone"));
+        assert_eq!(d.images.len(), 2, "the open document keeps them (undo may bring a paint back)");
     }
 
     fn al_frame(d: &mut Document, mode: LayoutMode) -> NodeId {

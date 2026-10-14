@@ -1023,20 +1023,25 @@ fn autosave_and_recovery_roundtrip() {
     a.doc.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 0., 10., 10.)));
     a.dirty = true;
     a.autosave(100.0);
-    // Written in the background.
-    let mut left = vec![];
+    // Written in the background; names start with the writer's process id.
+    let own = format!("{}-", std::process::id());
+    let mut mine = None;
     for _ in 0..200 {
-        left = crate::files::orphaned_recoveries(std::path::Path::new("none"));
-        if !left.is_empty() {
+        mine = std::fs::read_dir(crate::files::recovery_dir())
+            .ok()
+            .and_then(|rd| rd.flatten().map(|e| e.path()).find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&own) && p.extension().is_some_and(|e| e == "katachi"))));
+        if mine.is_some() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(!left.is_empty(), "autosave written");
-    // A new session sees the orphan and can recover it as unsaved work.
+    let mine = mine.expect("autosave written");
+    assert!(!crate::files::orphaned_recoveries(std::path::Path::new("none")).contains(&mine), "a running session's autosave isn't offered");
+    // Once the process that wrote it is gone, a new session can recover it as unsaved work.
+    let p = mine.with_file_name(mine.file_name().unwrap().to_string_lossy().replacen(&own, "4000000000-", 1));
+    std::fs::rename(&mine, &p).unwrap();
     let mut b = App::new(None);
-    assert!(!b.recoverable.is_empty());
-    let p = b.recoverable.iter().find(|p| left.contains(p)).unwrap().clone();
+    assert!(b.recoverable.contains(&p));
     b.recover(&p);
     assert_eq!(b.doc.nodes.len(), 1);
     assert!(b.dirty);
@@ -1148,9 +1153,44 @@ fn saves_keep_versions() {
     crate::files::save_version(&file, b"{\"katachi\":1}");
     std::thread::sleep(std::time::Duration::from_millis(5));
     crate::files::save_version(&file, b"{\"katachi\":2}");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    crate::files::save_version(&file, b"{\"katachi\":2}");
     let v = crate::files::versions(&file);
-    assert_eq!(v.len(), 2);
+    assert_eq!(v.len(), 2, "saving again without changes adds no version");
     assert_eq!(std::fs::read_to_string(&v[0].0).unwrap(), "{\"katachi\":2}", "newest first");
+    // History kept under the old (DefaultHasher) folder name moves to the stable one.
+    let other = file.with_file_name("katachi-versions-old.katachi");
+    let mut h = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(&other, &mut h);
+    let old = crate::files::data_dir().join("history").join(format!("{:016x}", std::hash::Hasher::finish(&h)));
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("1.katachi"), "{}").unwrap();
+    assert_eq!(crate::files::versions(&other).len(), 1);
+}
+
+#[test]
+fn atomic_writes_keep_symlinks_permissions_and_siblings() {
+    let dir = std::env::temp_dir().join(format!("katachi-atomic-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // The temp name can't be a real neighbor's (this was "a.katachi-tmp").
+    std::fs::write(dir.join("a.katachi-tmp"), "neighbor").unwrap();
+    crate::files::write_atomic(&dir.join("a.json"), b"new").unwrap();
+    assert_eq!(std::fs::read_to_string(dir.join("a.katachi-tmp")).unwrap(), "neighbor");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "no temp file left behind");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let real = dir.join("real.katachi");
+        std::fs::write(&real, "old").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("link.katachi");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        crate::files::write_atomic(&link, b"new").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "still a link");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
