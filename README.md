@@ -16,15 +16,38 @@ git clone https://github.com/dyascj/katachi && cd katachi
 scripts/macos-app.sh --install   # builds Katachi.app into /Applications
 ```
 
-**Linux**
+**Linux** (x86_64 and arm64, X11 and Wayland)
+
+Get the package for your distribution from the [latest release](https://github.com/dyascj/katachi/releases/latest):
 
 ```sh
-sudo apt install libxkbcommon-dev libgtk-3-dev   # build dependencies (Debian/Ubuntu)
-git clone https://github.com/dyascj/katachi && cd katachi
-cargo build --release && scripts/linux-install.sh   # binary, icon, and app-menu entry
+sudo apt install ./katachi_*_amd64.deb          # Debian, Ubuntu, Mint, Pop!_OS, elementary
+sudo dnf install ./katachi-*.x86_64.rpm         # Fedora, RHEL, Rocky, Alma, openSUSE (zypper)
+tar xzf Katachi-linux-x86_64.tar.gz && katachi/linux-install.sh   # any distribution, no root
 ```
 
-From a release tarball, unpack it and run `./linux-install.sh`.
+Builds run on glibc 2.28 and newer: Debian 11, Ubuntu 20.04, RHEL 8 and everything since. The
+tarball installs into `~/.local` (app menu entry, icons, and `.katachi` files open on double-click);
+`katachi/linux-install.sh --uninstall` removes it. From source:
+
+```sh
+git clone https://github.com/dyascj/katachi && cd katachi
+cargo build --release && scripts/linux-install.sh   # needs only Rust and a C compiler
+```
+
+Good to know on Linux:
+- Shortcuts use Ctrl where macOS uses Cmd, and menus show them that way. A few follow Figma's
+  Windows bindings: layout guides Ctrl Shift 4, use as mask Ctrl Alt M, distribute and tidy up
+  Alt Shift H / V / T.
+- Tabs sit in the title bar with Katachi's own window buttons. Settings > Appearance > "Use the
+  system title bar" switches to your desktop's.
+- Alt-drag duplicates layers. If your desktop moves windows with Alt-drag (XFCE, MATE, Cinnamon,
+  older Plasma), set its window-move key to Super.
+- Glass needs a compositor and takes effect after a restart.
+- On Wayland, dragging files in from a file manager isn't supported by the windowing library yet.
+  Use Open or Place image (Shift Ctrl K), or start with `WAYLAND_DISPLAY= katachi` to run under XWayland.
+- If the window stays black or the GPU misbehaves, start with `WGPU_BACKEND=gl katachi`.
+- Open and save dialogs use the desktop portal (`xdg-desktop-portal`), or `zenity` when there's no portal.
 
 **Any platform**
 
@@ -33,13 +56,14 @@ cargo install --path .
 katachi [file.katachi]
 ```
 
-Tagged releases (`v*`) build a universal macOS `.dmg`, a Windows `.zip`, and a Linux `.tar.gz` through
+Tagged releases (`v*`) build a universal macOS `.dmg`, a Windows `.zip`, and Linux `.deb`, `.rpm`, and `.tar.gz` packages for x86_64 and arm64 through
 GitHub Actions. Building from source needs Rust 1.92 or newer. To cut a release, write `release-notes/vX.Y.Z.md`, bump the version in `Cargo.toml`, and push the tag; the workflow signs every asset and publishes those notes.
 
 **Updates.** Installed release builds check GitHub for a newer release at launch. When there is one,
 **Update now** appears in the tab strip: it downloads your platform's build, checks its signature
-against the release key built into the app, swaps it in, and restarts. Set `KATACHI_NO_UPDATE=1` to
-turn the check off.
+against the release key built into the app, tests that the new build runs on your system, swaps it
+in, and restarts (after you save). Copies installed from a `.deb` or `.rpm` update with the next
+package instead. Set `KATACHI_NO_UPDATE=1` to turn the check off.
 
 ## Features
 
