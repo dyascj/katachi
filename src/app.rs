@@ -243,7 +243,6 @@ pub struct App {
     pub prev_sel: Vec<NodeId>,
     pub allow_close: bool,
     pub toast: Option<(String, f64)>,
-    title: String,
     screenshot: Option<(PathBuf, u32)>,
 }
 
@@ -347,7 +346,6 @@ impl App {
             prev_sel: vec![],
             allow_close: false,
             toast: None,
-            title: String::new(),
             screenshot: std::env::var_os("KATACHI_SCREENSHOT").map(|p| (PathBuf::from(p), 0)),
         };
         app.recoverable = crate::files::orphaned_recoveries(&app.recovery);
@@ -359,6 +357,11 @@ impl App {
             app.page = pg.min(app.doc.pages.len() - 1);
         }
         app
+    }
+
+    /// The window title while this file is on screen.
+    pub fn window_title(&self) -> String {
+        format!("{}{} - Katachi", self.display_name(), if self.dirty { " (Edited)" } else { "" })
     }
 
     /// The file's name, as tabs and the title show it.
@@ -1526,7 +1529,7 @@ impl App {
                 let max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
             }
-            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, &self.title, egui::FontId::proportional(12.5), crate::appearance::muted(&ctx));
+            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, self.window_title(), egui::FontId::proportional(12.5), crate::appearance::muted(&ctx));
             ui.painter().hline(r.x_range(), r.max.y - 0.5, egui::Stroke::new(1.0, line));
         });
     }
@@ -2340,11 +2343,6 @@ impl eframe::App for App {
         // A gesture (and its single undo step) ends when the pointer is up and no field is focused.
         if !ctx.input(|i| i.pointer.any_down()) && !ctx.egui_wants_keyboard_input() {
             self.in_gesture = false;
-        }
-        let title = format!("{}{} – Katachi", self.display_name(), if self.dirty { " (Edited)" } else { "" });
-        if title != self.title {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
-            self.title = title;
         }
     }
 }

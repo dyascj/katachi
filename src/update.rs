@@ -15,6 +15,8 @@ const ASSET: &str = if cfg!(target_os = "macos") {
     "Katachi-macos.app.tar.gz"
 } else if cfg!(windows) {
     "Katachi-windows.zip"
+} else if cfg!(target_arch = "aarch64") {
+    "Katachi-linux-aarch64.tar.gz"
 } else {
     "Katachi-linux-x86_64.tar.gz"
 };
@@ -39,7 +41,7 @@ pub struct Updater {
 impl Updater {
     /// Check now and every six hours, unless this is a development build.
     pub fn start() -> Self {
-        let off = cfg!(debug_assertions) || cfg!(test) || std::env::var_os("KATACHI_NO_UPDATE").is_some() || !crate::settings::load().check_updates;
+        let off = cfg!(debug_assertions) || cfg!(test) || std::env::var_os("KATACHI_NO_UPDATE").is_some() || !crate::settings::load().check_updates || managed().is_some();
         let u = Updater { state: Arc::new(Mutex::new(State::Idle)), seen: State::Idle, wake: Arc::default() };
         // Windows can't delete a running exe, so the last update's old copy goes now.
         if cfg!(windows) && let Ok(exe) = std::env::current_exe() {
@@ -139,6 +141,28 @@ impl Updater {
     }
 }
 
+/// Why this copy can't update itself, when something else installs updates: a package manager
+/// (installed under /usr), an AppImage or Flatpak (read-only), or a folder this user can't write.
+pub fn managed() -> Option<&'static str> {
+    if cfg!(target_os = "macos") || cfg!(windows) {
+        return None;
+    }
+    if std::env::var_os("APPIMAGE").is_some() {
+        return Some("This AppImage is updated by downloading the new one.");
+    }
+    if std::env::var_os("FLATPAK_ID").is_some() || std::env::var_os("SNAP").is_some() {
+        return Some("Updates come from your software store.");
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let probe = dir.join(".katachi-write-test");
+    if exe.starts_with("/usr") || std::fs::write(&probe, b"").is_err() {
+        return Some("Updates come from your package manager.");
+    }
+    let _ = std::fs::remove_file(probe);
+    None
+}
+
 /// Ask GitHub for the latest release; Some when it's newer than `current` and has this platform's build.
 fn check(current: &str) -> Result<Option<State>, String> {
     let body = curl_text(&format!("https://api.github.com/repos/{REPO}/releases/latest"))?;
@@ -164,11 +188,13 @@ pub fn newer(tag: &str, current: &str) -> bool {
 }
 
 fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
-    let out = std::process::Command::new("curl")
-        .args(["-fsSL", "--retry", "2", "-H", "User-Agent: Katachi"])
-        .args(args)
-        .output()
-        .map_err(|e| format!("curl: {e}"))?;
+    let out = match std::process::Command::new("curl").args(["-fsSL", "--retry", "2", "-H", "User-Agent: Katachi"]).args(args).output() {
+        // Some Linux installs ship wget but not curl.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !cfg!(windows) => {
+            std::process::Command::new("wget").args(["-qO-", "--tries=3", "--header=User-Agent: Katachi"]).args(args).output().map_err(|_| "neither curl nor wget is installed".to_string())?
+        }
+        r => r.map_err(|e| format!("curl: {e}"))?,
+    };
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
@@ -213,6 +239,14 @@ fn install(url: &str, sig_url: &str) -> Result<(), String> {
     };
     if !fresh.exists() {
         return Err("the download is missing the app".into());
+    }
+    // Never swap in a build this machine can't run (another CPU, or a newer system library).
+    if !cfg!(target_os = "macos") {
+        let ran = std::process::Command::new(&fresh).arg("--version").output();
+        if !ran.as_ref().is_ok_and(|o| o.status.success() && o.stdout.starts_with(b"katachi ")) {
+            let _ = std::fs::remove_dir_all(&stage);
+            return Err("the new version doesn't run on this system".into());
+        }
     }
     // Move the running copy aside (allowed even while it runs), put the new one in its place.
     let old = parent.join(if cfg!(target_os = "macos") { ".Katachi-old.app" } else if cfg!(windows) { "katachi.old.exe" } else { ".katachi-old" });

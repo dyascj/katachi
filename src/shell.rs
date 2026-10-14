@@ -25,12 +25,14 @@ pub struct Shell {
     held: Option<usize>,
     last_active: Option<usize>,
     home: Home,
+    /// The window title last sent (sent only on change; some desktops redraw it every time).
+    title: String,
     pub update: crate::update::Updater,
 }
 
 impl Shell {
     pub fn new(path: Option<PathBuf>) -> Self {
-        let mut s = Shell { tabs: vec![], active: None, idle: App::new(None), held: None, last_active: None, home: Home::default(), update: crate::update::Updater::start() };
+        let mut s = Shell { tabs: vec![], active: None, idle: App::new(None), held: None, last_active: None, home: Home::default(), title: String::new(), update: crate::update::Updater::start() };
         if let Some(p) = path {
             s.open(p);
         }
@@ -136,6 +138,11 @@ impl Shell {
         });
         if close && let Some(i) = self.active {
             self.request_close(i);
+        }
+        // Ctrl Q quits on Windows and Linux (macOS gets Cmd Q from its app menu). Quitting asks
+        // about unsaved work first, as closing the window does.
+        if !cfg!(target_os = "macos") && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Q)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         // Ctrl+Tab cycles Home and the tabs.
         let n = self.tabs.len() as i64 + 1;
@@ -671,7 +678,6 @@ impl eframe::App for Shell {
             Some(i) => self.tabs[i].ui(ui, frame),
             None => {
                 let action = self.home.ui(ui);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Title("Katachi".into()));
                 // Home has no app on screen: the session's own windows and the MCP server run here.
                 self.holder().session_frame(&ctx, frame);
                 match action {
@@ -698,6 +704,11 @@ impl eframe::App for Shell {
             self.held = Some(i);
             self.activate(Some(i));
         }
+        let title = self.active.and_then(|i| self.tabs.get(i)).map_or_else(|| "Katachi".to_string(), |t| t.window_title());
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
         self.wants();
         self.close_guard(&ctx);
         if self.update.poll(&ctx) {
@@ -710,8 +721,17 @@ impl eframe::App for Shell {
 fn reveal(p: &Path) {
     if cfg!(target_os = "macos") {
         let _ = std::process::Command::new("open").arg("-R").arg(p).spawn();
-    } else if let Some(dir) = p.parent() {
-        crate::plugin_view::open_url(&dir.display().to_string());
+    } else {
+        // Linux file managers that implement FileManager1 open the folder with the file selected.
+        let path: String = p.to_string_lossy().bytes().map(|b| if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
+        let uri = format!("array:string:file://{path}");
+        let shown = std::process::Command::new("dbus-send")
+            .args(["--session", "--print-reply", "--dest=org.freedesktop.FileManager1", "/org/freedesktop/FileManager1", "org.freedesktop.FileManager1.ShowItems", &uri, "string:"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !shown && let Some(dir) = p.parent() {
+            crate::plugin_view::open_url(&dir.display().to_string());
+        }
     }
 }
 

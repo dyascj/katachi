@@ -84,6 +84,27 @@ fn panel(a: &Appearance, dark: bool) -> Color32 {
     }
 }
 
+/// The desktop's color scheme from the XDG settings portal (GNOME, KDE, and others), falling back
+/// to GNOME's setting. None when neither says.
+/// ponytail: read once per launch; watch the portal's SettingChanged signal if live switching matters.
+fn linux_theme() -> Option<Theme> {
+    static T: std::sync::OnceLock<Option<Theme>> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        let run = |cmd: &str, args: &[&str]| std::process::Command::new(cmd).args(args).output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+        let portal = run(
+            "dbus-send",
+            &["--session", "--print-reply=literal", "--reply-timeout=500", "--dest=org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop", "org.freedesktop.portal.Settings.Read", "string:org.freedesktop.appearance", "string:color-scheme"],
+        );
+        match portal.as_deref().and_then(|s| s.split_whitespace().last()) {
+            Some("1") => return Some(Theme::Dark),
+            Some("2") => return Some(Theme::Light),
+            _ => {}
+        }
+        let gnome = run("gsettings", &["get", "org.gnome.desktop.interface", "color-scheme"])?;
+        Some(if gnome.contains("dark") { Theme::Dark } else { Theme::Light })
+    })
+}
+
 /// Install fonts-independent style for both themes and pick the active one.
 pub fn apply(ctx: &Context, a: &Appearance) {
     ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(match a.theme {
@@ -91,6 +112,12 @@ pub fn apply(ctx: &Context, a: &Appearance) {
         ThemePref::Dark => egui::SystemTheme::Dark,
         ThemePref::System => egui::SystemTheme::SystemDefault,
     }));
+    // winit can't read the desktop's light or dark preference on Linux; ask the desktop portal.
+    if cfg!(target_os = "linux")
+        && let Some(t) = linux_theme()
+    {
+        ctx.options_mut(|o| o.fallback_theme = t);
+    }
     ctx.set_theme(match a.theme {
         ThemePref::Light => egui::ThemePreference::Light,
         ThemePref::Dark => egui::ThemePreference::Dark,

@@ -289,9 +289,13 @@ impl App {
         row(ui, "Version", "", |ui| {
             ui.label(env!("CARGO_PKG_VERSION"));
         });
-        row(ui, "Check for updates automatically", "When one is out, Update now appears at the top left", |ui| {
-            toggle(ui, &mut self.prefs.check_updates);
-        });
+        if let Some(why) = crate::update::managed() {
+            row(ui, "Updates", why, |_| {});
+        } else {
+            row(ui, "Check for updates automatically", "When one is out, Update now appears at the top left", |ui| {
+                toggle(ui, &mut self.prefs.check_updates);
+            });
+        }
         row(ui, "Release notes", "What changed in each version", |ui| {
             if ui.button("Open").clicked() {
                 ui.ctx().open_url(egui::OpenUrl::new_tab("https://github.com/dyascj/katachi/releases"));

@@ -47,6 +47,9 @@ fn serve(mut stream: TcpStream, tx: &Sender<Call>, ctx: &egui::Context) -> std::
         let mut parts = line.split_whitespace();
         let (method, path) = (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("").to_string());
         let mut len = 0;
+        // Web pages can reach localhost too: only local origins (or none, from native clients)
+        // and a localhost Host (against DNS rebinding) may drive the document.
+        let mut foreign = false;
         loop {
             let mut h = String::new();
             reader.read_line(&mut h)?;
@@ -59,10 +62,20 @@ fn serve(mut stream: TcpStream, tx: &Sender<Call>, ctx: &egui::Context) -> std::
             {
                 len = v.trim().parse().unwrap_or(0);
             }
+            if let Some((k, v)) = h.split_once(':')
+                && (k.eq_ignore_ascii_case("origin") || k.eq_ignore_ascii_case("host"))
+                && !local_origin(v.trim())
+            {
+                foreign = true;
+            }
+        }
+        if len > 256 << 20 {
+            return Ok(());
         }
         let mut body = vec![0; len];
         reader.read_exact(&mut body)?;
         let (status, out) = match (method.as_str(), path.split('?').next().unwrap_or("")) {
+            _ if foreign => ("403 Forbidden", String::new()),
             ("POST", "/mcp") => match serde_json::from_slice::<Value>(&body) {
                 Ok(Value::Array(batch)) => {
                     let replies: Vec<Value> = batch.iter().filter_map(|m| handle(m, tx, ctx)).collect();
@@ -82,6 +95,14 @@ fn serve(mut stream: TcpStream, tx: &Sender<Call>, ctx: &egui::Context) -> std::
         write!(stream, "HTTP/1.1 {status}\r\n{ctype}Content-Length: {}\r\nMcp-Session-Id: katachi\r\n\r\n{out}", out.len())?;
         stream.flush()?;
     }
+}
+
+/// An Origin or Host header naming this machine: `http://localhost:1234`, `127.0.0.1:3855`, `[::1]`.
+fn local_origin(v: &str) -> bool {
+    let host = v.split_once("://").map_or(v, |(_, h)| h);
+    let host = host.split('/').next().unwrap_or("");
+    let name = if host.starts_with('[') { host.split(']').next().map(|h| &h[1..]).unwrap_or("") } else { host.split(':').next().unwrap_or("") };
+    matches!(name, "localhost" | "127.0.0.1" | "::1")
 }
 
 fn error(id: Value, code: i64, msg: &str) -> Value {
@@ -259,6 +280,16 @@ fn post(port: u16, body: &str) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_local_origins_and_hosts_are_served() {
+        for ok in ["http://localhost:5173", "http://127.0.0.1", "127.0.0.1:3855", "localhost", "http://[::1]:80"] {
+            assert!(local_origin(ok), "{ok}");
+        }
+        for bad in ["https://evil.example", "http://localhost.evil.example", "null", "evil.example:3855", "http://127.0.0.1.nip.io"] {
+            assert!(!local_origin(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn jsonrpc_lifecycle_and_tool_calls_reach_the_ui_thread() {
