@@ -14,6 +14,17 @@ pub enum Lang {
     Compose,
 }
 
+/// A variable's default code name per platform (0 Web, 1 iOS, 2 Android), from its slash name:
+/// "color/brand primary" is `var(--color-brand-primary)`, `colorBrandPrimary`, `color_brand_primary`.
+pub fn code_name(name: &str, platform: usize) -> String {
+    let words: Vec<String> = name.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(|w| w.to_lowercase()).collect();
+    match platform {
+        0 => format!("var(--{})", words.join("-")),
+        1 => words.iter().enumerate().map(|(i, w)| if i == 0 { w.clone() } else { w[..1].to_uppercase() + &w[1..] }).collect(),
+        _ => words.join("_"),
+    }
+}
+
 fn css_color(c: Rgba) -> String {
     if c.a() == 255 { format!("#{}", c.hex()) } else { format!("rgba({}, {}, {}, {})", c.0[0], c.0[1], c.0[2], num(c.a() as f32 / 255.0)) }
 }

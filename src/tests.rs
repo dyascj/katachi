@@ -2670,3 +2670,61 @@ fn paste_to_replace_takes_layers_copied_in_another_tab() {
     assert!(!b.state().doc.nodes.contains_key(&t));
     assert_eq!((b.state().doc.node(new).kind, rect(&b, new).center()), (Kind::Ellipse, pos2(120., 120.)));
 }
+
+#[test]
+fn variables_table_groups_aliases_and_paint_hexagon() {
+    use crate::doc::{Bindable, Rgba, VarValue};
+    let mut h = harness();
+    let rect_id = draw(&mut h, Key::R, (0.0, 0.0), (80.0, 80.0));
+    let (primary, accent) = {
+        let d = &mut h.state_mut().doc;
+        let c = d.add_collection("Theme".into());
+        let p = d.add_variable(c, "color/primary".into(), VarValue::Color(Rgba::rgb(255, 0, 0)));
+        let a = d.add_variable(c, "color/accent".into(), VarValue::Color(Rgba::rgb(0, 0, 255)));
+        (p, a)
+    };
+    h.state_mut().show_variables = true;
+    h.run_steps(3);
+    // Slash names group under a "color" row and show their leaf names.
+    assert!(h.query_all_by_value("color").next().is_some() && h.query_all_by_value("primary").next().is_some());
+    // The first row's hexagon makes it an alias of the other color.
+    h.get_all_by_label("Create alias").next().unwrap().click();
+    h.run_steps(2);
+    h.get_by_label("color/accent").click();
+    h.run_steps(2);
+    assert_eq!(h.state().doc.variable(primary).unwrap().values[0], VarValue::Alias(accent));
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().doc.variable(primary).unwrap().values[0], VarValue::Color(Rgba::rgb(255, 0, 0)), "undoable");
+    // Collapsing the group hides its rows; renaming it moves every variable.
+    h.get_by_label("Collapse group").click();
+    h.run_steps(2);
+    assert!(h.query_all_by_value("primary").next().is_none());
+    h.state_mut().show_variables = false;
+    // Fill's hexagon binds a color variable, then shows it in place of the paint.
+    h.state_mut().sel = vec![rect_id];
+    h.run_steps(2);
+    h.get_all_by_label("Apply variable").next().unwrap().click();
+    h.run_steps(2);
+    h.get_by_label("■ color/accent").click();
+    h.run_steps(2);
+    let n = h.state().doc.node(rect_id).clone();
+    assert_eq!((n.bindings.clone(), n.fills[0].color), (vec![(Bindable::Fill, accent)], Rgba::rgb(0, 0, 255)));
+    assert!(h.query_all_by_label("Detach variable").next().is_some());
+}
+
+#[test]
+fn plugin_variables_carry_scopes_and_code_syntax() {
+    let mut doc = crate::doc::Document::default();
+    crate::plugins::run(&mut doc, 0, &[], r##"
+        const col = figma.variables.createVariableCollection("Tokens");
+        const r = figma.variables.createVariable("radius/md", col, "FLOAT");
+        r.scopes = ["CORNER_RADIUS"];
+        r.setVariableCodeSyntax("WEB", "var(--radius-md)");
+    "##).unwrap();
+    let v = &doc.variables[0];
+    assert_eq!((v.scopes.clone(), v.code_syntax[0].as_str()), (vec![crate::doc::Bindable::Radius], "var(--radius-md)"));
+    // And back out again.
+    let out = crate::plugin_doc::snapshot(&doc, 0, &[], false);
+    assert_eq!(out["variables"][0]["scopes"], serde_json::json!(["CORNER_RADIUS"]));
+    assert_eq!(out["variables"][0]["codeSyntax"]["WEB"], "var(--radius-md)");
+}

@@ -53,6 +53,8 @@ pub enum Icon {
     Detach,
     Comment,
     Close,
+    /// Figma's hexagon "Apply variable".
+    Variable,
 }
 
 use crate::appearance as theme;
@@ -316,6 +318,10 @@ pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
             p.line_segment([at(-6., 2.), at(-2., -2.)], s);
             p.line_segment([at(2., 2.), at(6., -2.)], s);
             p.line_segment([at(-1., -5.), at(1., 5.)], Stroke::new(1.0, color.gamma_multiply(0.7)));
+        }
+        Icon::Variable => {
+            let pts: Vec<Pos2> = (0..6).map(|i| c + egui::Vec2::angled((i as f32 * 60.0 + 30.0).to_radians()) * 6.0).collect();
+            p.add(Shape::closed_line(pts, s));
         }
         Icon::Play => {
             p.add(Shape::convex_polygon(vec![at(-3.5, -5.), at(5., 0.), at(-3.5, 5.)], color, Stroke::NONE));
@@ -3548,15 +3554,48 @@ impl App {
         let mut paints = if stroke { n.strokes.clone() } else { n.fills.clone() };
         let mut changed = false;
         let link = if stroke { n.stroke_style } else { n.fill_style };
+        let prop = if stroke { crate::doc::Bindable::Stroke } else { crate::doc::Bindable::Fill };
         let mut add = false;
         let mut pick = None;
+        let mut var_pick = None;
         ui.horizontal(|ui| {
             ui.label(RichText::new(if stroke { "Stroke" } else { "Fill" }).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 add = icon_button(ui, Icon::Plus, false, 22.0, "").clicked();
                 pick = style_menu(ui, ui.id().with(("paint-styles", stroke)), &self.doc.styles, |v| matches!(v, StyleValue::Paint(_)));
+                // Figma's hexagon: apply a color variable to the paint.
+                if !self.doc.variables.is_empty() {
+                    let vb = icon_button(ui, Icon::Variable, false, 22.0, "Apply variable");
+                    egui::Popup::menu(&vb).id(ui.id().with(("paint-var", stroke))).style(crate::chrome::menu_style).show(|ui| {
+                        var_pick = self.variable_menu(ui, prop);
+                    });
+                }
             });
         });
+        if let Some(v) = var_pick {
+            self.bind_selection(prop, v);
+            return;
+        }
+        // A bound paint shows the variable's name in place of its value, with detach.
+        let bound = n.bindings.iter().find(|(b, _)| *b == prop).map(|(_, v)| *v);
+        if let Some(var) = bound {
+            let name = self.doc.variable(var).map_or("Missing variable".into(), |v| v.name.clone());
+            ui.horizontal(|ui| {
+                if let Some(p) = paints.last() {
+                    let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+                    ui.painter().rect_filled(r.shrink(2.0), 3.0, p.color.to32());
+                }
+                ui.label(RichText::new(name).color(BLUE));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, Icon::Detach, false, 22.0, "Detach variable").clicked() {
+                        self.checkpoint();
+                        for &s in &self.sel.clone() {
+                            self.doc.node_mut(s).bindings.retain(|(b, _)| *b != prop);
+                        }
+                    }
+                });
+            });
+        }
         let set_link = |app: &mut App, v: Option<crate::doc::StyleId>| {
             for &id in &app.sel.clone() {
                 let t = app.doc.node_mut(id);
@@ -3622,7 +3661,7 @@ impl App {
         }
         let mut remove = None;
         // Topmost paint first, as in Figma.
-        for i in (0..paints.len()).rev() {
+        for i in (0..paints.len()).rev().filter(|_| bound.is_none()) {
             let id = ui.id().with((stroke, i, first));
             match paint_row(ui, id, &mut paints[i], if stroke { "Stroke" } else { "Fill" }) {
                 PaintEvent::None => {}

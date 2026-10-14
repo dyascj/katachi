@@ -417,10 +417,24 @@ pub enum VarValue {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Variable {
     pub id: VarId,
+    /// Slashes group variables in the table, as in Figma ("color/brand/primary").
     pub name: String,
     pub collection: u64,
     /// One value per mode of the collection.
     pub values: Vec<VarValue>,
+    /// Figma's "Show in": the properties whose pickers offer this variable (empty = all supported).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<Bindable>,
+    /// Code syntax for Dev Mode: Web, iOS, Android (empty = derived from the name).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub code_syntax: [String; 3],
+}
+
+impl Variable {
+    /// Whether the bind pickers for `prop` offer this variable.
+    pub fn shows_in(&self, prop: Bindable) -> bool {
+        self.scopes.is_empty() || self.scopes.contains(&prop)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -445,6 +459,21 @@ pub enum Bindable {
     FontSize,
     Text,
     Visible,
+    LineHeight,
+    LetterSpacing,
+    ParagraphSpacing,
+    FontFamily,
+    FontWeight,
+    MinWidth,
+    MaxWidth,
+    MinHeight,
+    MaxHeight,
+    /// The first effect's color, blur, spread and offsets.
+    EffectColor,
+    EffectBlur,
+    EffectSpread,
+    EffectX,
+    EffectY,
 }
 
 impl Bindable {
@@ -463,10 +492,57 @@ impl Bindable {
             Bindable::FontSize => "Font size",
             Bindable::Text => "Text",
             Bindable::Visible => "Visibility",
+            Bindable::LineHeight => "Line height",
+            Bindable::LetterSpacing => "Letter spacing",
+            Bindable::ParagraphSpacing => "Paragraph spacing",
+            Bindable::FontFamily => "Font family",
+            Bindable::FontWeight => "Font weight",
+            Bindable::MinWidth => "Min width",
+            Bindable::MaxWidth => "Max width",
+            Bindable::MinHeight => "Min height",
+            Bindable::MaxHeight => "Max height",
+            Bindable::EffectColor => "Effect color",
+            Bindable::EffectBlur => "Effect blur",
+            Bindable::EffectSpread => "Effect spread",
+            Bindable::EffectX => "Effect X",
+            Bindable::EffectY => "Effect Y",
         }
     }
 
-    pub const ALL: [Bindable; 12] = [
+    /// Figma's variable scope for the property (`VariableScope`).
+    pub fn scope(self) -> &'static str {
+        match self {
+            Bindable::Fill => "ALL_FILLS",
+            Bindable::Stroke => "STROKE_COLOR",
+            Bindable::Opacity => "OPACITY",
+            Bindable::Radius => "CORNER_RADIUS",
+            Bindable::Width | Bindable::Height | Bindable::MinWidth | Bindable::MaxWidth | Bindable::MinHeight | Bindable::MaxHeight => "WIDTH_HEIGHT",
+            Bindable::Gap | Bindable::Padding => "GAP",
+            Bindable::StrokeWidth => "STROKE_FLOAT",
+            Bindable::FontSize => "FONT_SIZE",
+            Bindable::Text => "TEXT_CONTENT",
+            Bindable::Visible => "ALL_SCOPES",
+            Bindable::LineHeight => "LINE_HEIGHT",
+            Bindable::LetterSpacing => "LETTER_SPACING",
+            Bindable::ParagraphSpacing => "PARAGRAPH_SPACING",
+            Bindable::FontFamily => "FONT_FAMILY",
+            Bindable::FontWeight => "FONT_WEIGHT",
+            Bindable::EffectColor => "EFFECT_COLOR",
+            Bindable::EffectBlur | Bindable::EffectSpread | Bindable::EffectX | Bindable::EffectY => "EFFECT_FLOAT",
+        }
+    }
+
+    /// Properties covered by a Figma scope name (the inverse of `scope`).
+    pub fn from_scope(s: &str) -> Vec<Bindable> {
+        match s {
+            "FRAME_FILL" | "SHAPE_FILL" | "TEXT_FILL" => vec![Bindable::Fill],
+            "FONT_STYLE" => vec![Bindable::FontWeight],
+            "ALL_SCOPES" => vec![],
+            _ => Bindable::ALL.into_iter().filter(|b| b.scope() == s).collect(),
+        }
+    }
+
+    pub const ALL: [Bindable; 26] = [
         Bindable::Fill,
         Bindable::Stroke,
         Bindable::Opacity,
@@ -479,12 +555,26 @@ impl Bindable {
         Bindable::FontSize,
         Bindable::Text,
         Bindable::Visible,
+        Bindable::LineHeight,
+        Bindable::LetterSpacing,
+        Bindable::ParagraphSpacing,
+        Bindable::FontFamily,
+        Bindable::FontWeight,
+        Bindable::MinWidth,
+        Bindable::MaxWidth,
+        Bindable::MinHeight,
+        Bindable::MaxHeight,
+        Bindable::EffectColor,
+        Bindable::EffectBlur,
+        Bindable::EffectSpread,
+        Bindable::EffectX,
+        Bindable::EffectY,
     ];
     /// Whether a value of this kind fits the property.
     pub fn accepts(self, v: &VarValue) -> bool {
         match self {
-            Bindable::Fill | Bindable::Stroke => matches!(v, VarValue::Color(_)),
-            Bindable::Text => matches!(v, VarValue::Text(_)),
+            Bindable::Fill | Bindable::Stroke | Bindable::EffectColor => matches!(v, VarValue::Color(_)),
+            Bindable::Text | Bindable::FontFamily => matches!(v, VarValue::Text(_)),
             Bindable::Visible => matches!(v, VarValue::Bool(_)),
             _ => matches!(v, VarValue::Number(_)),
         }
@@ -2141,6 +2231,37 @@ impl Document {
         self.variables.iter().find(|v| v.id == id)
     }
 
+    /// A variable's value in its first mode, following aliases (its type, for pickers).
+    pub fn resolve_first(&self, id: VarId) -> Option<VarValue> {
+        let mut cur = id;
+        for _ in 0..8 {
+            match self.variable(cur)?.values.first()? {
+                VarValue::Alias(next) => cur = *next,
+                v => return Some(v.clone()),
+            }
+        }
+        None
+    }
+
+    /// Whether `id` is `target` or reaches it through aliases in any mode (an alias to it would loop).
+    pub fn aliases_to(&self, id: VarId, target: VarId) -> bool {
+        let mut seen = vec![];
+        let mut todo = vec![id];
+        while let Some(cur) = todo.pop() {
+            if cur == target {
+                return true;
+            }
+            if seen.contains(&cur) {
+                continue;
+            }
+            seen.push(cur);
+            if let Some(v) = self.variable(cur) {
+                todo.extend(v.values.iter().filter_map(|x| if let VarValue::Alias(a) = x { Some(*a) } else { None }));
+            }
+        }
+        false
+    }
+
     pub fn add_collection(&mut self, name: String) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -2152,7 +2273,7 @@ impl Document {
         let id = self.next_id;
         self.next_id += 1;
         let modes = self.collections.iter().find(|c| c.id == collection).map_or(1, |c| c.modes.len());
-        self.variables.push(Variable { id, name, collection, values: vec![value; modes] });
+        self.variables.push(Variable { id, name, collection, values: vec![value; modes], scopes: vec![], code_syntax: Default::default() });
         id
     }
 
@@ -2234,6 +2355,20 @@ impl Document {
                 (Bindable::FontSize, VarValue::Number(v)) => n.font_size = v.max(1.0),
                 (Bindable::Text, VarValue::Text(t)) => n.text = t,
                 (Bindable::Visible, VarValue::Bool(b)) => n.visible = b,
+                (Bindable::LineHeight, VarValue::Number(v)) => n.line_height = LineHeight::Px(v.max(0.0)),
+                (Bindable::LetterSpacing, VarValue::Number(v)) => n.letter_spacing = v,
+                (Bindable::ParagraphSpacing, VarValue::Number(v)) => n.paragraph_spacing = v.max(0.0),
+                (Bindable::FontFamily, VarValue::Text(t)) => n.font_family = t,
+                (Bindable::FontWeight, VarValue::Number(v)) => n.font_weight = v.clamp(1.0, 1000.0) as u16,
+                (Bindable::MinWidth, VarValue::Number(v)) => n.min_size[0] = Some(v.max(0.0)),
+                (Bindable::MaxWidth, VarValue::Number(v)) => n.max_size[0] = Some(v.max(0.0)),
+                (Bindable::MinHeight, VarValue::Number(v)) => n.min_size[1] = Some(v.max(0.0)),
+                (Bindable::MaxHeight, VarValue::Number(v)) => n.max_size[1] = Some(v.max(0.0)),
+                (Bindable::EffectColor, VarValue::Color(c)) => n.shadows.iter_mut().take(1).for_each(|s| s.color = c),
+                (Bindable::EffectBlur, VarValue::Number(v)) => n.shadows.iter_mut().take(1).for_each(|s| s.blur = v.max(0.0)),
+                (Bindable::EffectSpread, VarValue::Number(v)) => n.shadows.iter_mut().take(1).for_each(|s| s.spread = v),
+                (Bindable::EffectX, VarValue::Number(v)) => n.shadows.iter_mut().take(1).for_each(|s| s.offset.x = v),
+                (Bindable::EffectY, VarValue::Number(v)) => n.shadows.iter_mut().take(1).for_each(|s| s.offset.y = v),
                 _ => {}
             }
         }
@@ -2254,6 +2389,14 @@ impl Document {
             Bindable::FontSize => a.font_size != b.font_size,
             Bindable::Text => a.text != b.text,
             Bindable::Visible => a.visible != b.visible,
+            Bindable::LineHeight => a.line_height != b.line_height,
+            Bindable::LetterSpacing => a.letter_spacing != b.letter_spacing,
+            Bindable::ParagraphSpacing => a.paragraph_spacing != b.paragraph_spacing,
+            Bindable::FontFamily => a.font_family != b.font_family,
+            Bindable::FontWeight => a.font_weight != b.font_weight,
+            Bindable::MinWidth | Bindable::MinHeight => a.min_size != b.min_size,
+            Bindable::MaxWidth | Bindable::MaxHeight => a.max_size != b.max_size,
+            Bindable::EffectColor | Bindable::EffectBlur | Bindable::EffectSpread | Bindable::EffectX | Bindable::EffectY => a.shadows != b.shadows,
         }
     }
 
@@ -2272,6 +2415,20 @@ impl Document {
             (Bindable::FontSize, VarValue::Number(v)) => n.font_size == v.max(1.0),
             (Bindable::Text, VarValue::Text(t)) => n.text == *t,
             (Bindable::Visible, VarValue::Bool(b)) => n.visible == *b,
+            (Bindable::LineHeight, VarValue::Number(v)) => n.line_height == LineHeight::Px(v.max(0.0)),
+            (Bindable::LetterSpacing, VarValue::Number(v)) => n.letter_spacing == *v,
+            (Bindable::ParagraphSpacing, VarValue::Number(v)) => n.paragraph_spacing == v.max(0.0),
+            (Bindable::FontFamily, VarValue::Text(t)) => n.font_family == *t,
+            (Bindable::FontWeight, VarValue::Number(v)) => n.font_weight == v.clamp(1.0, 1000.0) as u16,
+            (Bindable::MinWidth, VarValue::Number(v)) => n.min_size[0] == Some(v.max(0.0)),
+            (Bindable::MaxWidth, VarValue::Number(v)) => n.max_size[0] == Some(v.max(0.0)),
+            (Bindable::MinHeight, VarValue::Number(v)) => n.min_size[1] == Some(v.max(0.0)),
+            (Bindable::MaxHeight, VarValue::Number(v)) => n.max_size[1] == Some(v.max(0.0)),
+            (Bindable::EffectColor, VarValue::Color(c)) => n.shadows.first().is_none_or(|s| s.color == *c),
+            (Bindable::EffectBlur, VarValue::Number(v)) => n.shadows.first().is_none_or(|s| s.blur == v.max(0.0)),
+            (Bindable::EffectSpread, VarValue::Number(v)) => n.shadows.first().is_none_or(|s| s.spread == *v),
+            (Bindable::EffectX, VarValue::Number(v)) => n.shadows.first().is_none_or(|s| s.offset.x == *v),
+            (Bindable::EffectY, VarValue::Number(v)) => n.shadows.first().is_none_or(|s| s.offset.y == *v),
             _ => true,
         }
     }
@@ -3908,5 +4065,33 @@ mod tests {
         let g = d.insert(0, Some(f), None, Node::new(Kind::Frame, r(0., 0., 50., 50.)));
         d.reparent(f, 0, Some(g), None);
         assert_eq!(d.node(f).parent, None);
+    }
+
+    #[test]
+    fn aliases_text_bindings_and_scopes() {
+        let mut d = Document::default();
+        let c = d.add_collection("Theme".into());
+        let base = d.add_variable(c, "size/base".into(), VarValue::Number(20.0));
+        let lh = d.add_variable(c, "text/line".into(), VarValue::Alias(base));
+        let fam = d.add_variable(c, "font/body".into(), VarValue::Text("Georgia".into()));
+        let shade = d.add_variable(c, "shadow".into(), VarValue::Color(Rgba::rgb(1, 2, 3)));
+        assert_eq!(d.resolve_first(lh), Some(VarValue::Number(20.0)), "aliases resolve to the target's value");
+        assert!(d.aliases_to(lh, base) && !d.aliases_to(base, lh), "an alias back would loop");
+        let mut t = Node::new(Kind::Text, r(0., 0., 50., 20.));
+        t.shadows = vec![Shadow::default()];
+        t.bindings = vec![(Bindable::LineHeight, lh), (Bindable::FontFamily, fam), (Bindable::MinWidth, base), (Bindable::EffectColor, shade)];
+        let t = d.insert(0, None, None, t);
+        d.apply_variables();
+        let n = d.node(t);
+        assert_eq!((n.line_height, n.font_family.as_str(), n.min_size[0], n.shadows[0].color), (LineHeight::Px(20.0), "Georgia", Some(20.0), Rgba::rgb(1, 2, 3)));
+        d.variables.iter_mut().find(|v| v.id == base).unwrap().values[0] = VarValue::Number(24.0);
+        d.apply_variables();
+        assert_eq!(d.node(t).line_height, LineHeight::Px(24.0), "editing the target moves the alias");
+        // Scopes: "Show in" limits which pickers offer a variable.
+        let v = d.variables.iter_mut().find(|v| v.id == base).unwrap();
+        v.scopes = Bindable::from_scope("CORNER_RADIUS");
+        assert!(v.shows_in(Bindable::Radius) && !v.shows_in(Bindable::Gap));
+        assert_eq!(Bindable::from_scope("WIDTH_HEIGHT").len(), 6);
+        assert!(Bindable::from_scope("ALL_SCOPES").is_empty());
     }
 }

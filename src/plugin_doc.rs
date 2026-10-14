@@ -492,6 +492,33 @@ fn reaction_from(v: &Value, refs: &Refs) -> Option<Reaction> {
 
 // ---------- layers ----------
 
+/// A node's `boundVariables` fields for a property. Paints and effects bind inside the paint or
+/// effect object, so they have none here.
+fn bound_keys(b: Bindable) -> &'static [&'static str] {
+    match b {
+        Bindable::Opacity => &["opacity"],
+        Bindable::Radius => &["topLeftRadius", "topRightRadius", "bottomRightRadius", "bottomLeftRadius"],
+        Bindable::Width => &["width"],
+        Bindable::Height => &["height"],
+        Bindable::Gap => &["itemSpacing"],
+        Bindable::Padding => &["paddingLeft", "paddingRight", "paddingTop", "paddingBottom"],
+        Bindable::StrokeWidth => &["strokeWeight"],
+        Bindable::FontSize => &["fontSize"],
+        Bindable::Text => &["characters"],
+        Bindable::Visible => &["visible"],
+        Bindable::LineHeight => &["lineHeight"],
+        Bindable::LetterSpacing => &["letterSpacing"],
+        Bindable::ParagraphSpacing => &["paragraphSpacing"],
+        Bindable::FontFamily => &["fontFamily"],
+        Bindable::FontWeight => &["fontWeight"],
+        Bindable::MinWidth => &["minWidth"],
+        Bindable::MaxWidth => &["maxWidth"],
+        Bindable::MinHeight => &["minHeight"],
+        Bindable::MaxHeight => &["maxHeight"],
+        Bindable::Fill | Bindable::Stroke | Bindable::EffectColor | Bindable::EffectBlur | Bindable::EffectSpread | Bindable::EffectX | Bindable::EffectY => &[],
+    }
+}
+
 /// One layer as the plugin API sees it (without children).
 pub fn node_json(doc: &Document, id: NodeId) -> Value {
     let n = doc.node(id);
@@ -548,20 +575,7 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
     }
     let mut bv = serde_json::Map::new();
     for (b, var) in &n.bindings {
-        let keys: &[&str] = match b {
-            Bindable::Opacity => &["opacity"],
-            Bindable::Radius => &["topLeftRadius", "topRightRadius", "bottomRightRadius", "bottomLeftRadius"],
-            Bindable::Width => &["width"],
-            Bindable::Height => &["height"],
-            Bindable::Gap => &["itemSpacing"],
-            Bindable::Padding => &["paddingLeft", "paddingRight", "paddingTop", "paddingBottom"],
-            Bindable::StrokeWidth => &["strokeWeight"],
-            Bindable::FontSize => &["fontSize"],
-            Bindable::Text => &["characters"],
-            Bindable::Visible => &["visible"],
-            Bindable::Fill | Bindable::Stroke => &[],
-        };
-        for k in keys {
+        for k in bound_keys(*b) {
             bv.insert(k.to_string(), alias(*var));
         }
     }
@@ -722,6 +736,16 @@ fn var_type(doc: &Document, v: &Variable) -> &'static str {
     "FLOAT"
 }
 
+/// Figma scope names for a variable's "Show in" list.
+fn var_scopes(v: &Variable) -> Vec<&'static str> {
+    let mut out: Vec<&str> = v.scopes.iter().map(|b| b.scope()).collect();
+    out.dedup();
+    if out.is_empty() {
+        out.push("ALL_SCOPES");
+    }
+    out
+}
+
 fn var_value_json(v: &VarValue) -> Value {
     match v {
         VarValue::Color(c) => rgba(*c),
@@ -759,7 +783,8 @@ pub fn snapshot(doc: &Document, page: usize, sel: &[NodeId], all_pages: bool) ->
             let modes: serde_json::Map<String, Value> = v.values.iter().enumerate().map(|(i, x)| (format!("{}:{i}", v.collection), var_value_json(x))).collect();
             json!({
                 "id": format!("VariableID:{}", v.id), "name": v.name, "variableCollectionId": format!("VariableCollectionId:{}", v.collection),
-                "resolvedType": var_type(doc, v), "valuesByMode": modes, "description": "", "scopes": ["ALL_SCOPES"],
+                "resolvedType": var_type(doc, v), "valuesByMode": modes, "description": "", "scopes": var_scopes(v),
+                "codeSyntax": { "WEB": v.code_syntax[0], "iOS": v.code_syntax[1], "ANDROID": v.code_syntax[2] },
             })
         }).collect::<Vec<_>>(),
     })
@@ -894,6 +919,13 @@ fn apply_styles_and_variables(doc: &mut Document, out: &Value, refs: &mut Refs) 
         let values: Vec<(usize, VarValue)> = v["valuesByMode"].as_object().into_iter().flatten().filter_map(|(m, x)| Some((refs.mode(m)?.1, var_value_from(x, refs)?))).collect();
         if let Some(var) = doc.variables.iter_mut().find(|x| x.id == id) {
             var.name = v["name"].as_str().unwrap_or(&var.name).to_string();
+            if let Some(sc) = v["scopes"].as_array() {
+                var.scopes = sc.iter().filter_map(|x| x.as_str()).flat_map(Bindable::from_scope).collect();
+                var.scopes.dedup();
+            }
+            for (i, k) in ["WEB", "iOS", "ANDROID"].into_iter().enumerate() {
+                var.code_syntax[i] = v["codeSyntax"][k].as_str().unwrap_or_default().to_string();
+            }
             for (i, x) in values {
                 if let Some(slot) = var.values.get_mut(i) {
                     *slot = x;
@@ -1267,21 +1299,11 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
     // Variables bound to properties.
     if changed("boundVariables") {
         let bv = &v["boundVariables"];
-        n.bindings.retain(|(b, _)| matches!(b, Bindable::Fill | Bindable::Stroke));
+        n.bindings.retain(|(b, _)| bound_keys(*b).is_empty());
         let pick = |keys: &[&str]| keys.iter().find_map(|k| bv[*k]["id"].as_str().and_then(|s| refs.var(s)));
-        for (b, keys) in [
-            (Bindable::Opacity, &["opacity"][..]),
-            (Bindable::Radius, &["cornerRadius", "topLeftRadius", "topRightRadius", "bottomLeftRadius", "bottomRightRadius"][..]),
-            (Bindable::Width, &["width"][..]),
-            (Bindable::Height, &["height"][..]),
-            (Bindable::Gap, &["itemSpacing"][..]),
-            (Bindable::Padding, &["paddingLeft", "paddingRight", "paddingTop", "paddingBottom"][..]),
-            (Bindable::StrokeWidth, &["strokeWeight"][..]),
-            (Bindable::FontSize, &["fontSize"][..]),
-            (Bindable::Text, &["characters"][..]),
-            (Bindable::Visible, &["visible"][..]),
-        ] {
-            if let Some(var) = pick(keys) {
+        for b in Bindable::ALL {
+            let radius: &[&str] = if b == Bindable::Radius { &["cornerRadius"] } else { &[] };
+            if let Some(var) = pick(bound_keys(b)).or_else(|| pick(radius)) {
                 n.bindings.push((b, var));
             }
         }
