@@ -12,6 +12,20 @@ use std::time::SystemTime;
 
 /// Matches where macOS centers the traffic lights (16 points down), so they sit mid-strip.
 pub const STRIP_H: f32 = 32.0;
+
+/// Katachi draws the window frame itself (Linux, unless the system title bar is chosen): window
+/// buttons at the end of the tab strip, drag to move, edges to resize.
+pub static OWN_FRAME: AtomicBool = AtomicBool::new(false);
+const BUTTONS_W: f32 = 3.0 * 40.0;
+
+fn own_frame() -> bool {
+    OWN_FRAME.load(Ordering::Relaxed)
+}
+
+/// Whether this window was opened with the desktop's title bar (Linux setting).
+pub fn uses_system_title_bar() -> bool {
+    !own_frame()
+}
 const BLUE: Color32 = Color32::from_rgb(0x0D, 0x99, 0xFF);
 
 pub struct Shell {
@@ -213,8 +227,8 @@ impl Shell {
         let mut action: Option<StripAction> = None;
         egui::Panel::top("tabstrip").exact_size(STRIP_H).resizable(false).show_separator_line(false).frame(egui::Frame::NONE.fill(bar)).show(ui, |ui| {
             let r = ui.max_rect();
-            // Empty strip: drag to move the window, double-click to zoom (macOS draws no title bar).
-            if cfg!(target_os = "macos") {
+            // Empty strip: drag to move the window, double-click to zoom (no system title bar).
+            if cfg!(target_os = "macos") || own_frame() {
                 let resp = ui.interact(r, egui::Id::new("strip-drag"), Sense::click_and_drag());
                 if resp.drag_started() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
@@ -260,7 +274,8 @@ impl Shell {
             x = home.max.x;
             p.vline(x, r.y_range(), Stroke::new(1.0, line));
             // File tabs share what's left, between 110 and 220 points each.
-            let room = (r.max.x - x - 44.0).max(0.0);
+            let end = if own_frame() { r.max.x - BUTTONS_W } else { r.max.x };
+            let room = (end - x - 44.0).max(0.0);
             let w = if self.tabs.is_empty() { 0.0 } else { (room / self.tabs.len() as f32).clamp(110.0, 220.0) };
             for (i, t) in self.tabs.iter().enumerate() {
                 let tr = Rect::from_min_size(pos2(x, r.min.y), vec2(w, r.height()));
@@ -307,7 +322,7 @@ impl Shell {
             }
             // New tab.
             let plus = Rect::from_min_size(pos2(x + 6.0, r.center().y - 12.0), vec2(24.0, 24.0));
-            if plus.max.x < r.max.x {
+            if plus.max.x < end {
                 let resp = ui.interact(plus, egui::Id::new("tab-new"), Sense::click());
                 resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "New design file"));
                 if resp.hovered() {
@@ -320,6 +335,11 @@ impl Shell {
                     action = Some(StripAction::New);
                 }
                 resp.on_hover_text("New design file");
+            }
+            if own_frame() {
+                if let Some(a) = window_buttons(ui, Rect::from_min_max(pos2(end, r.min.y), r.max)) {
+                    action = Some(a);
+                }
             }
             // The line under everything except the tab on screen, which runs into the content.
             let under = r.max.y - 0.5;
@@ -341,6 +361,7 @@ impl Shell {
             }
         });
         match action {
+            Some(StripAction::Window(cmd)) => ctx.send_viewport_cmd(cmd),
             Some(StripAction::Activate(i)) => self.activate(i),
             Some(StripAction::Close(i)) => self.request_close(i),
             Some(StripAction::New) => self.new_tab(),
@@ -362,10 +383,100 @@ impl Shell {
 }
 
 enum StripAction {
+    Window(egui::ViewportCommand),
     Activate(Option<usize>),
     Close(usize),
     New,
     Update,
+}
+
+/// Minimize, maximize and close, drawn at the end of the tab strip.
+fn window_buttons(ui: &mut egui::Ui, area: Rect) -> Option<StripAction> {
+    let ctx = ui.ctx().clone();
+    let max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+    let ink = crate::appearance::ink(&ctx);
+    let dark = ui.visuals().dark_mode;
+    let p = ui.painter().clone();
+    let mut action = None;
+    for (k, label) in ["Minimize", if max { "Restore" } else { "Maximize" }, "Close"].into_iter().enumerate() {
+        let b = Rect::from_min_size(pos2(area.min.x + k as f32 * 40.0, area.min.y), vec2(40.0, area.height()));
+        let resp = ui.interact(b, egui::Id::new(("window-button", k)), Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+        let close = k == 2;
+        let hot = resp.hovered();
+        if hot {
+            p.rect_filled(b, 0.0, if close { Color32::from_rgb(0xE8, 0x11, 0x23) } else if dark { Color32::from_gray(0x33) } else { Color32::from_gray(0xD4) });
+        }
+        let c = b.center();
+        let s = Stroke::new(1.0, if hot && close { Color32::WHITE } else { ink });
+        match k {
+            0 => {
+                p.hline(egui::Rangef::new(c.x - 5.0, c.x + 5.0), c.y, s);
+            }
+            1 if max => {
+                p.rect_stroke(Rect::from_center_size(c + vec2(-1.0, 1.0), vec2(8.0, 8.0)), 1.0, s, egui::StrokeKind::Middle);
+                p.line_segment([c + vec2(-3.0, -4.0), c + vec2(5.0, -4.0)], s);
+                p.line_segment([c + vec2(5.0, -4.0), c + vec2(5.0, 4.0)], s);
+            }
+            1 => {
+                p.rect_stroke(Rect::from_center_size(c, vec2(10.0, 10.0)), 1.0, s, egui::StrokeKind::Middle);
+            }
+            _ => {
+                p.line_segment([c - vec2(5.0, 5.0), c + vec2(5.0, 5.0)], s);
+                p.line_segment([c + vec2(-5.0, 5.0), c + vec2(5.0, -5.0)], s);
+            }
+        }
+        if resp.clicked() {
+            action = Some(StripAction::Window(match k {
+                0 => egui::ViewportCommand::Minimized(true),
+                1 => egui::ViewportCommand::Maximized(!max),
+                _ => egui::ViewportCommand::Close,
+            }));
+        }
+    }
+    action
+}
+
+/// With Katachi drawing the frame: a thin border, and pressing near an edge or corner resizes
+/// the window (the window manager takes over from there).
+fn resize_edges(ctx: &egui::Context) {
+    use egui::viewport::ResizeDirection as D;
+    let (max, full) = ctx.input(|i| (i.viewport().maximized.unwrap_or(false), i.viewport().fullscreen.unwrap_or(false)));
+    if max || full {
+        return;
+    }
+    let r = ctx.content_rect();
+    let line = crate::appearance::border(ctx);
+    ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("window-border"))).rect_stroke(r, 0.0, Stroke::new(1.0, line), egui::StrokeKind::Inside);
+    let (e, c) = (5.0, 14.0);
+    let zones = [
+        (D::NorthWest, Rect::from_min_size(r.min, vec2(c, c))),
+        (D::NorthEast, Rect::from_min_size(pos2(r.max.x - c, r.min.y), vec2(c, c))),
+        (D::SouthWest, Rect::from_min_size(pos2(r.min.x, r.max.y - c), vec2(c, c))),
+        (D::SouthEast, Rect::from_min_size(r.max - vec2(c, c), vec2(c, c))),
+        (D::North, Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + e))),
+        (D::South, Rect::from_min_max(pos2(r.min.x, r.max.y - e), r.max)),
+        (D::West, Rect::from_min_max(r.min, pos2(r.min.x + e, r.max.y))),
+        (D::East, Rect::from_min_max(pos2(r.max.x - e, r.min.y), r.max)),
+    ];
+    for (k, (dir, zone)) in zones.into_iter().enumerate() {
+        let resp = egui::Area::new(egui::Id::new(("resize-edge", k)))
+            .order(egui::Order::Foreground)
+            .fixed_pos(zone.min)
+            .show(ctx, |ui| ui.allocate_exact_size(zone.size(), Sense::drag()).1)
+            .inner;
+        if resp.hovered() || resp.dragged() {
+            ctx.set_cursor_icon(match dir {
+                D::North | D::South => egui::CursorIcon::ResizeVertical,
+                D::East | D::West => egui::CursorIcon::ResizeHorizontal,
+                D::NorthWest | D::SouthEast => egui::CursorIcon::ResizeNwSe,
+                D::NorthEast | D::SouthWest => egui::CursorIcon::ResizeNeSw,
+            });
+        }
+        if resp.drag_started() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+        }
+    }
 }
 
 /// A house outline for the Home tab.
@@ -669,6 +780,9 @@ impl eframe::App for Shell {
         }
         self.shortcuts(&ctx);
         self.hold();
+        if own_frame() {
+            resize_edges(&ctx);
+        }
         let presenting = self.active.is_some_and(|i| self.tabs[i].presenting.is_some());
         if !presenting {
             self.strip(ui);

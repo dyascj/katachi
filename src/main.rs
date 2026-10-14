@@ -57,6 +57,9 @@ fn main() -> eframe::Result {
     macos_open::install();
     let transparent = !cfg!(target_os = "linux") || appearance::load().glass;
     appearance::TRANSPARENT_WINDOW.store(transparent, std::sync::atomic::Ordering::Relaxed);
+    // Linux: tabs sit in the title bar with Katachi's own window buttons, as in Figma's desktop app.
+    let own_frame = cfg!(target_os = "linux") && !settings::load().system_title_bar;
+    shell::OWN_FRAME.store(own_frame, std::sync::atomic::Ordering::Relaxed);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Katachi")
@@ -67,7 +70,8 @@ fn main() -> eframe::Result {
             // without a compositor and on some drivers, so the default window stays opaque.
             .with_transparent(transparent)
             // Wayland and X11 match the window to katachi.desktop by this id (taskbar icon, pinning).
-            .with_app_id("katachi")
+            .with_app_id("io.github.dyascj.Katachi")
+            .with_decorations(!own_frame)
             // macOS: Katachi draws its own title bar (so it can be glass too); the traffic lights sit on it.
             .with_fullsize_content_view(true)
             .with_titlebar_shown(false)

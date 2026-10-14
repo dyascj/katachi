@@ -18,11 +18,13 @@ pub struct Prefs {
     pub nudge: f32,
     pub big_nudge: f32,
     pub check_updates: bool,
+    /// Linux: the desktop's own title bar above the tabs instead of tabs in the title bar.
+    pub system_title_bar: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { name: String::new(), snap_to_objects: true, highlight_on_hover: true, keep_tool_selected: false, show_dimensions: true, nudge: 1.0, big_nudge: 10.0, check_updates: true }
+        Prefs { name: String::new(), snap_to_objects: true, highlight_on_hover: true, keep_tool_selected: false, show_dimensions: true, nudge: 1.0, big_nudge: 10.0, check_updates: true, system_title_bar: false }
     }
 }
 
@@ -173,7 +175,18 @@ impl App {
                         ui.set_width(size.x - 64.0);
                         match tab {
                             Tab::Account => self.account_tab(ui),
-                            Tab::Appearance => appearance_tab(ui, &mut self.appearance),
+                            Tab::Appearance => {
+                                appearance_tab(ui, &mut self.appearance);
+                                if cfg!(target_os = "linux") {
+                                    section(ui, "Window");
+                                    row(ui, "Use the system title bar", "Your desktop's title bar above the tabs, instead of tabs in the title bar", |ui| {
+                                        toggle(ui, &mut self.prefs.system_title_bar);
+                                    });
+                                    if self.prefs.system_title_bar != crate::shell::uses_system_title_bar() {
+                                        ui.label(RichText::new("Restart Katachi to switch title bars.").color(crate::appearance::muted(ui.ctx())));
+                                    }
+                                }
+                            }
                             Tab::Canvas => canvas_tab(ui, &mut self.prefs),
                             Tab::Plugins => self.plugins_tab(ui),
                             Tab::Agents => self.agents_tab(ui),

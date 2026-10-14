@@ -144,6 +144,11 @@ impl Updater {
 /// Why this copy can't update itself, when something else installs updates: a package manager
 /// (installed under /usr), an AppImage or Flatpak (read-only), or a folder this user can't write.
 pub fn managed() -> Option<&'static str> {
+    static M: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *M.get_or_init(managed_now)
+}
+
+fn managed_now() -> Option<&'static str> {
     if cfg!(target_os = "macos") || cfg!(windows) {
         return None;
     }
