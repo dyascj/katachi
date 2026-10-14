@@ -111,6 +111,7 @@ impl App {
             }
         if secondary_pressed && resp.hovered()
             && let (Some(s), Some(w)) = (ptr, world) {
+                self.menu_at = Some(w);
                 match self.target_at(w, s, mods.command) {
                     Some(t) if !self.sel.contains(&t) => self.sel = vec![t],
                     None => self.sel.clear(),
@@ -2021,6 +2022,20 @@ impl App {
                 }
             });
         });
+        ui.separator();
+        let under = self.menu_at.map(|p| self.layers_at(p)).unwrap_or_default();
+        if under.len() > 1 {
+            ui.menu_button("Select layer", |ui| {
+                for id in under.into_iter().take(16) {
+                    let n = self.doc.node(id);
+                    let depth = self.doc.ancestors(id).len();
+                    if ui.selectable_label(self.sel == [id], format!("{}{}", "   ".repeat(depth.min(6)), n.name)).clicked() {
+                        self.sel = vec![id];
+                        ui.close();
+                    }
+                }
+            });
+        }
         if item(ui, "Select matching layers", "⌥⌘A", has) {
             self.select_matching();
             ui.close();
@@ -2093,6 +2108,10 @@ impl App {
             self.group_selection(true);
             ui.close();
         }
+        if item(ui, "Add auto layout", "⇧A", has) {
+            self.add_auto_layout();
+            ui.close();
+        }
         let container = self.sel.iter().any(|&s| self.doc.node(s).kind.is_container());
         if item(ui, "Ungroup", "⇧⌘G", container) {
             self.ungroup_selection();
@@ -2145,13 +2164,45 @@ impl App {
             self.toggle_locked();
             ui.close();
         }
-        if item(ui, "Lock all", "", true) {
-            self.lock_all(true);
-            ui.close();
-        }
-        if item(ui, "Unlock all", "", true) {
-            self.lock_all(false);
-            ui.close();
+        if has {
+            ui.separator();
+            if item(ui, "Flip horizontal", "⇧H", true) {
+                self.flip_selection(true);
+                ui.close();
+            }
+            if item(ui, "Flip vertical", "⇧V", true) {
+                self.flip_selection(false);
+                ui.close();
+            }
+            let pages: Vec<(usize, String)> = self.doc.pages.iter().enumerate().filter(|(i, p)| *i != self.page && !crate::panels::is_divider(&p.name)).map(|(i, p)| (i, p.name.clone())).collect();
+            if !pages.is_empty() {
+                ui.menu_button("Move to page", |ui| {
+                    for (i, name) in pages {
+                        if ui.button(name).clicked() {
+                            self.move_to_page(i);
+                            ui.close();
+                        }
+                    }
+                });
+            }
+        } else {
+            // Right-clicking empty canvas: page-wide commands, as in Figma.
+            if item(ui, "Lock all", "", true) {
+                self.lock_all(true);
+                ui.close();
+            }
+            if item(ui, "Unlock all", "", true) {
+                self.lock_all(false);
+                ui.close();
+            }
+            if item(ui, if self.ui_hidden { "Show UI" } else { "Hide UI" }, "⌘\\", true) {
+                self.ui_hidden = !self.ui_hidden;
+                ui.close();
+            }
+            if item(ui, if self.show_comments { "Hide comments" } else { "Show comments" }, "⇧C", true) {
+                self.show_comments = !self.show_comments;
+                ui.close();
+            }
         }
         if !self.doc.pages[self.page].guides.is_empty() {
             ui.separator();

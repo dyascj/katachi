@@ -275,6 +275,8 @@ pub struct App {
     /// Properties copied with Cmd+Alt+C.
     pub style_clip: Option<Node>,
     pub layer_search: Option<String>,
+    /// Where the canvas was right-clicked (world), for the menu's "Select layer".
+    pub menu_at: Option<Pos2>,
     pub batch_rename: Option<crate::panels::BatchRename>,
     /// This session's crash-recovery autosave.
     recovery: PathBuf,
@@ -387,6 +389,7 @@ impl App {
             var_collection: None,
             style_clip: None,
             layer_search: None,
+            menu_at: None,
             batch_rename: None,
             recovery: {
                 // Unique per window, even for two opened in the same millisecond.
@@ -890,6 +893,40 @@ impl App {
     }
 
     /// Shift+A: turn selected frames into auto layout, or wrap other selections in a new one.
+    /// Right-click > Move to page: the selection goes to another page at the same positions.
+    pub fn move_to_page(&mut self, to: usize) {
+        let roots = self.sel_roots();
+        if roots.is_empty() || to == self.page || to >= self.doc.pages.len() {
+            return;
+        }
+        self.checkpoint();
+        for id in roots {
+            self.doc.reparent(id, to, None, None);
+        }
+        self.doc.reflow();
+        self.sel.clear();
+        self.toast(format!("Moved to {}", self.doc.pages[to].name));
+    }
+
+    /// Visible, unlocked layers under world point `p`, top first (right-click > Select layer).
+    pub fn layers_at(&self, p: Pos2) -> Vec<NodeId> {
+        fn walk(doc: &Document, list: &[NodeId], p: Pos2, tol: f32, out: &mut Vec<NodeId>) {
+            for &id in list.iter().rev() {
+                let n = doc.node(id);
+                if !n.visible || n.locked || (n.kind.is_frame() && n.clip && !n.rect.contains(n.to_local(p))) {
+                    continue;
+                }
+                walk(doc, &n.children, p, tol, out);
+                if doc.hit_self(n, p, tol) || (n.kind.is_container() && n.rect.contains(n.to_local(p))) {
+                    out.push(id);
+                }
+            }
+        }
+        let mut out = vec![];
+        walk(&self.doc, &self.doc.pages[self.page].children, p, 2.0 / self.view.zoom, &mut out);
+        out
+    }
+
     pub fn add_auto_layout(&mut self) {
         let roots = self.sel_roots();
         if roots.is_empty() {

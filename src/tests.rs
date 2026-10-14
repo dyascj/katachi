@@ -2870,3 +2870,70 @@ fn number_keys_set_opacity_and_shift_x_swaps_fill_and_stroke() {
     key(&mut h, Modifiers::NONE, Key::Num5);
     assert_eq!(h.state().doc.node(t).opacity, 1.0);
 }
+
+/// UI review renders: `cargo test --release ui_tour -- --ignored` writes target/tour/*.png.
+#[test]
+#[ignore]
+fn ui_tour() {
+    isolate_data();
+    let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tour");
+    std::fs::create_dir_all(&out).unwrap();
+    for theme in [egui::Theme::Dark, egui::Theme::Light] {
+        let tag = if theme == egui::Theme::Dark { "dark" } else { "light" };
+        let mut h = Harness::builder().with_size(vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).with_theme(theme).wgpu().build_eframe(|cc| {
+            crate::setup_style(&cc.egui_ctx);
+            let mut app = App::new(Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/demo.katachi")));
+            app.recoverable.clear();
+            app
+        });
+        h.run_steps(4);
+        let save = |h: &mut Harness<App>, name: &str| {
+            h.run_steps(3);
+            h.render().unwrap().save(out.join(format!("{tag}-{name}.png"))).unwrap();
+        };
+        save(&mut h, "1-editor");
+        let first = h.state().doc.pages[0].children[0];
+        h.state_mut().sel = vec![first];
+        save(&mut h, "2-frame-selected");
+        let p = h.state().view.to_screen(h.state().doc.node(first).rect.center());
+        h.input_mut().events.push(Event::PointerMoved(p));
+        h.input_mut().events.push(Event::PointerButton { pos: p, button: PointerButton::Secondary, pressed: true, modifiers: Modifiers::NONE });
+        h.input_mut().events.push(Event::PointerButton { pos: p, button: PointerButton::Secondary, pressed: false, modifiers: Modifiers::NONE });
+        save(&mut h, "3-context-menu");
+        key(&mut h, Modifiers::NONE, Key::Escape);
+        click(&mut h, pos2(22.0, 22.0), Modifiers::NONE);
+        save(&mut h, "4-main-menu");
+        key(&mut h, Modifiers::NONE, Key::Escape);
+        h.state_mut().prototype_tab = true;
+        save(&mut h, "5-prototype");
+        h.state_mut().prototype_tab = false;
+        h.state_mut().dev_mode = true;
+        save(&mut h, "6-dev-mode");
+        h.state_mut().dev_mode = false;
+        h.state_mut().sel.clear();
+        h.state_mut().open_settings(crate::settings::Tab::Appearance);
+        save(&mut h, "7-settings");
+        h.state_mut().settings_tab = None;
+        key(&mut h, Modifiers::COMMAND, Key::K);
+        save(&mut h, "8-quick-actions");
+    }
+}
+
+#[test]
+fn right_click_select_layer_and_move_to_page() {
+    let mut h = harness();
+    let f = draw(&mut h, Key::F, (0.0, 0.0), (200.0, 200.0));
+    let r1 = draw(&mut h, Key::R, (20.0, 20.0), (120.0, 120.0));
+    // Everything under the pointer, top first: the rectangle, then the frame around it.
+    assert_eq!(h.state().layers_at(pos2(50.0, 50.0)), vec![r1, f]);
+    assert_eq!(h.state().layers_at(pos2(150.0, 150.0)), vec![f]);
+    h.state_mut().doc.pages.push(crate::doc::Page { name: "Two".into(), ..h.state().doc.pages[0].clone() });
+    h.state_mut().doc.pages[1].children.clear();
+    h.state_mut().sel = vec![f];
+    h.state_mut().move_to_page(1);
+    assert!(h.state().doc.pages[0].children.is_empty());
+    assert_eq!(h.state().doc.pages[1].children, vec![f]);
+    assert_eq!(h.state().doc.node(r1).parent, Some(f), "children travel with it");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().doc.pages[0].children, vec![f], "one undo step");
+}
