@@ -64,6 +64,8 @@ pub enum Drag {
     Pencil { points: Vec<Pos2> },
     /// Prototype tab: dragging a connection from a layer to a frame.
     Connect { from: NodeId },
+    /// A ruler guide being dragged (or just pulled out of a ruler).
+    Guide { index: usize },
     /// Smart selection: a spacing handle sets every gap along `axis` (0 = row) at once.
     Spacing { base: Document, axis: usize, items: Vec<(NodeId, Rect)>, gap: f32, start: Pos2 },
     /// Smart selection: one layer dragged by its center knob onto another's slot swaps them.
@@ -161,6 +163,10 @@ pub struct App {
     pub guides: Vec<[Pos2; 2]>,
     /// Equal-spacing markers while snapping: world segments across each matching gap.
     pub gap_marks: Vec<[Pos2; 2]>,
+    /// The selected ruler guide on this page (Backspace deletes it).
+    pub guide_sel: Option<usize>,
+    /// Pressed a ruler (new guide on this axis) or an existing guide; a drag moves it.
+    pub guide_grab: Option<(crate::doc::Axis, Option<usize>)>,
     pub frame_labels: Vec<(NodeId, Rect)>,
     pub layer_drag: Option<NodeId>,
     pub canvas_rect: Option<Rect>,
@@ -283,6 +289,8 @@ impl App {
             renaming_page: None,
             guides: vec![],
             gap_marks: vec![],
+            guide_sel: None,
+            guide_grab: None,
             frame_labels: vec![],
             layer_drag: None,
             canvas_rect: None,
@@ -593,6 +601,7 @@ impl App {
             self.end_text_edit();
             self.page = i;
             self.sel.clear();
+            self.guide_sel = None;
             self.view_ready = false;
         }
     }
@@ -2240,6 +2249,7 @@ impl App {
                     self.zoom_to(ctx, Some(s), false)
                 }
             }
+            (false, _, _, Key::Delete | Key::Backspace) if self.guide_sel.is_some() => self.delete_guide(),
             (false, _, _, Key::Delete | Key::Backspace) => self.delete_selection(),
             (false, _, _, Key::ArrowLeft) => self.nudge(vec2(-step, 0.0)),
             (false, _, _, Key::ArrowRight) => self.nudge(vec2(step, 0.0)),

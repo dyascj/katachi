@@ -835,6 +835,10 @@ impl App {
                 self.rulers = !self.rulers;
                 ui.close();
             }
+            if enabled(ui, !self.doc.pages[self.page].guides.is_empty(), "     Remove all guides", "") {
+                self.remove_all_guides();
+                ui.close();
+            }
             if check(ui, self.outline_mode, "Outlines", "⌘Y") {
                 self.outline_mode = !self.outline_mode;
                 ui.close();
@@ -1078,7 +1082,7 @@ impl App {
                 if icon_button(ui, Icon::Plus, false, 22.0, "Add page").clicked() {
                     self.checkpoint();
                     let n = self.doc.pages.len() + 1;
-                    self.doc.pages.push(Page { name: format!("Page {n}"), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None });
+                    self.doc.pages.push(Page { name: format!("Page {n}"), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, guides: vec![] });
                     self.select_page(n - 1);
                 }
             });

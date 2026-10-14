@@ -55,6 +55,7 @@ const COMMANDS: &[(&str, &str, Run)] = &[
     ("Show/Hide selection", "⇧⌘H", |a, _| a.toggle_visible()),
     ("Lock/Unlock selection", "⇧⌘L", |a, _| a.toggle_locked()),
     ("Rulers", "⇧R", |a, _| a.rulers = !a.rulers),
+    ("Remove all guides", "", |a, _| a.remove_all_guides()),
     ("Outline mode", "⌘Y", |a, _| a.outline_mode = !a.outline_mode),
     ("Layout guides", "⌃G", |a, _| a.show_grids = !a.show_grids),
     ("Hide UI", "⌘\\", |a, _| a.ui_hidden = !a.ui_hidden),

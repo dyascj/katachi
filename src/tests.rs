@@ -1858,7 +1858,7 @@ fn files_and_pages_reopen_where_they_were_viewed() {
     assert_eq!(g.state().view.zoom, 2.5);
     assert!((back - center).length() < 0.5, "{back:?} vs {center:?}");
     // Switching pages and back keeps each page's view.
-    g.state_mut().doc.pages.push(crate::doc::Page { name: "Two".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None });
+    g.state_mut().doc.pages.push(crate::doc::Page { name: "Two".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, guides: vec![] });
     g.state_mut().select_page(1);
     g.run_steps(2);
     g.state_mut().select_page(0);
@@ -2096,4 +2096,41 @@ fn smart_selection_spacing_handle_and_swap() {
     drag(&mut h, p, q, Modifiers::NONE);
     assert_eq!((rect(&h, a).min.x, rect(&h, b).min.x, rect(&h, c).min.x), (300., 150., 0.));
     assert_eq!(h.state().sel.len(), 3, "selection kept");
+}
+
+#[test]
+fn ruler_guides_create_snap_move_and_delete() {
+    use crate::doc::{Axis, Guide};
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    key(&mut h, Modifiers::SHIFT, Key::R);
+    let top = h.state().canvas_rect.unwrap().min + vec2(400.0, 10.0);
+    // Pull a horizontal guide out of the top ruler down to y = 200.
+    let to = pos2(top.x, s(&h, 0., 200.).y);
+    drag(&mut h, top, to, Modifiers::NONE);
+    assert_eq!(h.state().doc.pages[0].guides, vec![Guide { axis: Axis::Y, offset: 200.0 }]);
+    // Layers snap to it: the bottom edge dropped 3px short lands on the guide.
+    let (a, b) = (s(&h, 50., 50.), s(&h, 50., 147.));
+    click(&mut h, a, Modifiers::NONE);
+    drag(&mut h, a, b, Modifiers::NONE);
+    assert_eq!(rect(&h, id).min.y, 100.0);
+    // Drag the guide itself, then select it and delete it with Backspace.
+    let (a, b) = (s(&h, 300., 200.), s(&h, 300., 250.));
+    drag(&mut h, a, b, Modifiers::NONE);
+    assert_eq!(h.state().doc.pages[0].guides[0].offset, 250.0);
+    let p = s(&h, 300., 250.);
+    click(&mut h, p, Modifiers::NONE);
+    assert_eq!(h.state().guide_sel, Some(0));
+    assert!(h.state().sel.is_empty(), "selecting a guide drops the layer selection");
+    key(&mut h, Modifiers::NONE, Key::Backspace);
+    assert!(h.state().doc.pages[0].guides.is_empty());
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().doc.pages[0].guides.len(), 1, "undoable");
+    // Dragging it back onto the ruler removes it; guides round-trip through the file.
+    let json = crate::doc::file_json(&h.state().doc);
+    assert_eq!(crate::doc::parse_file(&json).unwrap().pages[0].guides.len(), 1);
+    let a = s(&h, 300., 250.);
+    drag(&mut h, a, top, Modifiers::NONE);
+    assert!(h.state().doc.pages[0].guides.is_empty());
+    assert!(!crate::doc::file_json(&h.state().doc).contains("guides"), "no guides, no field");
 }

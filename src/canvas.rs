@@ -1,7 +1,7 @@
 //! Infinite canvas: navigation, tools, selection, snapping, and on-canvas overlays.
 
 use crate::app::{App, Drag, Grip, Press, Tool};
-use crate::doc::{Kind, LayoutMode, Node, NodeId, Order, PathPoint, Sizing, rotate};
+use crate::doc::{Axis, Guide, Kind, LayoutMode, Node, NodeId, Order, PathPoint, Sizing, rotate};
 use crate::render::{self, View};
 use egui::{
     Color32, CornerRadius, CursorIcon, FontId, Key, Painter, PointerButton, Pos2, Rect, Sense, Stroke, StrokeKind,
@@ -13,6 +13,8 @@ const TEXT_EDIT_ID: &str = "katachi-text-edit";
 pub const BLUE: Color32 = Color32::from_rgb(0x0D, 0x99, 0xFF);
 pub const PURPLE: Color32 = Color32::from_rgb(0x97, 0x47, 0xFF);
 const SNAP: Color32 = Color32::from_rgb(0xF2, 0x48, 0x22);
+/// Ruler thickness, in screen points.
+const RULER: f32 = 20.0;
 /// Figma's pink for spacing: equal-gap markers and smart selection handles.
 const GAP: Color32 = Color32::from_rgb(0xFF, 0x24, 0xBD);
 
@@ -96,7 +98,7 @@ impl App {
         self.hover = None;
         if self.drag.is_none() && self.tool == Tool::Move && resp.hovered() && !panning
             && let (Some(s), Some(w)) = (ptr, world)
-                && self.handle_at(s).is_none() {
+                && self.handle_at(s).is_none() && self.guide_at(s).is_none() {
                     self.hover = self.target_at(w, s, mods.command);
                 }
 
@@ -163,6 +165,7 @@ impl App {
         if (mods.alt || self.dev_mode) && self.drag.is_none() {
             self.draw_measurements(&painter);
         }
+        self.draw_guides(&painter, rect);
         if self.rulers {
             self.draw_rulers(&painter, rect);
         }
@@ -383,6 +386,18 @@ impl App {
                 return;
             }
         }
+        // Rulers pull out new guides; the move tool grabs existing ones.
+        let ruler = self.ruler_at(s);
+        let guide = if ruler.is_none() { self.guide_at(s) } else { None };
+        self.guide_sel = guide;
+        if let Some(axis) = ruler.or(guide.map(|i| self.doc.pages[self.page].guides[i].axis)) {
+            if guide.is_some() {
+                self.sel.clear();
+            }
+            self.guide_grab = Some((axis, guide));
+            self.press = Some(Press { world: w, target: None, handle: None, toggle_off: false });
+            return;
+        }
         if tool == Tool::Move && self.vector_edit.is_some() && self.vector_press(s, mods.shift) {
             self.press = Some(Press { world: w, target: None, handle: None, toggle_off: false });
             return;
@@ -453,6 +468,17 @@ impl App {
             return;
         };
         self.pending_frame = None;
+        if let Some((axis, index)) = self.guide_grab.take() {
+            self.checkpoint();
+            let guides = &mut self.doc.pages[self.page].guides;
+            let index = index.unwrap_or_else(|| {
+                guides.push(Guide { axis, offset: 0.0 });
+                guides.len() - 1
+            });
+            self.guide_sel = Some(index);
+            self.drag = Some(Drag::Guide { index });
+            return;
+        }
         let start = press.world;
         if self.vector_edit.is_some() {
             self.drag = self.vector_drag_start();
@@ -710,6 +736,11 @@ impl App {
                     }
                 }
             }
+            Drag::Guide { index } => {
+                if let Some(axis) = self.doc.pages[self.page].guides.get(*index).map(|g| g.axis) {
+                    self.doc.pages[self.page].guides[*index].offset = self.px1(if axis == Axis::X { w.x } else { w.y });
+                }
+            }
             Drag::Spacing { base, axis, items, gap, start } => {
                 self.doc = base.clone();
                 let g = self.px1((*gap + (w - *start)[*axis]).max(0.0));
@@ -740,6 +771,19 @@ impl App {
                 if let Some(t) = target {
                     self.checkpoint();
                     self.doc.node_mut(from).reactions.push(crate::doc::Reaction { action: crate::doc::Action::Navigate(t), ..Default::default() });
+                }
+            }
+            Some(Drag::Guide { index }) => {
+                // Dropped back on its ruler (or off the canvas that way): gone.
+                let (s, r) = (self.view.to_screen(w), self.canvas_rect.unwrap_or(Rect::EVERYTHING));
+                let guides = &mut self.doc.pages[self.page].guides;
+                let gone = guides.get(index).is_some_and(|g| match g.axis {
+                    Axis::X => s.x < r.min.x + RULER,
+                    Axis::Y => s.y < r.min.y + RULER,
+                });
+                if gone {
+                    guides.remove(index);
+                    self.guide_sel = None;
                 }
             }
             Some(Drag::Swap { base, id, axis, mut items, .. }) => {
@@ -821,6 +865,10 @@ impl App {
     }
 
     fn on_click(&mut self, w: Pos2, mods: egui::Modifiers) {
+        if self.guide_grab.take().is_some() {
+            self.press = None;
+            return;
+        }
         if self.vector_edit.is_some() {
             self.press = None;
             return;
@@ -1073,19 +1121,20 @@ impl App {
     fn snap(&mut self, moving: Rect, exclude: &[NodeId], mx: [bool; 3], my: [bool; 3]) -> Vec2 {
         self.guides.clear();
         self.gap_marks.clear();
-        if !self.prefs.snap_to_objects {
-            return Vec2::ZERO;
-        }
         let tol = 5.0 / self.view.zoom;
-        let targets = self.snap_targets(exclude);
-        let sibs = self.snap_siblings(exclude);
+        let objects = self.prefs.snap_to_objects;
+        let targets = if objects { self.snap_targets(exclude) } else { vec![] };
+        let sibs = if objects { self.snap_siblings(exclude) } else { vec![] };
+        // Ruler guides always snap.
+        let lines: Vec<Guide> = self.doc.pages[self.page].guides.clone();
         let vals = |r: Rect, a: usize| [r.min[a], r.center()[a], r.max[a]];
         let mut corr = Vec2::ZERO;
         let mut gap_used = [None, None];
         for (a, mask) in [mx, my].into_iter().enumerate() {
             let mut best: Option<f32> = None;
             for (_, mv) in vals(moving, a).iter().enumerate().filter(|(i, _)| mask[*i]) {
-                for tv in targets.iter().flat_map(|r| vals(*r, a)) {
+                let on_axis = lines.iter().filter(|g| g.axis as usize == a).map(|g| g.offset);
+                for tv in targets.iter().flat_map(|r| vals(*r, a)).chain(on_axis) {
                     let d = tv - mv;
                     if d.abs() < tol && best.is_none_or(|b| d.abs() < b.abs()) {
                         best = Some(d);
@@ -1472,9 +1521,66 @@ impl App {
         }
     }
 
+    /// The ruler under screen point `s`, as the axis of the guide it pulls out (top ruler: Y).
+    fn ruler_at(&self, s: Pos2) -> Option<Axis> {
+        let r = self.canvas_rect.filter(|_| self.rulers)?;
+        let (top, left) = (s.y < r.min.y + RULER, s.x < r.min.x + RULER);
+        match (top, left) {
+            (true, false) => Some(Axis::Y),
+            (false, true) => Some(Axis::X),
+            _ => None,
+        }
+    }
+
+    /// The ruler guide within grabbing distance of screen point `s` (move tool only).
+    fn guide_at(&self, s: Pos2) -> Option<usize> {
+        if !self.tool.selects() || self.vector_edit.is_some() {
+            return None;
+        }
+        self.doc.pages[self.page].guides.iter().position(|g| {
+            let at = self.view.to_screen(pos2(g.offset, g.offset));
+            match g.axis {
+                Axis::X => (at.x - s.x).abs() <= 3.0,
+                Axis::Y => (at.y - s.y).abs() <= 3.0,
+            }
+        })
+    }
+
+    pub fn delete_guide(&mut self) {
+        if let Some(i) = self.guide_sel.take().filter(|i| *i < self.doc.pages[self.page].guides.len()) {
+            self.checkpoint();
+            self.doc.pages[self.page].guides.remove(i);
+        }
+    }
+
+    pub fn remove_all_guides(&mut self) {
+        self.guide_sel = None;
+        if !self.doc.pages[self.page].guides.is_empty() {
+            self.checkpoint();
+            self.doc.pages[self.page].guides.clear();
+        }
+    }
+
+    /// Ruler guides: thin red lines across the canvas. The selected one is bolder and shows its
+    /// position next to the ruler.
+    fn draw_guides(&self, painter: &Painter, rect: Rect) {
+        for (i, g) in self.doc.pages[self.page].guides.iter().enumerate() {
+            let on = self.guide_sel == Some(i);
+            let at = self.view.to_screen(pos2(g.offset, g.offset));
+            let (line, label) = match g.axis {
+                Axis::X => ([pos2(at.x, rect.min.y), pos2(at.x, rect.max.y)], pos2(at.x, rect.min.y + RULER + 12.0)),
+                Axis::Y => ([pos2(rect.min.x, at.y), pos2(rect.max.x, at.y)], pos2(rect.min.x + RULER + 20.0, at.y)),
+            };
+            painter.line_segment(line, Stroke::new(if on { 1.5 } else { 1.0 }, SNAP));
+            if on {
+                pill(painter, label, num(g.offset), SNAP);
+            }
+        }
+    }
+
     /// Shift+R: top and left rulers with the selection's span highlighted.
     fn draw_rulers(&self, painter: &Painter, rect: Rect) {
-        const T: f32 = 20.0;
+        const T: f32 = RULER;
         let bg = painter.ctx().global_style().visuals.panel_fill.to_opaque();
         let line = crate::appearance::border(painter.ctx());
         let text = crate::appearance::muted(painter.ctx());
@@ -1517,8 +1623,16 @@ impl App {
 
     fn set_cursor(&self, ui: &Ui, ptr: Option<Pos2>, panning: bool) {
         let Some(p) = ptr.filter(|_| ui.ui_contains_pointer()) else { return };
+        let guide = match &self.drag {
+            Some(Drag::Guide { index }) => Some(*index),
+            None => self.guide_at(p),
+            _ => None,
+        };
+        let guide = guide.and_then(|i| self.doc.pages[self.page].guides.get(i)).map(|g| g.axis);
         let icon = if panning {
             if ui.input(|i| i.pointer.any_down()) { CursorIcon::Grabbing } else { CursorIcon::Grab }
+        } else if let Some(axis) = guide {
+            if axis == Axis::X { CursorIcon::ResizeHorizontal } else { CursorIcon::ResizeVertical }
         } else {
             match self.tool {
                 Tool::Move | Tool::Scale => match self.handle_at(p) {
@@ -1828,6 +1942,14 @@ impl App {
         if item(ui, "Lock/Unlock", "⇧⌘L", has) {
             self.toggle_locked();
             ui.close();
+        }
+        let guides = !self.doc.pages[self.page].guides.is_empty();
+        if guides {
+            ui.separator();
+            if item(ui, "Remove all guides", "", true) {
+                self.remove_all_guides();
+                ui.close();
+            }
         }
     }
 }

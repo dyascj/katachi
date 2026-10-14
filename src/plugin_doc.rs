@@ -1239,7 +1239,7 @@ pub fn apply(doc: &mut Document, out: &Value) -> HashMap<String, NodeId> {
         let i = match p["id"].as_str().and_then(|s| s.strip_prefix("page:")).and_then(|s| s.parse::<usize>().ok()).filter(|i| *i < doc.pages.len()) {
             Some(i) => i,
             None => {
-                doc.pages.push(Page { name: name.clone(), children: vec![], background: PAGE_BG, flows: vec![], view: None });
+                doc.pages.push(Page { name: name.clone(), children: vec![], background: PAGE_BG, flows: vec![], view: None, guides: vec![] });
                 doc.pages.len() - 1
             }
         };
