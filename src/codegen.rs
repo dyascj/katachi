@@ -21,15 +21,23 @@ fn css_color(c: Rgba) -> String {
 fn css_paint(p: &Paint) -> String {
     match p.kind {
         PaintKind::Solid => css_color(p.color),
-        PaintKind::Linear | PaintKind::Radial => {
-            let stops: Vec<String> = p.stops.iter().map(|(t, c)| format!("{} {}%", css_color(*c), num(t * 100.0))).collect();
-            if p.kind == PaintKind::Linear {
-                // CSS angles: 0deg points up, clockwise.
-                let d = p.to - p.from;
-                let deg = (d.x.atan2(-d.y).to_degrees() + 360.0) % 360.0;
-                format!("linear-gradient({}deg, {})", num(deg), stops.join(", "))
-            } else {
-                format!("radial-gradient(50% 50% at {}% {}%, {})", num(p.from.x * 100.0), num(p.from.y * 100.0), stops.join(", "))
+        PaintKind::Linear | PaintKind::Radial | PaintKind::Angular | PaintKind::Diamond => {
+            let pct = |t: f32| format!("{}%", num(t * 100.0));
+            let stops: Vec<String> = p.stops.iter().map(|(t, c)| format!("{} {}", css_color(*c), pct(*t))).collect();
+            let at = format!("{} {}", pct(p.from.x), pct(p.from.y));
+            // CSS angles: 0deg points up, clockwise.
+            let d = p.to - p.from;
+            let deg = (d.x.atan2(-d.y).to_degrees() + 360.0) % 360.0;
+            match p.kind {
+                PaintKind::Linear => format!("linear-gradient({}deg, {})", num(deg), stops.join(", ")),
+                // Figma's angular starts toward the end handle and turns clockwise, as conic-gradient does.
+                PaintKind::Angular => format!("conic-gradient(from {}deg at {at}, {})", num(deg), stops.join(", ")),
+                _ => {
+                    // CSS has no diamond gradient (or rotated ellipses): an axis-aligned ellipse is closest.
+                    let w = p.width_point() - p.from;
+                    let (rx, ry) = if d.x.abs() >= d.y.abs() { (d.length(), w.length()) } else { (w.length(), d.length()) };
+                    format!("radial-gradient({} {} at {at}, {})", pct(rx), pct(ry), stops.join(", "))
+                }
             }
         }
         PaintKind::Image => "url(image.png) center / cover no-repeat".into(),
@@ -333,5 +341,19 @@ mod tests {
         assert!(tc.contains("font-weight: 600;") && tc.contains("text-transform: uppercase;") && !tc.contains("position"), "{tc}");
         assert!(swiftui(&d, t).contains("Text(\"Hi\")") && swiftui(&d, t).contains(".semibold"));
         assert!(compose(&d, f).starts_with("Row("));
+    }
+
+    #[test]
+    fn angular_is_conic_and_gradients_roundtrip_through_plugins() {
+        let mut p = crate::doc::Paint::solid(crate::doc::Rgba::rgb(255, 0, 0));
+        p.convert(PaintKind::Angular);
+        assert!(css_paint(&p).starts_with("conic-gradient(from 90deg at 50% 50%, #FF0000 0%"), "{}", css_paint(&p));
+        p.convert(PaintKind::Diamond);
+        p.width_to = Some(pos2(0.5, 0.75));
+        let v = crate::plugin_doc::paint_json(&p, None);
+        assert_eq!(v["type"], "GRADIENT_DIAMOND");
+        let back = crate::plugin_doc::paint_from(&v, &Document::default(), None).unwrap();
+        assert_eq!(back.kind, PaintKind::Diamond);
+        assert!(back.width_to.is_some_and(|w| w.distance(pos2(0.5, 0.75)) < 1e-4) && back.to.distance(p.to) < 1e-4);
     }
 }

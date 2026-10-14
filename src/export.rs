@@ -170,19 +170,45 @@ impl Svg<'_> {
             }
             PaintKind::Linear | PaintKind::Radial => {
                 let id = self.id("paint");
-                // Defined in the layer's unit square, mapped onto it.
-                let m = format!("matrix({} 0 0 {} {} {})", r.width().max(1e-3), r.height().max(1e-3), r.min.x, r.min.y);
+                let (sx, sy) = (r.width().max(1e-3), r.height().max(1e-3));
+                // Defined in the layer's unit square, mapped onto it. A radial is a unit circle
+                // mapped onto its two handle axes, which makes it an ellipse when they differ.
                 let geo = if p.kind == PaintKind::Linear {
-                    format!(r#"<linearGradient id="{id}" x1="{}" y1="{}" x2="{}" y2="{}""#, p.from.x, p.from.y, p.to.x, p.to.y)
+                    let m = format!("matrix({sx} 0 0 {sy} {} {})", r.min.x, r.min.y);
+                    format!(r#"<linearGradient id="{id}" x1="{}" y1="{}" x2="{}" y2="{}" gradientUnits="userSpaceOnUse" gradientTransform="{m}">"#, p.from.x, p.from.y, p.to.x, p.to.y)
                 } else {
-                    format!(r#"<radialGradient id="{id}" cx="{}" cy="{}" r="{}""#, p.from.x, p.from.y, (p.to - p.from).length())
+                    let (d, w) = (p.to - p.from, p.width_point() - p.from);
+                    let m = format!("matrix({} {} {} {} {} {})", sx * d.x, sy * d.y, sx * w.x, sy * w.y, r.min.x + sx * p.from.x, r.min.y + sy * p.from.y);
+                    format!(r#"<radialGradient id="{id}" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="{m}">"#)
                 };
-                let _ = write!(self.defs, r#"{geo} gradientUnits="userSpaceOnUse" gradientTransform="{m}">"#);
+                self.defs.push_str(&geo);
                 for (t, c) in &p.stops {
                     let (c, a) = color_parts(*c);
                     let _ = write!(self.defs, r#"<stop offset="{t}" stop-color="{c}" stop-opacity="{a:.3}"/>"#);
                 }
                 self.defs.push_str(if p.kind == PaintKind::Linear { "</linearGradient>" } else { "</radialGradient>" });
+                format!(r#"{name}="url(#{id})" {name}-opacity="{:.3}""#, p.alpha())
+            }
+            PaintKind::Angular | PaintKind::Diamond => {
+                // SVG has neither: bake the gradient into an image pattern over the layer.
+                // ponytail: 2 px per unit up to 1024 px a side; bump the density if big exports band
+                let px = |len: f32| (len * 2.0).ceil().clamp(16.0, 1024.0) as u32;
+                let (w, h) = (px(r.width()), px(r.height()));
+                let img = image::RgbaImage::from_fn(w, h, |x, y| {
+                    image::Rgba(p.sample(p.gradient_t(egui::pos2((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32))).0)
+                });
+                let mut png = std::io::Cursor::new(vec![]);
+                if img.write_to(&mut png, image::ImageFormat::Png).is_err() {
+                    return format!(r#"{name}="none""#);
+                }
+                use base64::Engine;
+                let data = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+                let id = self.id("paint");
+                let (x, y, w, h) = (r.min.x, r.min.y, r.width(), r.height());
+                let _ = write!(
+                    self.defs,
+                    r#"<pattern id="{id}" patternUnits="userSpaceOnUse" x="{x}" y="{y}" width="{w}" height="{h}"><image href="data:image/png;base64,{data}" x="0" y="0" width="{w}" height="{h}" preserveAspectRatio="none"/></pattern>"#
+                );
                 format!(r#"{name}="url(#{id})" {name}-opacity="{:.3}""#, p.alpha())
             }
             PaintKind::Image => {
@@ -811,6 +837,33 @@ mod tests {
         let img = image::load_from_memory(&png).unwrap().to_rgba8();
         assert!(img.get_pixel(5, 20).0[0] > 200, "left half red");
         assert!(img.get_pixel(35, 20).0[2] > 200, "right half blue");
+    }
+
+    #[test]
+    fn angular_diamond_and_elliptical_radial_export() {
+        let mut d = Document::default();
+        let px = |d: &Document, id, x, y| image::load_from_memory(&to_png(d, &[id], 1.0).unwrap()).unwrap().to_rgba8().get_pixel(x, y).0;
+        let mut add = |kind| {
+            let mut g = Paint::solid(Rgba::rgb(255, 0, 0));
+            g.convert(kind);
+            g.stops = vec![(0.0, Rgba::rgb(255, 0, 0)), (1.0, Rgba::rgb(0, 0, 255))];
+            let mut n = Node::new(Kind::Rectangle, Rect::from_min_size(pos2(0., 0.), vec2(100., 100.)));
+            n.fills = vec![g];
+            d.insert(0, None, None, n)
+        };
+        let (ang, dia, rad) = (add(PaintKind::Angular), add(PaintKind::Diamond), add(PaintKind::Radial));
+        // Angular: red just below the start ray (right of center), blue just above it, purple halfway round.
+        assert!(px(&d, ang, 90, 52)[0] > 200 && px(&d, ang, 90, 47)[2] > 200);
+        let left = px(&d, ang, 10, 50);
+        assert!(left[0] > 90 && left[2] > 90, "{left:?}");
+        // Diamond: the edge midpoint is the corner of the last ring; the box corner is past it.
+        assert!(px(&d, dia, 50, 50)[0] > 240);
+        assert!(px(&d, dia, 99, 99)[2] > 240 && px(&d, dia, 75, 75)[2] > 240);
+        // An elliptical radial (half as tall): blue already at 75% of the way down.
+        d.node_mut(rad).fills[0].width_to = Some(pos2(0.5, 0.75));
+        let svg = to_svg(&d, &[rad]);
+        assert!(svg.contains(r#"<radialGradient id="paint1" cx="0" cy="0" r="1""#), "{svg}");
+        assert!(px(&d, rad, 50, 76)[2] > 240 && px(&d, rad, 76, 50)[0] > 60);
     }
 
     #[test]

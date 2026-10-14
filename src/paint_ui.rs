@@ -154,18 +154,18 @@ fn swatch(ui: &mut Ui, p: &Paint) -> egui::Response {
         PaintKind::Solid => {
             painter.rect_filled(rect, 0.0, p.color.to32());
         }
-        PaintKind::Linear | PaintKind::Radial => {
+        PaintKind::Image => {
+            painter.rect_filled(rect, 0.0, Color32::from_gray(0xC8));
+            painter.circle_filled(rect.center() + vec2(3.0, -3.0), 2.5, Color32::WHITE);
+            painter.line_segment([rect.left_bottom() + vec2(2.0, -3.0), rect.center() + vec2(-1.0, 1.0)], Stroke::new(1.5, Color32::WHITE));
+        }
+        _ => {
             let n = 10;
             for i in 0..n {
                 let t = (i as f32 + 0.5) / n as f32;
                 let q = Rect::from_min_max(pos2(rect.min.x + rect.width() * i as f32 / n as f32, rect.min.y), pos2(rect.min.x + rect.width() * (i + 1) as f32 / n as f32, rect.max.y));
                 painter.rect_filled(q, 0.0, p.sample(t).to32());
             }
-        }
-        PaintKind::Image => {
-            painter.rect_filled(rect, 0.0, Color32::from_gray(0xC8));
-            painter.circle_filled(rect.center() + vec2(3.0, -3.0), 2.5, Color32::WHITE);
-            painter.line_segment([rect.left_bottom() + vec2(2.0, -3.0), rect.center() + vec2(-1.0, 1.0)], Stroke::new(1.5, Color32::WHITE));
         }
     }
     painter.rect_stroke(rect, 2.0, Stroke::new(1.0, Color32::from_black_alpha(25)), StrokeKind::Inside);
@@ -232,8 +232,9 @@ pub fn paint_row(ui: &mut Ui, id: egui::Id, paint: &mut Paint, title: &str) -> P
 
 fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEvent> {
     let mut ev = None;
-    ui.horizontal(|ui| {
-        for k in [PaintKind::Solid, PaintKind::Linear, PaintKind::Radial, PaintKind::Image] {
+    // Paint type as a dropdown, as in Figma's header.
+    crate::chrome::menu_button(ui, format!("{:?}", paint.kind), |ui| {
+        for k in PaintKind::ALL {
             if ui.selectable_label(paint.kind == k, format!("{k:?}")).clicked() && paint.kind != k {
                 paint.convert(k);
                 ev = Some(PaintEvent::Changed);
@@ -247,7 +248,7 @@ fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEve
                 ev = Some(PaintEvent::Changed);
             }
         }
-        PaintKind::Linear | PaintKind::Radial => {
+        PaintKind::Linear | PaintKind::Radial | PaintKind::Angular | PaintKind::Diamond => {
             if paint.kind == PaintKind::Linear {
                 // Angle of the gradient axis, measured like Figma (0° = left to right).
                 let d = paint.to - paint.from;

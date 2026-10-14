@@ -117,7 +117,7 @@ fn paints(list: &[Value]) -> Vec<Paint> {
             "SOLID" => Paint::solid(rgba(p.get("color"), opacity)),
             "GRADIENT_LINEAR" | "GRADIENT_RADIAL" | "GRADIENT_ANGULAR" | "GRADIENT_DIAMOND" => {
                 let mut g = Paint::solid(Rgba::WHITE.with_alpha((opacity * 255.0) as u8));
-                g.kind = if kind == "GRADIENT_LINEAR" { PaintKind::Linear } else { PaintKind::Radial };
+                g.kind = crate::doc::gradient_kind(kind);
                 g.stops = p.arr("stops").iter().map(|st| (st.f("position").unwrap_or(0.0), rgba(st.get("color"), 1.0))).collect();
                 // Figma's gradient transform maps the layer's unit square into gradient space,
                 // where the gradient runs along x at y = 0.5.
@@ -128,6 +128,7 @@ fn paints(list: &[Value]) -> Vec<Paint> {
                 } else {
                     g.from = inv.apply(pos2(0.5, 0.5));
                     g.to = inv.apply(pos2(1.0, 0.5));
+                    g.width_to = crate::doc::explicit_width(&g, inv.apply(pos2(0.5, 1.0)));
                 }
                 g
             }

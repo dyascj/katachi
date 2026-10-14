@@ -83,14 +83,17 @@ fn map(m: [[f64; 3]; 2], x: f64, y: f64) -> Pos2 {
 }
 
 /// Figma's gradientTransform maps the layer's unit square onto gradient space, where a linear
-/// gradient runs (0, 0.5) -> (1, 0.5) and a radial one is centered at (0.5, 0.5) with radius 0.5.
+/// gradient runs (0, 0.5) -> (1, 0.5) and the others are centered at (0.5, 0.5) with radius 0.5
+/// (the width handle at (0.5, 1)).
 fn gradient_transform(p: &Paint) -> Value {
     let (a, d) = (p.from, p.to - p.from);
     let (a, d) = ((a.x as f64, a.y as f64), (d.x as f64, d.y as f64));
+    let w = p.width_point() - p.from;
+    let w = (w.x as f64, w.y as f64);
     let m = if p.kind == PaintKind::Linear {
         [[d.0, -d.1, a.0 + 0.5 * d.1], [d.1, d.0, a.1 - 0.5 * d.0]]
     } else {
-        [[2.0 * d.0, -2.0 * d.1, a.0 - d.0 + d.1], [2.0 * d.1, 2.0 * d.0, a.1 - d.1 - d.0]]
+        [[2.0 * d.0, 2.0 * w.0, a.0 - d.0 - w.0], [2.0 * d.1, 2.0 * w.1, a.1 - d.1 - w.1]]
     };
     let t = inverse(m).unwrap_or([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]);
     json!([[t[0][0], t[0][1], t[0][2]], [t[1][0], t[1][1], t[1][2]]])
@@ -99,8 +102,13 @@ fn gradient_transform(p: &Paint) -> Value {
 pub fn paint_json(p: &Paint, bound: Option<VarId>) -> Value {
     let mut v = match p.kind {
         PaintKind::Solid => json!({ "type": "SOLID", "color": rgb(p.color), "opacity": unit(p.color.a()) }),
-        PaintKind::Linear | PaintKind::Radial => json!({
-            "type": if p.kind == PaintKind::Linear { "GRADIENT_LINEAR" } else { "GRADIENT_RADIAL" },
+        PaintKind::Linear | PaintKind::Radial | PaintKind::Angular | PaintKind::Diamond => json!({
+            "type": match p.kind {
+                PaintKind::Linear => "GRADIENT_LINEAR",
+                PaintKind::Angular => "GRADIENT_ANGULAR",
+                PaintKind::Diamond => "GRADIENT_DIAMOND",
+                _ => "GRADIENT_RADIAL",
+            },
             "gradientStops": p.stops.iter().map(|(t, c)| json!({ "position": t, "color": rgba(*c) })).collect::<Vec<_>>(),
             "gradientTransform": gradient_transform(p),
             "opacity": unit(p.color.a()),
@@ -129,7 +137,7 @@ pub fn paint_from(v: &Value, doc: &Document, layer: Option<egui::Vec2>) -> Optio
         "SOLID" => Paint::solid(color_from(v.get("color")?, opacity)),
         t @ ("GRADIENT_LINEAR" | "GRADIENT_RADIAL" | "GRADIENT_ANGULAR" | "GRADIENT_DIAMOND") => {
             let mut p = Paint::solid(Rgba::WHITE.with_alpha(byte(opacity)));
-            p.kind = if t == "GRADIENT_LINEAR" { PaintKind::Linear } else { PaintKind::Radial };
+            p.kind = gradient_kind(t);
             p.stops = v["gradientStops"].as_array()?.iter().map(|s| (f(s, "position").unwrap_or(0.0) as f32, color_from(&s["color"], 1.0))).collect();
             let t: Option<[[f64; 3]; 2]> = v["gradientTransform"].as_array().and_then(|rows| {
                 let row = |i: usize| -> Option<[f64; 3]> {
@@ -143,6 +151,7 @@ pub fn paint_from(v: &Value, doc: &Document, layer: Option<egui::Vec2>) -> Optio
                 (p.from, p.to) = (map(m, 0.0, 0.5), map(m, 1.0, 0.5));
             } else {
                 (p.from, p.to) = (map(m, 0.5, 0.5), map(m, 1.0, 0.5));
+                p.width_to = crate::doc::explicit_width(&p, map(m, 0.5, 1.0));
             }
             p
         }
