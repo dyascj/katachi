@@ -127,6 +127,14 @@ pub struct PluginRun {
 
 const CLIP_TAG: &str = "katachi/nodes:";
 
+/// One undo step: the document, and the selection and page it was edited with, so undo and
+/// redo bring back what was selected and go to the page where the change happened (as in Figma).
+struct Snapshot {
+    doc: Document,
+    sel: Vec<NodeId>,
+    page: usize,
+}
+
 pub struct App {
     pub doc: Document,
     pub page: usize,
@@ -217,8 +225,8 @@ pub struct App {
     autosave_gen: std::sync::Arc<std::sync::Mutex<u64>>,
     /// Autosaves from sessions that crashed, offered on launch.
     pub recoverable: Vec<PathBuf>,
-    undo: Vec<Document>,
-    redo: Vec<Document>,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
     /// In a multiplayer session: nodes this user changed after each undo checkpoint.
     undo_touched: Vec<std::collections::HashSet<NodeId>>,
     redo_touched: Vec<std::collections::HashSet<NodeId>>,
@@ -435,7 +443,7 @@ impl App {
         // Attribute pending multiplayer changes to the step they belong to before starting a new one.
         self.sync_collab(f64::MAX);
         // ponytail: whole-document snapshots, switch to an op log when docs get big
-        self.undo.push(self.doc.clone());
+        self.undo.push(Snapshot { doc: self.doc.clone(), sel: self.sel.clone(), page: self.page });
         self.undo_touched.push(Default::default());
         if self.undo.len() > 200 {
             self.undo.remove(0);
@@ -509,41 +517,52 @@ impl App {
 
     pub fn undo(&mut self) {
         self.sync_collab(f64::MAX);
-        if let Some(d) = self.undo.pop() {
+        if let Some(s) = self.undo.pop() {
             let touched = self.undo_touched.pop().unwrap_or_default();
-            if self.collab.is_some() {
-                let current = self.doc.clone();
-                self.restore_nodes(&d, &touched);
-                self.redo.push(current);
-            } else {
-                self.redo.push(std::mem::replace(&mut self.doc, d));
-            }
+            let current = self.swap_in(s.doc, &touched);
+            self.redo.push(current);
             self.redo_touched.push(touched);
-            self.after_history();
+            self.after_history(s.sel, s.page);
         }
     }
 
     pub fn redo(&mut self) {
         self.sync_collab(f64::MAX);
-        if let Some(d) = self.redo.pop() {
+        if let Some(s) = self.redo.pop() {
             let touched = self.redo_touched.pop().unwrap_or_default();
-            if self.collab.is_some() {
-                let current = self.doc.clone();
-                self.restore_nodes(&d, &touched);
-                self.undo.push(current);
-            } else {
-                self.undo.push(std::mem::replace(&mut self.doc, d));
-            }
+            let current = self.swap_in(s.doc, &touched);
+            self.undo.push(current);
             self.undo_touched.push(touched);
-            self.after_history();
+            self.after_history(s.sel, s.page);
         }
     }
 
-    fn after_history(&mut self) {
+    /// Bring back a snapshot's document (in a multiplayer session, only the nodes this user
+    /// touched) and return the current state for the other stack.
+    fn swap_in(&mut self, doc: Document, touched: &std::collections::HashSet<NodeId>) -> Snapshot {
+        let old = if self.collab.is_some() {
+            let current = self.doc.clone();
+            self.restore_nodes(&doc, touched);
+            current
+        } else {
+            std::mem::replace(&mut self.doc, doc)
+        };
+        Snapshot { doc: old, sel: self.sel.clone(), page: self.page }
+    }
+
+    fn after_history(&mut self, sel: Vec<NodeId>, page: usize) {
         self.dirty = true;
         self.vector_edit = None;
         self.editing_text = None;
-        self.page = self.page.min(self.doc.pages.len() - 1);
+        let page = page.min(self.doc.pages.len() - 1);
+        if page != self.page {
+            if self.page < self.doc.pages.len() {
+                self.remember_view();
+            }
+            self.page = page;
+            self.view_ready = false;
+        }
+        self.sel = sel;
         self.sel.retain(|id| self.doc.nodes.contains_key(id));
     }
 

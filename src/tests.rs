@@ -2081,3 +2081,30 @@ fn layers_panel_shift_ranges_multi_drag_and_reveal() {
     let r1 = row(&h, "Rectangle 1");
     assert!(r1.max.y <= 900.0 && r1.min.y > 0.0, "revealed at {r1:?}");
 }
+
+#[test]
+fn undo_brings_back_the_selection_and_page() {
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (50.0, 50.0));
+    key(&mut h, Modifiers::NONE, Key::ArrowRight);
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    assert!(h.state().sel.is_empty());
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().sel, vec![a], "what was selected comes back");
+    assert_eq!(rect(&h, a).min.x, 0.0);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::Z);
+    assert_eq!((h.state().sel.clone(), rect(&h, a).min.x), (vec![], 1.0), "redo returns to the state undo left");
+    // A change on another page: undo goes back there.
+    let mut pg = h.state().doc.pages[0].clone();
+    (pg.name, pg.children) = ("Page 2".into(), vec![]);
+    h.state_mut().doc.pages.push(pg);
+    h.state_mut().select_page(1);
+    h.run_steps(2);
+    let b = draw(&mut h, Key::O, (0.0, 0.0), (40.0, 40.0));
+    key(&mut h, Modifiers::NONE, Key::ArrowDown);
+    h.state_mut().select_page(0);
+    h.run_steps(2);
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!((h.state().page, h.state().sel.clone()), (1, vec![b]));
+    assert_eq!(rect(&h, b).min.y, 0.0);
+}
