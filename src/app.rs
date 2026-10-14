@@ -2194,6 +2194,8 @@ impl App {
             (true, false, true, Key::V) => self.paste_style(),
             (true, true, false, Key::R) => self.paste_to_replace(),
             (true, false, false, Key::Y) => self.outline_mode = !self.outline_mode,
+            (true, false, false, Key::Quote) => self.toggle_pref(|p| &mut p.pixel_grid),
+            (true, true, false, Key::Quote) => self.toggle_pref(|p| &mut p.snap_to_pixels),
             (true, false, true, Key::O) => self.outline_stroke_selection(),
             (true, false, true, Key::A) => self.select_matching(),
             (true, true, false, Key::C) => self.copy_as(ctx, "png"),

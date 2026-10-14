@@ -839,6 +839,14 @@ impl App {
                 self.remove_all_guides();
                 ui.close();
             }
+            if check(ui, self.prefs.pixel_grid, "Pixel grid", "⌘'") {
+                self.toggle_pref(|p| &mut p.pixel_grid);
+                ui.close();
+            }
+            if check(ui, self.prefs.snap_to_pixels, "Snap to pixel grid", "⇧⌘'") {
+                self.toggle_pref(|p| &mut p.snap_to_pixels);
+                ui.close();
+            }
             if check(ui, self.outline_mode, "Outlines", "⌘Y") {
                 self.outline_mode = !self.outline_mode;
                 ui.close();

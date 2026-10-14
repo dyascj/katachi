@@ -2177,3 +2177,22 @@ fn zoom_tool_and_next_frame() {
     h.run_steps(2);
     assert_eq!(h.state().tool, Tool::Move);
 }
+
+#[test]
+fn pixel_grid_and_snap_to_pixel_toggles() {
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    // Snapping to the pixel grid (on by default) keeps a fractional drag on whole pixels.
+    let (a, b) = (s(&h, 50., 50.), s(&h, 80.25, 50.));
+    drag(&mut h, a, b, Modifiers::NONE);
+    assert_eq!(rect(&h, id).min.x, 30.0);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::Quote);
+    assert!(!h.state().prefs.snap_to_pixels);
+    let (a, b) = (s(&h, 50., 50.), s(&h, 50.5, 80.25));
+    drag(&mut h, a, b, Modifiers::NONE);
+    assert_eq!(rect(&h, id).min, pos2(30.5, 30.25), "free positioning with snap off");
+    key(&mut h, Modifiers::COMMAND, Key::Quote);
+    assert!(!h.state().prefs.pixel_grid);
+    key(&mut h, Modifiers::COMMAND, Key::Quote);
+    assert!(h.state().prefs.pixel_grid);
+}

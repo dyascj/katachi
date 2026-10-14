@@ -153,7 +153,7 @@ impl App {
                 let w = self.view.to_world(p);
                 let size = self.doc.node(drop.0).rect.size();
                 let parent = self.frame_at(w, &[]);
-                let i = self.doc.instantiate(drop.0, self.page, parent, None, (w - size / 2.0).round());
+                let i = self.doc.instantiate(drop.0, self.page, parent, None, self.px(w - size / 2.0));
                 self.sel = vec![i];
             }
         }
@@ -453,7 +453,7 @@ impl App {
                     if let (true, Some(last)) = (mods.shift, self.pen.last()) {
                         p = snap_angle(last.p, p);
                     }
-                    self.pen.push(PathPoint { p: p.round(), ..Default::default() });
+                    self.pen.push(PathPoint { p: self.px(p), ..Default::default() });
                 }
             }
             _ => self.press = Some(Press { world: w, target: None, handle: None, toggle_off: false }),
@@ -527,7 +527,7 @@ impl App {
             Tool::Zoom => Some(Drag::Zoom { start }),
             t if t.draws_shape() || t == Tool::Text => {
                 self.checkpoint();
-                let start = self.snap_point(start.round(), &[]);
+                let start = self.snap_point(self.px(start), &[]);
                 let parent = if t == Tool::Section { None } else { self.frame_at(start, &[]) };
                 let mut node = self.shape_for(t, Rect::from_min_size(start, Vec2::ZERO));
                 if t == Tool::Text {
@@ -571,7 +571,7 @@ impl App {
                 }
                 let corr = self.snap(b.translate(d), &roots, [true; 3], [true; 3]);
                 d += corr;
-                let d = (b.min + d).round() - b.min;
+                let d = self.px(b.min + d) - b.min;
                 for id in roots {
                     self.doc.translate(id, d);
                 }
@@ -634,7 +634,7 @@ impl App {
                     if hy == -1 { nb.max.y = 2.0 * c.y - nb.min.y }
                     if hy == 1 { nb.min.y = 2.0 * c.y - nb.max.y }
                 }
-                let nb = Rect::from_two_pos(nb.min.round(), nb.max.round());
+                let nb = Rect::from_two_pos(self.px(nb.min), self.px(nb.max));
                 if rot != 0.0 {
                     // Keep the fixed side planted: move the new center back into world space.
                     let c = rotate(nb.center(), b.center(), rot);
@@ -686,7 +686,8 @@ impl App {
             Drag::Create { base, start, id } => {
                 self.doc = base.clone();
                 let a = *start;
-                let mut b = self.snap_point(w, &[*id]).round();
+                let p = self.snap_point(w, &[*id]);
+                let mut b = self.px(p);
                 if self.doc.node(*id).kind == Kind::Vector {
                     if mods.shift {
                         b = snap_angle(a, b);
@@ -905,7 +906,7 @@ impl App {
                 // Created on release so the new field keeps keyboard focus.
                 self.checkpoint();
                 let parent = self.frame_at(w, &[]);
-                let n = Node::new(Kind::Text, Rect::from_min_size(w.round(), Vec2::ZERO));
+                let n = Node::new(Kind::Text, Rect::from_min_size(self.px(w), Vec2::ZERO));
                 let id = self.doc.insert(self.page, parent, None, n);
                 self.sel = vec![id];
                 self.editing_text = Some(id);
@@ -915,7 +916,7 @@ impl App {
             t if t.draws_shape() => {
                 // A click without a drag drops a default 100×100 shape.
                 self.checkpoint();
-                let p = w.round();
+                let p = self.px(w);
                 let parent = if t == Tool::Section { None } else { self.frame_at(p, &[]) };
                 let node = self.shape_for(t, Rect::from_min_size(p, vec2(100.0, 100.0)));
                 let id = self.doc.insert(self.page, parent, None, node);
@@ -1262,9 +1263,13 @@ impl App {
         }
     }
 
-    /// `v` rounded to whole pixels when snapping to the pixel grid.
+    /// `p` on whole pixels when snapping to the pixel grid (Shift Cmd '), else as is.
+    fn px(&self, p: Pos2) -> Pos2 {
+        if self.prefs.snap_to_pixels { p.round() } else { p }
+    }
+
     fn px1(&self, v: f32) -> f32 {
-        v.round()
+        if self.prefs.snap_to_pixels { v.round() } else { v }
     }
 
     // ---------- overlays ----------
@@ -1473,9 +1478,9 @@ impl App {
         }
     }
 
-    /// Figma shows a pixel grid from 800% zoom.
+    /// Figma shows a pixel grid from 800% zoom (Cmd ' turns it off).
     fn draw_pixel_grid(&self, painter: &Painter, rect: Rect) {
-        if self.view.zoom < 8.0 {
+        if self.view.zoom < 8.0 || !self.prefs.pixel_grid {
             return;
         }
         let (a, b) = (self.view.to_world(rect.min), self.view.to_world(rect.max));

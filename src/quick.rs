@@ -59,6 +59,8 @@ const COMMANDS: &[(&str, &str, Run)] = &[
     ("Lock/Unlock selection", "⇧⌘L", |a, _| a.toggle_locked()),
     ("Rulers", "⇧R", |a, _| a.rulers = !a.rulers),
     ("Remove all guides", "", |a, _| a.remove_all_guides()),
+    ("Pixel grid", "⌘'", |a, _| a.toggle_pref(|p| &mut p.pixel_grid)),
+    ("Snap to pixel grid", "⇧⌘'", |a, _| a.toggle_pref(|p| &mut p.snap_to_pixels)),
     ("Outline mode", "⌘Y", |a, _| a.outline_mode = !a.outline_mode),
     ("Layout guides", "⌃G", |a, _| a.show_grids = !a.show_grids),
     ("Hide UI", "⌘\\", |a, _| a.ui_hidden = !a.ui_hidden),
