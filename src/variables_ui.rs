@@ -23,7 +23,7 @@ fn value_editor(ui: &mut Ui, id: egui::Id, v: &mut VarValue, names: &[(u64, Stri
             let changed = crate::paint_ui::color_swatch(ui, id.with("swatch"), c);
             changed | crate::paint_ui::hex_field(ui, id, c, 64.0)
         }
-        VarValue::Number(n) => ui.add(DragValue::new(n).speed(0.5).custom_formatter(|x, _| num(x as f32))).changed(),
+        VarValue::Number(n) => ui.add(DragValue::new(n).range(-1e9..=1e9).speed(0.5).custom_formatter(|x, _| num(x as f32))).changed(),
         VarValue::Text(t) => ui.add(egui::TextEdit::singleline(t).desired_width(90.0)).changed(),
         VarValue::Bool(b) => ui.checkbox(b, "").changed(),
         VarValue::Alias(a) => {

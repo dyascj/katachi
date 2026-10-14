@@ -1892,7 +1892,7 @@ impl App {
         };
         let local = n.rect.min + crate::text::draw_offset(&n, galley.rows.len());
         let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
-            let g = ui.painter().layout_job(crate::text::job(ui.ctx(), &n, buf.as_str(), zoom, color));
+            let g = crate::text::lay(ui.painter(), &n, buf.as_str(), zoom, color);
             crate::text::align_rows(g, &n, zoom)
         };
         for (off, m) in crate::text::markers(&n, &galley, zoom) {

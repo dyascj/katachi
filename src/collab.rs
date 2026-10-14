@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tungstenite::{Message, WebSocket};
@@ -59,7 +60,8 @@ pub const PEER_COLORS: [egui::Color32; 6] = [
 pub fn diff(base: &Document, doc: &Document) -> Vec<Op> {
     let mut ops = vec![];
     for (id, n) in &doc.nodes {
-        if base.nodes.get(id) != Some(n) {
+        // Untouched layers share their Arc with the base: skip the deep compare.
+        if !base.nodes.get(id).is_some_and(|b| Arc::ptr_eq(b, n) || same_but_expanded(b, n)) {
             ops.push(Op::Upsert(Box::new((**n).clone())));
         }
     }
@@ -82,7 +84,19 @@ pub fn diff(base: &Document, doc: &Document) -> Vec<Op> {
     ops
 }
 
-/// Apply ops. Derived text layout (wrapped lines) stays local so peers don't echo it back.
+/// Equal apart from `expanded`: whether a layer is open in the layers panel is each user's own
+/// view, so it isn't sent (selecting deep inside a frame would overwrite peers' edits to it).
+fn same_but_expanded(a: &Node, b: &Node) -> bool {
+    if a.expanded == b.expanded {
+        return a == b;
+    }
+    let mut a = a.clone();
+    a.expanded = b.expanded;
+    a == *b
+}
+
+/// Apply ops. Derived text layout (wrapped lines) and layers panel state stay local, so peers
+/// don't echo them back.
 pub fn apply(doc: &mut Document, ops: &[Op]) {
     for op in ops {
         match op {
@@ -90,6 +104,7 @@ pub fn apply(doc: &mut Document, ops: &[Op]) {
                 let mut n = (**n).clone();
                 if let Some(local) = doc.nodes.get(&n.id) {
                     n.lines = local.lines.clone();
+                    n.expanded = local.expanded;
                 }
                 doc.nodes.insert(n.id, std::sync::Arc::new(n));
             }
@@ -114,7 +129,26 @@ pub fn apply(doc: &mut Document, ops: &[Op]) {
 }
 
 /// Make parent links and child lists agree after concurrent edits (last writer wins per node).
+/// Also makes a loaded file safe: at least one page, and no layer inside itself.
 pub fn repair(doc: &mut Document) {
+    if doc.pages.is_empty() {
+        doc.pages = Document::default().pages;
+    }
+    let mut ordered: Vec<NodeId> = doc.nodes.keys().copied().collect();
+    ordered.sort();
+    // A parent chain that comes back to the layer is a cycle: the layer closing it moves to the top level.
+    for &id in &ordered {
+        let (mut cur, mut steps) = (doc.nodes[&id].parent, 0);
+        while let Some(p) = cur
+            && steps <= doc.nodes.len()
+        {
+            if p == id {
+                doc.node_mut(id).parent = None;
+                break;
+            }
+            (cur, steps) = (doc.nodes.get(&p).and_then(|n| n.parent), steps + 1);
+        }
+    }
     let ids: HashSet<NodeId> = doc.nodes.keys().copied().collect();
     for page in &mut doc.pages {
         page.children.retain(|c| ids.contains(c) && doc.nodes[c].parent.is_none());
@@ -130,8 +164,6 @@ pub fn repair(doc: &mut Document) {
             std::sync::Arc::make_mut(arc).children = kids;
         }
     }
-    let mut ordered: Vec<NodeId> = doc.nodes.keys().copied().collect();
-    ordered.sort();
     for id in ordered {
         match doc.nodes[&id].parent {
             Some(p) if !ids.contains(&p) => {
@@ -193,29 +225,76 @@ struct ServerState {
     next: u32,
 }
 
-/// Run the relay on `listener` in background threads. Returns the shared document handle.
-pub fn serve(listener: TcpListener, doc: Document) -> Arc<Mutex<Document>> {
+/// A running relay. Dropping it closes the port and disconnects everyone.
+pub struct Relay {
+    /// The shared document, as merged so far.
+    pub doc: Arc<Mutex<Document>>,
+    /// The session code: joiners connect to `host:port/token`; anything else is refused.
+    pub token: String,
+    port: u16,
+    stop: Arc<AtomicBool>,
+    state: Arc<Mutex<ServerState>>,
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // Dropping the senders ends every connection's pump.
+        if let Ok(mut s) = self.state.lock() {
+            s.clients.clear();
+        }
+        // Wake the accept loop so it sees the flag.
+        let _ = TcpStream::connect_timeout(&(std::net::Ipv4Addr::LOCALHOST, self.port).into(), Duration::from_secs(1));
+    }
+}
+
+/// A hard-to-guess session code (64 bits from the std hasher's OS-seeded random keys).
+pub fn session_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::hash::RandomState::new().build_hasher();
+    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+    h.write_u32(std::process::id());
+    format!("{:016x}", h.finish())
+}
+
+/// Run the relay on `listener` in background threads, admitting only clients that know `token`.
+pub fn serve(listener: TcpListener, doc: Document, token: String) -> Relay {
     let state = Arc::new(Mutex::new(ServerState { doc, clients: HashMap::new(), next: 1 }));
-    let snapshot = Arc::new(Mutex::new(state.lock().unwrap().doc.clone()));
-    let snap = snapshot.clone();
+    let snap = Arc::new(Mutex::new(state.lock().unwrap().doc.clone()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let port = listener.local_addr().map_or(0, |a| a.port());
+    let relay = Relay { doc: snap.clone(), token: token.clone(), port, stop: stop.clone(), state: state.clone() };
     std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let state = state.clone();
-            let snap = snap.clone();
+        for stream in listener.incoming() {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let Ok(stream) = stream else { continue };
+            let (state, snap, token) = (state.clone(), snap.clone(), token.clone());
             std::thread::spawn(move || {
-                let Ok(ws) = tungstenite::accept(stream) else { return };
+                // A connection that never finishes the handshake mustn't hold a thread forever.
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let check = |req: &tungstenite::handshake::server::Request, resp| {
+                    if req.uri().path().trim_start_matches('/') == token {
+                        Ok(resp)
+                    } else {
+                        Err(tungstenite::http::Response::builder().status(403).body(Some("Wrong session code".to_string())).unwrap_or_default())
+                    }
+                };
+                let Ok(ws) = tungstenite::accept_hdr(stream, check) else { return };
                 let (tx, rx) = channel::<String>();
                 let me = {
                     let mut s = state.lock().unwrap();
                     let me = s.next;
                     s.next += 1;
-                    s.clients.insert(me, tx.clone());
                     let welcome = ToClient::Welcome { client: me, doc: Box::new(s.doc.clone()) };
-                    let _ = tx.send(serde_json::to_string(&welcome).unwrap_or_default());
+                    let _ = tx.send(crate::doc::to_json(&welcome));
+                    // Only the relay holds the sender, so dropping the relay ends this connection.
+                    s.clients.insert(me, tx);
                     me
                 };
                 pump(ws, rx, |text| {
-                    let Ok(msg) = serde_json::from_str::<ToServer>(&text) else { return true };
+                    let Ok(msg) = crate::doc::from_json::<ToServer>(&text) else { return true };
                     let mut s = state.lock().unwrap();
                     let out = match msg {
                         ToServer::Ops(ops) => {
@@ -225,7 +304,7 @@ pub fn serve(listener: TcpListener, doc: Document) -> Arc<Mutex<Document>> {
                         }
                         ToServer::Presence(presence) => ToClient::Presence { from: me, presence },
                     };
-                    let json = serde_json::to_string(&out).unwrap_or_default();
+                    let json = crate::doc::to_json(&out);
                     for (id, c) in &s.clients {
                         if *id != me {
                             let _ = c.send(json.clone());
@@ -235,14 +314,14 @@ pub fn serve(listener: TcpListener, doc: Document) -> Arc<Mutex<Document>> {
                 });
                 let mut s = state.lock().unwrap();
                 s.clients.remove(&me);
-                let left = serde_json::to_string(&ToClient::Left { from: me }).unwrap_or_default();
+                let left = crate::doc::to_json(&ToClient::Left { from: me });
                 for c in s.clients.values() {
                     let _ = c.send(left.clone());
                 }
             });
         }
     });
-    snapshot
+    relay
 }
 
 /// A connection to a relay: messages in, JSON out.
@@ -251,16 +330,26 @@ pub struct Link {
     pub rx: Receiver<ToClient>,
 }
 
+/// Connect to `host:port/code`, the address the host shares.
 pub fn connect(addr: &str, ctx: Option<egui::Context>) -> Result<Link, String> {
     let url = if addr.starts_with("ws://") { addr.to_string() } else { format!("ws://{addr}") };
     let host = url.trim_start_matches("ws://").split('/').next().unwrap_or_default().to_string();
-    let stream = TcpStream::connect(&host).map_err(|e| e.to_string())?;
-    let (ws, _) = tungstenite::client(url.as_str(), stream).map_err(|e| e.to_string())?;
+    // Give up on an unreachable address in seconds, not the OS's minute and more.
+    let mut err = "No such address".to_string();
+    let stream = std::net::ToSocketAddrs::to_socket_addrs(&host)
+        .map_err(|e| e.to_string())?
+        .find_map(|a| TcpStream::connect_timeout(&a, Duration::from_secs(5)).map_err(|e| err = e.to_string()).ok())
+        .ok_or(err)?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let (ws, _) = tungstenite::client(url.as_str(), stream).map_err(|e| match e {
+        tungstenite::HandshakeError::Failure(tungstenite::Error::Http(r)) if r.status() == 403 => "Wrong session code. Ask the host for the full address.".to_string(),
+        e => e.to_string(),
+    })?;
     let (tx_out, rx_out) = channel::<String>();
     let (tx_in, rx_in) = channel::<ToClient>();
     std::thread::spawn(move || {
         pump(ws, rx_out, |text| {
-            if let Ok(msg) = serde_json::from_str::<ToClient>(&text) {
+            if let Ok(msg) = crate::doc::from_json::<ToClient>(&text) {
                 if tx_in.send(msg).is_err() {
                     return false;
                 }
@@ -278,7 +367,6 @@ pub fn connect(addr: &str, ctx: Option<egui::Context>) -> Result<Link, String> {
 pub struct Collab {
     pub link: Link,
     /// Server-assigned id (also the high bits of this client's node ids).
-    #[allow(dead_code)]
     pub client: u32,
     /// Document as last agreed with the server; local edits are diffs against it.
     pub base: Document,
@@ -286,9 +374,22 @@ pub struct Collab {
     pub me: Presence,
     pub address: String,
     pub hosting: bool,
+    /// The relay this app runs when hosting; leaving the session stops it.
+    pub relay: Option<Relay>,
     last_send: f64,
     last_presence: Option<Presence>,
     pub connected: bool,
+}
+
+/// Move `next_id` past any of `ids` in this client's range, so it never reuses one (a relay that
+/// restarted hands out client numbers again, and the file may hold that number's old layers).
+fn claim_ids(doc: &mut Document, client: u32, ids: impl IntoIterator<Item = NodeId>) {
+    let lo = (client as u64) << 32;
+    for id in ids {
+        if (lo..lo + (1 << 32)).contains(&id) {
+            doc.next_id = doc.next_id.max(id + 1);
+        }
+    }
 }
 
 impl Collab {
@@ -298,9 +399,11 @@ impl Collab {
         let ToClient::Welcome { client, doc } = welcome else { return Err("Unexpected reply".into()) };
         let mut doc = *doc;
         // Each client allocates ids from its own range so concurrent inserts never collide.
-        doc.next_id = doc.next_id.max((client as u64) << 32);
+        doc.next_id = (client as u64) << 32;
+        let ids: Vec<NodeId> = doc.nodes.keys().copied().collect();
+        claim_ids(&mut doc, client, ids);
         let me = Presence { name, color: client as usize % PEER_COLORS.len(), page: 0, cursor: None, selection: vec![] };
-        let c = Collab { link, client, base: doc.clone(), peers: HashMap::new(), me, address, hosting, last_send: 0.0, last_presence: None, connected: true };
+        let c = Collab { link, client, base: doc.clone(), peers: HashMap::new(), me, address, hosting, relay: None, last_send: 0.0, last_presence: None, connected: true };
         Ok((c, doc))
     }
 
@@ -317,6 +420,7 @@ impl Collab {
                     apply(&mut self.base, &ops);
                     apply(doc, &ops);
                     apply(doc, &pending);
+                    claim_ids(doc, self.client, ops.iter().filter_map(|op| if let Op::Upsert(n) = op { Some(n.id) } else { None }));
                     remote = true;
                     received.extend(ops);
                 }
@@ -348,7 +452,7 @@ impl Collab {
                         _ => {}
                     }
                 }
-                let _ = self.link.tx.send(serde_json::to_string(&ToServer::Ops(ops)).unwrap_or_default());
+                let _ = self.link.tx.send(crate::doc::to_json(&ToServer::Ops(ops)));
                 self.base = doc.clone();
                 // A forced send (undo checkpoints pass f64::MAX) mustn't stall the throttle forever.
                 if now < f64::MAX {
@@ -356,7 +460,7 @@ impl Collab {
                 }
             }
             if self.last_presence.as_ref() != Some(&self.me) {
-                let _ = self.link.tx.send(serde_json::to_string(&ToServer::Presence(self.me.clone())).unwrap_or_default());
+                let _ = self.link.tx.send(crate::doc::to_json(&ToServer::Presence(self.me.clone())));
                 self.last_presence = Some(self.me.clone());
             }
         }
@@ -406,10 +510,11 @@ mod tests {
     #[test]
     fn two_clients_converge_through_a_relay() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
         let mut seed = Document::default();
-        seed.insert(0, None, None, Node::new(Kind::Frame, r(0., 0.)));
-        let shared = serve(listener, seed);
+        let frame = seed.insert(0, None, None, Node::new(Kind::Frame, r(0., 0.)));
+        let relay = serve(listener, seed, session_token());
+        let shared = relay.doc.clone();
+        let addr = format!("127.0.0.1:{}/{}", relay.port, relay.token);
         let (mut ca, mut da) = Collab::join(connect(&addr, None).unwrap(), addr.clone(), "A".into(), true).unwrap();
         let (mut cb, mut db) = Collab::join(connect(&addr, None).unwrap(), addr.clone(), "B".into(), false).unwrap();
         assert_ne!(ca.client, cb.client);
@@ -433,8 +538,9 @@ mod tests {
         assert_eq!(da.pages[0].children.len(), 3);
         assert_eq!(db.pages[0].children.len(), 3);
         assert_eq!(cb.peers[&ca.client].cursor, Some(pos2(5., 5.)), "presence relayed");
-        // B edits A's rectangle; A sees it.
+        // B edits A's rectangle; A sees it. Folding a frame in the layers panel stays B's own.
         db.node_mut(na).name = "From B".into();
+        db.node_mut(frame).expanded = !da.node(frame).expanded;
         for _ in 0..200 {
             cb.tick(&mut db, t);
             ca.tick(&mut da, t);
@@ -445,6 +551,38 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(da.node(na).name, "From B");
+        assert_ne!(da.node(frame).expanded, db.node(frame).expanded, "expanded isn't shared");
         assert_eq!(shared.lock().unwrap().nodes.len(), 3, "server holds the merged document");
+        // Leaving (dropping the relay) disconnects everyone and closes the port.
+        drop(relay);
+        for _ in 0..200 {
+            ca.tick(&mut da, t);
+            if !ca.connected {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!ca.connected, "clients are dropped when the host leaves");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(connect(&addr, None).is_err(), "the port no longer accepts");
+    }
+
+    #[test]
+    fn relay_wants_the_session_code_and_ids_skip_existing_layers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut seed = Document::default();
+        // Layers an earlier client 1 made, before the relay restarted.
+        let mut old = Node::new(Kind::Rectangle, r(0., 0.));
+        old.id = (1 << 32) + 7;
+        seed.nodes.insert(old.id, Arc::new(old));
+        repair(&mut seed);
+        let relay = serve(listener, seed, "secret".into());
+        let host = format!("127.0.0.1:{}", relay.port);
+        assert!(connect(&host, None).is_err(), "no code");
+        assert!(connect(&format!("{host}/guess"), None).is_err(), "wrong code");
+        let (c, mut d) = Collab::join(connect(&format!("{host}/secret"), None).unwrap(), host.clone(), "A".into(), false).unwrap();
+        assert_eq!(c.client, 1);
+        let id = d.insert(0, None, None, Node::new(Kind::Ellipse, r(5., 5.)));
+        assert_eq!(id, (1 << 32) + 8, "new ids go past the existing ones in this client's range");
     }
 }

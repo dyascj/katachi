@@ -196,6 +196,7 @@ impl Shell {
             Some(Want::OpenDialog) => self.open_dialog(),
             Some(Want::CloseTab) => self.close(i),
             Some(Want::Home) => self.activate(None),
+            Some(Want::KeepOpen) => self.tabs.iter_mut().for_each(|t| t.allow_close = false),
             None => {}
         }
     }
@@ -828,12 +829,24 @@ impl eframe::App for Shell {
         }
         self.wants();
         self.close_guard(&ctx);
+        // Tabs in the background have unsaved work too.
+        let now = ctx.input(|i| i.time);
+        for t in &mut self.tabs {
+            t.autosave(now);
+        }
         if self.update.poll(&ctx) {
             // Restart straight into the new version, unless work was changed while it downloaded.
             if self.update.ready() && !self.tabs.iter().any(|t| t.dirty) {
                 self.update.restart();
             }
             ctx.request_repaint();
+        }
+    }
+
+    /// The window closed: every tab's unsaved work was saved or let go, so drop the autosaves.
+    fn on_exit(&mut self) {
+        for t in &self.tabs {
+            t.clear_recovery();
         }
     }
 }
@@ -870,6 +883,37 @@ mod tests {
         assert_eq!(ago(back(30 * 3600)), "yesterday");
         assert_eq!(ago(back(4 * 86400)), "4 days ago");
         assert_eq!(ago(back(65 * 86400)), "2 months ago");
+    }
+
+    #[test]
+    fn background_tabs_autosave_and_a_cancelled_quit_asks_again() {
+        crate::tests::isolate_data();
+        let tag = format!("Background {}", std::process::id());
+        let page = tag.clone();
+        // Each frame is 31 s, past the autosave interval.
+        let mut h = egui_kittest::Harness::builder().with_step_dt(31.0).build_eframe(move |cc| {
+            crate::setup_style(&cc.egui_ctx);
+            let mut s = Shell::new(None);
+            s.update = crate::update::Updater::off();
+            s.new_tab();
+            s.tabs[0].doc.pages[0].name = page.clone();
+            s.tabs[0].dirty = true;
+            s.new_tab();
+            s
+        });
+        h.run_steps(3);
+        let saved = (0..200).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::fs::read_dir(crate::files::recovery_dir()).into_iter().flatten().flatten().any(|e| std::fs::read_to_string(e.path()).is_ok_and(|s| s.contains(&tag)))
+        });
+        assert!(saved, "the tab that isn't on screen autosaved");
+        // Quitting: tab 0 said "Don't save", then tab 1 cancelled. Both must ask again next time.
+        let s = h.state_mut();
+        s.tabs[0].allow_close = true;
+        s.tabs[1].want = Some(Want::KeepOpen);
+        s.wants();
+        assert!(s.tabs.iter().all(|t| !t.allow_close));
+        s.tabs[0].clear_recovery();
     }
 
     #[test]

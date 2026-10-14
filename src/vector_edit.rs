@@ -298,9 +298,9 @@ impl App {
                 let mut moved = false;
                 ui.horizontal(|ui| {
                     ui.label("X");
-                    moved |= ui.add(egui::DragValue::new(&mut x).speed(0.5)).changed();
+                    moved |= ui.add(egui::DragValue::new(&mut x).range(-1e6..=1e6).speed(0.5)).changed();
                     ui.label("Y");
-                    moved |= ui.add(egui::DragValue::new(&mut y).speed(0.5)).changed();
+                    moved |= ui.add(egui::DragValue::new(&mut y).range(-1e6..=1e6).speed(0.5)).changed();
                 });
                 if moved {
                     self.begin_edit();

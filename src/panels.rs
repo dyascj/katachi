@@ -1320,6 +1320,10 @@ impl App {
                 self.doc.remove(id);
             }
             self.doc.pages.remove(i);
+            // Pages after the deleted one move up; stay on the one being viewed.
+            if i < self.page {
+                self.page -= 1;
+            }
             self.page = self.page.min(self.doc.pages.len() - 1);
             self.sel.clear();
             self.view_ready = false;
@@ -2515,7 +2519,7 @@ impl App {
             let mut changed = false;
             ui.horizontal(|ui| {
                 ui.label("Arc");
-                changed |= ui.add(DragValue::new(&mut start).speed(1.0).suffix("°")).on_hover_text("Start").changed();
+                changed |= ui.add(DragValue::new(&mut start).range(-360.0..=360.0).speed(1.0).suffix("°")).on_hover_text("Start").changed();
                 changed |= ui.add(DragValue::new(&mut sweep_pct).range(-100.0..=100.0).speed(0.5).suffix("%")).on_hover_text("Sweep").changed();
                 changed |= ui.add(DragValue::new(&mut ratio_pct).range(0.0..=99.0).speed(0.5).suffix("%")).on_hover_text("Ratio").changed();
             });
@@ -3408,11 +3412,13 @@ impl App {
             }
             if r.lost_focus() {
                 let v = buf.trim();
+                // "inf", "NaN" and negatives parse as floats but aren't line heights.
+                let ok = |x: &f32| x.is_finite() && *x >= 0.0;
                 t.line_height = if v.eq_ignore_ascii_case("auto") || v.is_empty() {
                     LineHeight::Auto
-                } else if let Some(p) = v.strip_suffix('%').and_then(|p| p.trim().parse().ok()) {
+                } else if let Some(p) = v.strip_suffix('%').and_then(|p| p.trim().parse().ok()).filter(ok) {
                     LineHeight::Percent(p)
-                } else if let Ok(px) = v.parse() {
+                } else if let Some(px) = v.parse().ok().filter(ok) {
                     LineHeight::Px(px)
                 } else {
                     t.line_height
@@ -3420,7 +3426,7 @@ impl App {
             }
             r.on_hover_text("Line height: Auto, pixels, or percent");
             let mut ls = t.letter_spacing;
-            if ui.add_sized([half(ui), 22.0], DragValue::new(&mut ls).speed(0.1).suffix("%").prefix("|A|  ").custom_formatter(|v, _| num(v as f32))).changed() {
+            if ui.add_sized([half(ui), 22.0], DragValue::new(&mut ls).range(-100.0..=1000.0).speed(0.1).suffix("%").prefix("|A|  ").custom_formatter(|v, _| num(v as f32))).changed() {
                 t.letter_spacing = ls;
             }
         });
@@ -3730,7 +3736,7 @@ impl App {
                         ui.data_mut(|d| d.remove::<String>(dash_id));
                     }
                     if r.lost_focus() {
-                        style.0 = buf.split([',', ' ']).filter_map(|t| t.trim().parse::<f32>().ok()).filter(|v| *v >= 0.0).collect();
+                        style.0 = buf.split([',', ' ']).filter_map(|t| t.trim().parse::<f32>().ok()).filter(|v| v.is_finite() && *v >= 0.0).collect();
                     }
                     ui.horizontal(|ui| {
                         ui.label("Caps");

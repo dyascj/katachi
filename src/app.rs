@@ -155,6 +155,8 @@ pub enum Want {
     OpenDialog,
     CloseTab,
     Home,
+    /// Quitting was cancelled: tabs already answered "Don't save" must ask again next time.
+    KeepOpen,
 }
 
 /// A plugin with a UI, running until it closes.
@@ -539,6 +541,10 @@ impl App {
         c.me.selection = self.sel.clone();
         c.me.cursor = self.pointer_world;
         let (touched, remote) = c.tick(&mut self.doc, now);
+        // Others' edits are changes to save too.
+        if !remote.is_empty() {
+            self.dirty = true;
+        }
         // A drag rebuilds the document from its starting copy every frame; that copy needs
         // others' changes too, or they'd vanish (and go out as deletions) mid-drag.
         if !remote.is_empty()
@@ -594,6 +600,11 @@ impl App {
     }
 
     pub fn undo(&mut self) {
+        // A drag rebuilds the document from its starting copy each frame; undoing under it
+        // would be overwritten and leave history out of step.
+        if self.drag.is_some() {
+            return;
+        }
         self.sync_collab(f64::MAX);
         if let Some(s) = self.undo.pop() {
             let touched = self.undo_touched.pop().unwrap_or_default();
@@ -605,6 +616,9 @@ impl App {
     }
 
     pub fn redo(&mut self) {
+        if self.drag.is_some() {
+            return;
+        }
         self.sync_collab(f64::MAX);
         if let Some(s) = self.redo.pop() {
             let touched = self.redo_touched.pop().unwrap_or_default();
@@ -1163,9 +1177,7 @@ impl App {
             return;
         }
         let frag = self.doc.extract(&roots);
-        if let Ok(json) = serde_json::to_string(&frag) {
-            ctx.copy_text(format!("{CLIP_TAG}{json}"));
-        }
+        ctx.copy_text(format!("{CLIP_TAG}{}", crate::doc::to_json(&frag)));
         self.clip_frag = Some(frag);
     }
 
@@ -1599,7 +1611,7 @@ impl App {
         }
         let file_name = |name: &str, p: &ExportSetting| {
             let scale = if p.format.raster() && p.scale != 1.0 { format!("@{}x", crate::canvas::num(p.scale)) } else { String::new() };
-            format!("{}{}{}.{}", name.replace('/', "-"), p.suffix, scale, p.format.ext())
+            format!("{}.{}", crate::export::safe_name(&format!("{name}{}{scale}", p.suffix)), p.format.ext())
         };
         // One file: ask where. Several: ask for a folder.
         let targets: Vec<std::path::PathBuf> = if jobs.len() == 1 {
@@ -1611,7 +1623,7 @@ impl App {
             }
         } else {
             match rfd::FileDialog::new().pick_folder() {
-                Some(dir) => jobs.iter().map(|(_, name, p)| dir.join(file_name(name, p))).collect(),
+                Some(dir) => crate::export::unique_names(jobs.iter().map(|(_, name, p)| file_name(name, p)).collect()).into_iter().map(|f| dir.join(f)).collect(),
                 None => return,
             }
         };
@@ -2056,6 +2068,9 @@ impl App {
                         ui.ctx().copy_text(c.address.clone());
                     }
                 });
+                if c.hosting {
+                    ui.label(egui::RichText::new("Others on your network join with this full address, code included.").small());
+                }
                 ui.separator();
                 ui.label(format!("{} (you)", c.me.name));
                 for p in c.peers.values() {
@@ -2087,7 +2102,7 @@ impl App {
                 ui.separator();
                 ui.label(egui::RichText::new("Join").strong());
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.collab_address).hint_text("192.168.1.20:7878").desired_width(180.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.collab_address).hint_text("192.168.1.20:7878/code").desired_width(180.0));
                     if ui.add_enabled(!self.collab_address.trim().is_empty(), egui::Button::new("Join")).clicked() {
                         action = Some("join");
                     }
@@ -2115,11 +2130,12 @@ impl App {
         match listener {
             Ok(l) => {
                 let port = l.local_addr().map_or(self.collab_port, |a| a.port());
-                crate::collab::serve(l, self.doc.clone());
-                let shared = format!("{}:{port}", crate::collab::local_ip());
-                self.join_session(ctx, &format!("127.0.0.1:{port}"), true);
+                let relay = crate::collab::serve(l, self.doc.clone(), crate::collab::session_token());
+                let shared = format!("{}:{port}/{}", crate::collab::local_ip(), relay.token);
+                self.join_session(ctx, &format!("127.0.0.1:{port}/{}", relay.token), true);
                 if let Some(c) = self.collab.as_mut() {
                     c.address = shared;
+                    c.relay = Some(relay);
                 }
             }
             Err(e) => self.toast(format!("Couldn't start a session: {e}")),
@@ -2673,7 +2689,8 @@ fn void(_: bool) {}
 
 /// Layers copied from Katachi, from clipboard text.
 fn clip_layers(text: &str) -> Option<Vec<Node>> {
-    serde_json::from_str(text.strip_prefix(CLIP_TAG)?).ok()
+    // Anything can be on the clipboard: parse leniently and repair the layer tree.
+    crate::doc::from_json::<Vec<Node>>(text.strip_prefix(CLIP_TAG)?).ok().map(|f| crate::doc::clean_fragment(&f))
 }
 
 #[cfg(test)]
@@ -2799,7 +2816,13 @@ impl App {
         ) {
             Some(0) => choice = Some(false),
             Some(2) => choice = Some(true),
-            Some(_) => self.confirm = None,
+            Some(_) => {
+                self.confirm = None;
+                if after == After::Close {
+                    self.allow_close = false;
+                    self.want = Some(Want::KeepOpen);
+                }
+            }
             None => {}
         }
         let Some(save) = choice else { return };
@@ -2809,7 +2832,7 @@ impl App {
         self.confirm = None;
         match after {
             After::Close => {
-                self.clear_recovery();
+                // The autosave goes when the window really closes (another tab may still cancel).
                 self.allow_close = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }

@@ -279,9 +279,12 @@ pub fn dashed(path: &Path, pattern: &[f32]) -> Path {
     let pattern: Vec<f32> = if pattern.len() % 2 == 1 { pattern.iter().chain(pattern).copied().collect() } else { pattern.to_vec() };
     let total: f32 = pattern.iter().sum();
     let mut b = Path::builder();
-    if total <= 0.0 {
+    // Dashes under a pixel look solid anyway, and millions of them would freeze the canvas.
+    if !(total >= 1.0) || pattern.iter().any(|d| !d.is_finite() || *d < 0.0) {
         return path.clone();
     }
+    const MAX_DASHES: usize = 20_000;
+    let mut dashes = 0;
     let (mut idx, mut left, mut on, mut open) = (0usize, pattern[0], true, false);
     for ev in path.iter().flattened(0.15) {
         match ev {
@@ -310,6 +313,10 @@ pub fn dashed(path: &Path, pattern: &[f32]) -> Path {
                         if on && open {
                             b.end(false);
                             open = false;
+                            dashes += 1;
+                            if dashes > MAX_DASHES {
+                                return path.clone();
+                            }
                         }
                         idx = (idx + 1) % pattern.len();
                         left = pattern[idx];
@@ -457,8 +464,7 @@ impl Textures {
             self.images.retain(|k, _| !k.starts_with(&prefix));
         }
         let entry = self.images.entry(cache).or_insert_with(|| {
-            let bytes = doc.images.get(key)?;
-            let mut img = image::load_from_memory(bytes).ok()?.to_rgba8();
+            let (mut img, size) = gpu_image(ctx, doc.images.get(key)?, 2)?;
             adj.apply(&mut img);
             let (w, h) = (img.width() as usize, img.height() as usize);
             let mut padded = vec![0u8; (w + 2) * (h + 2) * 4];
@@ -468,7 +474,7 @@ impl Textures {
                 padded[at..at + w * 4].copy_from_slice(src);
             }
             let color = ColorImage::from_rgba_unmultiplied([w + 2, h + 2], &padded);
-            Some((ctx.load_texture(format!("image-{key}-{adj:?}"), color, TextureOptions::LINEAR), vec2(w as f32, h as f32)))
+            Some((ctx.load_texture(format!("image-{key}-{adj:?}"), color, TextureOptions::LINEAR), size))
         });
         entry.as_ref().map(|(t, s)| (t.id(), *s))
     }
@@ -481,7 +487,7 @@ impl Textures {
             self.tiles.retain(|k, _| !k.starts_with(&prefix));
         }
         let entry = self.tiles.entry(cache).or_insert_with(|| {
-            let mut img = image::load_from_memory(doc.images.get(key)?).ok()?.to_rgba8();
+            let (mut img, _) = gpu_image(ctx, doc.images.get(key)?, 0)?;
             adj.apply(&mut img);
             let color = ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
             let opts = TextureOptions { wrap_mode: egui::TextureWrapMode::Repeat, ..TextureOptions::LINEAR };
@@ -489,6 +495,20 @@ impl Textures {
         });
         entry.as_ref().map(|t| t.id())
     }
+}
+
+/// Decode an embedded image for upload, shrunk to the GPU's largest texture (less `pad` pixels
+/// of border); wgpu rejects bigger ones. Also returns the original pixel size, which layout uses.
+fn gpu_image(ctx: &egui::Context, bytes: &[u8], pad: u32) -> Option<(image::RgbaImage, Vec2)> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let size = vec2(img.width() as f32, img.height() as f32);
+    let max = match ctx.input(|i| i.max_texture_side) {
+        0 => 8192,
+        m => m as u32,
+    } - pad;
+    // ponytail: the 1px Fit border is placed for the original size, under a texel off when shrunk.
+    let img = if img.width().max(img.height()) > max { img.resize(max, max, image::imageops::FilterType::Triangle) } else { img };
+    Some((img.to_rgba8(), size))
 }
 
 struct NodeRaster {
@@ -796,6 +816,37 @@ fn draw_content(painter: &Painter, sc: &mut Scene, n: &Node, a: f32) {
                 draw_marker(painter, v.to_screen(tip), dir, m, w, c);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tiny_or_endless_dashes_draw_solid() {
+        let line = |len: f32| {
+            let mut b = Path::builder();
+            b.begin(point(0.0, 0.0));
+            b.line_to(point(len, 0.0));
+            b.end(false);
+            b.build()
+        };
+        let count = |p: &Path| p.iter().filter(|e| matches!(e, lyon::path::Event::Begin { .. })).count();
+        assert_eq!(count(&dashed(&line(1e7), &[0.1, 0.1])), 1, "a cycle under a pixel");
+        assert_eq!(count(&dashed(&line(1e7), &[2.0, 2.0])), 1, "millions of dashes");
+        assert_eq!(count(&dashed(&line(100.0), &[10.0, 10.0])), 5);
+    }
+
+    #[test]
+    fn huge_images_shrink_to_the_texture_limit() {
+        let ctx = egui::Context::default();
+        let max = ctx.input(|i| i.max_texture_side) as u32;
+        let mut png = vec![];
+        image::RgbaImage::new(max + 500, 4).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let (img, size) = gpu_image(&ctx, &png, 2).unwrap();
+        assert_eq!(img.width(), max - 2);
+        assert_eq!(size, vec2((max + 500) as f32, 4.0), "layout keeps the real size");
     }
 }
 

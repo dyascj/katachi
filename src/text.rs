@@ -320,7 +320,38 @@ pub fn marker_galley(painter: &egui::Painter, n: &Node, marker: &str, zoom: f32,
     m.spans.clear();
     m.lists.clear();
     m.text_sizing = TextSizing::AutoWidth;
-    painter.layout_job(job(painter.ctx(), &m, marker, zoom, color))
+    lay(painter, &m, marker, zoom, color)
+}
+
+/// Biggest glyph egui rasterizes, in device pixels: its font atlas panics on glyphs wider
+/// than the atlas, which huge text at high zoom reaches.
+const MAX_GLYPH_PX: f32 = 1000.0;
+
+/// `job` laid out, with glyphs over `MAX_GLYPH_PX` laid out smaller and the result scaled up.
+pub fn lay(painter: &egui::Painter, n: &Node, text: &str, zoom: f32, color: Color32) -> Arc<Galley> {
+    let biggest = n.spans.iter().filter_map(|s| s.style.font_size).fold(n.font_size, f32::max) * painter.pixels_per_point();
+    let z = zoom.min(MAX_GLYPH_PX / biggest.max(1e-6));
+    let galley = painter.layout_job(job(painter.ctx(), n, text, z, color));
+    if z >= zoom {
+        return galley;
+    }
+    let s = zoom / z;
+    let mut shape = egui::epaint::TextShape::new(egui::Pos2::ZERO, galley, color);
+    shape.transform(egui::emath::TSTransform::from_scaling(s));
+    let mut galley = shape.galley;
+    // The mesh is scaled; glyph metrics too, so the editor's cursor and selection line up.
+    for row in &mut Arc::make_mut(&mut galley).rows {
+        for g in &mut Arc::make_mut(&mut row.row).glyphs {
+            g.pos = (g.pos.to_vec2() * s).to_pos2();
+            g.advance_width *= s;
+            g.line_height *= s;
+            g.font_ascent *= s;
+            g.font_height *= s;
+            g.font_face_ascent *= s;
+            g.font_face_height *= s;
+        }
+    }
+    galley
 }
 
 /// Offset (world units) from the box's top-left to where the galley is drawn:
@@ -345,7 +376,7 @@ pub fn draw_offset(n: &Node, rows: usize) -> Vec2 {
 /// Laid-out text for drawing, plus the content size at 100% and the wrapped lines.
 pub fn layout(painter: &egui::Painter, n: &Node, zoom: f32, color: Color32) -> (Arc<Galley>, Vec2, Vec<String>) {
     let text = if n.text.is_empty() { " " } else { n.text.as_str() };
-    let galley = painter.layout_job(job(painter.ctx(), n, text, zoom, color));
+    let galley = lay(painter, n, text, zoom, color);
     let rows = galley.rows.len();
     // Lines keep a trailing newline where the paragraph ended, so export can track char offsets.
     let lines = galley

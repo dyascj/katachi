@@ -498,6 +498,7 @@ pub struct Comment {
     pub page: usize,
     /// World position, or offset from the anchor's top-left when anchored.
     pub at: Pos2,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<NodeId>,
     /// (author, text, unix seconds); the first entry opens the thread.
     pub messages: Vec<(String, String, u64)>,
@@ -508,11 +509,17 @@ pub struct Comment {
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SpanStyle {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub font_family: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub font_weight: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub font_size: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<Rgba>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub decoration: Option<Decoration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub italic: Option<bool>,
 }
 
@@ -1940,13 +1947,151 @@ struct FileJson {
 
 /// Read a .katachi file's text.
 pub fn parse_file(text: &str) -> Result<Document, String> {
-    serde_json::from_str::<FileJson>(text).map(|f| f.document).map_err(|e| e.to_string())
+    let mut doc = from_json::<FileJson>(text)?.document;
+    crate::collab::repair(&mut doc);
+    doc.next_id = doc.nodes.keys().map(|k| k + 1).fold(doc.next_id, u64::max);
+    Ok(doc)
 }
 
-/// A .katachi file's text.
+/// A .katachi file's text. Images no paint uses any more (deleted or replaced) are left out.
 pub fn file_json(doc: &Document) -> String {
+    let used = used_images(doc);
+    let json = if doc.images.keys().all(|k| used.contains(k.as_str())) {
+        to_json(doc)
+    } else {
+        let mut pruned = doc.clone();
+        pruned.images.retain(|k, _| used.contains(k.as_str()));
+        to_json(&pruned)
+    };
+    format!(r#"{{"katachi":1,"document":{json}}}"#)
+}
+
+/// Image keys that paints refer to: on layers, their instance snapshots, and paint styles.
+fn used_images(doc: &Document) -> std::collections::HashSet<&str> {
+    fn add<'a>(n: &'a Node, out: &mut std::collections::HashSet<&'a str>) {
+        out.extend(n.fills.iter().chain(&n.strokes).map(|p| p.image.as_str()));
+        if let Some(s) = &n.synced {
+            add(s, out);
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    for n in doc.nodes.values() {
+        add(n, &mut out);
+    }
+    for s in &doc.styles {
+        if let StyleValue::Paint(ps) = &s.value {
+            out.extend(ps.iter().map(|p| p.image.as_str()));
+        }
+    }
+    out
+}
+
+/// JSON for files, the clipboard and multiplayer. serde_json writes NaN and infinity as `null`,
+/// which strict readers reject; if any slipped in, a lenient round trip turns them into numbers.
+pub fn to_json<T: Serialize + serde::de::DeserializeOwned>(v: &T) -> String {
     // Straight to text: going through a serde_json::Value doubles the time on big files.
-    format!(r#"{{"katachi":1,"document":{}}}"#, serde_json::to_string(doc).unwrap_or_default())
+    let s = serde_json::to_string(v).unwrap_or_default();
+    // Base64 image data can't contain these, so they only show up for real nulls.
+    if !(s.contains(":null") || s.contains(",null") || s.contains("[null")) {
+        return s;
+    }
+    serde_json::from_str(&s).ok().and_then(|x| T::deserialize(Lenient(x)).ok()).and_then(|t| serde_json::to_string(&t).ok()).unwrap_or(s)
+}
+
+/// Parse JSON from `to_json`, or from older versions that wrote non-finite numbers as `null`:
+/// those read as 0, or as the property's default on layers.
+pub fn from_json<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
+    serde_json::from_str(text).or_else(|e| {
+        let v: serde_json::Value = serde_json::from_str(text).map_err(|_| e.to_string())?;
+        T::deserialize(Lenient(v)).map_err(|_| e.to_string())
+    })
+}
+
+/// A `serde_json::Value` deserializer that reads `null` floats as 0 and drops `null` layer fields.
+struct Lenient(serde_json::Value);
+
+/// Map keys: strings, or numbers written as strings (node ids).
+struct Key(String);
+
+impl serde::de::IntoDeserializer<'_, serde_json::Error> for Lenient {
+    type Deserializer = Self;
+    fn into_deserializer(self) -> Self {
+        self
+    }
+}
+
+impl serde::de::IntoDeserializer<'_, serde_json::Error> for Key {
+    type Deserializer = Self;
+    fn into_deserializer(self) -> Self {
+        self
+    }
+}
+
+fn lenient_map<'de>(m: serde_json::Map<String, serde_json::Value>) -> serde::de::value::MapDeserializer<'de, impl Iterator<Item = (Key, Lenient)>, serde_json::Error> {
+    serde::de::value::MapDeserializer::new(m.into_iter().map(|(k, v)| (Key(k), Lenient(v))))
+}
+
+impl<'de> serde::Deserializer<'de> for Lenient {
+    type Error = serde_json::Error;
+    fn deserialize_any<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        match self.0 {
+            serde_json::Value::Array(a) => v.visit_seq(serde::de::value::SeqDeserializer::new(a.into_iter().map(Lenient))),
+            serde_json::Value::Object(m) => v.visit_map(lenient_map(m)),
+            other => other.deserialize_any(v),
+        }
+    }
+    fn deserialize_f32<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        self.deserialize_f64(v)
+    }
+    fn deserialize_f64<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        if self.0.is_null() { v.visit_f64(0.0) } else { self.deserialize_any(v) }
+    }
+    fn deserialize_option<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        if self.0.is_null() { v.visit_none() } else { v.visit_some(self) }
+    }
+    fn deserialize_newtype_struct<V: serde::de::Visitor<'de>>(self, _: &'static str, v: V) -> Result<V::Value, Self::Error> {
+        v.visit_newtype_struct(self)
+    }
+    fn deserialize_struct<V: serde::de::Visitor<'de>>(self, name: &'static str, _: &'static [&'static str], v: V) -> Result<V::Value, Self::Error> {
+        match self.0 {
+            // Every layer field has a default, which beats 0 (an opacity of 0 hides the layer).
+            serde_json::Value::Object(mut m) if name == "Node" => {
+                m.retain(|_, x| !x.is_null());
+                v.visit_map(lenient_map(m))
+            }
+            other => Lenient(other).deserialize_any(v),
+        }
+    }
+    fn deserialize_enum<V: serde::de::Visitor<'de>>(self, name: &'static str, variants: &'static [&'static str], v: V) -> Result<V::Value, Self::Error> {
+        use serde::de::IntoDeserializer;
+        match self.0 {
+            serde_json::Value::Object(m) => serde::de::value::MapAccessDeserializer::new(lenient_map(m)).deserialize_enum(name, variants, v),
+            serde_json::Value::String(s) => v.visit_enum(IntoDeserializer::<serde_json::Error>::into_deserializer(s)),
+            other => other.deserialize_enum(name, variants, v),
+        }
+    }
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 char str string bytes byte_buf unit unit_struct seq tuple tuple_struct map identifier ignored_any
+    }
+}
+
+impl<'de> serde::Deserializer<'de> for Key {
+    type Error = serde_json::Error;
+    fn deserialize_any<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        v.visit_string(self.0)
+    }
+    fn deserialize_u64<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        match self.0.parse() {
+            Ok(n) => v.visit_u64(n),
+            Err(_) => v.visit_string(self.0),
+        }
+    }
+    fn deserialize_u32<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        self.deserialize_u64(v)
+    }
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u128 f32 f64 char str string bytes byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map struct enum identifier ignored_any
+    }
 }
 
 mod images_b64 {
@@ -2010,9 +2155,12 @@ impl Document {
     pub fn ancestors(&self, id: NodeId) -> Vec<NodeId> {
         let mut out = vec![];
         let mut cur = self.nodes.get(&id).and_then(|n| n.parent);
-        while let Some(p) = cur {
+        // Bounded, so a corrupt parent cycle can't hang.
+        while let Some(p) = cur
+            && out.len() < self.nodes.len()
+        {
             out.push(p);
-            cur = self.nodes[&p].parent;
+            cur = self.nodes.get(&p).and_then(|n| n.parent);
         }
         out
     }
@@ -3163,6 +3311,7 @@ impl Document {
 
     /// Insert a fragment from `extract` under `parent` with fresh ids. Returns new root ids.
     pub fn paste(&mut self, frag: &[Node], page: usize, parent: Option<NodeId>, index: Option<usize>) -> Vec<NodeId> {
+        let frag = &clean_fragment(frag);
         let in_frag: std::collections::HashSet<NodeId> = frag.iter().map(|n| n.id).collect();
         let mut map: HashMap<NodeId, NodeId> = HashMap::new();
         let mut roots = vec![];
@@ -3265,6 +3414,37 @@ impl Document {
     pub fn bounds(&self, ids: &[NodeId]) -> Rect {
         ids.iter().fold(Rect::NOTHING, |r, id| r.union(self.nodes[id].aabb()))
     }
+}
+
+/// A fragment (from the clipboard, possibly hand-edited) made safe to paste: parent links that
+/// loop become roots, and parents come before their children, as `extract` writes them.
+pub fn clean_fragment(frag: &[Node]) -> Vec<Node> {
+    let mut nodes = frag.to_vec();
+    let at: HashMap<NodeId, usize> = nodes.iter().enumerate().map(|(i, n)| (n.id, i)).collect();
+    for i in 0..nodes.len() {
+        let (mut cur, mut steps) = (nodes[i].parent, 0);
+        while let Some(&p) = cur.and_then(|p| at.get(&p))
+            && steps <= nodes.len()
+        {
+            if p == i {
+                nodes[i].parent = None;
+                break;
+            }
+            (cur, steps) = (nodes[p].parent, steps + 1);
+        }
+    }
+    let (mut out, mut placed) = (Vec::with_capacity(nodes.len()), std::collections::HashSet::new());
+    while !nodes.is_empty() {
+        let (ready, mut wait): (Vec<Node>, Vec<Node>) = nodes.into_iter().partition(|n| n.parent.is_none_or(|p| !at.contains_key(&p) || placed.contains(&p)));
+        if ready.is_empty() {
+            // Only possible with duplicate ids; paste the rest as roots.
+            wait.iter_mut().for_each(|n| n.parent = None);
+        }
+        placed.extend(ready.iter().map(|n| n.id));
+        out.extend(ready);
+        nodes = wait;
+    }
+    out
 }
 
 /// Copy each property from `src` unless the instance layer overrode it
@@ -3423,6 +3603,67 @@ mod tests {
     }
 
     #[test]
+    fn non_finite_numbers_save_and_old_files_with_nulls_open() {
+        let mut d = Document::default();
+        let a = d.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 0., 10., 10.)));
+        d.node_mut(a).opacity = f32::NAN;
+        d.node_mut(a).rect.min.x = f32::INFINITY;
+        d.node_mut(a).dash = vec![4., f32::NAN];
+        d.node_mut(a).min_size = [None, Some(f32::NAN)];
+        d.node_mut(a).line_height = LineHeight::Px(f32::NAN);
+        d.node_mut(a).fills[0].stops = vec![(f32::NAN, Rgba::BLACK)];
+        d.comments.push(Comment { id: 1, page: 0, at: pos2(f32::NAN, 1.), anchor: None, messages: vec![], resolved: false });
+        // What older versions wrote: plain serde_json, NaN as null.
+        let old = format!(r#"{{"katachi":1,"document":{}}}"#, serde_json::to_string(&d).unwrap());
+        assert!(old.contains("null") && serde_json::from_str::<FileJson>(&old).is_err());
+        let back = parse_file(&old).expect("old file opens");
+        let n = back.node(a);
+        assert_eq!((n.opacity, n.rect.min.x, n.dash.clone(), n.min_size, n.line_height), (1.0, 0.0, vec![4., 0.], [None, None], LineHeight::Px(0.0)));
+        assert_eq!(n.fills[0].stops[0].0, 0.0);
+        assert_eq!(back.comments[0].at, pos2(0., 1.));
+        // New saves never contain the nulls in the first place.
+        let new = file_json(&d);
+        assert!(serde_json::from_str::<FileJson>(&new).is_ok(), "{new}");
+    }
+
+    #[test]
+    fn loading_repairs_cycles_missing_parents_and_pages() {
+        let mut d = Document::default();
+        let a = d.insert(0, None, None, Node::new(Kind::Frame, r(0., 0., 10., 10.)));
+        let b = d.insert(0, Some(a), None, Node::new(Kind::Frame, r(0., 0., 5., 5.)));
+        let c = d.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 0., 5., 5.)));
+        // a and b inside each other, c inside itself, a dangling child, and no pages.
+        d.node_mut(a).parent = Some(b);
+        d.node_mut(b).children.push(a);
+        d.node_mut(c).parent = Some(c);
+        d.node_mut(c).children = vec![c, 999];
+        d.pages.clear();
+        d.next_id = 1;
+        let back = parse_file(&file_json(&d)).unwrap();
+        assert_eq!(back.pages.len(), 1);
+        assert_eq!(back.ancestors(c), Vec::<NodeId>::new());
+        assert!(back.node(c).children.is_empty());
+        assert!(back.ancestors(a).len() + back.ancestors(b).len() == 1, "one of the pair is top level, the other inside it");
+        assert!(back.next_id > c, "new layers don't reuse ids");
+        // ancestors() itself never loops, even on a document that wasn't repaired.
+        assert!(d.ancestors(a).len() <= d.nodes.len());
+    }
+
+    #[test]
+    fn paste_survives_out_of_order_and_cyclic_fragments() {
+        let mut d = Document::default();
+        let mut parent = Node::new(Kind::Frame, r(0., 0., 10., 10.));
+        let mut kid = Node::new(Kind::Rectangle, r(0., 0., 5., 5.));
+        (parent.id, kid.id, kid.parent) = (1, 2, Some(1));
+        let ids = d.paste(&[kid.clone(), parent.clone()], 0, None, None);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(d.node(ids[0]).children.len(), 1, "the child lands in its parent");
+        parent.parent = Some(2);
+        let ids = d.paste(&[parent, kid], 0, None, None);
+        assert_eq!(ids.len(), 1, "the loop is cut");
+    }
+
+    #[test]
     fn group_ungroup_and_scale() {
         let mut d = Document::default();
         let a = d.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 0., 10., 10.)));
@@ -3544,6 +3785,22 @@ mod tests {
         assert!(json.contains("AQID+g=="), "{json}");
         let back: Document = serde_json::from_str(&json).unwrap();
         assert_eq!(back.images["abc"].as_slice(), &[1, 2, 3, 250]);
+    }
+
+    #[test]
+    fn saving_drops_images_no_paint_uses() {
+        let mut d = Document::default();
+        d.images.insert("gone".into(), std::sync::Arc::new(vec![1]));
+        d.images.insert("kept".into(), std::sync::Arc::new(vec![2]));
+        let mut p = Paint::solid(Rgba::WHITE);
+        (p.kind, p.image) = (PaintKind::Image, "kept".into());
+        // Only an instance's snapshot of its component still shows it.
+        let mut n = Node::new(Kind::Rectangle, r(0., 0., 1., 1.));
+        n.synced = Some(Box::new(Node { fills: vec![p], ..Node::default() }));
+        d.insert(0, None, None, n);
+        let back = parse_file(&file_json(&d)).unwrap();
+        assert!(back.images.contains_key("kept") && !back.images.contains_key("gone"));
+        assert_eq!(d.images.len(), 2, "the open document keeps them (undo may bring a paint back)");
     }
 
     fn al_frame(d: &mut Document, mode: LayoutMode) -> NodeId {

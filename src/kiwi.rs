@@ -142,7 +142,8 @@ impl Reader<'_> {
         let rest = self.data.get(self.at..self.at + 3).ok_or("unexpected end of data")?;
         self.at += 3;
         let bits = first as u32 | (rest[0] as u32) << 8 | (rest[1] as u32) << 16 | (rest[2] as u32) << 24;
-        Ok(f32::from_bits(bits.rotate_left(23)))
+        // NaN and infinity would end up in saved files as nulls; read them as 0.
+        Ok(Some(f32::from_bits(bits.rotate_left(23))).filter(|f| f.is_finite()).unwrap_or(0.0))
     }
     fn string(&mut self) -> Result<String, String> {
         let start = self.at;
@@ -324,7 +325,7 @@ mod tests {
         vu(&mut m, 1);
         vu(&mut m, 3);
         vu(&mut m, 2);
-        for (x, y) in [(1.5f32, -2.0f32), (0.0, 3.25)] {
+        for (x, y) in [(1.5f32, f32::NAN), (0.0, 3.25)] {
             fl(&mut m, x);
             fl(&mut m, y);
         }
@@ -336,6 +337,7 @@ mod tests {
         assert_eq!(v.s("kind"), Some("B"));
         assert_eq!(v.arr("pts")[1].f("y"), Some(3.25));
         assert_eq!(v.arr("pts")[0].f("x"), Some(1.5));
+        assert_eq!(v.arr("pts")[0].f("y"), Some(0.0), "NaN reads as 0");
         assert_eq!(v.get("n"), Some(&Value::Int(-7)));
     }
 }

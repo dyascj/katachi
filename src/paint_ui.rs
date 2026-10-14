@@ -639,7 +639,7 @@ fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEve
                 let mut deg = (-d.y.atan2(d.x).to_degrees()).round();
                 ui.horizontal(|ui| {
                     ui.label("Angle");
-                    if ui.add(DragValue::new(&mut deg).suffix("°").speed(1.0)).changed() {
+                    if ui.add(DragValue::new(&mut deg).range(-360.0..=360.0).suffix("°").speed(1.0)).changed() {
                         let a = -deg.to_radians();
                         let half = egui::Vec2::angled(a) * 0.5;
                         paint.from = pos2(0.5, 0.5) - half;

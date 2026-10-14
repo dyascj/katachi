@@ -126,6 +126,56 @@ fn shift_draw_is_square_and_alt_draws_from_center() {
 }
 
 #[test]
+fn undo_during_a_drag_is_ignored() {
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    let (a, b) = (s(&h, 50., 50.), s(&h, 80., 90.));
+    move_to(&mut h, a, Modifiers::NONE);
+    press(&mut h, a, true, Modifiers::NONE);
+    move_to(&mut h, a.lerp(b, 0.5), Modifiers::NONE);
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    move_to(&mut h, b, Modifiers::NONE);
+    press(&mut h, b, false, Modifiers::NONE);
+    h.run_steps(2);
+    assert_eq!(rect(&h, id), r(30., 40., 100., 100.));
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(rect(&h, id), r(0., 0., 100., 100.), "one undo takes back the move");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert!(h.state().doc.nodes.is_empty(), "the next one the drawing");
+}
+
+#[test]
+fn deleting_an_earlier_page_stays_on_the_current_one() {
+    let mut h = harness();
+    for name in ["Page 2", "Page 3", "Page 4"] {
+        let mut p = h.state().doc.pages[0].clone();
+        p.name = name.into();
+        h.state_mut().doc.pages.push(p);
+    }
+    h.state_mut().page = 2;
+    h.run_steps(2);
+    h.get_by_label("Page 1").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Delete page").click();
+    h.run_steps(2);
+    let st = h.state();
+    assert_eq!((st.doc.pages.len(), st.doc.pages[st.page].name.as_str()), (3, "Page 3"));
+}
+
+#[test]
+fn cancelling_a_quit_resets_every_tab() {
+    let mut h = harness();
+    h.state_mut().dirty = true;
+    h.state_mut().allow_close = true;
+    h.state_mut().confirm = Some(crate::app::After::Close);
+    h.run_steps(2);
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    assert!(!h.state().allow_close);
+    assert_eq!(h.state().want, Some(crate::app::Want::KeepOpen), "the window resets the other tabs");
+}
+
+#[test]
 fn move_resize_and_delete() {
     let mut h = harness();
     let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
@@ -1023,20 +1073,25 @@ fn autosave_and_recovery_roundtrip() {
     a.doc.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 0., 10., 10.)));
     a.dirty = true;
     a.autosave(100.0);
-    // Written in the background.
-    let mut left = vec![];
+    // Written in the background; names start with the writer's process id.
+    let own = format!("{}-", std::process::id());
+    let mut mine = None;
     for _ in 0..200 {
-        left = crate::files::orphaned_recoveries(std::path::Path::new("none"));
-        if !left.is_empty() {
+        mine = std::fs::read_dir(crate::files::recovery_dir())
+            .ok()
+            .and_then(|rd| rd.flatten().map(|e| e.path()).find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&own) && p.extension().is_some_and(|e| e == "katachi"))));
+        if mine.is_some() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(!left.is_empty(), "autosave written");
-    // A new session sees the orphan and can recover it as unsaved work.
+    let mine = mine.expect("autosave written");
+    assert!(!crate::files::orphaned_recoveries(std::path::Path::new("none")).contains(&mine), "a running session's autosave isn't offered");
+    // Once the process that wrote it is gone, a new session can recover it as unsaved work.
+    let p = mine.with_file_name(mine.file_name().unwrap().to_string_lossy().replacen(&own, "4000000000-", 1));
+    std::fs::rename(&mine, &p).unwrap();
     let mut b = App::new(None);
-    assert!(!b.recoverable.is_empty());
-    let p = b.recoverable.iter().find(|p| left.contains(p)).unwrap().clone();
+    assert!(b.recoverable.contains(&p));
     b.recover(&p);
     assert_eq!(b.doc.nodes.len(), 1);
     assert!(b.dirty);
@@ -1354,9 +1409,44 @@ fn saves_keep_versions() {
     crate::files::save_version(&file, b"{\"katachi\":1}");
     std::thread::sleep(std::time::Duration::from_millis(5));
     crate::files::save_version(&file, b"{\"katachi\":2}");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    crate::files::save_version(&file, b"{\"katachi\":2}");
     let v = crate::files::versions(&file);
-    assert_eq!(v.len(), 2);
+    assert_eq!(v.len(), 2, "saving again without changes adds no version");
     assert_eq!(std::fs::read_to_string(&v[0].0).unwrap(), "{\"katachi\":2}", "newest first");
+    // History kept under the old (DefaultHasher) folder name moves to the stable one.
+    let other = file.with_file_name("katachi-versions-old.katachi");
+    let mut h = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(&other, &mut h);
+    let old = crate::files::data_dir().join("history").join(format!("{:016x}", std::hash::Hasher::finish(&h)));
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("1.katachi"), "{}").unwrap();
+    assert_eq!(crate::files::versions(&other).len(), 1);
+}
+
+#[test]
+fn atomic_writes_keep_symlinks_permissions_and_siblings() {
+    let dir = std::env::temp_dir().join(format!("katachi-atomic-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // The temp name can't be a real neighbor's (this was "a.katachi-tmp").
+    std::fs::write(dir.join("a.katachi-tmp"), "neighbor").unwrap();
+    crate::files::write_atomic(&dir.join("a.json"), b"new").unwrap();
+    assert_eq!(std::fs::read_to_string(dir.join("a.katachi-tmp")).unwrap(), "neighbor");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "no temp file left behind");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let real = dir.join("real.katachi");
+        std::fs::write(&real, "old").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("link.katachi");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        crate::files::write_atomic(&link, b"new").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "still a link");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2936,4 +3026,29 @@ fn right_click_select_layer_and_move_to_page() {
     assert_eq!(h.state().doc.node(r1).parent, Some(f), "children travel with it");
     key(&mut h, Modifiers::COMMAND, Key::Z);
     assert_eq!(h.state().doc.pages[0].children, vec![f], "one undo step");
+}
+
+#[test]
+fn huge_text_draws_and_edits_without_overflowing_the_font_atlas() {
+    let mut h = harness();
+    let mut n = Node::new(Kind::Text, r(0., 0., 100., 100.));
+    n.text = "W".into();
+    n.font_size = 20000.;
+    let id = h.state_mut().doc.insert(0, None, None, n);
+    h.state_mut().doc.reflow();
+    h.run_steps(2);
+    h.state_mut().editing_text = Some(id);
+    h.run_steps(2);
+    assert!(h.state().doc.node(id).rect.width() > 10000., "laid out at its true size");
+}
+
+#[test]
+fn serve_refuses_a_file_it_cannot_read() {
+    let dir = std::env::temp_dir().join(format!("katachi-serve-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bad = dir.join("bad.katachi");
+    std::fs::write(&bad, "not a katachi file").unwrap();
+    assert!(crate::load_or_new(Some(&bad)).is_err(), "a broken file isn't replaced with an empty one");
+    assert!(crate::load_or_new(Some(&dir.join("new.katachi"))).is_ok(), "a new file starts empty");
+    let _ = std::fs::remove_dir_all(&dir);
 }
