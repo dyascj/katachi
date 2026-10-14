@@ -13,6 +13,8 @@ const TEXT_EDIT_ID: &str = "katachi-text-edit";
 pub const BLUE: Color32 = Color32::from_rgb(0x0D, 0x99, 0xFF);
 pub const PURPLE: Color32 = Color32::from_rgb(0x97, 0x47, 0xFF);
 const SNAP: Color32 = Color32::from_rgb(0xF2, 0x48, 0x22);
+/// Figma's pink for spacing: equal-gap markers and smart selection handles.
+const GAP: Color32 = Color32::from_rgb(0xFF, 0x24, 0xBD);
 
 pub fn num(v: f32) -> String {
     let r = (v * 100.0).round() / 100.0;
@@ -520,6 +522,7 @@ impl App {
                     let now = self.doc.node(id).aabb().min;
                     self.doc.translate(id, from + (w - *start) - now);
                     self.guides.clear();
+                    self.gap_marks.clear();
                     self.drag = Some(drag);
                     return;
                 }
@@ -703,6 +706,7 @@ impl App {
 
     fn on_drag_end(&mut self, w: Pos2) {
         self.guides.clear();
+        self.gap_marks.clear();
         self.vector_grabbed = None;
         match self.drag.take() {
             Some(Drag::Connect { from }) => {
@@ -941,17 +945,22 @@ impl App {
 
     // ---------- snapping ----------
 
-    fn snap_targets(&self, exclude: &[NodeId]) -> Vec<Rect> {
+    /// Visible siblings of the first excluded layer: what it aligns and spaces against.
+    fn snap_siblings(&self, exclude: &[NodeId]) -> Vec<Rect> {
         let parent = exclude.first().and_then(|&e| self.doc.nodes.get(&e)).and_then(|n| n.parent);
-        let mut out: Vec<Rect> = self
-            .doc
+        self.doc
             .children_of(self.page, parent)
             .iter()
             .filter(|c| !exclude.contains(c))
             .map(|c| self.doc.node(*c))
             .filter(|n| n.visible)
             .map(|n| n.aabb())
-            .collect();
+            .collect()
+    }
+
+    fn snap_targets(&self, exclude: &[NodeId]) -> Vec<Rect> {
+        let parent = exclude.first().and_then(|&e| self.doc.nodes.get(&e)).and_then(|n| n.parent);
+        let mut out = self.snap_siblings(exclude);
         if let Some(p) = parent {
             let pn = self.doc.node(p);
             out.push(pn.aabb());
@@ -1025,44 +1034,57 @@ impl App {
         }
     }
 
-    /// Correction that snaps the masked edges of `moving` to nearby sibling edges/centers.
-    /// Records guide lines for display.
+    /// Correction that snaps the masked edges of `moving` to nearby sibling edges/centers, or
+    /// to a gap that repeats the spacing between its neighbors (Figma's smart spacing guides).
+    /// Records guide lines and gap markers for display.
     fn snap(&mut self, moving: Rect, exclude: &[NodeId], mx: [bool; 3], my: [bool; 3]) -> Vec2 {
+        self.guides.clear();
+        self.gap_marks.clear();
         if !self.prefs.snap_to_objects {
-            self.guides.clear();
             return Vec2::ZERO;
         }
         let tol = 5.0 / self.view.zoom;
         let targets = self.snap_targets(exclude);
-        let xs = |r: Rect| [r.min.x, r.center().x, r.max.x];
-        let ys = |r: Rect| [r.min.y, r.center().y, r.max.y];
-        let best = |m: [f32; 3], mask: [bool; 3], t: &dyn Fn(Rect) -> [f32; 3]| {
+        let sibs = self.snap_siblings(exclude);
+        let vals = |r: Rect, a: usize| [r.min[a], r.center()[a], r.max[a]];
+        let mut corr = Vec2::ZERO;
+        let mut gap_used = [None, None];
+        for (a, mask) in [mx, my].into_iter().enumerate() {
             let mut best: Option<f32> = None;
-            for r in &targets {
-                for (_, mv) in m.iter().enumerate().filter(|(i, _)| mask[*i]) {
-                    for tv in t(*r) {
-                        let d = tv - mv;
-                        if d.abs() < tol && best.is_none_or(|b| d.abs() < b.abs()) {
-                            best = Some(d);
-                        }
+            for (_, mv) in vals(moving, a).iter().enumerate().filter(|(i, _)| mask[*i]) {
+                for tv in targets.iter().flat_map(|r| vals(*r, a)) {
+                    let d = tv - mv;
+                    if d.abs() < tol && best.is_none_or(|b| d.abs() < b.abs()) {
+                        best = Some(d);
                     }
                 }
             }
-            best
-        };
-        let corr = vec2(best(xs(moving), mx, &xs).unwrap_or(0.0), best(ys(moving), my, &ys).unwrap_or(0.0));
+            let gap = gap_snaps(moving, &sibs, a, mask).into_iter().filter(|(d, _)| d.abs() < tol).min_by(|x, y| x.0.abs().total_cmp(&y.0.abs()));
+            match (best, gap) {
+                (b, Some((d, g))) if b.is_none_or(|b| d.abs() <= b.abs()) => {
+                    corr[a] = d;
+                    gap_used[a] = Some(g);
+                }
+                (Some(b), _) => corr[a] = b,
+                _ => {}
+            }
+        }
         let m = moving.translate(corr);
-        self.guides.clear();
         for r in &targets {
-            for (i, mv) in xs(m).iter().enumerate() {
-                if mx[i] && xs(*r).iter().any(|t| (t - mv).abs() < 0.01) {
+            for (i, mv) in vals(m, 0).iter().enumerate() {
+                if mx[i] && vals(*r, 0).iter().any(|t| (t - mv).abs() < 0.01) {
                     self.guides.push([pos2(*mv, m.min.y.min(r.min.y)), pos2(*mv, m.max.y.max(r.max.y))]);
                 }
             }
-            for (i, mv) in ys(m).iter().enumerate() {
-                if my[i] && ys(*r).iter().any(|t| (t - mv).abs() < 0.01) {
+            for (i, mv) in vals(m, 1).iter().enumerate() {
+                if my[i] && vals(*r, 1).iter().any(|t| (t - mv).abs() < 0.01) {
                     self.guides.push([pos2(m.min.x.min(r.min.x), *mv), pos2(m.max.x.max(r.max.x), *mv)]);
                 }
+            }
+        }
+        for (a, g) in gap_used.into_iter().enumerate() {
+            if let Some(g) = g {
+                self.gap_marks.extend(equal_gaps(m, &sibs, a, g));
             }
         }
         corr
@@ -1070,7 +1092,7 @@ impl App {
 
     fn snap_point(&mut self, p: Pos2, exclude: &[NodeId]) -> Pos2 {
         let r = Rect::from_min_size(p, Vec2::ZERO);
-        p + self.snap(r, exclude, [true, false, false], [true, false, false])
+        p + self.snap(r, exclude, [true, false, true], [true, false, true])
     }
 
     // ---------- overlays ----------
@@ -1231,6 +1253,15 @@ impl App {
         for g in &self.guides {
             painter.line_segment([self.view.to_screen(g[0]), self.view.to_screen(g[1])], Stroke::new(1.0, SNAP));
         }
+        // Equal gaps: a pink span with end ticks and the gap size, as in Figma.
+        for [a, b] in &self.gap_marks {
+            let (sa, sb) = (self.view.to_screen(*a), self.view.to_screen(*b));
+            let t = (sb - sa).normalized().rot90() * 4.0;
+            for seg in [[sa, sb], [sa - t, sa + t], [sb - t, sb + t]] {
+                painter.line_segment(seg, Stroke::new(1.0, GAP));
+            }
+            pill(painter, sa.lerp(sb, 0.5) + t * 3.0, num(a.distance(*b)), GAP);
+        }
         if let (Some(Drag::Marquee { start, .. }), Some(p)) = (&self.drag, ptr) {
             let r = Rect::from_two_pos(self.view.to_screen(*start), p);
             painter.rect_filled(r, 0.0, BLUE.gamma_multiply(0.1));
@@ -1326,10 +1357,7 @@ impl App {
             }
             let (sa, sb) = (v.to_screen(a), v.to_screen(b));
             painter.line_segment([sa, sb], Stroke::new(1.0, red));
-            let g = painter.layout_no_wrap(num(d), FontId::proportional(11.0), Color32::WHITE);
-            let pill = Rect::from_center_size(sa.lerp(sb, 0.5), g.size() + vec2(8.0, 4.0));
-            painter.rect_filled(pill, 2.0, red);
-            painter.galley(pill.min + vec2(4.0, 2.0), g, Color32::WHITE);
+            pill(painter, sa.lerp(sb, 0.5), num(d), red);
         }
     }
 
@@ -1690,6 +1718,14 @@ impl App {
     }
 }
 
+/// A small measurement label centered at `at`: white text on `fill`.
+fn pill(painter: &Painter, at: Pos2, text: String, fill: Color32) {
+    let g = painter.layout_no_wrap(text, FontId::proportional(11.0), Color32::WHITE);
+    let r = Rect::from_center_size(at, g.size() + vec2(8.0, 4.0));
+    painter.rect_filled(r, 2.0, fill);
+    painter.galley(r.min + vec2(4.0, 2.0), g, Color32::WHITE);
+}
+
 /// Everything that affects a text layer's measured size, hashed.
 fn text_key(ctx: &egui::Context, n: &Node) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -1769,6 +1805,66 @@ pub fn smooth_stroke(points: &[Pos2], tol: f32) -> Vec<PathPoint> {
             }
             let t = (simple[i + 1] - simple[i - 1]) / 6.0;
             PathPoint { p, h_in: -t, h_out: t }
+        })
+        .collect()
+}
+
+/// Whether `r` and `s` overlap across axis `a`: in the same row (a = 0) or column (a = 1).
+fn across(r: Rect, s: Rect, a: usize) -> bool {
+    let b = 1 - a;
+    r.min[b] < s.max[b] && s.min[b] < r.max[b]
+}
+
+/// Adjacent pairs along axis `a` with empty space between them: each rect and its nearest
+/// neighbor after it in the same row or column.
+fn neighbors(rs: &[Rect], a: usize) -> Vec<(Rect, Rect)> {
+    rs.iter()
+        .filter_map(|p| {
+            let q = rs.iter().filter(|q| q.min[a] > p.max[a] && across(*p, **q, a)).min_by(|x, y| x.min[a].total_cmp(&y.min[a]))?;
+            Some((*p, *q))
+        })
+        .collect()
+}
+
+/// Equal-spacing snaps for `m` along axis `a`: corrections that put a masked edge one existing
+/// gap (between neighbors in its row) away from the nearest neighbor, or center `m` between
+/// its two neighbors. Each is (correction, gap).
+fn gap_snaps(m: Rect, sibs: &[Rect], a: usize, mask: [bool; 3]) -> Vec<(f32, f32)> {
+    let row: Vec<Rect> = sibs.iter().copied().filter(|s| across(m, *s, a)).collect();
+    let gaps: Vec<f32> = neighbors(&row, a).iter().map(|(p, q)| q.min[a] - p.max[a]).collect();
+    let c = m.center()[a];
+    let before = row.iter().filter(|s| s.max[a] <= c).max_by(|x, y| x.max[a].total_cmp(&y.max[a]));
+    let after = row.iter().filter(|s| s.min[a] >= c).min_by(|x, y| x.min[a].total_cmp(&y.min[a]));
+    let mut out = vec![];
+    if let (true, Some(l)) = (mask[0], before) {
+        out.extend(gaps.iter().map(|g| (l.max[a] + g - m.min[a], *g)));
+    }
+    if let (true, Some(r)) = (mask[2], after) {
+        out.extend(gaps.iter().map(|g| (r.min[a] - g - m.max[a], *g)));
+    }
+    if let (true, Some(l), Some(r)) = (mask[1], before, after) {
+        let g = (r.min[a] - l.max[a] - (m.max[a] - m.min[a])) / 2.0;
+        if g > 0.0 {
+            out.push((l.max[a] + g - m.min[a], g));
+        }
+    }
+    out
+}
+
+/// Every gap of size `g` along axis `a` in `m`'s row, as world segments across the gap.
+fn equal_gaps(m: Rect, sibs: &[Rect], a: usize, g: f32) -> Vec<[Pos2; 2]> {
+    let mut row: Vec<Rect> = sibs.iter().copied().filter(|s| across(m, *s, a)).collect();
+    row.push(m);
+    let b = 1 - a;
+    neighbors(&row, a)
+        .into_iter()
+        .filter(|(p, q)| (q.min[a] - p.max[a] - g).abs() < 0.5)
+        .map(|(p, q)| {
+            let mut s = p.max;
+            s[b] = (p.min[b].max(q.min[b]) + p.max[b].min(q.max[b])) / 2.0;
+            let mut e = s;
+            e[a] = q.min[a];
+            [s, e]
         })
         .collect()
 }

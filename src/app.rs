@@ -145,6 +145,8 @@ pub struct App {
     pub renaming: Option<(NodeId, String)>,
     pub renaming_page: Option<(usize, String)>,
     pub guides: Vec<[Pos2; 2]>,
+    /// Equal-spacing markers while snapping: world segments across each matching gap.
+    pub gap_marks: Vec<[Pos2; 2]>,
     pub frame_labels: Vec<(NodeId, Rect)>,
     pub layer_drag: Option<NodeId>,
     pub canvas_rect: Option<Rect>,
@@ -266,6 +268,7 @@ impl App {
             renaming: None,
             renaming_page: None,
             guides: vec![],
+            gap_marks: vec![],
             frame_labels: vec![],
             layer_drag: None,
             canvas_rect: None,

@@ -2048,3 +2048,31 @@ fn color_picker_drags_and_escape_from_find_keeps_selection() {
     assert!(!h.state().find.0);
     assert_eq!(h.state().sel, vec![id], "selection kept");
 }
+
+#[test]
+fn snaps_to_equal_spacing_and_marks_gaps() {
+    let mut h = harness();
+    draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    draw(&mut h, Key::R, (150.0, 0.0), (250.0, 100.0));
+    let c = draw(&mut h, Key::R, (400.0, 0.0), (500.0, 100.0));
+    // Drop c 3px past the 50px gap that a and b already have: it lands one gap after b.
+    let (a, b) = (s(&h, 450., 50.), s(&h, 353., 50.));
+    move_to(&mut h, a, Modifiers::NONE);
+    press(&mut h, a, true, Modifiers::NONE);
+    for i in 1..=6 {
+        move_to(&mut h, a.lerp(b, i as f32 / 6.0), Modifiers::NONE);
+    }
+    assert_eq!(h.state().gap_marks.len(), 2, "both 50px gaps marked");
+    press(&mut h, b, false, Modifiers::NONE);
+    h.run_steps(2);
+    assert_eq!(rect(&h, c).min.x, 300.0);
+    assert!(h.state().gap_marks.is_empty());
+    // Centered between two neighbors: equal gaps on both sides.
+    let mut h = harness();
+    draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    draw(&mut h, Key::R, (300.0, 0.0), (400.0, 100.0));
+    let c = draw(&mut h, Key::R, (0.0, 300.0), (100.0, 400.0));
+    let (a, b) = (s(&h, 50., 350.), s(&h, 198., 50.));
+    drag(&mut h, a, b, Modifiers::NONE);
+    assert_eq!(rect(&h, c), r(150., 0., 100., 100.));
+}
