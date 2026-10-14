@@ -1013,8 +1013,13 @@ impl App {
             if !k.visible || k.absolute {
                 continue;
             }
-            let center = k.aabb().center();
-            let before = if h { center.x < w.x } else { center.y < w.y };
+            let (b, center) = (k.aabb(), k.aabb().center());
+            let before = match pn.layout.mode {
+                // Grids read row by row: rows above, then cells to the left on the pointer's row.
+                LayoutMode::Grid => b.max.y < w.y || (b.min.y <= w.y && center.x < w.x),
+                _ if h => center.x < w.x,
+                _ => center.y < w.y,
+            };
             if before {
                 index = i + 1;
             }

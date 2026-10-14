@@ -925,8 +925,25 @@ impl App {
             return;
         }
         self.checkpoint();
-        for id in self.sel_roots() {
-            self.doc.translate(id, d);
+        // Later layers first when stepping forward, so a run of selected siblings moves together.
+        let mut roots = self.doc.sort_by_z(&self.sel_roots());
+        if d.x + d.y > 0.0 {
+            roots.reverse();
+        }
+        for id in roots {
+            // Children of auto layout step through the flow instead of moving (Figma).
+            let flow = self.doc.node(id).parent.map(|p| self.doc.node(p).layout).filter(|l| l.mode != LayoutMode::None && !self.doc.node(id).absolute);
+            let Some(l) = flow else {
+                self.doc.translate(id, d);
+                continue;
+            };
+            let sign = |v: f32| (v > 0.0) as isize - (v < 0.0) as isize;
+            let step = match l.mode {
+                LayoutMode::Horizontal => sign(d.x),
+                LayoutMode::Vertical => sign(d.y),
+                _ => sign(d.x) + sign(d.y) * l.grid[0].max(1) as isize,
+            };
+            self.doc.step_in_flow(id, step);
         }
         self.doc.reflow();
     }

@@ -609,7 +609,7 @@ fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
         } else if !matches!(n.kind, Kind::Group | Kind::Boolean) {
             painter.add(stroke_mesh(&node_path(n, &v, 0.0), 1.0, gray));
         }
-        for &c in &n.children {
+        for c in n.paint_order() {
             draw_node(painter, sc, c, alpha);
         }
         return;
@@ -710,7 +710,7 @@ fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
     } else {
         painter.clone()
     };
-    for &c in &n.children.clone() {
+    for c in n.paint_order() {
         draw_node(&child_painter, sc, c, a);
     }
 }

@@ -31,6 +31,8 @@ pub enum Icon {
     ArrowRight,
     /// Auto layout wrap: across, then back on the next row.
     Wrap,
+    /// Grid auto layout: a 2x2 of cells.
+    Grid,
     Opacity,
     Radius,
     PadH,
@@ -210,6 +212,11 @@ pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
             }
             p.line_segment([at(-5., 3.), at(-2., 0.)], s);
             p.line_segment([at(-5., 3.), at(-2., 6.)], s);
+        }
+        Icon::Grid => {
+            for (x, y) in [(-3.5, -3.5), (3.5, -3.5), (-3.5, 3.5), (3.5, 3.5)] {
+                p.rect_stroke(Rect::from_center_size(at(x, y), vec2(5.0, 5.0)), 1.0, s, egui::StrokeKind::Middle);
+            }
         }
         Icon::Opacity => {
             p.circle_stroke(c, 5.0, s);
@@ -453,9 +460,10 @@ fn align_grid(ui: &mut Ui, l: &mut AutoLayout) {
     let (rect, resp) = ui.allocate_exact_size(vec2(64.0, 64.0), Sense::click());
     let p = ui.painter();
     p.rect_filled(rect, 4.0, theme::subtle(ui.ctx()));
-    let h = l.mode == LayoutMode::Horizontal;
+    // Grids align their children in each cell like a horizontal layout: main = x, cross = y.
+    let h = l.mode != LayoutMode::Vertical;
     let idx = |a: AxisAlign| match a {
-        AxisAlign::Min => 0,
+        AxisAlign::Min | AxisAlign::Baseline => 0,
         AxisAlign::Center => 1,
         AxisAlign::Max => 2,
     };
@@ -3118,6 +3126,25 @@ impl App {
                 self.doc.reflow();
             }
         }
+        // Grid children span columns and rows.
+        if parent_al && roots.len() == 1 && n.parent.is_some_and(|p| self.doc.node(p).layout.mode == LayoutMode::Grid) {
+            let mut span = n.grid_span;
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                for (i, label) in [(0, "Col span"), (1, "Row span")] {
+                    let mut v = span[i].max(1) as f32;
+                    if num_field(ui, &mut v, label, 1.0, half(ui) - 4.0) {
+                        span[i] = v.round().clamp(1.0, 100.0) as u32;
+                        changed = true;
+                    }
+                }
+            });
+            if changed {
+                self.begin_edit();
+                self.doc.node_mut(first).grid_span = span;
+                self.doc.reflow();
+            }
+        }
         if n.kind.is_frame() {
             let mut clip = n.clip;
             if ui.checkbox(&mut clip, "Clip content").changed() {
@@ -3134,30 +3161,85 @@ impl App {
     fn auto_layout_controls(&mut self, ui: &mut Ui, f: NodeId) {
         let mut l = self.doc.node(f).layout;
         let before = l;
+        let kids = self.doc.node(f).children.len().max(1) as f32;
         ui.horizontal(|ui| {
             for (m, wrap, icon, tip) in [
                 (LayoutMode::Vertical, false, Icon::ArrowDown, "Vertical layout"),
                 (LayoutMode::Horizontal, false, Icon::ArrowRight, "Horizontal layout"),
                 (LayoutMode::Horizontal, true, Icon::Wrap, "Wrap"),
+                (LayoutMode::Grid, false, Icon::Grid, "Grid"),
             ] {
-                let on = l.mode == m && (m == LayoutMode::Vertical || l.wrap == wrap);
+                let on = l.mode == m && (m != LayoutMode::Horizontal || l.wrap == wrap);
                 if icon_button(ui, icon, on, 26.0, tip).clicked() {
                     l.mode = m;
                     l.wrap = wrap;
+                    // A new grid starts about square around the children it already has.
+                    if m == LayoutMode::Grid && l.grid[0] == 0 {
+                        let cols = kids.sqrt().ceil();
+                        l.grid = [cols as u32, (kids / cols).ceil() as u32];
+                    }
                 }
             }
         });
+        let grid = l.mode == LayoutMode::Grid;
+        if grid {
+            ui.horizontal(|ui| {
+                for (i, label) in [(0, "Columns"), (1, "Rows")] {
+                    let mut v = l.grid[i].max(1) as f32;
+                    if num_field(ui, &mut v, label, 1.0, half(ui) - 4.0) {
+                        l.grid[i] = v.round().clamp(1.0, 100.0) as u32;
+                    }
+                }
+            });
+            // Track sizing: every column (row) shares the space (Fill) or has one fixed size.
+            ui.horizontal(|ui| {
+                for (i, what) in [(0, "Col"), (1, "Row")] {
+                    let shown = if l.tracks[i].is_some() { format!("{what} Fixed") } else { format!("{what} Fill") };
+                    dropdown(ui, shown, |ui| {
+                        if ui.selectable_label(l.tracks[i].is_none(), "Fill").clicked() {
+                            l.tracks[i] = None;
+                        }
+                        if ui.selectable_label(l.tracks[i].is_some(), "Fixed").clicked() && l.tracks[i].is_none() {
+                            l.tracks[i] = Some(100.0);
+                        }
+                    });
+                    if let Some(t) = &mut l.tracks[i] {
+                        num_field(ui, t, "", 0.0, 44.0);
+                    }
+                }
+            });
+        }
         ui.horizontal(|ui| {
             align_grid(ui, &mut l);
             ui.vertical(|ui| {
-                ui.add_enabled_ui(!l.space_between, |ui| {
-                    num_field(ui, &mut l.gap, if l.mode == LayoutMode::Horizontal { "@gaph" } else { "@gapv" }, 0.0, (ui.available_width()).min(110.0));
+                ui.add_enabled_ui(!l.space_between || grid, |ui| {
+                    num_field(ui, &mut l.gap, if l.mode == LayoutMode::Vertical { "@gapv" } else { "@gaph" }, 0.0, (ui.available_width()).min(110.0));
                 });
-                if l.wrap && l.mode == LayoutMode::Horizontal {
+                if (l.wrap && l.mode == LayoutMode::Horizontal) || grid {
                     num_field(ui, &mut l.cross_gap, "@gapv", 0.0, (ui.available_width()).min(110.0));
                 }
-                ui.checkbox(&mut l.space_between, "Auto gap");
+                if !grid {
+                    ui.checkbox(&mut l.space_between, "Auto gap");
+                }
                 ui.checkbox(&mut l.strokes_included, "Include strokes").on_hover_text("Strokes take up space in the layout");
+            });
+        });
+        // Advanced settings: text baselines (horizontal flows) and canvas stacking.
+        ui.horizontal(|ui| {
+            if l.mode == LayoutMode::Horizontal {
+                let mut base = l.cross == AxisAlign::Baseline;
+                if ui.checkbox(&mut base, "Text baseline").on_hover_text("Align the first lines of text along the row").changed() {
+                    l.cross = if base { AxisAlign::Baseline } else { AxisAlign::Min };
+                }
+            }
+            dropdown(ui, if l.reverse_z { "First on top" } else { "Last on top" }, |ui| {
+                ui.label(RichText::new("Canvas stacking").small());
+                if ui.selectable_label(!l.reverse_z, "Last on top").clicked() {
+                    l.reverse_z = false;
+                }
+                if ui.selectable_label(l.reverse_z, "First on top").clicked() {
+                    l.reverse_z = true;
+                }
             });
         });
         let [t, r, b, lft] = &mut l.padding;

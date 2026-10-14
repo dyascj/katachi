@@ -751,6 +751,29 @@ fn shift_a_wraps_in_auto_layout_and_drag_reorders() {
 }
 
 #[test]
+fn arrow_keys_reorder_auto_layout_children() {
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (40.0, 40.0));
+    let b = draw(&mut h, Key::R, (60.0, 0.0), (100.0, 40.0));
+    let c = draw(&mut h, Key::R, (120.0, 0.0), (160.0, 40.0));
+    h.state_mut().sel = vec![a, b, c];
+    key(&mut h, Modifiers::SHIFT, Key::A);
+    let f = h.state().sel[0];
+    h.state_mut().sel = vec![a];
+    key(&mut h, Modifiers::NONE, Key::ArrowRight);
+    assert_eq!(h.state().doc.node(f).children, vec![b, a, c], "moves one place along the row");
+    assert_eq!(rect(&h, a).min.x, 50.0);
+    key(&mut h, Modifiers::NONE, Key::ArrowDown);
+    assert_eq!(h.state().doc.node(f).children, vec![b, a, c], "across the flow does nothing");
+    key(&mut h, Modifiers::NONE, Key::ArrowLeft);
+    assert_eq!(h.state().doc.node(f).children, vec![a, b, c]);
+    // Outside auto layout, arrows still nudge.
+    h.state_mut().sel = vec![f];
+    key(&mut h, Modifiers::NONE, Key::ArrowDown);
+    assert_eq!(rect(&h, f).min.y, 1.0);
+}
+
+#[test]
 fn components_instances_via_shortcuts() {
     let mut h = harness();
     let rect_id = draw(&mut h, Key::R, (0.0, 0.0), (80.0, 40.0));

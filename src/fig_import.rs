@@ -243,6 +243,7 @@ fn align(s: Option<&str>) -> AxisAlign {
     match s {
         Some("CENTER") => AxisAlign::Center,
         Some("MAX") => AxisAlign::Max,
+        Some("BASELINE") => AxisAlign::Baseline,
         _ => AxisAlign::Min,
     }
 }
@@ -706,6 +707,7 @@ fn import_node(
     n.layout.mode = match v.s("stackMode") {
         Some("HORIZONTAL") => LayoutMode::Horizontal,
         Some("VERTICAL") => LayoutMode::Vertical,
+        Some("GRID") => LayoutMode::Grid,
         _ => LayoutMode::None,
     };
     if n.layout.mode != LayoutMode::None {
@@ -723,8 +725,16 @@ fn import_node(
             wrap: v.s("stackWrap") == Some("WRAP"),
             strokes_included: v.b("bordersTakeSpace") == Some(true),
             cross_gap: v.f("stackCounterSpacing").filter(|g| g.is_finite()).or(v.f("stackSpacing")).unwrap_or(0.0),
+            reverse_z: v.b("stackReverseZIndex") == Some(true),
+            grid: [v.f("gridColumnCount").unwrap_or(0.0) as u32, v.f("gridRowCount").unwrap_or(0.0) as u32],
+            tracks: [None; 2],
         };
+        if n.layout.mode == LayoutMode::Grid {
+            n.layout.gap = v.f("gridColumnGap").unwrap_or(n.layout.gap);
+            n.layout.cross_gap = v.f("gridRowGap").unwrap_or(n.layout.cross_gap);
+        }
     }
+    n.grid_span = [v.f("gridColumnSpan").unwrap_or(1.0).max(1.0) as u32, v.f("gridRowSpan").unwrap_or(1.0).max(1.0) as u32];
     // Unset bounds are stored as 0 (min) and infinity (max).
     let bound = |k: &str, axis: &str| v.get(k).and_then(|s| s.get("value")).and_then(|s| s.f(axis)).filter(|x| x.is_finite() && *x > 0.0);
     n.min_size = [bound("minSize", "x"), bound("minSize", "y")];

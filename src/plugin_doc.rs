@@ -287,12 +287,14 @@ fn align_json(a: AxisAlign) -> &'static str {
         AxisAlign::Min => "MIN",
         AxisAlign::Center => "CENTER",
         AxisAlign::Max => "MAX",
+        AxisAlign::Baseline => "BASELINE",
     }
 }
 fn align_from(s: &str) -> AxisAlign {
     match s {
         "CENTER" => AxisAlign::Center,
         "MAX" => AxisAlign::Max,
+        "BASELINE" => AxisAlign::Baseline,
         _ => AxisAlign::Min,
     }
 }
@@ -541,6 +543,8 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
     let (main, cross) = if parent_mode == LayoutMode::Horizontal { (0, 1) } else { (1, 0) };
     v["layoutGrow"] = json!(if parent_mode != LayoutMode::None && n.sizing[main] == Sizing::Fill { 1 } else { 0 });
     v["layoutAlign"] = json!(if parent_mode != LayoutMode::None && n.sizing[cross] == Sizing::Fill { "STRETCH" } else { "INHERIT" });
+    v["gridColumnSpan"] = json!(n.grid_span[0]);
+    v["gridRowSpan"] = json!(n.grid_span[1]);
     if let Some(s) = n.stroke_sides {
         for (k, w) in ["strokeTopWeight", "strokeRightWeight", "strokeBottomWeight", "strokeLeftWeight"].iter().zip(s) {
             v[*k] = json!(w);
@@ -596,7 +600,13 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
             LayoutMode::None => "NONE",
             LayoutMode::Horizontal => "HORIZONTAL",
             LayoutMode::Vertical => "VERTICAL",
+            LayoutMode::Grid => "GRID",
         });
+        v["itemReverseZIndex"] = json!(l.reverse_z);
+        v["gridColumnCount"] = json!(l.grid[0].max(1));
+        v["gridRowCount"] = json!(l.grid[1]);
+        v["gridColumnGap"] = json!(l.gap);
+        v["gridRowGap"] = json!(l.cross_gap);
         v["layoutWrap"] = json!(if l.wrap { "WRAP" } else { "NO_WRAP" });
         v["itemSpacing"] = json!(l.gap);
         v["counterAxisSpacing"] = json!(l.cross_gap);
@@ -1042,6 +1052,11 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
     if changed("layoutPositioning") {
         n.absolute = s("layoutPositioning") == "ABSOLUTE";
     }
+    for (k, i) in [("gridColumnSpan", 0), ("gridRowSpan", 1)] {
+        if changed(k) {
+            n.grid_span[i] = num(k).unwrap_or(1.0).max(1.0) as u32;
+        }
+    }
     for (k, i, max) in [("minWidth", 0, false), ("minHeight", 1, false), ("maxWidth", 0, true), ("maxHeight", 1, true)] {
         if changed(k) {
             let val = num(k).filter(|x| x.is_finite() && *x > 0.0);
@@ -1055,8 +1070,26 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
             l.mode = match s("layoutMode") {
                 "HORIZONTAL" => LayoutMode::Horizontal,
                 "VERTICAL" => LayoutMode::Vertical,
+                "GRID" => LayoutMode::Grid,
                 _ => LayoutMode::None,
             };
+            if l.mode == LayoutMode::Grid && l.grid[0] == 0 {
+                l.grid = [2, 2];
+            }
+        }
+        if changed("itemReverseZIndex") {
+            l.reverse_z = v["itemReverseZIndex"].as_bool().unwrap_or(false);
+        }
+        for (k, i) in [("gridColumnCount", 0), ("gridRowCount", 1)] {
+            if changed(k) {
+                l.grid[i] = num(k).unwrap_or(0.0).max(0.0) as u32;
+            }
+        }
+        if changed("gridColumnGap") {
+            l.gap = num("gridColumnGap").unwrap_or(0.0);
+        }
+        if changed("gridRowGap") {
+            l.cross_gap = num("gridRowGap").unwrap_or(0.0);
         }
         if changed("layoutWrap") {
             l.wrap = s("layoutWrap") == "WRAP";

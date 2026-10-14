@@ -523,7 +523,7 @@ impl Svg<'_> {
             }
             // A mask layer clips everything above it in this parent (alpha mask, like Figma).
             let mut masks_open = 0;
-            for &c in &n.children {
+            for c in n.paint_order() {
                 let cn = doc.node(c);
                 if cn.is_mask && cn.visible {
                     let mid = self.id("mask");
