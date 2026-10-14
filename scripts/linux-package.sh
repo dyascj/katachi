@@ -73,7 +73,7 @@ Summary: $SUMMARY
 License: MIT
 URL: https://github.com/dyascj/katachi
 AutoReqProv: no
-Requires: libxkbcommon, libxkbcommon-x11
+Requires: libxkbcommon.so.0()(64bit), libxkbcommon-x11.so.0()(64bit)
 Recommends: mesa-vulkan-drivers, xdg-desktop-portal, curl
 %description
 $DESC
