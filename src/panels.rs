@@ -3071,6 +3071,11 @@ impl App {
                     changed = true;
                 }
             }
+            // An open gradient editor puts its handles on the canvas (one layer at a time, as in Figma).
+            if self.sel.len() == 1 && paints[i].kind.is_gradient() && egui::Popup::is_id_open(ui.ctx(), id.with("popup")) {
+                let stop = ui.data(|d| d.get_temp(id.with("stop"))).unwrap_or(0);
+                self.gradient_edit = Some(crate::app::GradientEdit { stroke, index: i, ui: id, stop });
+            }
         }
         if let Some(i) = remove {
             paints.remove(i);

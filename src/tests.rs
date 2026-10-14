@@ -2048,3 +2048,42 @@ fn color_picker_drags_and_escape_from_find_keeps_selection() {
     assert!(!h.state().find.0);
     assert_eq!(h.state().sel, vec![id], "selection kept");
 }
+
+#[test]
+fn gradient_handles_edit_on_canvas_while_the_editor_is_open() {
+    use crate::doc::{Paint, PaintKind, Rgba};
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    let mut g = Paint::solid(Rgba::rgb(255, 0, 0));
+    g.convert(PaintKind::Linear);
+    h.state_mut().doc.node_mut(id).fills = vec![g];
+    h.run_steps(2);
+    assert!(h.state().gradient_edit.is_none(), "handles only while the editor is open");
+    h.get_all_by_label("Color swatch").next().unwrap().click();
+    h.run_steps(3);
+    assert!(h.state().gradient_edit.is_some());
+    // Drag the end handle from the bottom center to the right center.
+    let (a, b) = (s(&h, 50.0, 100.0), s(&h, 100.0, 50.0));
+    drag(&mut h, a, b, Modifiers::NONE);
+    let p = h.state().doc.node(id).fills[0].clone();
+    assert!(p.to.distance(pos2(1.0, 0.5)) < 0.02, "{:?}", p.to);
+    assert_eq!(h.state().sel, vec![id], "the layer stays selected");
+    assert!(h.state().gradient_edit.is_some(), "and the editor open");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().doc.node(id).fills[0].to, pos2(0.5, 1.0), "one undo step for the drag");
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::Z);
+    // Clicking the line adds a stop there, selected.
+    let on_line = s(&h, 50.0, 0.0).lerp(s(&h, 100.0, 50.0), 0.4);
+    click(&mut h, on_line, Modifiers::NONE);
+    let p = h.state().doc.node(id).fills[0].clone();
+    assert_eq!(p.stops.len(), 3);
+    assert!((p.stops[1].0 - 0.4).abs() < 0.02, "{:?}", p.stops);
+    assert_eq!(h.state().gradient_edit.unwrap().stop, 1);
+    // Dragging that stop slides it along the line.
+    let further = s(&h, 50.0, 0.0).lerp(s(&h, 100.0, 50.0), 0.8);
+    drag(&mut h, on_line, further, Modifiers::NONE);
+    let p = h.state().doc.node(id).fills[0].clone();
+    assert!((p.stops[1].0 - 0.8).abs() < 0.02, "{:?}", p.stops);
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert!((h.state().doc.node(id).fills[0].stops[1].0 - 0.4).abs() < 0.02, "undo puts the stop back");
+}

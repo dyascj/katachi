@@ -134,13 +134,20 @@ const RIGHT_PANEL: f32 = 248.0;
 
 /// A Figma popover toggled by `button`: solid, titled, with a close button, opening to the left
 /// of the right panel (or below the button elsewhere), and closing on a click outside or Escape.
+/// Keep open popovers open through the next click: it edits what they show (a gradient
+/// handle on the canvas, a color picked with the eyedropper).
+pub fn pin_popovers(ctx: &egui::Context, on: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("pin-popovers"), on));
+}
+
 pub fn popover<R>(button: &Response, id: egui::Id, title: &str, width: f32, add: impl FnOnce(&mut Ui) -> R) -> Option<R> {
     let ctx = button.ctx.clone();
+    let pinned = ctx.data(|d| d.get_temp(egui::Id::new("pin-popovers"))).unwrap_or(false);
     let edge = ctx.content_rect().max.x - RIGHT_PANEL;
     let in_panel = button.rect.min.x >= edge - 1.0;
     let mut p = egui::Popup::from_toggle_button_response(button)
         .id(id)
-        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .close_behavior(if pinned { egui::PopupCloseBehavior::IgnoreClicks } else { egui::PopupCloseBehavior::CloseOnClickOutside })
         // Ordinary widget styling inside (egui's popups default to menu styling).
         .style(|_: &mut egui::Style| {})
         .frame(Frame::NONE)

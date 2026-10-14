@@ -1,6 +1,6 @@
 //! Infinite canvas: navigation, tools, selection, snapping, and on-canvas overlays.
 
-use crate::app::{App, Drag, Grip, Press, Tool};
+use crate::app::{App, Drag, GradGrab, Grip, Press, Tool};
 use crate::doc::{Kind, LayoutMode, Node, NodeId, Order, PathPoint, Sizing, rotate};
 use crate::render::{self, View};
 use egui::{
@@ -157,6 +157,12 @@ impl App {
 
         self.text_editor(ui, &painter);
         self.draw_overlays(&painter, ptr);
+        // Gradient handles edit what the open paint popover shows, so pressing one keeps it open.
+        let on_gradient = matches!(self.drag, Some(Drag::Gradient { .. })) || hover_pos.filter(|_| resp.hovered()).and_then(|p| self.gradient_hit(p)).is_some();
+        crate::chrome::pin_popovers(ui.ctx(), on_gradient);
+        if let Some(g) = self.gradient_edit {
+            ui.data_mut(|d| d.insert_temp(g.ui.with("stop"), g.stop));
+        }
         // Dev Mode shows distances on hover; design mode needs Alt.
         if (mods.alt || self.dev_mode) && self.drag.is_none() {
             self.draw_measurements(&painter);
@@ -364,6 +370,158 @@ impl App {
         (corner && !b.expand(5.0).contains(s)).then_some(Grip::Rotate)
     }
 
+    /// The gradient whose handles are on the canvas: its layer and paint.
+    fn edited_gradient(&self) -> Option<(NodeId, crate::doc::Paint)> {
+        let g = self.gradient_edit?;
+        let [id] = self.sel[..] else { return None };
+        let n = self.doc.node(id);
+        let p = if g.stroke { n.strokes.get(g.index) } else { n.fills.get(g.index) }?;
+        p.kind.is_gradient().then(|| (id, p.clone()))
+    }
+
+    fn set_edited_gradient(&mut self, id: NodeId, p: crate::doc::Paint) {
+        let Some(g) = self.gradient_edit else { return };
+        let n = self.doc.node_mut(id);
+        let paints = if g.stroke { &mut n.strokes } else { &mut n.fills };
+        if let Some(slot) = paints.get_mut(g.index) {
+            *slot = p;
+        }
+    }
+
+    /// Screen positions of a gradient's start, end, and width handles (paints live in the
+    /// layer's unrotated unit square).
+    fn gradient_handles(&self, id: NodeId, p: &crate::doc::Paint) -> [Pos2; 3] {
+        let n = self.doc.node(id);
+        [p.from, p.to, p.width_point()].map(|q| self.view.to_screen(rotate(n.rect.min + q.to_vec2() * n.rect.size(), n.rect.center(), n.rotation)))
+    }
+
+    fn gradient_hit(&self, s: Pos2) -> Option<GradGrab> {
+        if self.vector_edit.is_some() || self.editing_text.is_some() {
+            return None;
+        }
+        let (id, p) = self.edited_gradient()?;
+        let [a, b, w] = self.gradient_handles(id, &p);
+        let near = |q: Pos2| q.distance(s) <= 7.0;
+        if p.kind != crate::doc::PaintKind::Linear && near(w) {
+            return Some(GradGrab::Width);
+        }
+        if near(a) {
+            return Some(GradGrab::From);
+        }
+        if near(b) {
+            return Some(GradGrab::To);
+        }
+        if let Some(i) = p.stops.iter().position(|(t, _)| near(a.lerp(b, *t))) {
+            return Some(GradGrab::Stop(i));
+        }
+        let t = line_t(a, b, s);
+        (a.lerp(b, t).distance(s) <= 4.0).then_some(GradGrab::Line)
+    }
+
+    /// Add a stop where world point `w` falls on the gradient line, colored as the gradient is there.
+    fn add_gradient_stop(&mut self, w: Pos2) -> Option<usize> {
+        let (id, mut p) = self.edited_gradient()?;
+        let [a, b, _] = self.gradient_handles(id, &p);
+        let t = line_t(a, b, self.view.to_screen(w));
+        let i = p.stops.partition_point(|s| s.0 <= t);
+        p.stops.insert(i, (t, p.sample(t)));
+        self.set_edited_gradient(id, p);
+        self.gradient_edit.as_mut()?.stop = i;
+        Some(i)
+    }
+
+    /// A click on the gradient editor: the line adds a stop, a stop or end selects it.
+    fn gradient_click(&mut self, g: GradGrab, w: Pos2) {
+        let Some((_, p)) = self.edited_gradient() else { return };
+        let stop = match g {
+            GradGrab::Line => {
+                self.checkpoint();
+                self.add_gradient_stop(w)
+            }
+            GradGrab::Stop(i) => Some(i),
+            GradGrab::From => Some(0),
+            GradGrab::To => Some(p.stops.len().saturating_sub(1)),
+            GradGrab::Width => None,
+        };
+        if let (Some(i), Some(e)) = (stop, self.gradient_edit.as_mut()) {
+            e.stop = i;
+        }
+    }
+
+    /// Move a gradient handle or stop to world point `w`.
+    fn drag_gradient(&mut self, grab: &mut GradGrab, w: Pos2) {
+        let Some((id, mut p)) = self.edited_gradient() else { return };
+        let n = self.doc.node(id);
+        let l = rotate(w, n.rect.center(), -n.rotation);
+        let q = pos2((l.x - n.rect.min.x) / n.rect.width().max(1e-6), (l.y - n.rect.min.y) / n.rect.height().max(1e-6));
+        let linear = p.kind == crate::doc::PaintKind::Linear;
+        match *grab {
+            // Radial, angular, and diamond gradients move as a whole by their center.
+            GradGrab::From if !linear => {
+                let d = q - p.from;
+                p.to += d;
+                if let Some(wt) = &mut p.width_to {
+                    *wt += d;
+                }
+                p.from = q;
+            }
+            GradGrab::From => p.from = q,
+            GradGrab::To => {
+                // The width axis turns and scales with the main one (complex multiplication by new / old).
+                if let Some(wt) = p.width_to {
+                    let (od, nd, ow) = (p.to - p.from, q - p.from, wt - p.from);
+                    let r = vec2(nd.x * od.x + nd.y * od.y, nd.y * od.x - nd.x * od.y) / od.length_sq().max(1e-12);
+                    p.width_to = Some(p.from + vec2(ow.x * r.x - ow.y * r.y, ow.x * r.y + ow.y * r.x));
+                }
+                p.to = q;
+            }
+            GradGrab::Width => p.width_to = Some(q),
+            GradGrab::Stop(i) if i < p.stops.len() => {
+                let [a, b, _] = self.gradient_handles(id, &p);
+                let mut s = p.stops.remove(i);
+                s.0 = line_t(a, b, self.view.to_screen(w));
+                let j = p.stops.partition_point(|x| x.0 <= s.0);
+                p.stops.insert(j, s);
+                *grab = GradGrab::Stop(j);
+                if let Some(e) = self.gradient_edit.as_mut() {
+                    e.stop = j;
+                }
+            }
+            _ => return,
+        }
+        self.set_edited_gradient(id, p);
+    }
+
+    /// Figma's gradient editor on the canvas: the line from start to end with its stops, and the handles.
+    fn draw_gradient_handles(&self, painter: &Painter) {
+        let Some((id, p)) = self.edited_gradient() else { return };
+        let [a, b, w] = self.gradient_handles(id, &p);
+        let shadow = Stroke::new(3.0, Color32::from_black_alpha(70));
+        let line = Stroke::new(1.5, Color32::WHITE);
+        let knob = |c: Pos2, r: f32| {
+            painter.circle(c, r, Color32::WHITE, Stroke::new(1.0, Color32::from_black_alpha(90)));
+        };
+        if p.kind != crate::doc::PaintKind::Linear {
+            painter.line_segment([a, w], shadow);
+            painter.extend(egui::Shape::dashed_line(&[a, w], line, 4.0, 3.0));
+            knob(w, 4.0);
+        }
+        painter.line_segment([a, b], shadow);
+        painter.line_segment([a, b], line);
+        knob(a, 5.0);
+        knob(b, 5.0);
+        let sel = self.gradient_edit.map_or(0, |g| g.stop);
+        for (i, (t, c)) in p.stops.iter().enumerate() {
+            let r = Rect::from_center_size(a.lerp(b, *t), vec2(12.0, 12.0));
+            painter.rect_filled(r.expand(1.0), 3.0, Color32::from_black_alpha(70));
+            painter.rect_filled(r, 3.0, Color32::WHITE);
+            painter.rect_filled(r.shrink(2.0), 2.0, c.to32());
+            if i == sel {
+                painter.rect_stroke(r.expand(1.5), 4.0, Stroke::new(1.5, BLUE), StrokeKind::Outside);
+            }
+        }
+    }
+
     fn on_press(&mut self, s: Pos2, w: Pos2, mods: egui::Modifiers) {
         let tool = self.tool;
         // Clicking a comment pin opens its thread (whenever pins are showing).
@@ -391,6 +549,10 @@ impl App {
         match tool {
             Tool::Move | Tool::Scale => {
                 self.vector_edit = None;
+                if let Some(g) = self.gradient_hit(s) {
+                    self.press = Some(Press { world: w, target: None, handle: Some(Grip::Gradient(g)), toggle_off: false });
+                    return;
+                }
                 let handle = self.handle_at(s);
                 let target = if handle.is_some() { None } else { self.target_at(w, s, mods.command) };
                 let mut toggle_off = false;
@@ -460,7 +622,12 @@ impl App {
         }
         self.drag = match self.tool {
             Tool::Move | Tool::Scale => {
-                if let Some(grip) = press.handle {
+                if let Some(Grip::Gradient(g)) = press.handle {
+                    // One undo step per drag; dragging off the line pulls out a new stop.
+                    self.checkpoint();
+                    let grab = if g == GradGrab::Line { self.add_gradient_stop(start).map_or(g, GradGrab::Stop) } else { g };
+                    Some(Drag::Gradient { grab })
+                } else if let Some(grip) = press.handle {
                     self.checkpoint();
                     let (bounds, rot) = self.sel_frame().unwrap_or((Rect::NOTHING, 0.0));
                     let base = self.doc.clone();
@@ -471,6 +638,7 @@ impl App {
                             let a = (start - c).angle();
                             Some(Drag::Rotate { base, center: c, start_angle: a, start_rot: rot, deg: 0.0 })
                         }
+                        Grip::Gradient(_) => None,
                     }
                 } else if press.target.is_some() && !self.sel.is_empty() {
                     self.checkpoint();
@@ -696,6 +864,7 @@ impl App {
                     }
                 }
             }
+            Drag::Gradient { grab } => self.drag_gradient(grab, w),
             Drag::Pan | Drag::Connect { .. } => {}
         }
         self.drag = Some(drag);
@@ -792,6 +961,10 @@ impl App {
             Tool::Move | Tool::Scale => {
                 if let Some(t) = self.pending_frame.take() {
                     if mods.shift { self.sel.push(t) } else { self.sel = vec![t] }
+                }
+                if let Some(Press { handle: Some(Grip::Gradient(g)), .. }) = self.press {
+                    self.press = None;
+                    return self.gradient_click(g, w);
                 }
                 if let Some(p) = self.press.take() {
                     match p.target {
@@ -1228,6 +1401,7 @@ impl App {
                 painter.galley(pill.min + vec2(4.0, 2.0), g, Color32::WHITE);
             }
         }
+        self.draw_gradient_handles(painter);
         for g in &self.guides {
             painter.line_segment([self.view.to_screen(g[0]), self.view.to_screen(g[1])], Stroke::new(1.0, SNAP));
         }
@@ -1382,6 +1556,7 @@ impl App {
             if ui.input(|i| i.pointer.any_down()) { CursorIcon::Grabbing } else { CursorIcon::Grab }
         } else {
             match self.tool {
+                Tool::Move | Tool::Scale if self.gradient_hit(p).is_some() => CursorIcon::Grab,
                 Tool::Move | Tool::Scale => match self.handle_at(p) {
                     Some(Grip::Resize(-1, -1) | Grip::Resize(1, 1)) => CursorIcon::ResizeNwSe,
                     Some(Grip::Resize(1, -1) | Grip::Resize(-1, 1)) => CursorIcon::ResizeNeSw,
@@ -1771,6 +1946,11 @@ pub fn smooth_stroke(points: &[Pos2], tol: f32) -> Vec<PathPoint> {
             PathPoint { p, h_in: -t, h_out: t }
         })
         .collect()
+}
+
+/// Where `s` projects onto segment a-b, 0 at a and 1 at b.
+fn line_t(a: Pos2, b: Pos2, s: Pos2) -> f32 {
+    ((s - a).dot(b - a) / (b - a).length_sq().max(1e-6)).clamp(0.0, 1.0)
 }
 
 fn snap_angle(from: Pos2, to: Pos2) -> Pos2 {

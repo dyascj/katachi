@@ -64,6 +64,8 @@ pub enum Drag {
     Pencil { points: Vec<Pos2> },
     /// Prototype tab: dragging a connection from a layer to a frame.
     Connect { from: NodeId },
+    /// A gradient handle or stop on the canvas.
+    Gradient { grab: GradGrab },
 }
 
 impl Drag {
@@ -83,6 +85,30 @@ pub enum Grip {
     Resize(i8, i8),
     /// Just outside a corner.
     Rotate,
+    /// A handle of the gradient being edited.
+    Gradient(GradGrab),
+}
+
+/// Parts of Figma's on-canvas gradient editor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GradGrab {
+    From,
+    To,
+    /// The second axis of radial, angular, and diamond gradients.
+    Width,
+    Stop(usize),
+    /// The line between the stops: a click adds a stop there.
+    Line,
+}
+
+/// The gradient paint whose editor popover is open; its handles show on the canvas.
+#[derive(Clone, Copy, Debug)]
+pub struct GradientEdit {
+    pub stroke: bool,
+    pub index: usize,
+    /// The paint row's id (its editor keeps the selected stop under it).
+    pub ui: egui::Id,
+    pub stop: usize,
 }
 
 /// Mouse-down state for the move tool, resolved into a click or a drag.
@@ -241,6 +267,7 @@ pub struct App {
     pub export_svg: bool,
     pub confirm: Option<After>,
     pub prev_sel: Vec<NodeId>,
+    pub gradient_edit: Option<GradientEdit>,
     pub allow_close: bool,
     pub toast: Option<(String, f64)>,
     title: String,
@@ -348,6 +375,7 @@ impl App {
             allow_close: false,
             toast: None,
             title: String::new(),
+            gradient_edit: None,
             screenshot: std::env::var_os("KATACHI_SCREENSHOT").map(|p| (PathBuf::from(p), 0)),
         };
         app.recoverable = crate::files::orphaned_recoveries(&app.recovery);
@@ -2315,6 +2343,8 @@ impl eframe::App for App {
         }
         self.shortcuts(&ctx);
         self.title_bar(ui);
+        // The fill and stroke rows say which gradient editor is open, if any.
+        self.gradient_edit = None;
         if !self.ui_hidden {
             self.left_panel(ui);
             self.right_panel(ui);
