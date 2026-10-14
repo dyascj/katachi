@@ -1343,7 +1343,7 @@ impl App {
         for n in self.doc.nodes.values().filter(|n| !n.reactions.is_empty() && self.doc.page_of(n.id) == self.page) {
             let a = self.view.rect_to_screen(n.aabb());
             for r in &n.reactions {
-                if let crate::doc::Action::Navigate(t) | crate::doc::Action::OpenOverlay(t) = r.action
+                if let crate::doc::Action::Navigate(t) | crate::doc::Action::OpenOverlay(t) | crate::doc::Action::SwapOverlay(t) | crate::doc::Action::ChangeTo(t) | crate::doc::Action::ScrollTo(t) = r.action
                     && let Some(tn) = self.doc.nodes.get(&t) {
                         let b = self.view.rect_to_screen(tn.aabb());
                         noodle(pos2(a.max.x, a.center().y), pos2(b.min.x, b.center().y));

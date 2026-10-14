@@ -239,7 +239,7 @@ impl App {
                     (Some(i), _, _) => i,
                     (None, Some(name), Some(true)) => {
                         self.checkpoint();
-                        self.doc.pages.push(crate::doc::Page { name: name.to_string(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, guides: vec![] });
+                        self.doc.pages.push(crate::doc::Page { name: name.to_string(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, guides: vec![], prototype: Default::default() });
                         self.doc.pages.len() - 1
                     }
                     _ => return Err(format!("no page {want}")),

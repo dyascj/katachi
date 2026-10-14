@@ -517,6 +517,17 @@ fn dropdown(ui: &mut Ui, text: impl std::fmt::Display, add: impl FnOnce(&mut Ui)
     crate::chrome::menu_button(ui, text.to_string(), add);
 }
 
+/// A small plot of an easing curve, like the one beside Figma's easing menu.
+fn easing_curve(ui: &mut Ui, e: crate::doc::Easing, size: egui::Vec2) {
+    let (r, _) = ui.allocate_exact_size(size, Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(r, 3.0, ui.visuals().extreme_bg_color);
+    // Room above and below for curves that overshoot.
+    let at = |t: f32| egui::pos2(r.min.x + 2.0 + t * (r.width() - 4.0), r.max.y - r.height() * (0.25 + e.at(t) * 0.5));
+    let pts: Vec<egui::Pos2> = (0..=32).map(|i| at(i as f32 / 32.0)).collect();
+    p.add(egui::Shape::line(pts, egui::Stroke::new(1.5, BLUE)));
+}
+
 fn heading(ui: &mut Ui, title: &str) {
     ui.add_space(4.0);
     ui.label(RichText::new(title).strong());
@@ -1179,7 +1190,7 @@ impl App {
                 if icon_button(ui, Icon::Plus, false, 22.0, "Add page").clicked() {
                     self.checkpoint();
                     let n = self.doc.pages.len() + 1;
-                    self.doc.pages.push(Page { name: format!("Page {n}"), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, guides: vec![] });
+                    self.doc.pages.push(Page { name: format!("Page {n}"), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, guides: vec![], prototype: Default::default() });
                     self.select_page(n - 1);
                 }
             });
@@ -1290,7 +1301,7 @@ impl App {
         }
         if let Some(at) = divider_at {
             self.checkpoint();
-            self.insert_page(at, Page { name: "---".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, guides: vec![] });
+            self.insert_page(at, Page { name: "---".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, guides: vec![], prototype: Default::default() });
         }
         if let Some(i) = delete {
             self.checkpoint();
@@ -1838,10 +1849,36 @@ impl App {
     }
 
     fn prototype_props(&mut self, ui: &mut Ui) {
-        use crate::doc::{Action, Direction, Reaction, TransitionKind, Trigger};
-        use crate::prototype::{describe, frames_on_page, top_frame};
+        use crate::doc::{Action, Device, Direction, Easing, Overflow, OverlayPos, Reaction, ScrollPos, TransitionKind, Trigger, VarValue};
+        use crate::prototype::{describe, frames_on_page, key_label, sibling_variants, top_frame, trigger_label};
+        use std::mem::discriminant;
         let frames = frames_on_page(&self.doc, self.page);
         let Some(&id) = self.sel.first() else {
+            heading(ui, "Prototype settings");
+            let mut ps = self.doc.pages[self.page].prototype;
+            egui::Grid::new("proto-settings").num_columns(2).min_col_width(72.0).show(ui, |ui| {
+                ui.label("Device");
+                dropdown(ui, ps.device.label(), |ui| {
+                    for d in Device::ALL {
+                        ui.selectable_value(&mut ps.device, d, d.label());
+                    }
+                });
+                ui.end_row();
+                ui.label("Background");
+                ui.horizontal(|ui| {
+                    let mut c = [ps.background.0[0], ps.background.0[1], ps.background.0[2]];
+                    if egui::color_picker::color_edit_button_srgb(ui, &mut c).changed() {
+                        ps.background = Rgba::rgb(c[0], c[1], c[2]);
+                    }
+                    hex_field(ui, ui.id().with("proto-bg"), &mut ps.background, 56.0);
+                });
+                ui.end_row();
+            });
+            if ps != self.doc.pages[self.page].prototype {
+                self.begin_edit();
+                self.doc.pages[self.page].prototype = ps;
+            }
+            ui.separator();
             heading(ui, "Flow starting points");
             let flows = self.doc.pages[self.page].flows.clone();
             if flows.is_empty() {
@@ -1895,58 +1932,140 @@ impl App {
             changed = true;
         }
         let name = |doc: &crate::doc::Document, f: NodeId| doc.nodes.get(&f).map_or("Missing".to_string(), |n| n.name.clone());
+        // Change to: the variants of the set this layer is in.
+        let variants = sibling_variants(&self.doc, id);
+        // Scroll to: layers inside a scrolling frame of this one.
+        let scrollable: Vec<NodeId> = self.doc.descendants(top).into_iter().filter(|&d| self.doc.ancestors(d).iter().any(|a| self.doc.node(*a).overflow != Overflow::None)).collect();
         let mut remove = None;
         for (i, r) in reactions.iter_mut().enumerate() {
             let pid = ui.id().with(("reaction", id, i));
             ui.horizontal(|ui| {
                 let open = ui.add(egui::Button::new(describe(&self.doc, r)).frame(false).truncate());
-                crate::chrome::popover(&open, pid, "Interaction", 240.0, |ui| {
+                crate::chrome::popover(&open, pid, "Interaction", 260.0, |ui| {
                     let before = r.clone();
                     egui::Grid::new(pid.with("grid")).num_columns(2).show(ui, |ui| {
                         ui.label("Trigger");
-                        let t_label = |t: &Trigger| match t {
-                            Trigger::OnClick => "On click".into(),
-                            Trigger::OnHover => "On hover".into(),
-                            Trigger::WhilePressed => "While pressing".into(),
-                            Trigger::AfterDelay(ms) => format!("After delay {ms}ms"),
-                        };
-                        dropdown(ui, t_label(&r.trigger), |ui| {
-                            for t in [Trigger::OnClick, Trigger::OnHover, Trigger::WhilePressed, Trigger::AfterDelay(800)] {
-                                let label = t_label(&t);
-                                ui.selectable_value(&mut r.trigger, t, label);
+                        let kinds = [
+                            (Trigger::OnClick, "On click"),
+                            (Trigger::OnDrag, "On drag"),
+                            (Trigger::OnHover, "While hovering"),
+                            (Trigger::WhilePressed, "While pressing"),
+                            (Trigger::Key(egui::Key::Space, egui::Modifiers::NONE), "Key/Gamepad"),
+                            (Trigger::MouseEnter, "Mouse enter"),
+                            (Trigger::MouseLeave, "Mouse leave"),
+                            (Trigger::AfterDelay(800), "After delay"),
+                        ];
+                        dropdown(ui, trigger_label(&r.trigger), |ui| {
+                            for (t, label) in kinds {
+                                let on = discriminant(&r.trigger) == discriminant(&t);
+                                if ui.selectable_label(on, label).clicked() && !on {
+                                    r.trigger = t;
+                                }
                             }
                         });
                         ui.end_row();
-                        if let Trigger::AfterDelay(ms) = &mut r.trigger {
-                            ui.label("Delay");
-                            ui.add(DragValue::new(ms).range(0..=60000).suffix("ms").speed(10.0));
-                            ui.end_row();
+                        match &mut r.trigger {
+                            Trigger::AfterDelay(ms) => {
+                                ui.label("Delay");
+                                ui.add(DragValue::new(ms).range(0..=60000).suffix("ms").speed(10.0));
+                                ui.end_row();
+                            }
+                            Trigger::Key(k, m) => {
+                                // Press the key to set it, as in Figma.
+                                ui.label("Key");
+                                let rec = egui::Id::new(crate::prototype::RECORDING_KEY);
+                                let recording = ui.data(|d| d.get_temp::<egui::Id>(rec)) == Some(pid);
+                                let b = ui.add(egui::Button::new(if recording { "Press a key...".to_string() } else { key_label(*k, *m) }).selected(recording));
+                                if recording {
+                                    let filter = egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true };
+                                    ui.memory_mut(|mem| {
+                                        mem.request_focus(b.id);
+                                        mem.set_focus_lock_filter(b.id, filter);
+                                    });
+                                    let pressed = ui.input(|i| {
+                                        i.events.iter().find_map(|e| match e {
+                                            egui::Event::Key { key, pressed: true, modifiers, .. } => Some((*key, *modifiers)),
+                                            _ => None,
+                                        })
+                                    });
+                                    if let Some((key, mods)) = pressed {
+                                        (*k, *m) = (key, egui::Modifiers { alt: mods.alt, shift: mods.shift, command: mods.command, ..Default::default() });
+                                        ui.data_mut(|d| d.remove::<egui::Id>(rec));
+                                        ui.memory_mut(|mem| mem.surrender_focus(b.id));
+                                    }
+                                } else if b.clicked() {
+                                    ui.data_mut(|d| d.insert_temp(rec, pid));
+                                }
+                                ui.end_row();
+                            }
+                            _ => {}
                         }
                         ui.label("Action");
                         let a_label = match &r.action {
                             Action::None => "None",
                             Action::Navigate(_) => "Navigate to",
+                            Action::ChangeTo(_) => "Change to",
                             Action::Back => "Back",
+                            Action::ScrollTo(_) => "Scroll to",
                             Action::OpenOverlay(_) => "Open overlay",
+                            Action::SwapOverlay(_) => "Swap overlay",
                             Action::CloseOverlay => "Close overlay",
                             Action::OpenUrl(_) => "Open link",
+                            Action::SetVariable(..) => "Set variable",
                         };
                         let first = frames.iter().copied().find(|f| *f != top).unwrap_or(top);
+                        let mut acts = vec![(Action::Navigate(first), "Navigate to")];
+                        // Change to only makes sense inside a variant; it defaults to another variant.
+                        if let Some(&v) = variants.iter().find(|&&v| v != id && !self.doc.is_ancestor(v, id)).or(variants.first()) {
+                            acts.push((Action::ChangeTo(v), "Change to"));
+                        }
+                        acts.push((Action::Back, "Back"));
+                        if let Some(&l) = scrollable.first() {
+                            acts.push((Action::ScrollTo(l), "Scroll to"));
+                        }
+                        acts.extend([
+                            (Action::OpenUrl("https://".into()), "Open link"),
+                            (Action::OpenOverlay(first), "Open overlay"),
+                            (Action::SwapOverlay(first), "Swap overlay"),
+                            (Action::CloseOverlay, "Close overlay"),
+                        ]);
+                        if let Some(v) = self.doc.variables.first() {
+                            acts.push((Action::SetVariable(v.id, v.values.first().cloned().unwrap_or(VarValue::Bool(true))), "Set variable"));
+                        }
+                        acts.push((Action::None, "None"));
                         dropdown(ui, a_label, |ui| {
-                            ui.selectable_value(&mut r.action, Action::Navigate(first), "Navigate to");
-                            ui.selectable_value(&mut r.action, Action::Back, "Back");
-                            ui.selectable_value(&mut r.action, Action::OpenOverlay(first), "Open overlay");
-                            ui.selectable_value(&mut r.action, Action::CloseOverlay, "Close overlay");
-                            ui.selectable_value(&mut r.action, Action::OpenUrl("https://".into()), "Open link");
-                            ui.selectable_value(&mut r.action, Action::None, "None");
+                            for (a, label) in acts {
+                                let on = discriminant(&r.action) == discriminant(&a);
+                                if ui.selectable_label(on, label).clicked() && !on {
+                                    r.action = a;
+                                }
+                            }
                         });
                         ui.end_row();
                         match &mut r.action {
-                            Action::Navigate(dest) | Action::OpenOverlay(dest) => {
+                            Action::Navigate(dest) | Action::OpenOverlay(dest) | Action::SwapOverlay(dest) => {
                                 ui.label("Destination");
                                 dropdown(ui, name(&self.doc, *dest), |ui| {
                                     for &f in &frames {
                                         ui.selectable_value(dest, f, name(&self.doc, f));
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                            Action::ChangeTo(dest) => {
+                                ui.label("Variant");
+                                dropdown(ui, name(&self.doc, *dest), |ui| {
+                                    for &v in &variants {
+                                        ui.selectable_value(dest, v, name(&self.doc, v));
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                            Action::ScrollTo(dest) => {
+                                ui.label("Layer");
+                                dropdown(ui, name(&self.doc, *dest), |ui| {
+                                    for &l in &scrollable {
+                                        ui.selectable_value(dest, l, name(&self.doc, l));
                                     }
                                 });
                                 ui.end_row();
@@ -1956,9 +2075,93 @@ impl App {
                                 ui.text_edit_singleline(url);
                                 ui.end_row();
                             }
+                            Action::SetVariable(var, val) => {
+                                ui.label("Variable");
+                                let vname = self.doc.variable(*var).map_or("Missing".to_string(), |v| v.name.clone());
+                                dropdown(ui, vname, |ui| {
+                                    for v in &self.doc.variables {
+                                        if ui.selectable_label(v.id == *var, &v.name).clicked() && v.id != *var {
+                                            *var = v.id;
+                                            *val = v.values.first().cloned().unwrap_or(VarValue::Bool(true));
+                                        }
+                                    }
+                                });
+                                ui.end_row();
+                                ui.label("Value");
+                                match val {
+                                    VarValue::Color(c) => {
+                                        ui.horizontal(|ui| {
+                                            let mut rgb = [c.0[0], c.0[1], c.0[2]];
+                                            if egui::color_picker::color_edit_button_srgb(ui, &mut rgb).changed() {
+                                                *c = Rgba([rgb[0], rgb[1], rgb[2], c.0[3]]);
+                                            }
+                                            hex_field(ui, pid.with("var-hex"), c, 56.0);
+                                        });
+                                    }
+                                    VarValue::Number(n) => {
+                                        ui.add(DragValue::new(n).speed(1.0));
+                                    }
+                                    VarValue::Text(t) => {
+                                        ui.text_edit_singleline(t);
+                                    }
+                                    VarValue::Bool(b) => {
+                                        ui.checkbox(b, "");
+                                    }
+                                    VarValue::Alias(_) => {
+                                        ui.label("Alias");
+                                    }
+                                }
+                                ui.end_row();
+                            }
                             _ => {}
                         }
-                        if matches!(r.action, Action::Navigate(_) | Action::Back) {
+                        if matches!(r.action, Action::OpenOverlay(_) | Action::SwapOverlay(_)) {
+                            let o = &mut r.overlay;
+                            ui.label("Position");
+                            let positions = [
+                                (OverlayPos::Center, "Center"),
+                                (OverlayPos::TopLeft, "Top left"),
+                                (OverlayPos::TopCenter, "Top center"),
+                                (OverlayPos::TopRight, "Top right"),
+                                (OverlayPos::BottomLeft, "Bottom left"),
+                                (OverlayPos::BottomCenter, "Bottom center"),
+                                (OverlayPos::BottomRight, "Bottom right"),
+                                (OverlayPos::Manual, "Manual"),
+                            ];
+                            dropdown(ui, positions.iter().find(|p| p.0 == o.position).map_or("", |p| p.1), |ui| {
+                                for (p, label) in positions {
+                                    ui.selectable_value(&mut o.position, p, label);
+                                }
+                            });
+                            ui.end_row();
+                            if o.position == OverlayPos::Manual {
+                                // From the trigger layer's top-left.
+                                ui.label("Offset");
+                                ui.horizontal(|ui| {
+                                    ui.add(DragValue::new(&mut o.offset.x).prefix("X "));
+                                    ui.add(DragValue::new(&mut o.offset.y).prefix("Y "));
+                                });
+                                ui.end_row();
+                            }
+                            ui.label("");
+                            ui.checkbox(&mut o.close_outside, "Close when clicking outside");
+                            ui.end_row();
+                            ui.label("");
+                            ui.horizontal(|ui| {
+                                let mut on = o.background.is_some();
+                                if ui.checkbox(&mut on, "Add background behind overlay").changed() {
+                                    o.background = on.then_some(Rgba([0, 0, 0, 64]));
+                                }
+                                if let Some(bg) = &mut o.background {
+                                    let mut c = bg.to32();
+                                    if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::OnlyBlend).changed() {
+                                        *bg = Rgba(c.to_srgba_unmultiplied());
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                        }
+                        if matches!(r.action, Action::Navigate(_) | Action::Back | Action::ScrollTo(_)) {
                             ui.label("Animation");
                             let k_label = |k: TransitionKind| match k {
                                 TransitionKind::Instant => "Instant",
@@ -1968,8 +2171,14 @@ impl App {
                                 TransitionKind::Push => "Push",
                                 TransitionKind::SlideIn => "Slide in",
                             };
+                            // Scrolling either jumps or animates.
+                            let kinds: &[TransitionKind] = if matches!(r.action, Action::ScrollTo(_)) {
+                                &[TransitionKind::Instant, TransitionKind::SmartAnimate]
+                            } else {
+                                &[TransitionKind::Instant, TransitionKind::Dissolve, TransitionKind::SmartAnimate, TransitionKind::MoveIn, TransitionKind::Push, TransitionKind::SlideIn]
+                            };
                             dropdown(ui, k_label(r.transition.kind), |ui| {
-                                for k in [TransitionKind::Instant, TransitionKind::Dissolve, TransitionKind::SmartAnimate, TransitionKind::MoveIn, TransitionKind::Push, TransitionKind::SlideIn] {
+                                for &k in kinds {
                                     ui.selectable_value(&mut r.transition.kind, k, k_label(k));
                                 }
                             });
@@ -1984,12 +2193,43 @@ impl App {
                                 ui.end_row();
                             }
                             if r.transition.kind != TransitionKind::Instant {
-                                ui.label("Duration");
-                                let mut ms = (r.transition.duration * 1000.0).round();
-                                if ui.add(DragValue::new(&mut ms).range(0.0..=10000.0).suffix("ms").speed(10.0)).changed() {
-                                    r.transition.duration = ms / 1000.0;
-                                }
+                                let e = &mut r.transition.easing;
+                                ui.label("Easing");
+                                ui.horizontal(|ui| {
+                                    dropdown(ui, e.label(), |ui| {
+                                        for x in Easing::ALL {
+                                            ui.horizontal(|ui| {
+                                                easing_curve(ui, x, vec2(24.0, 16.0));
+                                                let on = discriminant(e) == discriminant(&x);
+                                                if ui.selectable_label(on, x.label()).clicked() && !on {
+                                                    *e = x;
+                                                }
+                                            });
+                                        }
+                                    });
+                                    easing_curve(ui, *e, vec2(40.0, 24.0));
+                                });
                                 ui.end_row();
+                                if let Easing::Custom(c) = e {
+                                    ui.label("Bezier");
+                                    ui.horizontal(|ui| {
+                                        for (i, v) in c.iter_mut().enumerate() {
+                                            // x stays inside 0..1 so time only runs forward.
+                                            let range = if i % 2 == 0 { 0.0..=1.0 } else { -2.0..=3.0 };
+                                            ui.add(DragValue::new(v).range(range).speed(0.01).max_decimals(2));
+                                        }
+                                    });
+                                    ui.end_row();
+                                }
+                                // Springs settle in their own time.
+                                if !e.is_spring() {
+                                    ui.label("Duration");
+                                    let mut ms = (r.transition.duration * 1000.0).round();
+                                    if ui.add(DragValue::new(&mut ms).range(0.0..=10000.0).suffix("ms").speed(10.0)).changed() {
+                                        r.transition.duration = ms / 1000.0;
+                                    }
+                                    ui.end_row();
+                                }
                             }
                         }
                     });
@@ -2009,6 +2249,41 @@ impl App {
         if changed {
             self.begin_edit();
             self.doc.node_mut(id).reactions = reactions;
+        }
+        // Scroll behavior: how frames scroll and how their children move with them.
+        let n = self.doc.node(id);
+        let (is_frame, in_frame) = (n.kind.is_frame() && n.kind != Kind::Section, n.parent.is_some_and(|p| self.doc.node(p).kind.is_frame()));
+        if is_frame || in_frame {
+            ui.separator();
+            heading(ui, "Scroll behavior");
+            let (mut overflow, mut pos) = (n.overflow, n.scroll_pos);
+            egui::Grid::new("scroll-behavior").num_columns(2).min_col_width(72.0).show(ui, |ui| {
+                if in_frame {
+                    let all = [(ScrollPos::Scroll, "Scroll with parent"), (ScrollPos::Fixed, "Fixed"), (ScrollPos::Sticky, "Sticky")];
+                    ui.label("Position");
+                    dropdown(ui, all.iter().find(|x| x.0 == pos).map_or("", |x| x.1), |ui| {
+                        for (p, label) in all {
+                            ui.selectable_value(&mut pos, p, label);
+                        }
+                    });
+                    ui.end_row();
+                }
+                if is_frame {
+                    let all = [(Overflow::None, "No scrolling"), (Overflow::Horizontal, "Horizontal"), (Overflow::Vertical, "Vertical"), (Overflow::Both, "Both directions")];
+                    ui.label("Overflow");
+                    dropdown(ui, all.iter().find(|x| x.0 == overflow).map_or("", |x| x.1), |ui| {
+                        for (o, label) in all {
+                            ui.selectable_value(&mut overflow, o, label);
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+            if (overflow, pos) != (n.overflow, n.scroll_pos) {
+                self.checkpoint();
+                let n = self.doc.node_mut(id);
+                (n.overflow, n.scroll_pos) = (overflow, pos);
+            }
         }
     }
 

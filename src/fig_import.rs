@@ -285,14 +285,14 @@ pub fn to_document(fig: &FigFile) -> Result<Document, String> {
         // Figma keeps component masters for instances on a hidden canvas; bring it in as a page.
         let name = if pg.b("internalOnly") == Some(true) { "Internal components".to_string() } else { pg.s("name").unwrap_or("Page").to_string() };
         let bg = pg.get("backgroundColor").map(|c| rgba(Some(c), 1.0).with_alpha(255)).unwrap_or(crate::doc::PAGE_BG);
-        doc.pages.push(Page { name, children: vec![], background: bg, flows: vec![], view: None, guides: vec![] });
+        doc.pages.push(Page { name, children: vec![], background: bg, flows: vec![], view: None, guides: vec![], prototype: Default::default() });
         let page = doc.pages.len() - 1;
         for (_, child) in kids.get(&page_guid).cloned().unwrap_or_default() {
             import_node(&mut doc, &by_guid, &kids, &blobs, child, page, None, Affine::ID, &mut ids, &mut instances);
         }
     }
     if doc.pages.is_empty() {
-        doc.pages.push(Page { name: "Page 1".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, guides: vec![] });
+        doc.pages.push(Page { name: "Page 1".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, guides: vec![], prototype: Default::default() });
     }
     // Instances point at their main components once everything exists; sync builds their layers.
     for (inst, sym) in instances {
@@ -731,6 +731,18 @@ fn import_node(
     n.max_size = [bound("maxSize", "x"), bound("maxSize", "y")];
     n.absolute = v.s("stackPositioning") == Some("ABSOLUTE");
     n.constraints = [constraint(v.s("horizontalConstraint")), constraint(v.s("verticalConstraint"))];
+    // Prototype scrolling.
+    n.overflow = match v.s("scrollDirection") {
+        Some("VERTICAL") => crate::doc::Overflow::Vertical,
+        Some("HORIZONTAL") => crate::doc::Overflow::Horizontal,
+        Some("BOTH") => crate::doc::Overflow::Both,
+        _ => crate::doc::Overflow::None,
+    };
+    n.scroll_pos = match v.s("scrollBehavior") {
+        Some("FIXED_WHEN_CHILD_OF_SCROLLING_FRAME") => crate::doc::ScrollPos::Fixed,
+        Some("STICKY_SCROLLS") => crate::doc::ScrollPos::Sticky,
+        _ => crate::doc::ScrollPos::Scroll,
+    };
     // Layers start collapsed, as in Figma.
     n.expanded = false;
     finish_common(&mut n, v);
@@ -965,6 +977,24 @@ mod tests {
         doc.node_mut(frame).modes.clear();
         doc.reflow();
         assert_eq!(doc.node(rect).fills[0].color, Rgba::rgb(255, 0, 0), "switching back to the default mode");
+    }
+
+    #[test]
+    fn scroll_behavior_imports() {
+        use serde_json::json;
+        let g = |l: u64| json!({ "sessionID": 1, "localID": l });
+        let at = |l: u64, pos: &str| json!({ "guid": g(l), "position": pos });
+        let xf = json!({ "m00": 1.0, "m01": 0.0, "m02": 0.0, "m10": 0.0, "m11": 1.0, "m12": 0.0 });
+        let msg = json!({ "nodeChanges": [
+            { "guid": g(0), "type": "DOCUMENT" },
+            { "guid": g(1), "type": "CANVAS", "name": "Page", "parentIndex": at(0, "a") },
+            { "guid": g(2), "type": "FRAME", "name": "List", "parentIndex": at(1, "a"), "size": { "x": 100, "y": 100 }, "transform": xf, "scrollDirection": "VERTICAL" },
+            { "guid": g(3), "type": "RECTANGLE", "name": "Header", "parentIndex": at(2, "a"), "size": { "x": 10, "y": 10 }, "transform": xf, "scrollBehavior": "STICKY_SCROLLS" },
+        ] });
+        let doc = to_document(&FigFile { message: kv(msg), images: HashMap::new() }).unwrap();
+        let frame = doc.nodes.values().find(|n| n.kind == Kind::Frame).unwrap();
+        assert_eq!(frame.overflow, crate::doc::Overflow::Vertical);
+        assert_eq!(doc.node(frame.children[0]).scroll_pos, crate::doc::ScrollPos::Sticky);
     }
 
     /// Import a real file and report what came through.
