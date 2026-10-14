@@ -2755,3 +2755,30 @@ fn text_formatting_shortcuts_style_layers_and_ranges() {
     let svg = crate::export::to_svg(&h.state().doc, &[jid]);
     assert_eq!(svg.matches(r#"textLength="120""#).count(), h.state().doc.node(jid).lines.len() - 1, "{svg}");
 }
+
+#[test]
+fn copy_and_paste_properties_survive_egui_clipboard_events() {
+    use crate::app::TEST_CLIPBOARD;
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (40.0, 40.0));
+    let b = draw(&mut h, Key::R, (100.0, 0.0), (140.0, 40.0));
+    h.state_mut().doc.node_mut(a).opacity = 0.5;
+    h.state_mut().sel = vec![a];
+    // The windowing layer sends Alt Cmd C and Alt Cmd V as Copy and Paste, never as C and V keys.
+    let am = Modifiers::COMMAND | Modifiers::ALT;
+    clip_event(&mut h, am, Event::Copy);
+    assert!(h.state().style_clip.is_some(), "Alt Cmd C copies properties");
+    h.state_mut().sel = vec![b];
+    clip_event(&mut h, am, Event::Paste("some text".into()));
+    assert_eq!(h.state().doc.node(b).opacity, 0.5, "Alt Cmd V pastes properties");
+    assert_eq!(h.state().doc.nodes.len(), 2, "and doesn't paste the clipboard text");
+    let release = Event::Key { key: Key::V, physical_key: None, pressed: false, repeat: false, modifiers: am };
+    clip_event(&mut h, am, release.clone());
+    // With no text on the clipboard only the V key's release arrives.
+    h.state_mut().doc.node_mut(b).opacity = 1.0;
+    TEST_CLIPBOARD.with(|c| c.borrow_mut().1 = Some(image::RgbaImage::new(2, 2)));
+    clip_event(&mut h, am, release);
+    TEST_CLIPBOARD.with(|c| c.borrow_mut().1 = None);
+    assert_eq!(h.state().doc.node(b).opacity, 0.5);
+    assert_eq!(h.state().doc.nodes.len(), 2, "no image pasted");
+}
