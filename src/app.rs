@@ -920,14 +920,12 @@ impl App {
             return;
         }
         let frag = self.doc.extract(&roots);
-        if let Ok(json) = serde_json::to_string(&frag) {
-            ctx.copy_text(format!("{CLIP_TAG}{json}"));
-        }
+        ctx.copy_text(format!("{CLIP_TAG}{}", crate::doc::to_json(&frag)));
         self.clip_frag = Some(frag);
     }
 
     pub fn paste_text(&mut self, text: &str) {
-        if let Some(frag) = text.strip_prefix(CLIP_TAG).and_then(|j| serde_json::from_str::<Vec<Node>>(j).ok()) {
+        if let Some(frag) = text.strip_prefix(CLIP_TAG).and_then(|j| crate::doc::from_json::<Vec<Node>>(j).ok()).map(|f| crate::doc::clean_fragment(&f)) {
             self.checkpoint();
             // Paste into a selected frame, otherwise next to the original.
             let parent = match self.sel.as_slice() {

@@ -172,7 +172,7 @@ fn blob_paths(blob: &[u8], to_world: Affine) -> Vec<SubPath> {
     let f = |at: &mut usize| -> Option<f32> {
         let v = f32::from_le_bytes(blob.get(*at..*at + 4)?.try_into().ok()?);
         *at += 4;
-        Some(v)
+        Some(if v.is_finite() { v } else { 0.0 })
     };
     let finish = |cur: &mut Vec<PathPoint>, out: &mut Vec<SubPath>, closed: bool| {
         if closed && cur.len() > 1 && cur[0].p.distance(cur[cur.len() - 1].p) < 0.01 {

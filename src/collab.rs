@@ -114,7 +114,26 @@ pub fn apply(doc: &mut Document, ops: &[Op]) {
 }
 
 /// Make parent links and child lists agree after concurrent edits (last writer wins per node).
+/// Also makes a loaded file safe: at least one page, and no layer inside itself.
 pub fn repair(doc: &mut Document) {
+    if doc.pages.is_empty() {
+        doc.pages = Document::default().pages;
+    }
+    let mut ordered: Vec<NodeId> = doc.nodes.keys().copied().collect();
+    ordered.sort();
+    // A parent chain that comes back to the layer is a cycle: the layer closing it moves to the top level.
+    for &id in &ordered {
+        let (mut cur, mut steps) = (doc.nodes[&id].parent, 0);
+        while let Some(p) = cur
+            && steps <= doc.nodes.len()
+        {
+            if p == id {
+                doc.node_mut(id).parent = None;
+                break;
+            }
+            (cur, steps) = (doc.nodes.get(&p).and_then(|n| n.parent), steps + 1);
+        }
+    }
     let ids: HashSet<NodeId> = doc.nodes.keys().copied().collect();
     for page in &mut doc.pages {
         page.children.retain(|c| ids.contains(c) && doc.nodes[c].parent.is_none());
@@ -130,8 +149,6 @@ pub fn repair(doc: &mut Document) {
             std::sync::Arc::make_mut(arc).children = kids;
         }
     }
-    let mut ordered: Vec<NodeId> = doc.nodes.keys().copied().collect();
-    ordered.sort();
     for id in ordered {
         match doc.nodes[&id].parent {
             Some(p) if !ids.contains(&p) => {
