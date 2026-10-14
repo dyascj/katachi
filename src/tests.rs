@@ -2927,8 +2927,8 @@ fn right_click_select_layer_and_move_to_page() {
     // Everything under the pointer, top first: the rectangle, then the frame around it.
     assert_eq!(h.state().layers_at(pos2(50.0, 50.0)), vec![r1, f]);
     assert_eq!(h.state().layers_at(pos2(150.0, 150.0)), vec![f]);
-    h.state_mut().doc.pages.push(crate::doc::Page { name: "Two".into(), ..h.state().doc.pages[0].clone() });
-    h.state_mut().doc.pages[1].children.clear();
+    let two = crate::doc::Page { name: "Two".into(), children: vec![], ..h.state().doc.pages[0].clone() };
+    h.state_mut().doc.pages.push(two);
     h.state_mut().sel = vec![f];
     h.state_mut().move_to_page(1);
     assert!(h.state().doc.pages[0].children.is_empty());
