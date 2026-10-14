@@ -1140,6 +1140,10 @@ impl App {
                 self.doc.remove(id);
             }
             self.doc.pages.remove(i);
+            // Pages after the deleted one move up; stay on the one being viewed.
+            if i < self.page {
+                self.page -= 1;
+            }
             self.page = self.page.min(self.doc.pages.len() - 1);
             self.sel.clear();
             self.view_ready = false;

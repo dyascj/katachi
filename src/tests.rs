@@ -126,6 +126,56 @@ fn shift_draw_is_square_and_alt_draws_from_center() {
 }
 
 #[test]
+fn undo_during_a_drag_is_ignored() {
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    let (a, b) = (s(&h, 50., 50.), s(&h, 80., 90.));
+    move_to(&mut h, a, Modifiers::NONE);
+    press(&mut h, a, true, Modifiers::NONE);
+    move_to(&mut h, a.lerp(b, 0.5), Modifiers::NONE);
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    move_to(&mut h, b, Modifiers::NONE);
+    press(&mut h, b, false, Modifiers::NONE);
+    h.run_steps(2);
+    assert_eq!(rect(&h, id), r(30., 40., 100., 100.));
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(rect(&h, id), r(0., 0., 100., 100.), "one undo takes back the move");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert!(h.state().doc.nodes.is_empty(), "the next one the drawing");
+}
+
+#[test]
+fn deleting_an_earlier_page_stays_on_the_current_one() {
+    let mut h = harness();
+    for name in ["Page 2", "Page 3", "Page 4"] {
+        let mut p = h.state().doc.pages[0].clone();
+        p.name = name.into();
+        h.state_mut().doc.pages.push(p);
+    }
+    h.state_mut().page = 2;
+    h.run_steps(2);
+    h.get_by_label("Page 1").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Delete page").click();
+    h.run_steps(2);
+    let st = h.state();
+    assert_eq!((st.doc.pages.len(), st.doc.pages[st.page].name.as_str()), (3, "Page 3"));
+}
+
+#[test]
+fn cancelling_a_quit_resets_every_tab() {
+    let mut h = harness();
+    h.state_mut().dirty = true;
+    h.state_mut().allow_close = true;
+    h.state_mut().confirm = Some(crate::app::After::Close);
+    h.run_steps(2);
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    assert!(!h.state().allow_close);
+    assert_eq!(h.state().want, Some(crate::app::Want::KeepOpen), "the window resets the other tabs");
+}
+
+#[test]
 fn move_resize_and_delete() {
     let mut h = harness();
     let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));

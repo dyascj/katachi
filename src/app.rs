@@ -109,6 +109,8 @@ pub enum Want {
     OpenDialog,
     CloseTab,
     Home,
+    /// Quitting was cancelled: tabs already answered "Don't save" must ask again next time.
+    KeepOpen,
 }
 
 /// A plugin with a UI, running until it closes.
@@ -515,6 +517,11 @@ impl App {
     }
 
     pub fn undo(&mut self) {
+        // A drag rebuilds the document from its starting copy each frame; undoing under it
+        // would be overwritten and leave history out of step.
+        if self.drag.is_some() {
+            return;
+        }
         self.sync_collab(f64::MAX);
         if let Some(d) = self.undo.pop() {
             let touched = self.undo_touched.pop().unwrap_or_default();
@@ -531,6 +538,9 @@ impl App {
     }
 
     pub fn redo(&mut self) {
+        if self.drag.is_some() {
+            return;
+        }
         self.sync_collab(f64::MAX);
         if let Some(d) = self.redo.pop() {
             let touched = self.redo_touched.pop().unwrap_or_default();
@@ -1330,7 +1340,7 @@ impl App {
         }
         let file_name = |name: &str, p: &ExportSetting| {
             let scale = if p.format.raster() && p.scale != 1.0 { format!("@{}x", crate::canvas::num(p.scale)) } else { String::new() };
-            format!("{}{}{}.{}", name.replace('/', "-"), p.suffix, scale, p.format.ext())
+            format!("{}.{}", crate::export::safe_name(&format!("{name}{}{scale}", p.suffix)), p.format.ext())
         };
         // One file: ask where. Several: ask for a folder.
         let targets: Vec<std::path::PathBuf> = if jobs.len() == 1 {
@@ -1342,7 +1352,7 @@ impl App {
             }
         } else {
             match rfd::FileDialog::new().pick_folder() {
-                Some(dir) => jobs.iter().map(|(_, name, p)| dir.join(file_name(name, p))).collect(),
+                Some(dir) => crate::export::unique_names(jobs.iter().map(|(_, name, p)| file_name(name, p)).collect()).into_iter().map(|f| dir.join(f)).collect(),
                 None => return,
             }
         };
@@ -2374,7 +2384,13 @@ impl App {
         ) {
             Some(0) => choice = Some(false),
             Some(2) => choice = Some(true),
-            Some(_) => self.confirm = None,
+            Some(_) => {
+                self.confirm = None;
+                if after == After::Close {
+                    self.allow_close = false;
+                    self.want = Some(Want::KeepOpen);
+                }
+            }
             None => {}
         }
         let Some(save) = choice else { return };
@@ -2384,7 +2400,7 @@ impl App {
         self.confirm = None;
         match after {
             After::Close => {
-                self.clear_recovery();
+                // The autosave goes when the window really closes (another tab may still cancel).
                 self.allow_close = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }

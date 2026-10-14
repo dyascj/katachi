@@ -741,11 +741,44 @@ pub fn svg_to_png(doc: &Document, svg: &str, scale: f32) -> Result<Vec<u8>, Stri
     pix.encode_png().map_err(|e| e.to_string())
 }
 
+/// A layer name as a file name: slashes become "-", characters Windows forbids go, and so do
+/// leading dots (hidden files, or ".." climbing out of the export folder).
+pub fn safe_name(name: &str) -> String {
+    let s: String = name.chars().filter(|c| !r#":*?"<>|"#.contains(*c) && !c.is_control()).map(|c| if c == '/' || c == '\\' { '-' } else { c }).collect();
+    let s = s.trim().trim_start_matches('.').trim_start();
+    if s.is_empty() { "Untitled".into() } else { s.to_string() }
+}
+
+/// File names made distinct with " 2", " 3" before the extension (ignoring case, as macOS and
+/// Windows do), so exporting same-named layers doesn't overwrite one with another.
+pub fn unique_names(names: Vec<String>) -> Vec<String> {
+    let mut taken = std::collections::HashSet::new();
+    names
+        .into_iter()
+        .map(|name| {
+            let (stem, ext) = name.rsplit_once('.').map_or((name.as_str(), String::new()), |(s, e)| (s, format!(".{e}")));
+            let out = (1..).map(|i| if i == 1 { name.clone() } else { format!("{stem} {i}{ext}") }).find(|n| !taken.contains(&n.to_lowercase())).unwrap_or_default();
+            taken.insert(out.to_lowercase());
+            out
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::doc::{Node, PathPoint};
     use egui::{pos2, vec2};
+
+    #[test]
+    fn export_file_names_are_safe_and_distinct() {
+        assert_eq!(safe_name("../../.ssh/Icons/Home"), "-..-.ssh-Icons-Home");
+        assert_eq!(safe_name("..\\evil"), "-evil");
+        assert_eq!(safe_name("..."), "Untitled");
+        assert_eq!(safe_name("a:b*c?d\"e<f>g|h"), "abcdefgh");
+        let names = unique_names(vec!["Icon.png".into(), "icon.png".into(), "Icon.png".into(), "Icon@2x.png".into()]);
+        assert_eq!(names, ["Icon.png", "icon 2.png", "Icon 3.png", "Icon@2x.png"]);
+    }
 
     #[test]
     fn svg_and_png_roundtrip() {
