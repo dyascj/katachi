@@ -2757,6 +2757,39 @@ fn text_formatting_shortcuts_style_layers_and_ranges() {
 }
 
 #[test]
+fn italics_use_real_faces_and_slant_only_without_one() {
+    use crate::text::{style_name, styles_for};
+    let mut h = harness();
+    assert_eq!(style_name(400, true), "Italic");
+    assert_eq!(style_name(700, true), "Bold Italic");
+    assert_eq!(style_name(600, false), "Semi Bold");
+    assert!([400, 500, 600, 700].iter().all(|w| styles_for("Inter").contains(&(*w, false))));
+    let slanted = |h: &Harness<App>, family: &str, italic: bool| {
+        let mut n = Node::new(Kind::Text, r(0., 0., 10., 10.));
+        (n.font_family, n.italic) = (family.into(), italic);
+        crate::text::job(&h.ctx, &n, "x", 1.0, egui::Color32::BLACK).sections[0].format.italics
+    };
+    // No such family: Inter stands in, slanted.
+    let mut t = Node::new(Kind::Text, r(0., 0., 10., 10.));
+    (t.text, t.font_family, t.italic) = ("Hi".into(), "No Such Font".into(), true);
+    let missing = h.state_mut().doc.insert(0, None, None, t.clone());
+    // A family with a real italic (when this machine has one) draws it unslanted.
+    let real = crate::text::families().iter().find(|f| styles_for(f).contains(&(400, true)) && styles_for(f).contains(&(400, false))).cloned();
+    if let Some(f) = &real {
+        t.font_family = f.clone();
+        h.state_mut().doc.insert(0, None, None, t);
+    }
+    h.run_steps(4);
+    assert!(slanted(&h, "No Such Font", true));
+    assert!(!slanted(&h, "No Such Font", false));
+    assert!(crate::export::to_svg(&h.state().doc, &[missing]).contains(r#"font-style="italic""#));
+    if let Some(f) = real {
+        assert!(!slanted(&h, &f, true), "{f} has an italic face");
+        assert_eq!(crate::text::font_family(&h.ctx, &f, 400, true).0, egui::FontFamily::Name(format!("{f}#400i").into()));
+    }
+}
+
+#[test]
 fn copy_and_paste_properties_survive_egui_clipboard_events() {
     use crate::app::TEST_CLIPBOARD;
     let mut h = harness();

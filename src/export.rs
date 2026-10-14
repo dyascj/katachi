@@ -723,7 +723,7 @@ pub fn encode(doc: &Document, svg: &str, format: crate::doc::ExportFormat, scale
         }
         ExportFormat::Pdf => {
             let mut opt = svg2pdf::usvg::Options::default();
-            if doc.nodes.values().any(|n| n.kind == Kind::Text && n.font_family != "Inter") {
+            if needs_system_fonts(doc) {
                 opt.fontdb_mut().load_system_fonts();
             }
             for f in FONTS {
@@ -735,11 +735,19 @@ pub fn encode(doc: &Document, svg: &str, format: crate::doc::ExportFormat, scale
     }
 }
 
+/// System fonts only when text uses one (or an italic, which Inter isn't bundled in); Inter is
+/// always bundled. usvg then picks the same faces the canvas does: both query fontdb by family,
+/// weight and style.
+/// ponytail: a family without an italic face exports upright, where the canvas slants it.
+fn needs_system_fonts(doc: &Document) -> bool {
+    doc.nodes.values().any(|n| {
+        n.kind == Kind::Text && (n.font_family != "Inter" || n.italic || n.spans.iter().any(|s| s.style.font_family.is_some() || s.style.italic == Some(true)))
+    })
+}
+
 pub fn svg_to_png(doc: &Document, svg: &str, scale: f32) -> Result<Vec<u8>, String> {
     let mut opt = resvg::usvg::Options::default();
-    // System fonts only when a layer uses one; Inter is always bundled.
-    let needs_system = doc.nodes.values().any(|n| n.kind == Kind::Text && n.font_family != "Inter");
-    if needs_system {
+    if needs_system_fonts(doc) {
         opt.fontdb = std::sync::Arc::new(crate::text::system_fonts().clone());
     }
     for f in FONTS {

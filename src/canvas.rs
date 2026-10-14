@@ -253,10 +253,10 @@ impl App {
         let mut changed = false;
         for id in ids {
             let n = self.doc.node(id);
-            crate::text::ensure_font(&ctx, &n.font_family, n.font_weight);
+            crate::text::ensure_font(&ctx, &n.font_family, n.font_weight, n.italic);
             for sp in &n.spans {
                 let fam = sp.style.font_family.as_deref().unwrap_or(&n.font_family);
-                crate::text::ensure_font(&ctx, fam, sp.style.font_weight.unwrap_or(n.font_weight));
+                crate::text::ensure_font(&ctx, fam, sp.style.font_weight.unwrap_or(n.font_weight), sp.style.italic.unwrap_or(n.italic));
             }
             let key = text_key(&ctx, n);
             if self.text_keys.get(&id) == Some(&key) {
@@ -2180,8 +2180,8 @@ fn text_key(ctx: &egui::Context, n: &Node) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::hash::DefaultHasher::new();
     n.text.hash(&mut h);
-    format!("{:?}", crate::text::font_family(ctx, &n.font_family, n.font_weight)).hash(&mut h);
-    (n.font_size.to_bits(), n.letter_spacing.to_bits(), n.text_sizing as u8, n.text_case as u8, n.italic).hash(&mut h);
+    format!("{:?}", crate::text::font_family(ctx, &n.font_family, n.font_weight, n.italic)).hash(&mut h);
+    (n.font_size.to_bits(), n.letter_spacing.to_bits(), n.text_sizing as u8, n.text_case as u8).hash(&mut h);
     format!("{:?}", n.line_height).hash(&mut h);
     (n.truncate, n.max_lines, n.paragraph_spacing.to_bits()).hash(&mut h);
     format!("{:?}", n.lists).hash(&mut h);

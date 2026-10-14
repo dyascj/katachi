@@ -2369,7 +2369,7 @@ impl App {
                 }
             }
             if dn.kind == Kind::Text {
-                let t = format!("{} {} · {}px", dn.font_family, crate::text::weight_name(dn.font_weight), num(dn.font_size));
+                let t = format!("{} {} · {}px", dn.font_family, crate::text::style_name(dn.font_weight, dn.italic), num(dn.font_size));
                 if !type_styles.contains(&t) {
                     type_styles.push(t);
                 }
@@ -3319,7 +3319,7 @@ impl App {
 
     fn typography_section(&mut self, ui: &mut Ui, n: &crate::doc::Node) {
         use crate::doc::{Decoration, LineHeight, TextAlign, TextCase, TextSizing, VAlign};
-        use crate::text::{families, weight_name, weights_for};
+        use crate::text::{families, style_name, styles_for};
         let mut pick = None;
         ui.horizontal(|ui| {
             ui.label(RichText::new("Typography").strong());
@@ -3383,9 +3383,12 @@ impl App {
                     let current = *f == t.font_family;
                     if ui.add(egui::Button::new(format!("{}{f}", if current { "✓  " } else { "     " })).frame(false)).clicked() {
                         t.font_family = f.clone();
-                        let ws = weights_for(f);
-                        if !ws.contains(&t.font_weight) {
-                            t.font_weight = *ws.iter().min_by_key(|w| (**w as i32 - 400).abs()).unwrap_or(&400);
+                        // Keep the style if the new family has it, else its nearest, upright if need be.
+                        let ss = styles_for(f);
+                        if !ss.contains(&(t.font_weight, t.italic)) {
+                            let italic = t.italic && ss.iter().any(|s| s.1);
+                            let near = ss.iter().filter(|s| s.1 == italic).min_by_key(|s| (s.0 as i32 - t.font_weight as i32).abs());
+                            (t.font_weight, t.italic) = near.copied().unwrap_or((400, false));
                         }
                         ui.close();
                     }
@@ -3393,9 +3396,12 @@ impl App {
             });
         });
         ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("weight").width(half(ui) - 12.0).selected_text(weight_name(t.font_weight)).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
-                for w in weights_for(&t.font_family) {
-                    ui.selectable_value(&mut t.font_weight, w, weight_name(w));
+            // Font styles as Figma lists them: each weight, then its italic.
+            egui::ComboBox::from_id_salt("weight").width(half(ui) - 12.0).selected_text(style_name(t.font_weight, t.italic)).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+                for (w, i) in styles_for(&t.font_family) {
+                    if ui.selectable_label((t.font_weight, t.italic) == (w, i), style_name(w, i)).clicked() {
+                        (t.font_weight, t.italic) = (w, i);
+                    }
                 }
             });
             num_field(ui, &mut t.font_size, "", 1.0, half(ui));
@@ -3511,6 +3517,7 @@ impl App {
         });
         let changed = t.font_family != n.font_family
             || t.font_weight != n.font_weight
+            || t.italic != n.italic
             || t.font_size != n.font_size
             || t.line_height != n.line_height
             || t.letter_spacing != n.letter_spacing
@@ -3527,6 +3534,7 @@ impl App {
             let patch = crate::doc::SpanStyle {
                 font_family: (t.font_family != n.font_family).then(|| t.font_family.clone()),
                 font_weight: (t.font_weight != n.font_weight).then_some(t.font_weight),
+                italic: (t.italic != n.italic).then_some(t.italic),
                 font_size: (t.font_size != n.font_size).then_some(t.font_size),
                 decoration: (t.decoration != n.decoration).then_some(t.decoration),
                 ..Default::default()
@@ -3544,6 +3552,7 @@ impl App {
                 d.text_style = None;
                 d.font_family = t.font_family.clone();
                 d.font_weight = t.font_weight;
+                d.italic = t.italic;
                 d.font_size = t.font_size;
                 d.line_height = t.line_height;
                 d.letter_spacing = t.letter_spacing;

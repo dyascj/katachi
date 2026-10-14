@@ -38,17 +38,27 @@ pub fn families() -> &'static [String] {
     })
 }
 
+/// Inter's weights bundled with the app (upright only).
+const INTER: [u16; 4] = [400, 500, 600, 700];
+
+/// Installed styles of `family` as (weight, italic), lightest first, each upright before its italic.
+pub fn styles_for(family: &str) -> Vec<(u16, bool)> {
+    let mut s: Vec<(u16, bool)> = system_fonts()
+        .faces()
+        .filter(|f| f.families.iter().any(|(n, _)| n == family))
+        .map(|f| (f.weight.0, f.style != fontdb::Style::Normal))
+        .collect();
+    if family == "Inter" {
+        s.extend(INTER.map(|w| (w, false)));
+    }
+    s.sort();
+    s.dedup();
+    if s.is_empty() { vec![(400, false)] } else { s }
+}
+
 /// Upright weights installed for `family`.
 pub fn weights_for(family: &str) -> Vec<u16> {
-    if family == "Inter" {
-        return vec![400, 500, 600, 700];
-    }
-    let mut w: Vec<u16> = system_fonts()
-        .faces()
-        .filter(|f| f.style == fontdb::Style::Normal && f.families.iter().any(|(n, _)| n == family))
-        .map(|f| f.weight.0)
-        .collect();
-    w.sort();
+    let mut w: Vec<u16> = styles_for(family).into_iter().filter(|s| !s.1).map(|s| s.0).collect();
     w.dedup();
     if w.is_empty() { vec![400] } else { w }
 }
@@ -76,13 +86,16 @@ pub fn style_name(w: u16, italic: bool) -> String {
     }
 }
 
+/// A face: family, weight, italic.
+type FaceKey = (String, u16, bool);
+
 #[derive(Default)]
 struct Registry {
     /// Usable now.
-    ready: HashMap<(String, u16), FontFamily>,
+    ready: HashMap<FaceKey, FontFamily>,
     /// Handed to egui on this pass; usable from a later one.
-    pending: HashMap<(String, u16), u64>,
-    missing: HashSet<(String, u16)>,
+    pending: HashMap<FaceKey, u64>,
+    missing: HashSet<FaceKey>,
 }
 
 /// Fonts loaded into one egui context (each context has its own font set).
@@ -90,36 +103,44 @@ fn registry(ctx: &egui::Context) -> Arc<Mutex<Registry>> {
     ctx.data_mut(|d| d.get_temp_mut_or_insert_with(egui::Id::new("katachi-font-registry"), || Arc::new(Mutex::new(Registry::default()))).clone())
 }
 
-/// Make `family`/`weight` available to egui. Call once per frame before drawing text.
-pub fn ensure_font(ctx: &egui::Context, family: &str, weight: u16) {
-    if family == "Inter" {
+/// Make a face of `family` available to egui. Call once per frame before drawing text.
+pub fn ensure_font(ctx: &egui::Context, family: &str, weight: u16, italic: bool) {
+    if family == "Inter" && !italic && INTER.contains(&weight) {
         return;
     }
-    let key = (family.to_string(), weight);
+    if italic {
+        // Its upright face too: the stand-in until the italic loads, or for good if there's none.
+        ensure_font(ctx, family, weight, false);
+    }
+    let key = (family.to_string(), weight, italic);
     let reg = registry(ctx);
     let mut r = reg.lock().unwrap();
     if r.ready.contains_key(&key) || r.missing.contains(&key) {
         return;
     }
+    let name = format!("{family}#{weight}{}", if italic { "i" } else { "" });
     let pass = ctx.cumulative_pass_nr();
     if let Some(&added) = r.pending.get(&key) {
         // egui binds new fonts at the start of a pass, so only use it on a later one.
         if pass > added {
             r.pending.remove(&key);
-            let name = format!("{family}#{weight}");
             r.ready.insert(key, FontFamily::Name(name.into()));
             ctx.request_repaint();
         }
         return;
     }
     let db = system_fonts();
-    let q = fontdb::Query { families: &[fontdb::Family::Name(family)], weight: fontdb::Weight(weight), ..Default::default() };
-    let face = db.query(&q).and_then(|id| db.with_face_data(id, |data, index| (data.to_vec(), index)));
+    let style = if italic { fontdb::Style::Italic } else { fontdb::Style::Normal };
+    let q = fontdb::Query { families: &[fontdb::Family::Name(family)], weight: fontdb::Weight(weight), style, ..Default::default() };
+    // fontdb falls back to an upright face when there's no italic; that one doesn't count.
+    let face = db
+        .query(&q)
+        .filter(|&id| !italic || db.face(id).is_some_and(|f| f.style != fontdb::Style::Normal))
+        .and_then(|id| db.with_face_data(id, |data, index| (data.to_vec(), index)));
     let Some((data, index)) = face else {
         r.missing.insert(key);
         return;
     };
-    let name = format!("{family}#{weight}");
     let mut fd = egui::FontData::from_owned(data);
     fd.index = index;
     ctx.add_font(egui::epaint::text::FontInsert {
@@ -134,18 +155,23 @@ pub fn ensure_font(ctx: &egui::Context, family: &str, weight: u16) {
     ctx.request_repaint();
 }
 
-/// egui family for a node's font, falling back to Inter until a system font is loaded.
-pub fn font_family(ctx: &egui::Context, family: &str, weight: u16) -> FontFamily {
-    if family != "Inter"
-        && let Some(f) = registry(ctx).lock().unwrap().ready.get(&(family.to_string(), weight)) {
-            return f.clone();
-        }
-    match weight {
+/// egui family for a face, and whether to slant it: italics without an italic face (or before it
+/// loads) are the upright face slanted, and fonts fall back to Inter until loaded.
+pub fn font_family(ctx: &egui::Context, family: &str, weight: u16, italic: bool) -> (FontFamily, bool) {
+    let ready = registry(ctx).lock().unwrap().ready.get(&(family.to_string(), weight, italic)).cloned();
+    if let Some(f) = ready {
+        return (f, false);
+    }
+    if italic {
+        return (font_family(ctx, family, weight, false).0, true);
+    }
+    let f = match weight {
         0..=449 => FontFamily::Proportional,
         450..=549 => FontFamily::Name("Inter Medium".into()),
         550..=649 => FontFamily::Name("Inter SemiBold".into()),
         _ => FontFamily::Name("Inter Bold".into()),
-    }
+    };
+    (f, false)
 }
 
 pub fn apply_case(text: &str, case: TextCase) -> String {
@@ -187,14 +213,15 @@ pub fn job(ctx: &egui::Context, n: &Node, text: &str, zoom: f32, color: Color32)
         let deco = Stroke::new((n.font_size / 14.0).max(1.0) * zoom, c);
         let decoration = st.decoration.unwrap_or(n.decoration);
         let family = st.font_family.as_deref().unwrap_or(&n.font_family);
+        let (face, slant) = font_family(ctx, family, st.font_weight.unwrap_or(n.font_weight), st.italic.unwrap_or(n.italic));
         TextFormat {
-            font_id: FontId::new(size, font_family(ctx, family, st.font_weight.unwrap_or(n.font_weight))),
+            font_id: FontId::new(size, face),
             color: c,
             extra_letter_spacing: n.letter_spacing / 100.0 * size,
             line_height: (n.line_height != LineHeight::Auto).then(|| line_pitch(n) * zoom),
             underline: if decoration == Decoration::Underline { deco } else { Stroke::NONE },
             strikethrough: if decoration == Decoration::Strikethrough { deco } else { Stroke::NONE },
-            italics: st.italic.unwrap_or(n.italic),
+            italics: slant,
             ..Default::default()
         }
     };
