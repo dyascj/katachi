@@ -74,6 +74,8 @@ pub enum Drag {
     Spacing { base: Document, axis: usize, items: Vec<(NodeId, Rect)>, gap: f32, start: Pos2 },
     /// Smart selection: one layer dragged by its center knob onto another's slot swaps them.
     Swap { base: Document, id: NodeId, axis: usize, items: Vec<(NodeId, Rect)>, start: Pos2 },
+    /// An auto layout frame's gap or padding handle (`Grip::Gap` / `Grip::Padding`).
+    LayoutSpacing { base: Document, id: NodeId, grip: Grip, start: Pos2 },
 }
 
 impl Drag {
@@ -86,6 +88,7 @@ impl Drag {
             | Drag::Create { base, .. }
             | Drag::Vector { base, .. }
             | Drag::Spacing { base, .. }
+            | Drag::LayoutSpacing { base, .. }
             | Drag::Swap { base, .. } => Some(base),
             _ => None,
         }
@@ -103,6 +106,10 @@ pub enum Grip {
     Spacing(usize),
     /// Smart selection: a layer's center knob.
     Swap(NodeId),
+    /// A selected auto layout frame's gap handle.
+    Gap,
+    /// A selected auto layout frame's padding handle: top, right, bottom, left.
+    Padding(usize),
 }
 
 /// Mouse-down state for the move tool, resolved into a click or a drag.

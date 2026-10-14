@@ -774,6 +774,30 @@ fn arrow_keys_reorder_auto_layout_children() {
 }
 
 #[test]
+fn drag_auto_layout_gap_and_padding_handles() {
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (40.0, 40.0));
+    let b = draw(&mut h, Key::R, (60.0, 0.0), (100.0, 40.0));
+    h.state_mut().sel = vec![a, b];
+    key(&mut h, Modifiers::SHIFT, Key::A);
+    let f = h.state().sel[0];
+    assert_eq!(rect(&h, f), r(0., 0., 90., 40.));
+    // The gap handle sits mid-gap; dragging it right widens the gap.
+    let (from, to) = (s(&h, 45., 20.), s(&h, 55., 20.));
+    drag(&mut h, from, to, Modifiers::NONE);
+    assert_eq!(h.state().doc.node(f).layout.gap, 20.0);
+    assert_eq!(rect(&h, b).min.x, 60.0);
+    assert_eq!(h.state().sel, vec![f], "the frame stays selected");
+    // Top padding (0) has a sliver handle; Shift sets every side.
+    let (from, to) = (s(&h, 50., 7.), s(&h, 50., 19.));
+    drag(&mut h, from, to, Modifiers::SHIFT);
+    assert_eq!(h.state().doc.node(f).layout.padding, [12.0; 4]);
+    assert_eq!(rect(&h, f), r(0., 0., 124., 64.));
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().doc.node(f).layout.padding, [0.0; 4], "one undo step per drag");
+}
+
+#[test]
 fn components_instances_via_shortcuts() {
     let mut h = harness();
     let rect_id = draw(&mut h, Key::R, (0.0, 0.0), (80.0, 40.0));
