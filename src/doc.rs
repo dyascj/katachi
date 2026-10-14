@@ -180,10 +180,16 @@ pub enum TextCase {
 pub enum Trigger {
     #[default]
     OnClick,
+    /// Figma's "While hovering": the action holds while the pointer stays on the layer.
     OnHover,
     WhilePressed,
     /// Fires this many milliseconds after the frame appears.
     AfterDelay(u32),
+    MouseEnter,
+    MouseLeave,
+    OnDrag,
+    /// Key/Gamepad: a key with modifiers (only Cmd/Ctrl, Shift and Alt are kept).
+    Key(egui::Key, egui::Modifiers),
 }
 
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
@@ -195,6 +201,14 @@ pub enum Action {
     OpenOverlay(NodeId),
     CloseOverlay,
     OpenUrl(String),
+    /// Interactive components: switch the instance the trigger is in to this variant.
+    ChangeTo(NodeId),
+    /// Scroll the layer's scrolling frame until the layer reaches its top-left.
+    ScrollTo(NodeId),
+    /// Replace the topmost overlay with this frame.
+    SwapOverlay(NodeId),
+    /// Give a variable a new value for the rest of the presentation.
+    SetVariable(VarId, VarValue),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -221,13 +235,114 @@ pub enum Direction {
 pub struct Transition {
     pub kind: TransitionKind,
     pub direction: Direction,
-    /// Seconds.
+    /// Seconds (springs settle in their own time).
     pub duration: f32,
+    #[serde(default)]
+    pub easing: Easing,
 }
 
 impl Default for Transition {
     fn default() -> Self {
-        Self { kind: TransitionKind::Instant, direction: Direction::Left, duration: 0.3 }
+        Self { kind: TransitionKind::Instant, direction: Direction::Left, duration: 0.3, easing: Easing::EaseOut }
+    }
+}
+
+/// Figma's animation curves.
+#[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize)]
+pub enum Easing {
+    Linear,
+    EaseIn,
+    #[default]
+    EaseOut,
+    EaseInOut,
+    EaseInBack,
+    EaseOutBack,
+    EaseInOutBack,
+    /// Cubic bezier control points: x1, y1, x2, y2.
+    Custom([f32; 4]),
+    Gentle,
+    Quick,
+    Bouncy,
+    Slow,
+}
+
+/// Where an overlay opens, relative to the frame (or the trigger, for Manual).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum OverlayPos {
+    #[default]
+    Center,
+    TopLeft,
+    TopCenter,
+    TopRight,
+    BottomLeft,
+    BottomCenter,
+    BottomRight,
+    Manual,
+}
+
+/// Open and Swap overlay settings.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OverlaySettings {
+    pub position: OverlayPos,
+    /// Manual position: from the trigger layer's top-left.
+    pub offset: Vec2,
+    pub close_outside: bool,
+    /// Color laid behind the overlay; None leaves the frame as is.
+    pub background: Option<Rgba>,
+}
+
+impl Default for OverlaySettings {
+    /// Centered, closing on an outside click, over a dimmed frame (how overlays always opened before).
+    fn default() -> Self {
+        Self { position: OverlayPos::Center, offset: Vec2::ZERO, close_outside: true, background: Some(Rgba([0, 0, 0, 100])) }
+    }
+}
+
+/// Prototype overflow: which way a frame scrolls when its content runs past its edges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Overflow {
+    #[default]
+    None,
+    Vertical,
+    Horizontal,
+    Both,
+}
+
+/// How a layer moves when its parent frame scrolls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ScrollPos {
+    #[default]
+    Scroll,
+    Fixed,
+    /// Scrolls until its top edge reaches the frame's top, then stays.
+    Sticky,
+}
+
+/// Devices a prototype can be presented in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Device {
+    #[default]
+    None,
+    IPhone16,
+    IPhone16ProMax,
+    Pixel9,
+    IPad,
+    MacBook,
+    Desktop,
+}
+
+/// A page's prototype settings.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProtoSettings {
+    pub device: Device,
+    pub background: Rgba,
+}
+
+impl Default for ProtoSettings {
+    fn default() -> Self {
+        Self { device: Device::None, background: Rgba::rgb(0x1E, 0x1E, 0x1E) }
     }
 }
 
@@ -238,6 +353,9 @@ pub struct Reaction {
     pub action: Action,
     #[serde(default)]
     pub transition: Transition,
+    /// Open and Swap overlay only.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub overlay: OverlaySettings,
 }
 
 /// A component property definition (on a component or component set).
@@ -1221,6 +1339,12 @@ pub struct Node {
     /// Prototype interactions.
     #[serde(skip_serializing_if = "dflt::reactions")]
     pub reactions: Vec<Reaction>,
+    /// Frames: prototype scrolling.
+    #[serde(skip_serializing_if = "dflt::overflow")]
+    pub overflow: Overflow,
+    /// Children of scrolling frames: scroll along, stay fixed, or stick.
+    #[serde(skip_serializing_if = "dflt::scroll_pos")]
+    pub scroll_pos: ScrollPos,
     /// Properties driven by variables.
     #[serde(skip_serializing_if = "dflt::bindings")]
     pub bindings: Vec<(Bindable, VarId)>,
@@ -1353,6 +1477,8 @@ mod dflt {
         exports: Vec<ExportSetting>,
         blend: BlendMode,
         reactions: Vec<Reaction>,
+        overflow: Overflow,
+        scroll_pos: ScrollPos,
         bindings: Vec<(Bindable, VarId)>,
         modes: Vec<(u64, usize)>,
         fill_style: Option<StyleId>,
@@ -1436,6 +1562,8 @@ impl Default for Node {
             exports: vec![],
             blend: BlendMode::Normal,
             reactions: vec![],
+            overflow: Overflow::None,
+            scroll_pos: ScrollPos::Scroll,
             bindings: vec![],
             modes: vec![],
             fill_style: None,
@@ -1646,6 +1774,8 @@ pub struct Page {
     /// Where the page was last viewed: world center x, y and zoom (saved in the file, as Figma does).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub prototype: ProtoSettings,
 }
 
 pub const PAGE_BG: Rgba = Rgba::rgb(0xF5, 0xF5, 0xF5);
@@ -1767,7 +1897,7 @@ pub enum Order {
 impl Default for Document {
     fn default() -> Self {
         Self {
-            pages: vec![Page { name: "Page 1".into(), children: vec![], background: PAGE_BG, flows: vec![], view: None }],
+            pages: vec![Page { name: "Page 1".into(), children: vec![], background: PAGE_BG, flows: vec![], view: None, prototype: Default::default() }],
             nodes: HashMap::new(),
             next_id: 1,
             images: HashMap::new(),
@@ -3068,7 +3198,7 @@ fn merge_from(e: &mut Node, src: &Node) {
     take!(
         name, visible, opacity, fills, strokes, stroke_width, stroke_sides, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, min_size, max_size, constraints, absolute,
         paths, even_odd, text, font_size, font_weight, font_family, text_sizing, text_align, text_valign, line_height, letter_spacing,
-        decoration, text_case, paragraph_spacing, truncate, max_lines, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, fill_style,
+        decoration, text_case, paragraph_spacing, truncate, max_lines, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, overflow, scroll_pos, fill_style,
         stroke_style, text_style, effect_style, prop_bind, is_mask, blend, bindings, modes, spans, lists
     );
     e.synced = Some(Box::new(Node { children: vec![], synced: None, ..src.clone() }));

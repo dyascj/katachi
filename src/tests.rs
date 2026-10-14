@@ -1141,6 +1141,212 @@ fn prototype_connect_present_and_navigate() {
     assert!(h.state().presenting.is_none());
 }
 
+/// Screen point of (x, y) in the frame being presented.
+fn ps(h: &Harness<App>, x: f32, y: f32) -> Pos2 {
+    let st = h.state();
+    let frame = st.presenting.as_ref().expect("presenting").frame;
+    st.presented_view(&st.presented(), frame, Rect::from_min_size(Pos2::ZERO, vec2(1440., 900.))).to_screen(pos2(x, y))
+}
+
+#[test]
+fn prototype_change_to_swaps_variants_while_presenting() {
+    use crate::doc::{Action, Reaction, Trigger};
+    let mut h = harness();
+    let st = h.state_mut();
+    let comp = |st: &mut App, name: &str, x: f32| {
+        let mut c = Node::new(Kind::Component, r(x, 400., 80., 40.));
+        c.name = name.into();
+        st.doc.insert(0, None, None, c)
+    };
+    let (a, b, c) = (comp(st, "State=Default", 0.), comp(st, "State=Hover", 100.), comp(st, "State=Pressed", 200.));
+    st.doc.combine_as_variants(&[a, b, c]);
+    // Hovering shows Hover; clicking Hover switches to Pressed.
+    st.doc.node_mut(a).reactions.push(Reaction { trigger: Trigger::OnHover, action: Action::ChangeTo(b), ..Default::default() });
+    st.doc.node_mut(b).reactions.push(Reaction { trigger: Trigger::OnClick, action: Action::ChangeTo(c), ..Default::default() });
+    let frame = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(0., 0., 300., 200.)));
+    let inst = st.doc.instantiate(a, 0, Some(frame), None, pos2(20., 20.));
+    assert_eq!(crate::prototype::sibling_variants(&st.doc, a), vec![a, b, c], "Change to is offered inside a variant");
+    assert!(crate::prototype::sibling_variants(&st.doc, frame).is_empty());
+    st.sel = vec![frame];
+    st.present(0.0);
+    h.run_steps(2);
+    let variant = |h: &Harness<App>| h.state().presented().node(inst).component;
+    let on = ps(&h, 60., 40.);
+    move_to(&mut h, on, Modifiers::NONE);
+    h.run_steps(1);
+    assert_eq!(variant(&h), Some(b), "while hovering");
+    let away = ps(&h, 250., 150.);
+    move_to(&mut h, away, Modifiers::NONE);
+    h.run_steps(1);
+    assert_eq!(variant(&h), Some(a), "back when the pointer leaves");
+    click(&mut h, on, Modifiers::NONE);
+    assert_eq!(variant(&h), Some(c));
+    assert_eq!(h.state().doc.node(inst).component, Some(a), "the file is untouched");
+}
+
+#[test]
+fn prototype_enter_leave_key_and_drag_triggers() {
+    use crate::doc::{Action, Easing, OverlayPos, OverlaySettings, Reaction, Transition, TransitionKind, Trigger};
+    let mut h = harness();
+    let st = h.state_mut();
+    let a = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(0., 0., 300., 200.)));
+    let b = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(400., 0., 300., 200.)));
+    let tip = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(800., 0., 100., 50.)));
+    let btn = st.doc.insert(0, Some(a), None, Node::new(Kind::Rectangle, r(20., 20., 80., 40.)));
+    let pad = st.doc.insert(0, Some(a), None, Node::new(Kind::Rectangle, r(150., 100., 100., 80.)));
+    // A tooltip in the bottom-right corner while the pointer is on the button.
+    let corner = OverlaySettings { position: OverlayPos::BottomRight, background: None, ..Default::default() };
+    st.doc.node_mut(btn).reactions = vec![
+        Reaction { trigger: Trigger::MouseEnter, action: Action::OpenOverlay(tip), overlay: corner, ..Default::default() },
+        Reaction { trigger: Trigger::MouseLeave, action: Action::CloseOverlay, ..Default::default() },
+    ];
+    st.doc.node_mut(pad).reactions.push(Reaction { trigger: Trigger::OnDrag, action: Action::Navigate(b), ..Default::default() });
+    let spring = Transition { kind: TransitionKind::SmartAnimate, easing: Easing::Bouncy, ..Default::default() };
+    st.doc.node_mut(a).reactions.push(Reaction { trigger: Trigger::Key(Key::K, Modifiers::COMMAND), action: Action::Navigate(b), transition: spring, ..Default::default() });
+    st.sel = vec![a];
+    st.present(0.0);
+    h.run_steps(2);
+    let on = ps(&h, 60., 40.);
+    move_to(&mut h, on, Modifiers::NONE);
+    h.run_steps(1);
+    let overlays = |h: &Harness<App>| h.state().presenting.as_ref().unwrap().overlays.clone();
+    assert_eq!(overlays(&h).len(), 1, "mouse enter");
+    assert_eq!(overlays(&h)[0].at, vec2(200., 150.), "bottom right of the frame");
+    let off = ps(&h, 120., 150.);
+    move_to(&mut h, off, Modifiers::NONE);
+    h.run_steps(1);
+    assert!(overlays(&h).is_empty(), "mouse leave");
+    // Cmd+K navigates with a spring, which settles in its own time.
+    key(&mut h, Modifiers::COMMAND, Key::K);
+    assert_eq!(h.state().presenting.as_ref().map(|p| p.frame), Some(b));
+    assert!(h.state().presenting.as_ref().unwrap().anim.is_some());
+    h.run_steps(70);
+    assert!(h.state().presenting.as_ref().unwrap().anim.is_none());
+    // Restart, then drag the pad.
+    key(&mut h, Modifiers::NONE, Key::R);
+    assert_eq!(h.state().presenting.as_ref().map(|p| p.frame), Some(a));
+    let (p, q) = (ps(&h, 160., 120.), ps(&h, 240., 120.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    assert_eq!(h.state().presenting.as_ref().map(|p| p.frame), Some(b));
+}
+
+#[test]
+fn prototype_scroll_to_fixed_layers_and_wheel() {
+    use crate::doc::{Action, Overflow, Reaction, ScrollPos};
+    let mut h = harness();
+    let st = h.state_mut();
+    let a = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(0., 0., 200., 200.)));
+    st.doc.node_mut(a).overflow = Overflow::Vertical;
+    st.doc.insert(0, Some(a), None, Node::new(Kind::Rectangle, r(0., 0., 200., 600.)));
+    let target = st.doc.insert(0, Some(a), None, Node::new(Kind::Rectangle, r(0., 400., 200., 50.)));
+    let bar = st.doc.insert(0, Some(a), None, Node::new(Kind::Rectangle, r(0., 170., 200., 30.)));
+    st.doc.node_mut(bar).scroll_pos = ScrollPos::Fixed;
+    let go = st.doc.insert(0, Some(a), None, Node::new(Kind::Rectangle, r(10., 10., 50., 30.)));
+    st.doc.node_mut(go).reactions.push(Reaction { action: Action::ScrollTo(target), ..Default::default() });
+    st.sel = vec![a];
+    st.present(0.0);
+    h.run_steps(2);
+    let at = ps(&h, 30., 20.);
+    click(&mut h, at, Modifiers::NONE);
+    let offset = |h: &Harness<App>| h.state().presenting.as_ref().unwrap().scroll.get(&a).copied().unwrap_or_default();
+    assert_eq!(offset(&h), vec2(0., 400.), "scrolled to the target, as far as the content goes");
+    let shown = h.state().presented();
+    assert_eq!(shown.node(target).rect.min.y, 0.);
+    assert_eq!(shown.node(bar).rect.min.y, 170., "fixed layers stay put");
+    // The wheel scrolls back up.
+    for _ in 0..4 {
+        h.event(Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, 50.0), modifiers: Modifiers::NONE, phase: egui::TouchPhase::Move });
+        h.run_steps(3);
+    }
+    h.run_steps(20);
+    let y = offset(&h).y;
+    assert!(y < 400. && y >= 0., "{y}");
+}
+
+#[test]
+fn prototype_overlay_settings_swap_overlay_and_set_variable() {
+    use crate::doc::{Action, Bindable, OverlayPos, OverlaySettings, Reaction, Rgba, VarValue};
+    let mut h = harness();
+    let st = h.state_mut();
+    let m = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(0., 0., 300., 200.)));
+    let menu = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(800., 300., 100., 60.)));
+    let next = st.doc.insert(0, Some(menu), None, Node::new(Kind::Rectangle, r(810., 310., 30., 30.)));
+    let sheet = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(800., 500., 80., 80.)));
+    let swatch = st.doc.insert(0, Some(m), None, Node::new(Kind::Rectangle, r(10., 10., 40., 40.)));
+    let red = st.doc.insert(0, Some(m), None, Node::new(Kind::Rectangle, r(60., 10., 40., 40.)));
+    let open = st.doc.insert(0, Some(m), None, Node::new(Kind::Rectangle, r(110., 10., 40., 40.)));
+    let c = st.doc.add_collection("Theme".into());
+    let var = st.doc.add_variable(c, "accent".into(), VarValue::Color(Rgba::WHITE));
+    st.doc.node_mut(swatch).bindings.push((Bindable::Fill, var));
+    st.doc.reflow();
+    st.doc.node_mut(red).reactions.push(Reaction { action: Action::SetVariable(var, VarValue::Color(Rgba::rgb(255, 0, 0))), ..Default::default() });
+    // A menu just under the button that stays open on outside clicks.
+    let below = OverlaySettings { position: OverlayPos::Manual, offset: vec2(0., 45.), close_outside: false, background: None };
+    st.doc.node_mut(open).reactions.push(Reaction { action: Action::OpenOverlay(menu), overlay: below, ..Default::default() });
+    st.doc.node_mut(next).reactions.push(Reaction { action: Action::SwapOverlay(sheet), ..Default::default() });
+    st.sel = vec![m];
+    st.present(0.0);
+    h.run_steps(2);
+    let at = ps(&h, 80., 30.);
+    click(&mut h, at, Modifiers::NONE);
+    assert_eq!(h.state().presented().node(swatch).fills[0].color, Rgba::rgb(255, 0, 0), "bound fill follows the variable");
+    assert_eq!(h.state().doc.node(swatch).fills[0].color, Rgba::WHITE, "the file is untouched");
+    let at = ps(&h, 130., 30.);
+    click(&mut h, at, Modifiers::NONE);
+    let overlays = |h: &Harness<App>| h.state().presenting.as_ref().unwrap().overlays.clone();
+    assert_eq!(overlays(&h)[0].at, vec2(110., 55.), "offset from the trigger");
+    let outside = ps(&h, 20., 180.);
+    click(&mut h, outside, Modifiers::NONE);
+    assert_eq!(overlays(&h).len(), 1, "stays open on outside clicks");
+    let at = ps(&h, 110. + 25., 55. + 25.);
+    click(&mut h, at, Modifiers::NONE);
+    let shown = overlays(&h);
+    assert_eq!((shown.len(), shown[0].id, shown[0].at), (1, sheet, vec2(110., 60.)), "swapped for a centered sheet");
+}
+
+#[test]
+fn prototype_presents_inside_a_device() {
+    use crate::doc::{Action, Device, Reaction};
+    let mut h = harness();
+    let st = h.state_mut();
+    st.doc.pages[0].prototype.device = Device::IPhone16;
+    let a = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(0., 0., 393., 852.)));
+    let b = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(500., 0., 393., 852.)));
+    let btn = st.doc.insert(0, Some(a), None, Node::new(Kind::Rectangle, r(20., 700., 100., 40.)));
+    st.doc.node_mut(btn).reactions.push(Reaction { action: Action::Navigate(b), ..Default::default() });
+    st.sel = vec![a];
+    st.present(0.0);
+    h.run_steps(2);
+    let window = Rect::from_min_size(Pos2::ZERO, vec2(1440., 900.));
+    let v = h.state().presented_view(&h.state().doc, a, window);
+    assert!(v.zoom < 1.0, "the phone scales down to fit");
+    assert!(window.contains_rect(v.rect_to_screen(rect(&h, a))));
+    let at = ps(&h, 70., 720.);
+    click(&mut h, at, Modifiers::NONE);
+    assert_eq!(h.state().presenting.as_ref().map(|p| p.frame), Some(b));
+}
+
+#[test]
+fn prototype_key_trigger_is_set_by_pressing_it() {
+    use crate::doc::{Action, Reaction, Trigger};
+    let mut h = harness();
+    let a = draw(&mut h, Key::F, (0.0, 0.0), (200.0, 150.0));
+    let r0 = Reaction { trigger: Trigger::Key(Key::Space, Modifiers::NONE), action: Action::Back, ..Default::default() };
+    h.state_mut().doc.node_mut(a).reactions.push(r0.clone());
+    h.state_mut().prototype_tab = true;
+    h.state_mut().sel = vec![a];
+    h.run_steps(2);
+    let row = crate::prototype::describe(&h.state().doc, &r0);
+    h.get_by_label(&row).click();
+    h.run_steps(2);
+    h.get_by_label(&crate::prototype::key_label(Key::Space, Modifiers::NONE)).click();
+    h.run_steps(2);
+    let tool = h.state().tool;
+    key(&mut h, Modifiers::SHIFT, Key::K);
+    assert_eq!(h.state().doc.node(a).reactions[0].trigger, Trigger::Key(Key::K, Modifiers::SHIFT));
+    assert!(h.state().tool == tool, "the key went to the trigger, not a shortcut");
+}
+
 #[test]
 fn saves_keep_versions() {
     isolate_data();
@@ -1858,7 +2064,7 @@ fn files_and_pages_reopen_where_they_were_viewed() {
     assert_eq!(g.state().view.zoom, 2.5);
     assert!((back - center).length() < 0.5, "{back:?} vs {center:?}");
     // Switching pages and back keeps each page's view.
-    g.state_mut().doc.pages.push(crate::doc::Page { name: "Two".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None });
+    g.state_mut().doc.pages.push(crate::doc::Page { name: "Two".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, prototype: Default::default() });
     g.state_mut().select_page(1);
     g.run_steps(2);
     g.state_mut().select_page(0);

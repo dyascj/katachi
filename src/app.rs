@@ -2071,6 +2071,9 @@ impl App {
     // ---------- shortcuts ----------
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.data(|d| d.get_temp::<egui::Id>(egui::Id::new(crate::prototype::RECORDING_KEY))).is_some() {
+            return;
+        }
         let typing = ctx.egui_wants_keyboard_input();
         let events = ctx.input(|i| i.events.clone());
         for e in events {

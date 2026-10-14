@@ -328,44 +328,118 @@ fn prop_json(v: &PropValue) -> (&'static str, Value) {
 
 // ---------- prototyping ----------
 
+/// JavaScript key codes for Key/Gamepad triggers (letters, digits, and the common named keys).
+const KEY_CODES: [(egui::Key, u32); 11] = [
+    (egui::Key::Backspace, 8),
+    (egui::Key::Tab, 9),
+    (egui::Key::Enter, 13),
+    (egui::Key::Escape, 27),
+    (egui::Key::Space, 32),
+    (egui::Key::ArrowLeft, 37),
+    (egui::Key::ArrowUp, 38),
+    (egui::Key::ArrowRight, 39),
+    (egui::Key::ArrowDown, 40),
+    (egui::Key::Delete, 46),
+    (egui::Key::Minus, 189),
+];
+
+fn key_code(k: egui::Key) -> Option<u32> {
+    KEY_CODES.iter().find(|(key, _)| *key == k).map(|(_, c)| *c).or_else(|| {
+        let mut name = k.name().chars();
+        match (name.next(), name.next()) {
+            (Some(c), None) if c.is_ascii_alphanumeric() => Some(c.to_ascii_uppercase() as u32),
+            _ => None,
+        }
+    })
+}
+
+fn key_from_code(c: u32) -> Option<egui::Key> {
+    KEY_CODES.iter().find(|(_, code)| *code == c).map(|(k, _)| *k).or_else(|| egui::Key::from_name(&char::from_u32(c)?.to_string()))
+}
+
+const EASINGS: [(Easing, &str); 11] = [
+    (Easing::Linear, "LINEAR"),
+    (Easing::EaseIn, "EASE_IN"),
+    (Easing::EaseOut, "EASE_OUT"),
+    (Easing::EaseInOut, "EASE_IN_AND_OUT"),
+    (Easing::EaseInBack, "EASE_IN_BACK"),
+    (Easing::EaseOutBack, "EASE_OUT_BACK"),
+    (Easing::EaseInOutBack, "EASE_IN_AND_OUT_BACK"),
+    (Easing::Gentle, "GENTLE"),
+    (Easing::Quick, "QUICK"),
+    (Easing::Bouncy, "BOUNCY"),
+    (Easing::Slow, "SLOW"),
+];
+
 fn reaction_json(r: &Reaction) -> Value {
     let trigger = match r.trigger {
         Trigger::OnClick => json!({ "type": "ON_CLICK" }),
         Trigger::OnHover => json!({ "type": "ON_HOVER" }),
         Trigger::WhilePressed => json!({ "type": "ON_PRESS" }),
         Trigger::AfterDelay(ms) => json!({ "type": "AFTER_TIMEOUT", "timeout": ms as f32 / 1000.0 }),
+        Trigger::MouseEnter => json!({ "type": "MOUSE_ENTER", "delay": 0 }),
+        Trigger::MouseLeave => json!({ "type": "MOUSE_LEAVE", "delay": 0 }),
+        Trigger::OnDrag => json!({ "type": "ON_DRAG" }),
+        Trigger::Key(k, m) => {
+            let mods = [(m.shift, 16), (m.command, if cfg!(target_os = "macos") { 91 } else { 17 }), (m.alt, 18)].into_iter().filter(|x| x.0).map(|x| x.1);
+            json!({ "type": "ON_KEY_DOWN", "device": "KEYBOARD", "keyCodes": mods.chain(key_code(k)).collect::<Vec<u32>>() })
+        }
     };
     let t = r.transition;
+    let easing = match t.easing {
+        Easing::Custom([x1, y1, x2, y2]) => json!({ "type": "CUSTOM_CUBIC_BEZIER", "easingFunctionCubicBezier": { "x1": x1, "y1": y1, "x2": x2, "y2": y2 } }),
+        e => json!({ "type": EASINGS.iter().find(|x| x.0 == e).map_or("EASE_OUT", |x| x.1) }),
+    };
     let transition = match t.kind {
         TransitionKind::Instant => Value::Null,
         k => json!({
             "type": match k { TransitionKind::Dissolve => "DISSOLVE", TransitionKind::SmartAnimate => "SMART_ANIMATE", TransitionKind::MoveIn => "MOVE_IN", TransitionKind::Push => "PUSH", _ => "SLIDE_IN" },
             "direction": match t.direction { Direction::Left => "LEFT", Direction::Right => "RIGHT", Direction::Up => "TOP", Direction::Down => "BOTTOM" },
-            "duration": t.duration, "easing": { "type": "EASE_OUT" },
+            "duration": t.duration, "easing": easing,
         }),
     };
-    let action = match &r.action {
+    let node = |id: &NodeId, nav: &str| json!({ "type": "NODE", "destinationId": id.to_string(), "navigation": nav, "transition": transition });
+    let mut action = match &r.action {
         Action::None => Value::Null,
-        Action::Navigate(id) => json!({ "type": "NODE", "destinationId": id.to_string(), "navigation": "NAVIGATE", "transition": transition }),
-        Action::OpenOverlay(id) => json!({ "type": "NODE", "destinationId": id.to_string(), "navigation": "OVERLAY", "transition": transition }),
+        Action::Navigate(id) => node(id, "NAVIGATE"),
+        Action::OpenOverlay(id) => node(id, "OVERLAY"),
+        Action::SwapOverlay(id) => node(id, "SWAP"),
+        Action::ScrollTo(id) => node(id, "SCROLL_TO"),
+        Action::ChangeTo(id) => node(id, "CHANGE_TO"),
         Action::Back => json!({ "type": "BACK" }),
         Action::CloseOverlay => json!({ "type": "CLOSE" }),
         Action::OpenUrl(u) => json!({ "type": "URL", "url": u }),
+        Action::SetVariable(var, val) => json!({ "type": "SET_VARIABLE", "variableId": format!("VariableID:{var}"), "variableValue": { "type": "VARIABLE_DATA", "value": var_value_json(val) } }),
     };
+    if r.overlay.position == OverlayPos::Manual && action.is_object() {
+        action["overlayRelativePosition"] = json!({ "x": r.overlay.offset.x, "y": r.overlay.offset.y });
+    }
     json!({ "trigger": trigger, "actions": if action.is_null() { vec![] } else { vec![action] } })
 }
 
 fn reaction_from(v: &Value, refs: &Refs) -> Option<Reaction> {
-    let trigger = match v["trigger"]["type"].as_str()? {
-        "ON_HOVER" | "MOUSE_ENTER" => Trigger::OnHover,
+    let tr = &v["trigger"];
+    let trigger = match tr["type"].as_str()? {
+        "ON_HOVER" => Trigger::OnHover,
         "ON_PRESS" | "MOUSE_DOWN" => Trigger::WhilePressed,
-        "AFTER_TIMEOUT" => Trigger::AfterDelay((f(&v["trigger"], "timeout").unwrap_or(0.8) * 1000.0) as u32),
+        "AFTER_TIMEOUT" => Trigger::AfterDelay((f(tr, "timeout").unwrap_or(0.8) * 1000.0) as u32),
+        "MOUSE_ENTER" => Trigger::MouseEnter,
+        "MOUSE_LEAVE" => Trigger::MouseLeave,
+        "ON_DRAG" => Trigger::OnDrag,
+        "ON_KEY_DOWN" => {
+            let codes: Vec<u32> = tr["keyCodes"].as_array().into_iter().flatten().filter_map(|c| c.as_u64()).map(|c| c as u32).collect();
+            let key = codes.iter().find_map(|&c| (![16, 17, 18, 91].contains(&c)).then(|| key_from_code(c)).flatten())?;
+            let m = egui::Modifiers { shift: codes.contains(&16), alt: codes.contains(&18), command: codes.contains(&17) || codes.contains(&91), ..Default::default() };
+            Trigger::Key(key, m)
+        }
         _ => Trigger::OnClick,
     };
     // Figma allows several actions per trigger; Katachi plays the first.
     let a = v["actions"].as_array().and_then(|a| a.first()).or(v.get("action"))?;
     let t = &a["transition"];
     let transition = if t.is_object() {
+        let e = &t["easing"];
+        let bez = &e["easingFunctionCubicBezier"];
         Transition {
             kind: match t["type"].as_str() {
                 Some("DISSOLVE") => TransitionKind::Dissolve,
@@ -382,21 +456,38 @@ fn reaction_from(v: &Value, refs: &Refs) -> Option<Reaction> {
                 _ => Direction::Left,
             },
             duration: f(t, "duration").unwrap_or(0.3) as f32,
+            easing: match e["type"].as_str() {
+                Some("CUSTOM_CUBIC_BEZIER") => Easing::Custom(["x1", "y1", "x2", "y2"].map(|k| f(bez, k).unwrap_or(0.0) as f32)),
+                Some(name) => EASINGS.iter().find(|x| x.1 == name).map_or(Easing::EaseOut, |x| x.0),
+                None => Easing::EaseOut,
+            },
         }
     } else {
         Transition::default()
     };
+    let mut overlay = OverlaySettings::default();
+    if let Some(o) = a.get("overlayRelativePosition").filter(|o| o.is_object()) {
+        overlay.position = OverlayPos::Manual;
+        overlay.offset = vec2(f(o, "x").unwrap_or(0.0) as f32, f(o, "y").unwrap_or(0.0) as f32);
+    }
     let action = match a["type"].as_str()? {
         "NODE" => {
             let dest = refs.node(a["destinationId"].as_str()?)?;
-            if a["navigation"].as_str() == Some("OVERLAY") { Action::OpenOverlay(dest) } else { Action::Navigate(dest) }
+            match a["navigation"].as_str() {
+                Some("OVERLAY") => Action::OpenOverlay(dest),
+                Some("SWAP") => Action::SwapOverlay(dest),
+                Some("SCROLL_TO") => Action::ScrollTo(dest),
+                Some("CHANGE_TO") => Action::ChangeTo(dest),
+                _ => Action::Navigate(dest),
+            }
         }
         "BACK" => Action::Back,
         "CLOSE" => Action::CloseOverlay,
         "URL" => Action::OpenUrl(a["url"].as_str()?.to_string()),
+        "SET_VARIABLE" => Action::SetVariable(refs.var(a["variableId"].as_str()?)?, var_value_from(&a["variableValue"]["value"], refs)?),
         _ => return None,
     };
-    Some(Reaction { trigger, action, transition })
+    Some(Reaction { trigger, action, transition, overlay })
 }
 
 // ---------- layers ----------
@@ -476,6 +567,10 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
     }
     v["boundVariables"] = Value::Object(bv);
     v["reactions"] = json!(n.reactions.iter().map(reaction_json).collect::<Vec<_>>());
+    if n.kind.is_frame() {
+        v["overflowDirection"] = json!(match n.overflow { Overflow::None => "NONE", Overflow::Vertical => "VERTICAL", Overflow::Horizontal => "HORIZONTAL", Overflow::Both => "BOTH" });
+    }
+    v["scrollBehavior"] = json!(match n.scroll_pos { ScrollPos::Scroll => "SCROLLS", ScrollPos::Fixed => "FIXED", ScrollPos::Sticky => "STICKY_SCROLLS" });
     v["explicitVariableModes"] = Value::Object(n.modes.iter().map(|(c, m)| (format!("VariableCollectionId:{c}"), json!(format!("{c}:{m}")))).collect());
     if !n.prop_bind.is_empty() {
         let refs: serde_json::Map<String, Value> = n
@@ -1194,6 +1289,21 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
     if changed("reactions") {
         n.reactions = v["reactions"].as_array().into_iter().flatten().filter_map(|r| reaction_from(r, refs)).collect();
     }
+    if changed("overflowDirection") {
+        n.overflow = match v["overflowDirection"].as_str() {
+            Some("VERTICAL") => Overflow::Vertical,
+            Some("HORIZONTAL") => Overflow::Horizontal,
+            Some("BOTH") => Overflow::Both,
+            _ => Overflow::None,
+        };
+    }
+    if changed("scrollBehavior") {
+        n.scroll_pos = match v["scrollBehavior"].as_str() {
+            Some("FIXED") => ScrollPos::Fixed,
+            Some("STICKY_SCROLLS") => ScrollPos::Sticky,
+            _ => ScrollPos::Scroll,
+        };
+    }
     if changed("explicitVariableModes") {
         n.modes = v["explicitVariableModes"].as_object().into_iter().flatten().filter_map(|(_, m)| refs.mode(m.as_str()?)).collect();
     }
@@ -1239,7 +1349,7 @@ pub fn apply(doc: &mut Document, out: &Value) -> HashMap<String, NodeId> {
         let i = match p["id"].as_str().and_then(|s| s.strip_prefix("page:")).and_then(|s| s.parse::<usize>().ok()).filter(|i| *i < doc.pages.len()) {
             Some(i) => i,
             None => {
-                doc.pages.push(Page { name: name.clone(), children: vec![], background: PAGE_BG, flows: vec![], view: None });
+                doc.pages.push(Page { name: name.clone(), children: vec![], background: PAGE_BG, flows: vec![], view: None, prototype: Default::default() });
                 doc.pages.len() - 1
             }
         };

@@ -285,14 +285,14 @@ pub fn to_document(fig: &FigFile) -> Result<Document, String> {
         // Figma keeps component masters for instances on a hidden canvas; bring it in as a page.
         let name = if pg.b("internalOnly") == Some(true) { "Internal components".to_string() } else { pg.s("name").unwrap_or("Page").to_string() };
         let bg = pg.get("backgroundColor").map(|c| rgba(Some(c), 1.0).with_alpha(255)).unwrap_or(crate::doc::PAGE_BG);
-        doc.pages.push(Page { name, children: vec![], background: bg, flows: vec![], view: None });
+        doc.pages.push(Page { name, children: vec![], background: bg, flows: vec![], view: None, prototype: Default::default() });
         let page = doc.pages.len() - 1;
         for (_, child) in kids.get(&page_guid).cloned().unwrap_or_default() {
             import_node(&mut doc, &by_guid, &kids, &blobs, child, page, None, Affine::ID, &mut ids, &mut instances);
         }
     }
     if doc.pages.is_empty() {
-        doc.pages.push(Page { name: "Page 1".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None });
+        doc.pages.push(Page { name: "Page 1".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, prototype: Default::default() });
     }
     // Instances point at their main components once everything exists; sync builds their layers.
     for (inst, sym) in instances {
