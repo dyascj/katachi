@@ -363,7 +363,8 @@ impl Textures {
 
     fn gradient(&mut self, ctx: &egui::Context, p: &Paint) -> TextureId {
         let mut h = DefaultHasher::new();
-        (p.kind as u8, p.from.x.to_bits(), p.from.y.to_bits(), p.to.x.to_bits(), p.to.y.to_bits()).hash(&mut h);
+        let w = p.width_point();
+        (p.kind as u8, p.from.x.to_bits(), p.from.y.to_bits(), p.to.x.to_bits(), p.to.y.to_bits(), w.x.to_bits(), w.y.to_bits()).hash(&mut h);
         for (t, c) in &p.stops {
             (t.to_bits(), c.0).hash(&mut h);
         }
@@ -527,7 +528,7 @@ fn paint_geo(painter: &Painter, sc: &mut Scene, n: &Node, geo: VertexBuffers<Pos
     };
     let (tex, uv): (TextureId, Box<dyn Fn(Pos2) -> Pos2>) = match p.kind {
         PaintKind::Solid => return void(painter.add(to_mesh(geo, p.color.to32().gamma_multiply(a)))),
-        PaintKind::Linear | PaintKind::Radial => (sc.tex.gradient(ctx, p), Box::new(unit)),
+        PaintKind::Linear | PaintKind::Radial | PaintKind::Angular | PaintKind::Diamond => (sc.tex.gradient(ctx, p), Box::new(unit)),
         PaintKind::Image if p.scale_mode == crate::doc::ScaleMode::Tile => match (sc.tex.image_tile(ctx, sc.doc, &p.image, &p.adjust), sc.tex.image(ctx, sc.doc, &p.image, &p.adjust)) {
             (Some(id), Some((_, size))) => {
                 let tile = size * p.tile_scale.max(0.01);
@@ -663,8 +664,12 @@ fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
         // Masks only shape what's above them.
         return;
     }
+    // Blend modes, of layers or of single paints, need real compositing: the top-level layer
+    // holding them is drawn through resvg (paint blends then mix only within that layer).
+    let paint_blend = |d: &Node| d.fills.iter().chain(&d.strokes).any(|p| p.visible && p.blend != crate::doc::BlendMode::Normal);
     let needs_compositing = n.children.iter().any(|c| sc.doc.node(*c).is_mask)
-        || (n.parent.is_none() && sc.doc.descendants(id).iter().any(|d| sc.doc.node(*d).blend != crate::doc::BlendMode::Normal));
+        || (n.parent.is_none()
+            && (paint_blend(n) || sc.doc.descendants(id).iter().any(|d| sc.doc.node(*d).blend != crate::doc::BlendMode::Normal || paint_blend(sc.doc.node(*d)))));
     if Some(id) != sc.hide && (needs_compositing || n.shadows.iter().any(|s| s.visible && matches!(s.kind, EffectKind::InnerShadow | EffectKind::LayerBlur))) {
         if !on_screen {
             return;

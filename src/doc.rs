@@ -803,6 +803,10 @@ impl BlendMode {
         BlendMode::Color,
         BlendMode::Luminosity,
     ];
+    /// From Figma's name for it ("MULTIPLY", "COLOR_BURN"; anything else is Normal).
+    pub fn from_figma(name: Option<&str>) -> Self {
+        BlendMode::ALL.into_iter().find(|b| Some(b.css().replace('-', "_").to_uppercase().as_str()) == name).unwrap_or_default()
+    }
     /// CSS / SVG `mix-blend-mode` keyword.
     pub fn css(self) -> &'static str {
         match self {
@@ -1005,6 +1009,33 @@ pub enum PaintKind {
     Linear,
     Radial,
     Image,
+    /// Sweeps around `from`, starting toward `to` and turning toward the width handle.
+    Angular,
+    /// Like radial, with diamond-shaped rings whose corners sit on the handles.
+    Diamond,
+}
+
+impl PaintKind {
+    /// In Figma's paint type menu order.
+    pub const ALL: [PaintKind; 6] = [PaintKind::Solid, PaintKind::Linear, PaintKind::Radial, PaintKind::Angular, PaintKind::Diamond, PaintKind::Image];
+    pub fn is_gradient(self) -> bool {
+        !matches!(self, PaintKind::Solid | PaintKind::Image)
+    }
+}
+
+/// Figma's GRADIENT_* paint type names.
+pub fn gradient_kind(figma: &str) -> PaintKind {
+    match figma {
+        "GRADIENT_LINEAR" => PaintKind::Linear,
+        "GRADIENT_ANGULAR" => PaintKind::Angular,
+        "GRADIENT_DIAMOND" => PaintKind::Diamond,
+        _ => PaintKind::Radial,
+    }
+}
+
+/// An imported width handle, kept only where it differs from the derived one (circles stay small).
+pub fn explicit_width(p: &Paint, w: Pos2) -> Option<Pos2> {
+    (w.distance(p.width_point()) > 1e-4).then_some(w)
 }
 
 /// How an image fills its layer.
@@ -1069,6 +1100,11 @@ pub struct Paint {
     pub from: Pos2,
     #[serde(default, skip_serializing_if = "is_default")]
     pub to: Pos2,
+    /// Figma's third gradient handle: the end of the second axis of radial, angular, and
+    /// diamond gradients (an ellipse when it's not perpendicular to `to` at the same length).
+    /// None = derived from `from` and `to`, a circle in the unit square.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width_to: Option<Pos2>,
     /// Key into `Document::images`.
     #[serde(default, skip_serializing_if = "is_default")]
     pub image: String,
@@ -1080,6 +1116,9 @@ pub struct Paint {
     /// Image paints: color adjustments.
     #[serde(default, skip_serializing_if = "is_default")]
     pub adjust: ImageAdjust,
+    /// How this paint mixes with the paints and layers under it (Figma's per-paint blend).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub blend: BlendMode,
 }
 
 /// Figma's image adjustments, each -1..=1 (0 = unchanged).
@@ -1140,10 +1179,12 @@ impl Paint {
             stops: vec![],
             from: Pos2::ZERO,
             to: Pos2::ZERO,
+            width_to: None,
             image: String::new(),
             scale_mode: ScaleMode::Fill,
             tile_scale: 1.0,
             adjust: ImageAdjust::default(),
+            blend: BlendMode::Normal,
         }
     }
 
@@ -1164,7 +1205,7 @@ impl Paint {
         let base = if self.kind == PaintKind::Solid { self.color.with_alpha(255) } else { self.stops.first().map_or(Rgba::BLACK, |s| s.1) };
         match kind {
             PaintKind::Solid => self.color = base.with_alpha(a),
-            PaintKind::Linear | PaintKind::Radial => {
+            _ if kind.is_gradient() => {
                 if self.stops.len() < 2 {
                     self.stops = vec![(0.0, base), (1.0, base.with_alpha(0))];
                 }
@@ -1173,9 +1214,10 @@ impl Paint {
                 } else {
                     (pos2(0.5, 0.5), pos2(1.0, 0.5))
                 };
+                self.width_to = None;
                 self.color = Rgba::WHITE.with_alpha(a);
             }
-            PaintKind::Image => self.color = Rgba::WHITE.with_alpha(a),
+            _ => self.color = Rgba::WHITE.with_alpha(a),
         }
         self.kind = kind;
     }
@@ -1201,12 +1243,28 @@ impl Paint {
         stops.last().unwrap().1
     }
 
+    /// The width handle, explicit or derived (perpendicular to `from`-`to`, same length).
+    pub fn width_point(&self) -> Pos2 {
+        let d = self.to - self.from;
+        self.width_to.unwrap_or(self.from + vec2(-d.y, d.x))
+    }
+
     /// Gradient parameter for a point in the layer's unit square.
     pub fn gradient_t(&self, p: Pos2) -> f32 {
         let d = self.to - self.from;
+        let q = p - self.from;
+        if self.kind == PaintKind::Linear {
+            return q.dot(d) / d.length_sq().max(1e-6);
+        }
+        // Coordinates along the two handle axes: q = a * d + b * w.
+        let w = self.width_point() - self.from;
+        let det = d.x * w.y - d.y * w.x;
+        let det = if det.abs() < 1e-9 { 1e-9 } else { det };
+        let (a, b) = ((q.x * w.y - q.y * w.x) / det, (d.x * q.y - d.y * q.x) / det);
         match self.kind {
-            PaintKind::Radial => (p - self.from).length() / d.length().max(1e-6),
-            _ => (p - self.from).dot(d) / d.length_sq().max(1e-6),
+            PaintKind::Angular => b.atan2(a).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU,
+            PaintKind::Diamond => a.abs() + b.abs(),
+            _ => a.hypot(b),
         }
     }
 }
@@ -3464,6 +3522,16 @@ mod tests {
         assert_eq!(p.gradient_t(pos2(0.3, 0.5)), 0.5, "top-to-bottom by default");
         p.convert(PaintKind::Radial);
         assert_eq!(p.gradient_t(pos2(0.5, 0.0)), 1.0);
+        // A width handle at half length squashes the circle into an ellipse.
+        p.width_to = Some(pos2(0.5, 0.75));
+        assert!((p.gradient_t(pos2(0.5, 0.75)) - 1.0).abs() < 1e-5);
+        assert!((p.gradient_t(pos2(1.0, 0.5)) - 1.0).abs() < 1e-5);
+        p.convert(PaintKind::Diamond);
+        assert_eq!(p.width_to, None);
+        assert!((p.gradient_t(pos2(0.75, 0.75)) - 1.0).abs() < 1e-5, "corners on the handles");
+        p.convert(PaintKind::Angular);
+        assert_eq!(p.gradient_t(pos2(1.0, 0.5)), 0.0, "starts toward the end handle");
+        assert!((p.gradient_t(pos2(0.5, 1.0)) - 0.25).abs() < 1e-5, "then clockwise");
         p.convert(PaintKind::Solid);
         assert_eq!(p.color, Rgba::rgb(255, 0, 0));
     }

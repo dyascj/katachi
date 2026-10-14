@@ -58,6 +58,12 @@ const COMMANDS: &[(&str, &str, Run)] = &[
     ("Lock all", "", |a, _| a.lock_all(true)),
     ("Unlock all", "", |a, _| a.lock_all(false)),
     ("Duplicate", "⌘D", |a, _| a.duplicate_selection()),
+    ("Swap fill and stroke", "⇧X", |a, _| a.swap_fill_stroke()),
+    ("Pick color", "I", |a, _| {
+        if !a.sel.is_empty() {
+            a.start_eyedrop(crate::paint_ui::EyeTarget::Fill)
+        }
+    }),
     ("Delete", "⌫", |a, _| a.delete_selection()),
     ("Select all", "⌘A", |a, _| a.select_all()),
     ("Select inverse", "⇧⌘A", |a, _| a.select_inverse()),

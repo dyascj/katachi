@@ -117,7 +117,7 @@ fn paints(list: &[Value]) -> Vec<Paint> {
             "SOLID" => Paint::solid(rgba(p.get("color"), opacity)),
             "GRADIENT_LINEAR" | "GRADIENT_RADIAL" | "GRADIENT_ANGULAR" | "GRADIENT_DIAMOND" => {
                 let mut g = Paint::solid(Rgba::WHITE.with_alpha((opacity * 255.0) as u8));
-                g.kind = if kind == "GRADIENT_LINEAR" { PaintKind::Linear } else { PaintKind::Radial };
+                g.kind = crate::doc::gradient_kind(kind);
                 g.stops = p.arr("stops").iter().map(|st| (st.f("position").unwrap_or(0.0), rgba(st.get("color"), 1.0))).collect();
                 // Figma's gradient transform maps the layer's unit square into gradient space,
                 // where the gradient runs along x at y = 0.5.
@@ -128,6 +128,7 @@ fn paints(list: &[Value]) -> Vec<Paint> {
                 } else {
                     g.from = inv.apply(pos2(0.5, 0.5));
                     g.to = inv.apply(pos2(1.0, 0.5));
+                    g.width_to = crate::doc::explicit_width(&g, inv.apply(pos2(0.5, 1.0)));
                 }
                 g
             }
@@ -159,6 +160,7 @@ fn paints(list: &[Value]) -> Vec<Paint> {
             _ => continue,
         };
         paint.visible = visible;
+        paint.blend = crate::doc::BlendMode::from_figma(p.s("blendMode"));
         out.push(paint);
     }
     out
@@ -860,10 +862,7 @@ fn text_props(n: &mut Node, v: &Value) {
 fn finish_common(n: &mut Node, v: &Value) {
     n.visible = v.b("visible").unwrap_or(true);
     n.opacity = v.f("opacity").unwrap_or(1.0);
-    n.blend = crate::doc::BlendMode::ALL
-        .into_iter()
-        .find(|b| Some(b.css().replace('-', "_").to_uppercase().as_str()) == v.s("blendMode"))
-        .unwrap_or_default();
+    n.blend = crate::doc::BlendMode::from_figma(v.s("blendMode"));
     n.is_mask = v.b("mask") == Some(true);
     n.cap = match v.s("strokeCap") {
         Some("ROUND") => Cap::Round,

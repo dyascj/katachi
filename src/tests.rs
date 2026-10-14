@@ -2670,3 +2670,203 @@ fn paste_to_replace_takes_layers_copied_in_another_tab() {
     assert!(!b.state().doc.nodes.contains_key(&t));
     assert_eq!((b.state().doc.node(new).kind, rect(&b, new).center()), (Kind::Ellipse, pos2(120., 120.)));
 }
+
+#[test]
+fn gradient_handles_edit_on_canvas_while_the_editor_is_open() {
+    use crate::doc::{Paint, PaintKind, Rgba};
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    let mut g = Paint::solid(Rgba::rgb(255, 0, 0));
+    g.convert(PaintKind::Linear);
+    h.state_mut().doc.node_mut(id).fills = vec![g];
+    h.run_steps(2);
+    assert!(h.state().gradient_edit.is_none(), "handles only while the editor is open");
+    h.get_all_by_label("Color swatch").next().unwrap().click();
+    h.run_steps(3);
+    assert!(h.state().gradient_edit.is_some());
+    // Drag the end handle from the bottom center to the right center.
+    let (a, b) = (s(&h, 50.0, 100.0), s(&h, 100.0, 50.0));
+    drag(&mut h, a, b, Modifiers::NONE);
+    let p = h.state().doc.node(id).fills[0].clone();
+    assert!(p.to.distance(pos2(1.0, 0.5)) < 0.02, "{:?}", p.to);
+    assert_eq!(h.state().sel, vec![id], "the layer stays selected");
+    assert!(h.state().gradient_edit.is_some(), "and the editor open");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().doc.node(id).fills[0].to, pos2(0.5, 1.0), "one undo step for the drag");
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::Z);
+    // Clicking the line adds a stop there, selected.
+    let on_line = s(&h, 50.0, 0.0).lerp(s(&h, 100.0, 50.0), 0.4);
+    click(&mut h, on_line, Modifiers::NONE);
+    let p = h.state().doc.node(id).fills[0].clone();
+    assert_eq!(p.stops.len(), 3);
+    assert!((p.stops[1].0 - 0.4).abs() < 0.02, "{:?}", p.stops);
+    assert_eq!(h.state().gradient_edit.unwrap().stop, 1);
+    // Dragging that stop slides it along the line.
+    let further = s(&h, 50.0, 0.0).lerp(s(&h, 100.0, 50.0), 0.8);
+    drag(&mut h, on_line, further, Modifiers::NONE);
+    let p = h.state().doc.node(id).fills[0].clone();
+    assert!((p.stops[1].0 - 0.8).abs() < 0.02, "{:?}", p.stops);
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert!((h.state().doc.node(id).fills[0].stops[1].0 - 0.4).abs() < 0.02, "undo puts the stop back");
+}
+
+/// What the eyedropper's window screenshot would show: one color everywhere.
+fn fake_screenshot(h: &mut Harness<App>, c: egui::Color32) {
+    let size = h.ctx.content_rect().size() * h.ctx.pixels_per_point();
+    let image = std::sync::Arc::new(egui::ColorImage::filled([size.x as usize, size.y as usize], c));
+    h.event(Event::Screenshot { viewport_id: egui::ViewportId::ROOT, user_data: Default::default(), image });
+    h.run_steps(2);
+}
+
+#[test]
+fn eyedropper_picks_fills_and_picker_colors() {
+    use crate::doc::Rgba;
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (80.0, 80.0));
+    // I with a layer selected picks its fill; Escape cancels and keeps the selection.
+    key(&mut h, Modifiers::NONE, Key::I);
+    assert!(h.state().eyedrop.is_some());
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    assert!(h.state().eyedrop.is_none());
+    assert_eq!(h.state().sel, vec![id]);
+    key(&mut h, Modifiers::NONE, Key::I);
+    fake_screenshot(&mut h, egui::Color32::from_rgb(10, 200, 30));
+    let far = s(&h, 400.0, 300.0);
+    click(&mut h, far, Modifiers::NONE);
+    assert!(h.state().eyedrop.is_none());
+    assert_eq!(h.state().doc.node(id).fills[0].color, Rgba::rgb(10, 200, 30));
+    assert_eq!(h.state().sel, vec![id], "the click picked, it didn't deselect");
+    // From the color picker: the pick lands in the picker, which stays open.
+    h.get_all_by_label("Color swatch").next().unwrap().click();
+    h.run_steps(3);
+    h.get_by_label("Pick color  I").click();
+    h.run_steps(3);
+    assert!(h.state().eyedrop.is_some());
+    fake_screenshot(&mut h, egui::Color32::from_rgb(200, 20, 90));
+    click(&mut h, far, Modifiers::NONE);
+    assert_eq!(h.state().doc.node(id).fills[0].color, Rgba::rgb(200, 20, 90));
+    assert!(egui::Popup::is_any_open(&h.ctx), "picker still open");
+}
+
+#[test]
+fn color_picker_formats_and_page_swatches() {
+    use crate::doc::Rgba;
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (40.0, 40.0));
+    let b = draw(&mut h, Key::R, (60.0, 0.0), (100.0, 40.0));
+    h.state_mut().doc.node_mut(a).fills[0].color = Rgba::rgb(0x12, 0x34, 0x56);
+    h.state_mut().sel = vec![b];
+    h.run_steps(2);
+    h.get_all_by_label("Color swatch").next().unwrap().click();
+    h.run_steps(3);
+    // The other layer's color is offered under "On this page"; a click applies it.
+    assert!(h.query_by_label("On this page").is_some());
+    h.get_by_label("#123456").click();
+    h.run_steps(2);
+    assert_eq!(h.state().doc.node(b).fills[0].color, Rgba::rgb(0x12, 0x34, 0x56));
+    // The format dropdown switches the fields.
+    // (Menus inside a popover open to the side: their buttons end in an arrow.)
+    h.get_by_label("Hex \u{23F5}").click();
+    h.run_steps(2);
+    h.get_by_label("HSL").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("HSL \u{23F5}").is_some() && h.query_by_label("Hex \u{23F5}").is_none(), "HSL fields now");
+    assert!(h.query_by_label("HSB").is_none(), "the format menu closed, the picker stayed open");
+}
+
+/// Visual check of the paint tools: `cargo test paint_look -- --ignored` writes target/look-*.png.
+#[test]
+#[ignore]
+fn paint_look() {
+    use crate::doc::{Paint, PaintKind, Rgba};
+    isolate_data();
+    let mut h = Harness::builder().with_size(vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).wgpu().build_eframe(|cc| {
+        crate::setup_style(&cc.egui_ctx);
+        let mut app = App::new(None);
+        app.recoverable.clear();
+        app
+    });
+    h.run_steps(2);
+    let mut ids = vec![];
+    for (i, kind) in [PaintKind::Angular, PaintKind::Diamond, PaintKind::Radial].into_iter().enumerate() {
+        let mut g = Paint::solid(Rgba::rgb(13, 153, 255));
+        g.convert(kind);
+        g.stops = vec![(0.0, Rgba::rgb(13, 153, 255)), (0.5, Rgba::rgb(255, 199, 0)), (1.0, Rgba::rgb(151, 71, 255))];
+        if kind == PaintKind::Radial {
+            g.width_to = Some(pos2(0.5, 0.75));
+        }
+        let mut n = Node::new(Kind::Rectangle, r(-560. + i as f32 * 220., -100., 200., 200.));
+        n.fills = vec![g];
+        ids.push(h.state_mut().doc.insert(0, None, None, n));
+    }
+    h.state_mut().sel = vec![ids[2]];
+    h.run_steps(2);
+    h.get_all_by_label("Color swatch").next().unwrap().click();
+    h.run_steps(4);
+    assert!(egui::Popup::is_any_open(&h.ctx));
+    h.render().unwrap().save("target/look-gradient.png").unwrap();
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    h.state_mut().doc.node_mut(ids[2]).fills = vec![Paint::solid(Rgba::rgb(0x8E, 0x72, 0xFF))];
+    h.run_steps(2);
+    h.get_all_by_label("Color swatch").next().unwrap().click();
+    h.run_steps(4);
+    h.render().unwrap().save("target/look-picker.png").unwrap();
+    h.get_by_label("Pick color  I").click();
+    h.run_steps(3);
+    let size = h.ctx.content_rect().size() * h.ctx.pixels_per_point();
+    let image = std::sync::Arc::new(egui::ColorImage::new([size.x as usize, size.y as usize], (0..(size.x * size.y) as usize).map(|i| egui::Color32::from_gray((i % 7 * 30) as u8)).collect()));
+    h.event(Event::Screenshot { viewport_id: egui::ViewportId::ROOT, user_data: Default::default(), image });
+    let p = s(&h, 0.0, 0.0);
+    move_to(&mut h, p, Modifiers::NONE);
+    h.run_steps(2);
+    h.render().unwrap().save("target/look-eyedropper.png").unwrap();
+}
+
+#[test]
+fn paint_rows_reorder_by_dragging_their_grip() {
+    use crate::doc::{Paint, Rgba};
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (80.0, 80.0));
+    let (r, g, b) = (Rgba::rgb(255, 0, 0), Rgba::rgb(0, 255, 0), Rgba::rgb(0, 0, 255));
+    h.state_mut().doc.node_mut(id).fills = vec![Paint::solid(r), Paint::solid(g), Paint::solid(b)];
+    h.run_steps(2);
+    // Fill rows list topmost (blue) first: drag it below the last row (red).
+    let grips: Vec<Rect> = h.get_all_by_label("Drag to reorder").map(|n| n.rect()).collect();
+    assert_eq!(grips.len(), 3);
+    drag(&mut h, grips[0].center(), grips[2].center() + vec2(0.0, 14.0), Modifiers::NONE);
+    let order = |h: &Harness<App>| h.state().doc.node(id).fills.iter().map(|p| p.color).collect::<Vec<_>>();
+    assert_eq!(order(&h), vec![b, r, g], "blue is now the bottom paint");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(order(&h), vec![r, g, b], "one undo step");
+}
+
+#[test]
+fn number_keys_set_opacity_and_shift_x_swaps_fill_and_stroke() {
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (80.0, 80.0));
+    let op = |h: &Harness<App>| (h.state().doc.node(id).opacity * 100.0).round();
+    key(&mut h, Modifiers::NONE, Key::Num4);
+    key(&mut h, Modifiers::NONE, Key::Num5);
+    assert_eq!(op(&h), 45.0, "two digits typed quickly");
+    h.run_steps(60);
+    key(&mut h, Modifiers::NONE, Key::Num7);
+    assert_eq!(op(&h), 70.0);
+    h.run_steps(60);
+    key(&mut h, Modifiers::NONE, Key::Num0);
+    assert_eq!(op(&h), 100.0, "0 is 100%");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(op(&h), 45.0, "45 was one undo step");
+    // Shift X: the fill becomes the stroke.
+    let fill = h.state().doc.node(id).fills.clone();
+    key(&mut h, Modifiers::SHIFT, Key::X);
+    let n = h.state().doc.node(id);
+    assert!(n.fills.is_empty() && n.strokes == fill && n.stroke_width > 0.0);
+    // Not while typing: digits go to the text being edited.
+    key(&mut h, Modifiers::NONE, Key::T);
+    let p = s(&h, 300.0, 300.0);
+    click(&mut h, p, Modifiers::NONE);
+    let t = h.state().editing_text.expect("editing new text");
+    key(&mut h, Modifiers::NONE, Key::Num5);
+    assert_eq!(h.state().doc.node(t).opacity, 1.0);
+}
