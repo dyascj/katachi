@@ -523,11 +523,40 @@ fn heading(ui: &mut Ui, title: &str) {
     ui.add_space(2.0);
 }
 
+/// A page named only with dashes ("---") is a divider in the pages list, as in Figma.
+pub fn is_divider(name: &str) -> bool {
+    let t = name.trim();
+    !t.is_empty() && t.chars().all(|c| c == '-')
+}
+
+/// Cmd R with several layers selected: Figma's batch rename.
+pub struct BatchRename {
+    /// `$&` is the current name, `$n` an ascending number, `$N` a descending one. Empty keeps the name.
+    pub to: String,
+    pub start: usize,
+    pub find: String,
+    pub with: String,
+    focus: bool,
+}
+
+impl BatchRename {
+    /// The new name of the `i`th of `count` layers: Match / Replace with first, then Rename to.
+    pub fn name(&self, old: &str, i: usize, count: usize) -> String {
+        let name = if self.find.is_empty() { old.to_string() } else { old.replace(&self.find, &self.with) };
+        if self.to.is_empty() {
+            return name;
+        }
+        // Numbers first, so a name that happens to contain "$n" stays as it is.
+        self.to.replace("$n", &(self.start + i).to_string()).replace("$N", &(self.start + count - 1 - i).to_string()).replace("$&", &name)
+    }
+}
+
 impl App {
     // ---------- left: menu, pages, layers ----------
 
     pub fn left_panel(&mut self, ui: &mut Ui) {
-        if self.sel != self.prev_sel {
+        let reveal = self.sel != self.prev_sel;
+        if reveal {
             self.prev_sel = self.sel.clone();
             for id in self.sel.clone() {
                 for a in self.doc.ancestors(id) {
@@ -574,13 +603,23 @@ impl App {
             if let Some(q) = &mut self.layer_search {
                 ui.add(egui::TextEdit::singleline(q).hint_text("Find layers").desired_width(f32::INFINITY));
             }
-            // Only the rows in view are built, so huge files stay fast.
+            // Only the rows in view are built, so huge files stay fast. Figma's layer rows are
+            // 32 points tall; `show_rows` adds item spacing to each row, so there is none.
             let rows = self.layer_rows();
-            let row_h = 28.0;
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, row_h, rows.len(), |ui, range| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                self.layers(ui, &rows[range]);
-            });
+            let row_h = 32.0;
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let view_key = ui.id().with("layers-view");
+            let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+            // A new canvas selection scrolls its first row into view, as in Figma.
+            if reveal && let Some(i) = rows.iter().position(|(id, _)| self.sel.contains(id)) {
+                let (top, h): (f32, f32) = ui.data(|d| d.get_temp(view_key)).unwrap_or_default();
+                let y = i as f32 * row_h;
+                if y < top || y + row_h > top + h {
+                    area = area.vertical_scroll_offset((y + (row_h - h) / 2.0).max(0.0));
+                }
+            }
+            let out = area.show_rows(ui, row_h, rows.len(), |ui, range| self.layers(ui, &rows, range));
+            ui.data_mut(|d| d.insert_temp(view_key, (out.state.offset.y, out.inner_rect.height())));
         });
     }
 
@@ -790,7 +829,15 @@ impl App {
                 ui.close();
             }
             if item(ui, "Paste", "⌘V") {
-                ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                self.paste_from_menu(&ctx, false);
+                ui.close();
+            }
+            if enabled(ui, has, "Paste over selection", "⇧⌘V") {
+                self.paste_from_menu(&ctx, true);
+                ui.close();
+            }
+            if enabled(ui, has, "Paste to replace", "⇧⌘R") {
+                self.paste_to_replace();
                 ui.close();
             }
             if enabled(ui, has, "Duplicate", "⌘D") {
@@ -815,8 +862,22 @@ impl App {
                 self.select_all();
                 ui.close();
             }
+            if item(ui, "Select inverse", "⇧⌘A") {
+                self.select_inverse();
+                ui.close();
+            }
             if enabled(ui, has, "Select matching layers", "⌥⌘A") {
                 self.select_matching();
+                ui.close();
+            }
+            for (what, label) in crate::app::Same::MENU {
+                if enabled(ui, has, label, "") {
+                    self.select_same(what);
+                    ui.close();
+                }
+            }
+            if enabled(ui, has, "Rename…", "⌘R") {
+                self.rename_selection();
                 ui.close();
             }
             if item(ui, "Find and replace…", "⌘F") {
@@ -956,6 +1017,14 @@ impl App {
                 self.outline_stroke_selection();
                 ui.close();
             }
+            if enabled(ui, has, "Resize to fit", "⌥⇧⌘R") {
+                self.resize_to_fit();
+                ui.close();
+            }
+            if enabled(ui, has, "Remove fill", "") {
+                self.remove_fills();
+                ui.close();
+            }
             ui.separator();
             if enabled(ui, has, "Flip horizontal", "⇧H") {
                 self.flip_selection(true);
@@ -972,6 +1041,14 @@ impl App {
             }
             if enabled(ui, has, "Lock/Unlock selection", "⇧⌘L") {
                 self.toggle_locked();
+                ui.close();
+            }
+            if item(ui, "Lock all", "") {
+                self.lock_all(true);
+                ui.close();
+            }
+            if item(ui, "Unlock all", "") {
+                self.lock_all(false);
                 ui.close();
             }
         });
@@ -1107,11 +1184,47 @@ impl App {
                 }
             });
         });
-        let mut delete = None;
+        let (mut delete, mut duplicate, mut divider_at) = (None, None, None);
+        // Pages reorder by dragging: the page being dragged, kept across frames.
+        let drag_key = ui.id().with("page-drag");
+        let mut dragging: Option<usize> = ui.data(|d| d.get_temp(drag_key));
+        let mut rects = vec![];
         for i in 0..self.doc.pages.len() {
-            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
             let page_name = self.doc.pages[i].name.clone();
+            let divider = is_divider(&page_name);
+            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), if divider { 13.0 } else { 26.0 }), Sense::click_and_drag());
+            rects.push(rect);
+            if resp.drag_started() {
+                dragging = Some(i);
+            }
             resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, i == self.page, &page_name));
+            crate::chrome::context_menu(&resp, |ui| {
+                if ui.button("Rename").clicked() {
+                    self.renaming_page = Some((i, page_name.clone()));
+                    ui.close();
+                }
+                if !divider && ui.button("Duplicate page").clicked() {
+                    duplicate = Some(i);
+                    ui.close();
+                }
+                if ui.button("Add divider").clicked() {
+                    divider_at = Some(i + 1);
+                    ui.close();
+                }
+                if ui.add_enabled(self.doc.pages.len() > 1, egui::Button::new(if divider { "Delete divider" } else { "Delete page" })).clicked() {
+                    delete = Some(i);
+                    ui.close();
+                }
+            });
+            if divider && !matches!(&self.renaming_page, Some((pi, _)) if *pi == i) {
+                // Figma's page dividers: a line in the list, never opened.
+                let x = rect.x_range().shrink(10.0);
+                ui.painter().hline(x, rect.center().y, Stroke::new(1.0, theme::border(ui.ctx())));
+                if resp.double_clicked() {
+                    self.renaming_page = Some((i, page_name));
+                }
+                continue;
+            }
             if i == self.page {
                 ui.painter().rect_filled(rect, 4.0, theme::subtle(ui.ctx()));
             } else if resp.hovered() {
@@ -1147,16 +1260,37 @@ impl App {
             if resp.double_clicked() {
                 self.renaming_page = Some((i, self.doc.pages[i].name.clone()));
             }
-            crate::chrome::context_menu(&resp, |ui| {
-                if ui.button("Rename").clicked() {
-                    self.renaming_page = Some((i, self.doc.pages[i].name.clone()));
-                    ui.close();
+        }
+        if let Some(from) = dragging {
+            let (ptr, released) = ui.input(|i| (i.pointer.hover_pos(), i.pointer.any_released()));
+            let span = rects.first().map_or(Rect::NOTHING, |f| f.union(*rects.last().unwrap())).expand2(vec2(0.0, 8.0));
+            // The gap the page would go into: before the first row whose middle is below the pointer.
+            if let Some(p) = ptr.filter(|p| span.contains(*p)) {
+                let slot = rects.iter().position(|r| p.y < r.center().y).unwrap_or(rects.len());
+                if slot != from && slot != from + 1 {
+                    let y = rects.get(slot).map_or(span.max.y - 8.0, |r| r.min.y);
+                    ui.painter().hline(span.x_range(), y, Stroke::new(2.0, BLUE));
+                    if released {
+                        self.move_page(from, slot);
+                    }
                 }
-                if ui.add_enabled(self.doc.pages.len() > 1, egui::Button::new("Delete page")).clicked() {
-                    delete = Some(i);
-                    ui.close();
-                }
-            });
+            }
+            if released {
+                dragging = None;
+            }
+        }
+        ui.data_mut(|d| match dragging {
+            Some(i) => {
+                d.insert_temp(drag_key, i);
+            }
+            None => d.remove::<usize>(drag_key),
+        });
+        if let Some(i) = duplicate {
+            self.duplicate_page(i);
+        }
+        if let Some(at) = divider_at {
+            self.checkpoint();
+            self.insert_page(at, Page { name: "---".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, guides: vec![] });
         }
         if let Some(i) = delete {
             self.checkpoint();
@@ -1168,6 +1302,47 @@ impl App {
             self.sel.clear();
             self.view_ready = false;
         }
+    }
+
+    /// Page indices (the open page, comments) after pages move around.
+    fn renumber_pages(&mut self, f: impl Fn(usize) -> usize) {
+        self.page = f(self.page);
+        for c in &mut self.doc.comments {
+            c.page = f(c.page);
+        }
+    }
+
+    fn insert_page(&mut self, at: usize, page: Page) {
+        self.renumber_pages(|p| if p >= at { p + 1 } else { p });
+        self.doc.pages.insert(at, page);
+    }
+
+    /// Move page `from` into the gap `slot` (0 = before the first page, len = after the last).
+    pub fn move_page(&mut self, from: usize, slot: usize) {
+        let to = if slot > from { slot - 1 } else { slot };
+        if to == from || to >= self.doc.pages.len() {
+            return;
+        }
+        self.checkpoint();
+        let p = self.doc.pages.remove(from);
+        self.doc.pages.insert(to, p);
+        self.renumber_pages(|p| match p {
+            p if p == from => to,
+            p if from < p && p <= to => p - 1,
+            p if to <= p && p < from => p + 1,
+            p => p,
+        });
+    }
+
+    /// A copy of a page and everything on it, right after it, opened.
+    pub fn duplicate_page(&mut self, i: usize) {
+        self.checkpoint();
+        let src = self.doc.pages[i].clone();
+        let frag = self.doc.extract(&src.children);
+        self.insert_page(i + 1, Page { name: format!("{} copy", src.name), children: vec![], flows: vec![], ..src });
+        self.doc.paste(&frag, i + 1, None, None);
+        self.doc.reflow();
+        self.select_page(i + 1);
     }
 
     fn layer_rows(&self) -> Vec<(NodeId, usize)> {
@@ -1202,11 +1377,11 @@ impl App {
         out
     }
 
-    fn layers(&mut self, ui: &mut Ui, rows: &[(NodeId, usize)]) {
+    /// The rows in `range` of `rows` (all of them are needed for Shift-click ranges).
+    fn layers(&mut self, ui: &mut Ui, rows: &[(NodeId, usize)], range: std::ops::Range<usize>) {
         let mut rects: Vec<(NodeId, Rect)> = vec![];
-        let shift = ui.input(|i| i.modifiers.shift || i.modifiers.command);
-        for &(id, depth) in rows {
-            // Figma's layer rows are 32 points tall.
+        let (shift, cmd) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
+        for &(id, depth) in &rows[range] {
             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click_and_drag());
             rects.push((id, rect));
             let n = self.doc.node(id).clone();
@@ -1290,8 +1465,19 @@ impl App {
                 } else if at(chev.expand(4.0)) && !self.doc.node(id).children.is_empty() {
                     let n = self.doc.node_mut(id);
                     n.expanded = !n.expanded;
-                } else if shift {
+                } else if cmd {
                     if selected { self.sel.retain(|s| *s != id) } else { self.sel.push(id) }
+                } else if shift && let Some(anchor) = self.sel.last().and_then(|a| rows.iter().position(|r| r.0 == *a)) {
+                    // Shift-click selects the rows from the last selected one to this one; the
+                    // anchor stays last, so the next Shift-click extends from it again.
+                    let i = rows.iter().position(|r| r.0 == id).unwrap_or(anchor);
+                    let mut range: Vec<NodeId> = rows[i.min(anchor)..=i.max(anchor)].iter().map(|r| r.0).collect();
+                    if i > anchor {
+                        range.reverse();
+                    }
+                    self.sel = range;
+                } else if shift {
+                    self.sel.push(id);
                 } else {
                     self.end_text_edit();
                     self.sel = vec![id];
@@ -1312,9 +1498,11 @@ impl App {
         self.layer_drop(ui, &rects);
     }
 
-    /// Drag-and-drop reordering in the layers list.
+    /// Drag-and-drop reordering in the layers list. Dragging a selected row moves every selected
+    /// layer (their top-most roots), keeping their stacking order.
     fn layer_drop(&mut self, ui: &mut Ui, rects: &[(NodeId, Rect)]) {
         let Some(dragged) = self.layer_drag else { return };
+        let moving = if self.sel.contains(&dragged) { self.doc.sort_by_z(&self.sel_roots()) } else { vec![dragged] };
         let (ptr, released) = ui.input(|i| (i.pointer.hover_pos(), i.pointer.any_released()));
         let target = ptr.and_then(|p| {
             rects.iter().find(|(_, r)| p.y >= r.min.y && p.y < r.max.y).map(|&(id, r)| {
@@ -1324,7 +1512,7 @@ impl App {
                 (id, r, zone)
             })
         });
-        let valid = |id: NodeId| id != dragged && !self.doc.is_ancestor(dragged, id);
+        let valid = |id: NodeId| moving.iter().all(|&m| id != m && !self.doc.is_ancestor(m, id));
         if let Some((id, r, zone)) = target.filter(|t| valid(t.0)) {
             let p = ui.painter();
             match zone {
@@ -1340,21 +1528,96 @@ impl App {
                 self.checkpoint();
                 let n = self.doc.node(id);
                 let into_top = zone == 1 || (zone == 2 && n.expanded && !n.children.is_empty());
-                if into_top {
-                    self.doc.reparent(dragged, self.page, Some(id), None);
-                } else {
-                    let parent = n.parent;
-                    let list: Vec<NodeId> = self.doc.children_of(self.page, parent).iter().copied().filter(|c| *c != dragged).collect();
-                    let i = list.iter().position(|c| *c == id).unwrap_or(0);
-                    // The list is drawn top-first, so "above" means a higher z index.
-                    self.doc.reparent(dragged, self.page, parent, Some(if zone == 0 { i + 1 } else { i }));
+                let parent = if into_top { Some(id) } else { n.parent };
+                // Bottom-most first: each goes in just above the one before it.
+                let mut below: Option<NodeId> = None;
+                for &m in &moving {
+                    let list: Vec<NodeId> = self.doc.children_of(self.page, parent).iter().copied().filter(|c| *c != m).collect();
+                    let at = match below {
+                        Some(b) => list.iter().position(|c| *c == b).map_or(list.len(), |i| i + 1),
+                        None if into_top => list.len(),
+                        // The list is drawn top-first, so "above" means a higher z index.
+                        None => list.iter().position(|c| *c == id).map_or(0, |i| if zone == 0 { i + 1 } else { i }),
+                    };
+                    self.doc.reparent(m, self.page, parent, Some(at));
+                    below = Some(m);
                 }
                 self.doc.reflow();
-                self.sel = vec![dragged];
+                self.sel = moving;
             }
         }
         if released {
             self.layer_drag = None;
+        }
+    }
+
+    /// Cmd R: rename one layer in its row, or several at once in the batch rename window.
+    pub fn rename_selection(&mut self) {
+        match self.sel[..] {
+            [] => {}
+            [id] => {
+                self.left_tab_assets = false;
+                self.renaming = Some((id, self.doc.node(id).name.clone()));
+            }
+            _ => self.batch_rename = Some(BatchRename { to: String::new(), start: 1, find: String::new(), with: String::new(), focus: true }),
+        }
+    }
+
+    /// The batch rename window, with a preview of the first few names. Layers are numbered
+    /// bottom to top, so they count up in the order they were made.
+    pub fn batch_rename_window(&mut self, ctx: &egui::Context) {
+        let Some(mut b) = self.batch_rename.take() else { return };
+        let targets = self.doc.sort_by_z(&self.sel);
+        if targets.len() < 2 {
+            return;
+        }
+        let (mut open, mut apply, mut cancel) = (true, false, false);
+        crate::chrome::window(ctx, "Rename layers", &mut open, 300.0, |ui| {
+            let muted = theme::muted(ui.ctx());
+            let field = |ui: &mut Ui, label: &str, buf: &mut String, hint: &str| {
+                ui.label(label);
+                let r = ui.add(egui::TextEdit::singleline(buf).hint_text(hint).desired_width(f32::INFINITY));
+                ui.add_space(4.0);
+                r
+            };
+            let r = field(ui, "Rename to", &mut b.to, "$& keeps the current name");
+            if std::mem::take(&mut b.focus) {
+                r.request_focus();
+            }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("$& name, $n number, $N number descending").small().color(muted));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(egui::DragValue::new(&mut b.start).range(0..=99999)).on_hover_text("Start number");
+                });
+            });
+            ui.add_space(4.0);
+            let f = field(ui, "Match", &mut b.find, "Text to find in names");
+            let w = field(ui, "Replace with", &mut b.with, "");
+            ui.separator();
+            for (i, &id) in targets.iter().take(3).enumerate() {
+                let old = &self.doc.node(id).name;
+                ui.add(egui::Label::new(RichText::new(format!("{old}  \u{2192}  {}", b.name(old, i, targets.len()))).small()).truncate());
+            }
+            if targets.len() > 3 {
+                ui.label(RichText::new(format!("and {} more", targets.len() - 3)).small().color(muted));
+            }
+            ui.add_space(6.0);
+            let enter = [&r, &f, &w].iter().any(|r| r.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), 26.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                apply = enter || ui.add(egui::Button::new(RichText::new("Rename").color(Color32::WHITE)).fill(BLUE).corner_radius(6)).clicked();
+            });
+        });
+        if apply {
+            self.checkpoint();
+            for (i, &id) in targets.iter().enumerate() {
+                let name = b.name(&self.doc.node(id).name, i, targets.len());
+                if !name.trim().is_empty() {
+                    self.doc.node_mut(id).name = name;
+                }
+            }
+        } else if open && !cancel {
+            self.batch_rename = Some(b);
         }
     }
 

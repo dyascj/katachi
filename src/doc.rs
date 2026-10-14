@@ -1029,6 +1029,14 @@ impl Paint {
         }
     }
 
+    /// An image fill showing the document image stored under `key`.
+    pub fn image(key: String) -> Self {
+        let mut p = Self::solid(Rgba::WHITE);
+        p.convert(PaintKind::Image);
+        p.image = key;
+        p
+    }
+
     /// Switch kind, seeding Figma's defaults from the current color.
     pub fn convert(&mut self, kind: PaintKind) {
         if kind == self.kind {

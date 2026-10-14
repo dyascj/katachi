@@ -2196,3 +2196,271 @@ fn pixel_grid_and_snap_to_pixel_toggles() {
     key(&mut h, Modifiers::SHIFT, Key::Quote);
     assert!(h.state().prefs.pixel_grid);
 }
+
+#[test]
+fn layers_panel_shift_ranges_multi_drag_and_reveal() {
+    let mut h = harness();
+    let ids: Vec<NodeId> = (0..60).map(|i| h.state_mut().doc.insert(0, None, None, Node::new(Kind::Rectangle, r(i as f32 * 30., 0., 20., 20.)))).collect();
+    h.run_steps(2);
+    let row = |h: &Harness<App>, name: &str| h.get_by_label(name).rect();
+    let click_row = |h: &mut Harness<App>, name: &str, m| {
+        let p = row(h, name).center();
+        click(h, p, m);
+    };
+    // The list is top-first: Rectangle 60 is the top row.
+    click_row(&mut h, "Rectangle 60", Modifiers::NONE);
+    click_row(&mut h, "Rectangle 57", Modifiers::SHIFT);
+    let mut sel = h.state().sel.clone();
+    sel.sort();
+    assert_eq!(sel, ids[56..60].to_vec(), "Shift-click selects the range");
+    click_row(&mut h, "Rectangle 58", Modifiers::COMMAND);
+    assert_eq!(h.state().sel.len(), 3, "Cmd-click toggles one row");
+    // Drag two selected rows below Rectangle 55: both move, in their order.
+    h.state_mut().sel = vec![ids[59], ids[58]];
+    h.run_steps(2);
+    let (from, to) = (row(&h, "Rectangle 60").center(), row(&h, "Rectangle 55").center() + vec2(0.0, 8.0));
+    drag(&mut h, from, to, Modifiers::NONE);
+    let kids = &h.state().doc.pages[0].children;
+    assert_eq!(kids[54..57].to_vec(), vec![ids[58], ids[59], ids[54]], "moved together, order kept");
+    // Rows are virtualized: the bottom one isn't built until the selection scrolls it into view.
+    assert!(h.query_by_label("Rectangle 1").is_none());
+    h.state_mut().sel = vec![ids[0]];
+    h.run_steps(3);
+    let r1 = row(&h, "Rectangle 1");
+    assert!(r1.max.y <= 900.0 && r1.min.y > 0.0, "revealed at {r1:?}");
+}
+
+#[test]
+fn undo_brings_back_the_selection_and_page() {
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (50.0, 50.0));
+    key(&mut h, Modifiers::NONE, Key::ArrowRight);
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    assert!(h.state().sel.is_empty());
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().sel, vec![a], "what was selected comes back");
+    assert_eq!(rect(&h, a).min.x, 0.0);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::Z);
+    assert_eq!((h.state().sel.clone(), rect(&h, a).min.x), (vec![], 1.0), "redo returns to the state undo left");
+    // A change on another page: undo goes back there.
+    let mut pg = h.state().doc.pages[0].clone();
+    (pg.name, pg.children) = ("Page 2".into(), vec![]);
+    h.state_mut().doc.pages.push(pg);
+    h.state_mut().select_page(1);
+    h.run_steps(2);
+    let b = draw(&mut h, Key::O, (0.0, 0.0), (40.0, 40.0));
+    key(&mut h, Modifiers::NONE, Key::ArrowDown);
+    h.state_mut().select_page(0);
+    h.run_steps(2);
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!((h.state().page, h.state().sel.clone()), (1, vec![b]));
+    assert_eq!(rect(&h, b).min.y, 0.0);
+}
+
+#[test]
+fn select_all_inverse_and_same_properties() {
+    use crate::app::Same;
+    use crate::doc::{Paint, Rgba};
+    let mut h = harness();
+    let add = |h: &mut Harness<App>, kind, c| {
+        let mut n = Node::new(kind, r(0., 0., 20., 20.));
+        n.fills = vec![Paint::solid(c)];
+        h.state_mut().doc.insert(0, None, None, n)
+    };
+    let (red, blue) = (Rgba::rgb(255, 0, 0), Rgba::rgb(0, 0, 255));
+    let a = add(&mut h, Kind::Rectangle, red);
+    let b = add(&mut h, Kind::Ellipse, red);
+    let c = add(&mut h, Kind::Rectangle, blue);
+    let locked = add(&mut h, Kind::Rectangle, red);
+    h.state_mut().doc.node_mut(locked).locked = true;
+    key(&mut h, Modifiers::COMMAND, Key::A);
+    assert_eq!(h.state().sel, vec![a, b, c], "Cmd A skips locked layers");
+    h.state_mut().sel = vec![a];
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::A);
+    assert_eq!(h.state().sel, vec![b, c], "select inverse");
+    h.state_mut().sel = vec![a];
+    h.state_mut().select_same(Same::Fill);
+    assert_eq!(h.state().sel, vec![a, b], "same fill, any kind");
+    // No stroke on the layer: the selection stays.
+    h.state_mut().select_same(Same::Stroke);
+    assert_eq!(h.state().sel, vec![a, b]);
+    let text = |h: &mut Harness<App>, size| {
+        let mut t = Node::new(Kind::Text, r(0., 50., 80., 20.));
+        (t.text, t.font_size) = ("Hi".into(), size);
+        h.state_mut().doc.insert(0, None, None, t)
+    };
+    let (t1, _, t3) = (text(&mut h, 16.0), text(&mut h, 24.0), text(&mut h, 16.0));
+    h.state_mut().sel = vec![t1];
+    h.state_mut().select_same(Same::Font);
+    assert_eq!(h.state().sel, vec![t1, t3]);
+}
+
+#[test]
+fn batch_rename_numbers_and_replaces_as_one_undo_step() {
+    let mut h = harness();
+    let ids: Vec<NodeId> = (0..3).map(|i| draw(&mut h, Key::R, (i as f32 * 60.0, 0.0), (i as f32 * 60.0 + 40.0, 40.0))).collect();
+    // One layer: inline rename in its row.
+    key(&mut h, Modifiers::COMMAND, Key::R);
+    assert!(h.state().renaming.is_some() && h.state().batch_rename.is_none());
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    h.state_mut().sel = ids.clone();
+    h.run_steps(2);
+    key(&mut h, Modifiers::COMMAND, Key::R);
+    let b = h.state_mut().batch_rename.as_mut().expect("batch rename open");
+    b.to = "Card $n of $N ($&)".into();
+    (b.find, b.with) = ("Rectangle".into(), "Box".into());
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("Card 1 of 3 (Box 1)").is_some(), "live preview");    h.get_by_label("Rename").click();
+    h.run_steps(2);
+    let names: Vec<String> = ids.iter().map(|&id| h.state().doc.node(id).name.clone()).collect();
+    assert_eq!(names, ["Card 1 of 3 (Box 1)", "Card 2 of 2 (Box 2)", "Card 3 of 1 (Box 3)"]);
+    assert!(h.state().batch_rename.is_none());
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().doc.node(ids[2]).name, "Rectangle 3", "one undo step");
+    assert_eq!(h.state().doc.node(ids[0]).name, "Rectangle 1");
+}
+
+fn copied_text(h: &mut Harness<App>) -> String {
+    h.event(Event::Copy);
+    h.step();
+    h.output().platform_output.commands.iter().find_map(|c| match c {
+        egui::OutputCommand::CopyText(t) => Some(t.clone()),
+        _ => None,
+    }).expect("copied to clipboard")
+}
+
+#[test]
+fn resize_to_fit_remove_fill_lock_all_and_paste_over_selection() {
+    let mut h = harness();
+    let f = draw(&mut h, Key::F, (0.0, 0.0), (200.0, 200.0));
+    let a = draw(&mut h, Key::R, (10.0, 20.0), (50.0, 60.0));
+    assert_eq!(h.state().doc.node(a).parent, Some(f));
+    h.state_mut().sel = vec![f];
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT | Modifiers::ALT, Key::R);
+    assert_eq!((rect(&h, f), rect(&h, a)), (r(10., 20., 40., 40.), r(10., 20., 40., 40.)), "frame hugs its child, which stays put");
+    h.state_mut().sel = vec![a];
+    h.state_mut().remove_fills();
+    assert!(h.state().doc.node(a).fills.is_empty());
+    // Lock all locks the page's top level; Unlock all frees nested layers too.
+    h.state_mut().doc.node_mut(a).locked = true;
+    h.state_mut().lock_all(true);
+    assert!(h.state().doc.node(f).locked && h.state().sel.is_empty());
+    h.state_mut().lock_all(false);
+    assert!(!h.state().doc.node(f).locked && !h.state().doc.node(a).locked);
+    // Copy the child; Cmd V with the frame selected pastes into it, Shift Cmd V over it.
+    h.state_mut().sel = vec![a];
+    let copied = copied_text(&mut h);
+    h.state_mut().sel = vec![f];
+    h.event(Event::Paste(copied.clone()));
+    h.run_steps(2);
+    let inside = h.state().sel[0];
+    assert_eq!(h.state().doc.node(inside).parent, Some(f));
+    h.state_mut().sel = vec![f];
+    h.input_mut().modifiers = Modifiers::COMMAND | Modifiers::SHIFT;
+    h.event(Event::Paste(copied));
+    h.run_steps(2);
+    h.input_mut().modifiers = Modifiers::NONE;
+    let over = h.state().sel[0];
+    assert_eq!(h.state().doc.node(over).parent, None, "over the frame, not in it");
+    assert_eq!(h.state().doc.pages[0].children, vec![f, over]);
+    assert_eq!(rect(&h, over), rect(&h, a), "same position as copied");
+}
+
+#[test]
+fn clipboard_images_paste_and_dropped_images_replace_fills() {
+    use crate::app::TEST_CLIPBOARD;
+    let mut h = harness();
+    let img = image::RgbaImage::from_pixel(40, 30, image::Rgba([0, 200, 0, 255]));
+    TEST_CLIPBOARD.with(|c| c.borrow_mut().1 = Some(img.clone()));
+    // Cmd V with only an image on the clipboard reaches egui as just the V key going up.
+    let v_up = Event::Key { key: Key::V, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::COMMAND };
+    h.event(v_up.clone());
+    h.run_steps(2);
+    let id = h.state().sel[0];
+    let center = h.state().view_center_world();
+    let n = h.state().doc.node(id);
+    assert_eq!((n.rect.size(), n.rect.center()), (vec2(40., 30.), center));
+    assert_eq!(n.fills[0].kind, crate::doc::PaintKind::Image);
+    // With a frame selected, the image goes in the middle of it.
+    let f = draw(&mut h, Key::F, (150.0, 150.0), (350.0, 350.0));
+    h.event(v_up.clone());
+    h.run_steps(2);
+    let inner = h.state().sel[0];
+    assert_eq!((h.state().doc.node(inner).parent, rect(&h, inner).center()), (Some(f), pos2(250., 250.)));
+    // A text paste doesn't also paste the image.
+    let count = h.state().doc.nodes.len();
+    h.event(Event::Paste("hello".into()));
+    h.event(v_up);
+    h.run_steps(2);
+    assert_eq!(h.state().doc.nodes.len(), count + 1, "just the text layer");
+    // Dropping an image on a layer with an image fill swaps the image; Alt-drop does it on any layer.
+    let drop = |h: &mut Harness<App>, at: Pos2, m: Modifiers, color: [u8; 4]| {
+        let mut buf = std::io::Cursor::new(vec![]);
+        image::RgbaImage::from_pixel(8, 8, image::Rgba(color)).write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        let p = s(h, at.x, at.y);
+        move_to(h, p, m);
+        h.input_mut().dropped_files.push(egui::DroppedFile { name: "new.png".into(), bytes: Some(buf.into_inner().into()), ..Default::default() });
+        h.input_mut().modifiers = m;
+        h.run_steps(2);
+        h.input_mut().modifiers = Modifiers::NONE;
+    };
+    let count = h.state().doc.nodes.len();
+    let old_key = h.state().doc.node(id).fills[0].image.clone();
+    drop(&mut h, center - vec2(10., 10.), Modifiers::NONE, [255, 0, 0, 255]);
+    assert_eq!(h.state().doc.nodes.len(), count, "no new layer");
+    assert_ne!(h.state().doc.node(id).fills[0].image, old_key, "image replaced");
+    let plain = draw(&mut h, Key::R, (-400.0, 0.0), (-300.0, 100.0));
+    drop(&mut h, pos2(-350., 50.), Modifiers::ALT, [0, 0, 255, 255]);
+    assert_eq!(h.state().doc.node(plain).fills.iter().map(|p| p.kind).collect::<Vec<_>>(), vec![crate::doc::PaintKind::Image]);
+    TEST_CLIPBOARD.with(|c| c.borrow_mut().1 = None);
+}
+
+#[test]
+fn pages_reorder_by_dragging_duplicate_and_dividers() {
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (50.0, 50.0));
+    for name in ["Page 2", "---", "Page 3"] {
+        let mut pg = h.state().doc.pages[0].clone();
+        (pg.name, pg.children) = (name.into(), vec![]);
+        h.state_mut().doc.pages.push(pg);
+    }
+    h.run_steps(2);
+    let names = |h: &Harness<App>| h.state().doc.pages.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+    // A divider is a line in the list: clicking it opens nothing.
+    let divider = h.get_by_label("---").rect();
+    assert!(divider.height() < 20.0);
+    click(&mut h, divider.center(), Modifiers::NONE);
+    assert_eq!(h.state().page, 0);
+    // Drag Page 3 above Page 1; the open page stays open.
+    let (from, to) = (h.get_by_label("Page 3").rect().center(), h.get_by_label("Page 1").rect().min + vec2(20.0, 3.0));
+    drag(&mut h, from, to, Modifiers::NONE);
+    assert_eq!(names(&h), ["Page 3", "Page 1", "Page 2", "---"]);
+    assert_eq!(h.state().page, 1, "still on Page 1");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(names(&h)[0], "Page 1", "undoable");
+    h.state_mut().duplicate_page(0);
+    h.run_steps(2);
+    assert_eq!(names(&h)[..2], ["Page 1", "Page 1 copy"]);
+    assert_eq!(h.state().page, 1, "the copy opens");
+    let copy = h.state().doc.pages[1].children.clone();
+    assert_eq!(copy.len(), 1);
+    assert_ne!(copy[0], a);
+    assert_eq!(rect(&h, copy[0]), rect(&h, a));
+}
+
+#[test]
+fn paste_to_replace_takes_layers_copied_in_another_tab() {
+    use crate::app::TEST_CLIPBOARD;
+    let mut a = harness();
+    let e = draw(&mut a, Key::O, (0.0, 0.0), (30.0, 30.0));
+    a.state_mut().sel = vec![e];
+    let copied = copied_text(&mut a);
+    let mut b = harness();
+    let t = draw(&mut b, Key::R, (100.0, 100.0), (140.0, 140.0));
+    TEST_CLIPBOARD.with(|c| c.borrow_mut().0 = Some(copied));
+    key(&mut b, Modifiers::COMMAND | Modifiers::SHIFT, Key::R);
+    TEST_CLIPBOARD.with(|c| c.borrow_mut().0 = None);
+    let new = b.state().sel[0];
+    assert!(!b.state().doc.nodes.contains_key(&t));
+    assert_eq!((b.state().doc.node(new).kind, rect(&b, new).center()), (Kind::Ellipse, pos2(120., 120.)));
+}
