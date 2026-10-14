@@ -197,6 +197,9 @@ pub struct App {
     debug_plugin: Option<PathBuf>,
     /// The last layers copied here, for Paste to replace.
     pub clip_frag: Option<Vec<Node>>,
+    /// The V key went down as a key (not as a paste), and a paste arrived, since V last went up.
+    v_pressed: bool,
+    pasted: bool,
     /// Find and replace (Cmd F): (open, query, replacement, focus the field next frame).
     pub find: (bool, String, String, bool),
     /// Plugins > Run script console.
@@ -297,6 +300,8 @@ impl App {
             show_history: false,
             find: (false, String::new(), String::new(), false),
             clip_frag: None,
+            v_pressed: false,
+            pasted: false,
             plugin: None,
             own_title_bar: false,
             appearance: crate::appearance::load(),
@@ -913,6 +918,64 @@ impl App {
         }
     }
 
+    /// Object > Lock all / Unlock all: the page's layers (locking the top level covers the rest).
+    pub fn lock_all(&mut self, lock: bool) {
+        let roots = self.doc.pages[self.page].children.clone();
+        let all: Vec<NodeId> = if lock { roots } else { roots.iter().flat_map(|&r| std::iter::once(r).chain(self.doc.descendants(r))).collect() };
+        let ids: Vec<NodeId> = all.into_iter().filter(|&id| self.doc.node(id).locked != lock).collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for id in ids {
+            self.doc.node_mut(id).locked = lock;
+        }
+        if lock {
+            self.sel.clear();
+        }
+    }
+
+    /// Alt Shift Cmd R: selected frames take the size of their contents; the contents stay put.
+    /// Auto layout frames switch to hug instead.
+    pub fn resize_to_fit(&mut self) {
+        let frames: Vec<NodeId> = self
+            .sel
+            .iter()
+            .copied()
+            .filter(|&id| {
+                let n = self.doc.node(id);
+                n.kind.is_frame() && n.kind != Kind::Instance && n.rotation == 0.0 && !n.children.is_empty()
+            })
+            .collect();
+        if frames.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for id in frames {
+            if self.doc.node(id).layout.mode != LayoutMode::None {
+                self.doc.node_mut(id).sizing = [Sizing::Hug, Sizing::Hug];
+            } else {
+                let b = self.doc.bounds(&self.doc.node(id).children.clone());
+                self.doc.set_rect_with(id, b, false);
+            }
+        }
+        self.doc.reflow();
+    }
+
+    /// Remove fill: the selection keeps its strokes and effects but loses every fill.
+    pub fn remove_fills(&mut self) {
+        let ids: Vec<NodeId> = self.sel.iter().copied().filter(|&id| !self.doc.node(id).fills.is_empty()).collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for id in ids {
+            let n = self.doc.node_mut(id);
+            n.fills.clear();
+            n.fill_style = None;
+        }
+    }
+
     pub fn align(&mut self, a: Align) {
         let roots = self.sel_roots();
         let Some(&first) = roots.first() else { return };
@@ -955,14 +1018,18 @@ impl App {
         self.clip_frag = Some(frag);
     }
 
-    pub fn paste_text(&mut self, text: &str) {
-        if let Some(frag) = text.strip_prefix(CLIP_TAG).and_then(|j| serde_json::from_str::<Vec<Node>>(j).ok()) {
+    /// Paste clipboard text: copied layers, SVG markup, or plain text. `over` is Shift Cmd V
+    /// (Paste over selection): the layers go just above the selection, never into a selected frame.
+    pub fn paste_text(&mut self, text: &str, over: bool) {
+        if let Some(frag) = clip_layers(text) {
             self.checkpoint();
             // Paste into a selected frame, otherwise next to the original.
-            let parent = match self.sel.as_slice() {
-                [one] if self.doc.node(*one).kind.is_frame() => Some(*one),
-                [one, ..] => self.doc.node(*one).parent,
-                [] => None,
+            let top = self.doc.sort_by_z(&self.sel_roots()).last().copied();
+            let (parent, mut at) = match self.sel.as_slice() {
+                _ if over => top.map_or((None, None), |t| (self.doc.node(t).parent, Some(self.doc.index_in_parent(t) + 1))),
+                [one] if self.doc.node(*one).kind.is_frame() => (Some(*one), None),
+                [one, ..] => (self.doc.node(*one).parent, None),
+                [] => (None, None),
             };
             // Pasting a main component that still exists makes an instance of it.
             let in_frag: std::collections::HashSet<NodeId> = frag.iter().map(|n| n.id).collect();
@@ -970,11 +1037,12 @@ impl App {
             for root in frag.iter().filter(|n| !n.parent.is_some_and(|p| in_frag.contains(&p))) {
                 let live = self.doc.nodes.get(&root.id).is_some_and(|n| n.kind == Kind::Component);
                 if root.kind == Kind::Component && live {
-                    out.push(self.doc.instantiate(root.id, self.page, parent, None, root.rect.min));
+                    out.push(self.doc.instantiate(root.id, self.page, parent, at, root.rect.min));
                 } else {
                     let sub: Vec<Node> = frag.iter().filter(|n| n.id == root.id || self.frag_descends(&frag, n.id, root.id)).cloned().collect();
-                    out.extend(self.doc.paste(&sub, self.page, parent, None));
+                    out.extend(self.doc.paste(&sub, self.page, parent, at));
                 }
+                at = at.map(|i| i + 1);
             }
             self.doc.reflow();
             self.sel = out;
@@ -991,9 +1059,10 @@ impl App {
         }
     }
 
-    /// Shift Cmd R: put the copied layers where each selected layer is, replacing it.
+    /// Shift Cmd R: put the copied layers where each selected layer is, replacing it. Layers
+    /// copied in another tab (or window) come from the system clipboard.
     pub fn paste_to_replace(&mut self) {
-        let Some(frag) = self.clip_frag.clone() else {
+        let Some(frag) = clipboard_text().as_deref().and_then(clip_layers).or_else(|| self.clip_frag.clone()) else {
             self.toast("Copy something first".into());
             return;
         };
@@ -1987,10 +2056,7 @@ impl App {
             Ok((f, images)) => {
                 for (id, bytes) in images {
                     let key = self.add_image(bytes);
-                    let mut p = crate::doc::Paint::solid(crate::doc::Rgba::WHITE);
-                    p.convert(crate::doc::PaintKind::Image);
-                    p.image = key;
-                    self.doc.node_mut(id).fills = vec![p];
+                    self.doc.node_mut(id).fills = vec![crate::doc::Paint::image(key)];
                 }
                 if centered {
                     let size = self.doc.node(f).rect.size();
@@ -2032,16 +2098,61 @@ impl App {
         let size = vec2(img.width() as f32, img.height() as f32);
         let key = self.add_image(bytes);
         let mut n = Node::new(Kind::Rectangle, Rect::from_center_size(at.round(), size));
-        let mut p = crate::doc::Paint::solid(crate::doc::Rgba::WHITE);
-        p.convert(crate::doc::PaintKind::Image);
-        p.image = key;
-        n.fills = vec![p];
+        n.fills = vec![crate::doc::Paint::image(key)];
         n.name = name.to_string();
         let parent = self.frame_at(at, &[]);
         let id = self.doc.insert(self.page, parent, None, n);
         self.sel = vec![id];
         self.tool = Tool::Move;
         Some(id)
+    }
+
+    /// An image dropped on a layer that shows one (or on any layer, with Alt) replaces its image,
+    /// as in Figma; other fills give way to it.
+    pub fn replace_fill_image(&mut self, id: NodeId, bytes: Vec<u8>) -> Option<NodeId> {
+        image::load_from_memory(&bytes).ok()?;
+        self.checkpoint();
+        let key = self.add_image(bytes);
+        let n = self.doc.node_mut(id);
+        match n.fills.iter_mut().rev().find(|p| p.kind == crate::doc::PaintKind::Image) {
+            Some(p) => p.image = key,
+            None => n.fills = vec![crate::doc::Paint::image(key)],
+        }
+        n.fill_style = None;
+        Some(id)
+    }
+
+    /// Cmd V with an image on the clipboard (a screenshot, say): an image layer at natural size,
+    /// in the middle of the view or of the selected frame.
+    pub fn paste_clipboard_image(&mut self) -> bool {
+        let Some(img) = clipboard_image() else { return false };
+        let mut png = std::io::Cursor::new(vec![]);
+        if img.write_to(&mut png, image::ImageFormat::Png).is_err() {
+            return false;
+        }
+        let frame = match self.sel[..] {
+            [f] if self.doc.node(f).kind.is_frame() => Some(f),
+            _ => None,
+        };
+        let at = frame.map_or(self.view_center_world(), |f| self.doc.node(f).rect.center());
+        let Some(id) = self.place_image(png.into_inner(), "Image", at) else { return false };
+        if let Some(f) = frame
+            && self.doc.node(id).parent != Some(f)
+        {
+            self.doc.reparent(id, self.page, Some(f), None);
+            self.doc.reflow();
+        }
+        true
+    }
+
+    /// Edit > Paste (and Paste over selection): the clipboard's text or layers, else its image.
+    pub fn paste_from_menu(&mut self, ctx: &egui::Context, over: bool) {
+        match clipboard_text().filter(|t| !t.is_empty()) {
+            Some(t) => self.paste_text(&t, over),
+            // No direct access (or nothing there): let egui read it.
+            None if !self.paste_clipboard_image() => ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste),
+            None => {}
+        }
     }
 
     /// Alt Cmd O: strokes become filled vectors. Layers that also have fills become a group of both.
@@ -2126,7 +2237,7 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let typing = ctx.egui_wants_keyboard_input();
-        let events = ctx.input(|i| i.events.clone());
+        let (events, shift) = ctx.input(|i| (i.events.clone(), i.modifiers.shift));
         for e in events {
             match e {
                 Event::Copy if !typing => self.copy(ctx),
@@ -2134,8 +2245,22 @@ impl App {
                     self.copy(ctx);
                     self.delete_selection();
                 }
-                Event::Paste(t) if !typing => self.paste_text(&t),
-                Event::Key { key, pressed: true, modifiers: m, .. } => self.key(ctx, key, m, typing),
+                Event::Paste(t) if !typing => {
+                    self.pasted = true;
+                    self.paste_text(&t, shift);
+                }
+                // Cmd V with no text on the clipboard (an image, say) reaches egui only as the V
+                // key's release: the press was taken as a paste that found nothing to deliver.
+                Event::Key { key: Key::V, pressed: false, .. } => {
+                    let (seen, pasted) = (std::mem::take(&mut self.v_pressed), std::mem::take(&mut self.pasted));
+                    if !typing && !seen && !pasted {
+                        self.paste_clipboard_image();
+                    }
+                }
+                Event::Key { key, pressed: true, modifiers: m, .. } => {
+                    self.v_pressed |= key == Key::V;
+                    self.key(ctx, key, m, typing)
+                }
                 _ => {}
             }
         }
@@ -2205,6 +2330,7 @@ impl App {
             (true, false, true, Key::C) => self.style_clip = self.sel.first().map(|&id| self.doc.node(id).clone()),
             (true, false, true, Key::V) => self.paste_style(),
             (true, true, false, Key::R) => self.paste_to_replace(),
+            (true, true, true, Key::R) => self.resize_to_fit(),
             (true, false, false, Key::Y) => self.outline_mode = !self.outline_mode,
             (true, false, true, Key::O) => self.outline_stroke_selection(),
             (true, false, true, Key::A) => self.select_matching(),
@@ -2350,6 +2476,36 @@ impl App {
 }
 
 fn void(_: bool) {}
+
+/// Layers copied from Katachi, from clipboard text.
+fn clip_layers(text: &str) -> Option<Vec<Node>> {
+    serde_json::from_str(text.strip_prefix(CLIP_TAG)?).ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The clipboard as tests see it (they never touch the real one): text, image.
+    pub static TEST_CLIPBOARD: std::cell::RefCell<(Option<String>, Option<image::RgbaImage>)> = const { std::cell::RefCell::new((None, None)) };
+}
+
+/// The system clipboard's text, read directly (egui only hands it over inside a paste event).
+fn clipboard_text() -> Option<String> {
+    #[cfg(test)]
+    return TEST_CLIPBOARD.with(|c| c.borrow().0.clone());
+    #[cfg(not(test))]
+    arboard::Clipboard::new().ok()?.get_text().ok()
+}
+
+/// An image on the system clipboard; egui doesn't deliver these at all.
+fn clipboard_image() -> Option<image::RgbaImage> {
+    #[cfg(test)]
+    return TEST_CLIPBOARD.with(|c| c.borrow().1.clone());
+    #[cfg(not(test))]
+    {
+        let img = arboard::Clipboard::new().ok()?.get_image().ok()?;
+        image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned())
+    }
+}
 
 fn same_font(a: &Node, b: &Node) -> bool {
     b.font_family == a.font_family && b.font_size == a.font_size && b.font_weight == a.font_weight

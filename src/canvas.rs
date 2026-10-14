@@ -173,8 +173,9 @@ impl App {
     }
 
     /// Files dropped on the canvas: images become image-filled rectangles, SVGs become vectors.
+    /// An image dropped on a layer with an image fill (or on any layer with Alt) replaces its image.
     fn accept_drops(&mut self, ui: &Ui, at: Pos2) {
-        let files = ui.input(|i| i.raw.dropped_files.clone());
+        let (files, alt) = ui.input(|i| (i.raw.dropped_files.clone(), i.modifiers.alt));
         let mut placed = vec![];
         let mut offset = 0.0;
         for f in files {
@@ -199,7 +200,12 @@ impl App {
                 return;
             }
             let is_svg = f.name.to_lowercase().ends_with(".svg") || f.path.as_ref().is_some_and(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg")));
-            let id = if is_svg { self.import_svg(&bytes, &name, w, true) } else { self.place_image(bytes, &name, w) };
+            let onto = self.doc.hit(self.page, w, 0.0).filter(|&t| alt || self.doc.node(t).fills.iter().any(|p| p.kind == crate::doc::PaintKind::Image));
+            let id = match onto {
+                _ if is_svg => self.import_svg(&bytes, &name, w, true),
+                Some(t) => self.replace_fill_image(t, bytes),
+                None => self.place_image(bytes, &name, w),
+            };
             placed.extend(id);
             offset += 20.0;
         }
@@ -1536,8 +1542,7 @@ impl App {
             ui.close();
         }
         if item(ui, "Paste", "⌘V", true) {
-            // Reading the system clipboard goes through egui's paste event.
-            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+            self.paste_from_menu(&ctx, false);
             ui.close();
         }
         ui.add_enabled_ui(has, |ui| {
@@ -1557,7 +1562,11 @@ impl App {
                     self.paste_style();
                     ui.close();
                 }
-                if ui.add_enabled(self.clip_frag.is_some(), egui::Button::new("Paste to replace").shortcut_text(crate::chrome::keys("⇧⌘R"))).clicked() {
+                if ui.add(egui::Button::new("Paste over selection").shortcut_text(crate::chrome::keys("⇧⌘V"))).clicked() {
+                    self.paste_from_menu(&ctx, true);
+                    ui.close();
+                }
+                if ui.add(egui::Button::new("Paste to replace").shortcut_text(crate::chrome::keys("⇧⌘R"))).clicked() {
                     self.paste_to_replace();
                     ui.close();
                 }
@@ -1685,6 +1694,14 @@ impl App {
         }
         if item(ui, "Lock/Unlock", "⇧⌘L", has) {
             self.toggle_locked();
+            ui.close();
+        }
+        if item(ui, "Lock all", "", true) {
+            self.lock_all(true);
+            ui.close();
+        }
+        if item(ui, "Unlock all", "", true) {
+            self.lock_all(false);
             ui.close();
         }
     }

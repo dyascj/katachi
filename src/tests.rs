@@ -2171,3 +2171,115 @@ fn batch_rename_numbers_and_replaces_as_one_undo_step() {
     assert_eq!(h.state().doc.node(ids[2]).name, "Rectangle 3", "one undo step");
     assert_eq!(h.state().doc.node(ids[0]).name, "Rectangle 1");
 }
+
+fn copied_text(h: &mut Harness<App>) -> String {
+    h.event(Event::Copy);
+    h.step();
+    h.output().platform_output.commands.iter().find_map(|c| match c {
+        egui::OutputCommand::CopyText(t) => Some(t.clone()),
+        _ => None,
+    }).expect("copied to clipboard")
+}
+
+#[test]
+fn resize_to_fit_remove_fill_lock_all_and_paste_over_selection() {
+    let mut h = harness();
+    let f = draw(&mut h, Key::F, (0.0, 0.0), (200.0, 200.0));
+    let a = draw(&mut h, Key::R, (10.0, 20.0), (50.0, 60.0));
+    assert_eq!(h.state().doc.node(a).parent, Some(f));
+    h.state_mut().sel = vec![f];
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT | Modifiers::ALT, Key::R);
+    assert_eq!((rect(&h, f), rect(&h, a)), (r(10., 20., 40., 40.), r(10., 20., 40., 40.)), "frame hugs its child, which stays put");
+    h.state_mut().sel = vec![a];
+    h.state_mut().remove_fills();
+    assert!(h.state().doc.node(a).fills.is_empty());
+    // Lock all locks the page's top level; Unlock all frees nested layers too.
+    h.state_mut().doc.node_mut(a).locked = true;
+    h.state_mut().lock_all(true);
+    assert!(h.state().doc.node(f).locked && h.state().sel.is_empty());
+    h.state_mut().lock_all(false);
+    assert!(!h.state().doc.node(f).locked && !h.state().doc.node(a).locked);
+    // Copy the child; Cmd V with the frame selected pastes into it, Shift Cmd V over it.
+    h.state_mut().sel = vec![a];
+    let copied = copied_text(&mut h);
+    h.state_mut().sel = vec![f];
+    h.event(Event::Paste(copied.clone()));
+    h.run_steps(2);
+    let inside = h.state().sel[0];
+    assert_eq!(h.state().doc.node(inside).parent, Some(f));
+    h.state_mut().sel = vec![f];
+    h.input_mut().modifiers = Modifiers::COMMAND | Modifiers::SHIFT;
+    h.event(Event::Paste(copied));
+    h.run_steps(2);
+    h.input_mut().modifiers = Modifiers::NONE;
+    let over = h.state().sel[0];
+    assert_eq!(h.state().doc.node(over).parent, None, "over the frame, not in it");
+    assert_eq!(h.state().doc.pages[0].children, vec![f, over]);
+    assert_eq!(rect(&h, over), rect(&h, a), "same position as copied");
+}
+
+#[test]
+fn clipboard_images_paste_and_dropped_images_replace_fills() {
+    use crate::app::TEST_CLIPBOARD;
+    let mut h = harness();
+    let img = image::RgbaImage::from_pixel(40, 30, image::Rgba([0, 200, 0, 255]));
+    TEST_CLIPBOARD.with(|c| c.borrow_mut().1 = Some(img.clone()));
+    // Cmd V with only an image on the clipboard reaches egui as just the V key going up.
+    let v_up = Event::Key { key: Key::V, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::COMMAND };
+    h.event(v_up.clone());
+    h.run_steps(2);
+    let id = h.state().sel[0];
+    let center = h.state().view_center_world();
+    let n = h.state().doc.node(id);
+    assert_eq!((n.rect.size(), n.rect.center()), (vec2(40., 30.), center));
+    assert_eq!(n.fills[0].kind, crate::doc::PaintKind::Image);
+    // With a frame selected, the image goes in the middle of it.
+    let f = draw(&mut h, Key::F, (150.0, 150.0), (350.0, 350.0));
+    h.event(v_up.clone());
+    h.run_steps(2);
+    let inner = h.state().sel[0];
+    assert_eq!((h.state().doc.node(inner).parent, rect(&h, inner).center()), (Some(f), pos2(250., 250.)));
+    // A text paste doesn't also paste the image.
+    let count = h.state().doc.nodes.len();
+    h.event(Event::Paste("hello".into()));
+    h.event(v_up);
+    h.run_steps(2);
+    assert_eq!(h.state().doc.nodes.len(), count + 1, "just the text layer");
+    // Dropping an image on a layer with an image fill swaps the image; Alt-drop does it on any layer.
+    let drop = |h: &mut Harness<App>, at: Pos2, m: Modifiers, color: [u8; 4]| {
+        let mut buf = std::io::Cursor::new(vec![]);
+        image::RgbaImage::from_pixel(8, 8, image::Rgba(color)).write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        let p = s(h, at.x, at.y);
+        move_to(h, p, m);
+        h.input_mut().dropped_files.push(egui::DroppedFile { name: "new.png".into(), bytes: Some(buf.into_inner().into()), ..Default::default() });
+        h.input_mut().modifiers = m;
+        h.run_steps(2);
+        h.input_mut().modifiers = Modifiers::NONE;
+    };
+    let count = h.state().doc.nodes.len();
+    let old_key = h.state().doc.node(id).fills[0].image.clone();
+    drop(&mut h, center - vec2(10., 10.), Modifiers::NONE, [255, 0, 0, 255]);
+    assert_eq!(h.state().doc.nodes.len(), count, "no new layer");
+    assert_ne!(h.state().doc.node(id).fills[0].image, old_key, "image replaced");
+    let plain = draw(&mut h, Key::R, (-400.0, 0.0), (-300.0, 100.0));
+    drop(&mut h, pos2(-350., 50.), Modifiers::ALT, [0, 0, 255, 255]);
+    assert_eq!(h.state().doc.node(plain).fills.iter().map(|p| p.kind).collect::<Vec<_>>(), vec![crate::doc::PaintKind::Image]);
+    TEST_CLIPBOARD.with(|c| c.borrow_mut().1 = None);
+}
+
+#[test]
+fn paste_to_replace_takes_layers_copied_in_another_tab() {
+    use crate::app::TEST_CLIPBOARD;
+    let mut a = harness();
+    let e = draw(&mut a, Key::O, (0.0, 0.0), (30.0, 30.0));
+    a.state_mut().sel = vec![e];
+    let copied = copied_text(&mut a);
+    let mut b = harness();
+    let t = draw(&mut b, Key::R, (100.0, 100.0), (140.0, 140.0));
+    TEST_CLIPBOARD.with(|c| c.borrow_mut().0 = Some(copied));
+    key(&mut b, Modifiers::COMMAND | Modifiers::SHIFT, Key::R);
+    TEST_CLIPBOARD.with(|c| c.borrow_mut().0 = None);
+    let new = b.state().sel[0];
+    assert!(!b.state().doc.nodes.contains_key(&t));
+    assert_eq!((b.state().doc.node(new).kind, rect(&b, new).center()), (Kind::Ellipse, pos2(120., 120.)));
+}

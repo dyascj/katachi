@@ -823,7 +823,15 @@ impl App {
                 ui.close();
             }
             if item(ui, "Paste", "⌘V") {
-                ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                self.paste_from_menu(&ctx, false);
+                ui.close();
+            }
+            if enabled(ui, has, "Paste over selection", "⇧⌘V") {
+                self.paste_from_menu(&ctx, true);
+                ui.close();
+            }
+            if enabled(ui, has, "Paste to replace", "⇧⌘R") {
+                self.paste_to_replace();
                 ui.close();
             }
             if enabled(ui, has, "Duplicate", "⌘D") {
@@ -979,6 +987,14 @@ impl App {
                 self.outline_stroke_selection();
                 ui.close();
             }
+            if enabled(ui, has, "Resize to fit", "⌥⇧⌘R") {
+                self.resize_to_fit();
+                ui.close();
+            }
+            if enabled(ui, has, "Remove fill", "") {
+                self.remove_fills();
+                ui.close();
+            }
             ui.separator();
             if enabled(ui, has, "Flip horizontal", "⇧H") {
                 self.flip_selection(true);
@@ -995,6 +1011,14 @@ impl App {
             }
             if enabled(ui, has, "Lock/Unlock selection", "⇧⌘L") {
                 self.toggle_locked();
+                ui.close();
+            }
+            if item(ui, "Lock all", "") {
+                self.lock_all(true);
+                ui.close();
+            }
+            if item(ui, "Unlock all", "") {
+                self.lock_all(false);
                 ui.close();
             }
         });
