@@ -1,6 +1,6 @@
 //! App state, document actions, undo, clipboard, files, and keyboard shortcuts.
 
-use crate::doc::{AutoLayout, BoolOp, Document, Kind, LayoutMode, Node, NodeId, Order, Sizing};
+use crate::doc::{AutoLayout, Bindable, BoolOp, Document, Kind, LayoutMode, Node, NodeId, Order, Sizing};
 use crate::render::View;
 use egui::{Event, Key, Modifiers, Pos2, Rect, Vec2, vec2};
 use std::path::PathBuf;
@@ -268,6 +268,8 @@ pub struct App {
     pub confirm: Option<After>,
     pub prev_sel: Vec<NodeId>,
     pub gradient_edit: Option<GradientEdit>,
+    /// The last opacity digit typed and when, for two-digit values.
+    last_digit: Option<(u8, f64)>,
     pub eyedrop: Option<crate::paint_ui::Eyedrop>,
     pub allow_close: bool,
     pub toast: Option<(String, f64)>,
@@ -377,6 +379,7 @@ impl App {
             toast: None,
             title: String::new(),
             gradient_edit: None,
+            last_digit: None,
             eyedrop: None,
             screenshot: std::env::var_os("KATACHI_SCREENSHOT").map(|p| (PathBuf::from(p), 0)),
         };
@@ -666,6 +669,51 @@ impl App {
                 *n = Node { id: n.id, parent: n.parent, children: n.children.clone(), name, fills: vec![], clip: false, ..Node::new(Kind::Frame, r) };
             }
             self.sel = vec![g];
+        }
+    }
+
+    /// Shift X: swap the selection's fill and stroke paints, with their styles and variables.
+    pub fn swap_fill_stroke(&mut self) {
+        if self.sel.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for id in self.sel.clone() {
+            let n = self.doc.node_mut(id);
+            if n.kind == Kind::Group {
+                continue;
+            }
+            std::mem::swap(&mut n.fills, &mut n.strokes);
+            std::mem::swap(&mut n.fill_style, &mut n.stroke_style);
+            for (b, _) in &mut n.bindings {
+                *b = match *b {
+                    Bindable::Fill => Bindable::Stroke,
+                    Bindable::Stroke => Bindable::Fill,
+                    other => other,
+                };
+            }
+            if !n.strokes.is_empty() && n.stroke_width <= 0.0 {
+                n.stroke_width = 1.0;
+            }
+        }
+    }
+
+    /// Figma's number keys set the selection's opacity: 1 = 10% ... 9 = 90%, 0 = 100%, and two
+    /// digits typed quickly an exact value (4 then 5 = 45%, 0 then 0 = 0%), in one undo step.
+    pub fn opacity_key(&mut self, digit: u8, now: f64) {
+        if self.sel.is_empty() {
+            return;
+        }
+        let pct = match self.last_digit.take() {
+            Some((first, t)) if now - t < 0.6 => (first * 10 + digit) as f32,
+            _ => {
+                self.checkpoint();
+                self.last_digit = Some((digit, now));
+                if digit == 0 { 100.0 } else { digit as f32 * 10.0 }
+            }
+        };
+        for id in self.sel.clone() {
+            self.doc.node_mut(id).opacity = pct / 100.0;
         }
     }
 
@@ -2210,6 +2258,8 @@ impl App {
             (false, false, true, Key::S) => self.align(Align::Bottom),
             (false, true, false, Key::H) => self.flip_selection(true),
             (false, true, false, Key::V) => self.flip_selection(false),
+            (false, true, false, Key::X) => self.swap_fill_stroke(),
+            (false, false, false, k) if digit(k).is_some() => self.opacity_key(digit(k).unwrap_or(0), ctx.input(|i| i.time)),
             (false, shift, false, Key::Tab) => {
                 // Tab cycles layers in Figma; stop egui from moving widget focus instead.
                 ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
@@ -2331,6 +2381,11 @@ impl App {
 }
 
 fn void(_: bool) {}
+
+/// The number key's digit.
+fn digit(k: Key) -> Option<u8> {
+    [Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9].iter().position(|d| *d == k).map(|i| i as u8)
+}
 
 impl eframe::App for App {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {

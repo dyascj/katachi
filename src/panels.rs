@@ -948,6 +948,10 @@ impl App {
                 self.flip_selection(false);
                 ui.close();
             }
+            if enabled(ui, has, "Swap fill and stroke", "⇧X") {
+                self.swap_fill_stroke();
+                ui.close();
+            }
             ui.separator();
             if enabled(ui, has, "Show/Hide selection", "⇧⌘H") {
                 self.toggle_visible();

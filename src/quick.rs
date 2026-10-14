@@ -49,6 +49,7 @@ const COMMANDS: &[(&str, &str, Run)] = &[
     ("Outline stroke", "⌥⌘O", |a, _| a.outline_stroke_selection()),
     ("Use as mask", "⌃⌘M", |a, _| a.toggle_mask()),
     ("Duplicate", "⌘D", |a, _| a.duplicate_selection()),
+    ("Swap fill and stroke", "⇧X", |a, _| a.swap_fill_stroke()),
     ("Pick color", "I", |a, _| {
         if !a.sel.is_empty() {
             a.start_eyedrop(crate::paint_ui::EyeTarget::Fill)

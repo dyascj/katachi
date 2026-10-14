@@ -2217,3 +2217,34 @@ fn paint_rows_reorder_by_dragging_their_grip() {
     key(&mut h, Modifiers::COMMAND, Key::Z);
     assert_eq!(order(&h), vec![r, g, b], "one undo step");
 }
+
+#[test]
+fn number_keys_set_opacity_and_shift_x_swaps_fill_and_stroke() {
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (80.0, 80.0));
+    let op = |h: &Harness<App>| (h.state().doc.node(id).opacity * 100.0).round();
+    key(&mut h, Modifiers::NONE, Key::Num4);
+    key(&mut h, Modifiers::NONE, Key::Num5);
+    assert_eq!(op(&h), 45.0, "two digits typed quickly");
+    h.run_steps(60);
+    key(&mut h, Modifiers::NONE, Key::Num7);
+    assert_eq!(op(&h), 70.0);
+    h.run_steps(60);
+    key(&mut h, Modifiers::NONE, Key::Num0);
+    assert_eq!(op(&h), 100.0, "0 is 100%");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(op(&h), 45.0, "45 was one undo step");
+    // Shift X: the fill becomes the stroke.
+    let fill = h.state().doc.node(id).fills.clone();
+    key(&mut h, Modifiers::SHIFT, Key::X);
+    let n = h.state().doc.node(id);
+    assert!(n.fills.is_empty() && n.strokes == fill && n.stroke_width > 0.0);
+    // Not while typing: digits go to the text being edited.
+    key(&mut h, Modifiers::NONE, Key::T);
+    let p = s(&h, 300.0, 300.0);
+    click(&mut h, p, Modifiers::NONE);
+    let t = h.state().editing_text.expect("editing new text");
+    key(&mut h, Modifiers::NONE, Key::Num5);
+    assert_eq!(h.state().doc.node(t).opacity, 1.0);
+}

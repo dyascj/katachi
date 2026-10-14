@@ -77,6 +77,8 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Bring to front, send to back", "⌥ ⌘ ], ⌥ ⌘ ["),
     ("Flip horizontal, vertical", "⇧ H, ⇧ V"),
     ("Pick color (eyedropper)", "I"),
+    ("Swap fill and stroke", "⇧ X"),
+    ("Opacity 10% to 100%, exact (e.g. 4 5)", "1 to 9, 0"),
     ("Distribute, tidy up", "⌃ ⌥ H / V, ⌃ ⌥ T"),
     ("Show or hide, lock", "⇧ ⌘ H, ⇧ ⌘ L"),
     ("Next and previous layer, select parent", "Tab, ⇧ Tab, ⇧ ↵"),
