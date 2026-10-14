@@ -80,6 +80,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Show or hide, lock", "⇧ ⌘ H, ⇧ ⌘ L"),
     ("Next and previous layer, select parent", "Tab, ⇧ Tab, ⇧ ↵"),
     ("Zoom to fit, 100%, selection", "⇧ 1, ⇧ 0, ⇧ 2"),
+    ("Zoom tool, next and previous frame", "Z, N, ⇧ N"),
     ("Rulers, layout guides, hide UI, outline", "⇧ R, ⌃ G, ⌘ \\, ⌘ Y"),
     ("Dev Mode, present", "⇧ D, ⌥ ⌘ ↵"),
     ("Save, open, place image, export", "⌘ S, ⌘ O, ⇧ ⌘ K, ⇧ ⌘ E"),

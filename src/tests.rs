@@ -2134,3 +2134,46 @@ fn ruler_guides_create_snap_move_and_delete() {
     assert!(h.state().doc.pages[0].guides.is_empty());
     assert!(!crate::doc::file_json(&h.state().doc).contains("guides"), "no guides, no field");
 }
+
+#[test]
+fn zoom_tool_and_next_frame() {
+    let mut h = harness();
+    let center = |h: &Harness<App>| h.state().view.to_world(h.state().canvas_rect.unwrap().center());
+    // Z: click zooms in at the point, Alt-click zooms back out.
+    key(&mut h, Modifiers::NONE, Key::Z);
+    assert_eq!(h.state().tool, Tool::Zoom, "a tap keeps the zoom tool");
+    let p = s(&h, 100., 100.);
+    click(&mut h, p, Modifiers::NONE);
+    assert_eq!(h.state().view.zoom, 2.0);
+    assert!((s(&h, 100., 100.) - p).length() < 0.5, "the clicked point stays put");
+    click(&mut h, p, Modifiers::ALT);
+    assert_eq!(h.state().view.zoom, 1.0);
+    // Dragging a box zooms to fit it.
+    let (a, b) = (s(&h, 0., 0.), s(&h, 40., 40.));
+    drag(&mut h, a, b, Modifiers::NONE);
+    assert!(h.state().view.zoom > 10.0);
+    assert!((center(&h) - pos2(20., 20.)).length() < 0.5);
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    // N and Shift N walk the top-level frames in layers-panel order (top first).
+    let st = h.state_mut();
+    let f1 = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(0., 0., 100., 100.)));
+    let f2 = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(1000., 0., 100., 100.)));
+    st.zoom_target = Some(f1);
+    h.run_steps(2);
+    let c = |h: &Harness<App>, f: NodeId| (center(h) - h.state().doc.node(f).rect.center()).length() < 0.5;
+    assert!(c(&h, f1));
+    key(&mut h, Modifiers::NONE, Key::N);
+    assert!(c(&h, f2), "wraps from the bottom frame to the top one");
+    key(&mut h, Modifiers::NONE, Key::N);
+    assert!(c(&h, f1));
+    key(&mut h, Modifiers::SHIFT, Key::N);
+    assert!(c(&h, f2));
+    // Holding Z makes the zoom tool temporary: releasing it brings back the previous tool.
+    let z = |pressed| Event::Key { key: Key::Z, physical_key: None, pressed, repeat: false, modifiers: Modifiers::NONE };
+    h.event(z(true));
+    h.run_steps(40);
+    assert_eq!(h.state().tool, Tool::Zoom);
+    h.event(z(false));
+    h.run_steps(2);
+    assert_eq!(h.state().tool, Tool::Move);
+}

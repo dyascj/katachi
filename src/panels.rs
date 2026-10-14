@@ -872,6 +872,18 @@ impl App {
                 self.zoom_to(&ctx, Some(self.sel.clone()), false);
                 ui.close();
             }
+            if item(ui, "Zoom to next frame", "N") {
+                self.zoom_frame(&ctx, 1);
+                ui.close();
+            }
+            if item(ui, "Zoom to previous frame", "⇧N") {
+                self.zoom_frame(&ctx, -1);
+                ui.close();
+            }
+            if item(ui, "Zoom tool", "Z") {
+                self.set_tool(crate::app::Tool::Zoom);
+                ui.close();
+            }
             ui.separator();
             if check(ui, self.dev_mode, "Dev Mode", "⇧D") {
                 self.dev_mode = !self.dev_mode;

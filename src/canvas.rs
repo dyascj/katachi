@@ -524,6 +524,7 @@ impl App {
                 }
             }
             Tool::Pencil => Some(Drag::Pencil { points: vec![start] }),
+            Tool::Zoom => Some(Drag::Zoom { start }),
             t if t.draws_shape() || t == Tool::Text => {
                 self.checkpoint();
                 let start = self.snap_point(start.round(), &[]);
@@ -751,7 +752,7 @@ impl App {
                 let d = w - *start;
                 self.doc.translate(*id, vec2(self.px1(d.x), self.px1(d.y)));
             }
-            Drag::Pan | Drag::Connect { .. } => {}
+            Drag::Pan | Drag::Connect { .. } | Drag::Zoom { .. } => {}
         }
         self.drag = Some(drag);
     }
@@ -771,6 +772,16 @@ impl App {
                 if let Some(t) = target {
                     self.checkpoint();
                     self.doc.node_mut(from).reactions.push(crate::doc::Reaction { action: crate::doc::Action::Navigate(t), ..Default::default() });
+                }
+            }
+            Some(Drag::Zoom { start }) => {
+                let r = Rect::from_two_pos(start, w);
+                if let Some(screen) = self.canvas_rect {
+                    if r.width().max(r.height()) * self.view.zoom > 4.0 {
+                        self.view = View::fit(r, screen, 256.0);
+                    } else {
+                        self.view.zoom_at(self.view.to_screen(w), 2.0);
+                    }
                 }
             }
             Some(Drag::Guide { index }) => {
@@ -885,6 +896,10 @@ impl App {
                         _ => {}
                     }
                 }
+            }
+            Tool::Zoom => {
+                let at = self.view.to_screen(w);
+                self.view.zoom_at(at, if mods.alt { 0.5 } else { 2.0 });
             }
             Tool::Text => {
                 // Created on release so the new field keeps keyboard focus.
@@ -1422,7 +1437,7 @@ impl App {
             }
             pill(painter, sa.lerp(sb, 0.5) + t * 3.0, num(a.distance(*b)), GAP);
         }
-        if let (Some(Drag::Marquee { start, .. }), Some(p)) = (&self.drag, ptr) {
+        if let (Some(Drag::Marquee { start, .. } | Drag::Zoom { start }), Some(p)) = (&self.drag, ptr) {
             let r = Rect::from_two_pos(self.view.to_screen(*start), p);
             painter.rect_filled(r, 0.0, BLUE.gamma_multiply(0.1));
             painter.rect_stroke(r, 0.0, Stroke::new(1.0, BLUE), StrokeKind::Inside);
@@ -1649,6 +1664,8 @@ impl App {
                 Tool::Text => CursorIcon::Text,
                 Tool::Comment => CursorIcon::Cell,
                 Tool::Hand => CursorIcon::Grab,
+                Tool::Zoom if ui.input(|i| i.modifiers.alt) => CursorIcon::ZoomOut,
+                Tool::Zoom => CursorIcon::ZoomIn,
                 _ => CursorIcon::Crosshair,
             }
         };

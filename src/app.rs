@@ -25,6 +25,8 @@ pub enum Tool {
     Text,
     /// C: drop comment pins.
     Comment,
+    /// Z: click zooms in, Alt-click out, drag a box to zoom to it.
+    Zoom,
 }
 
 impl Tool {
@@ -64,6 +66,8 @@ pub enum Drag {
     Pencil { points: Vec<Pos2> },
     /// Prototype tab: dragging a connection from a layer to a frame.
     Connect { from: NodeId },
+    /// Zoom tool: the box to zoom to.
+    Zoom { start: Pos2 },
     /// A ruler guide being dragged (or just pulled out of a ruler).
     Guide { index: usize },
     /// Smart selection: a spacing handle sets every gap along `axis` (0 = row) at once.
@@ -163,6 +167,8 @@ pub struct App {
     pub guides: Vec<[Pos2; 2]>,
     /// Equal-spacing markers while snapping: world segments across each matching gap.
     pub gap_marks: Vec<[Pos2; 2]>,
+    /// Z held down: the tool to go back to on release, and when Z went down.
+    pub zoom_hold: Option<(Tool, f64)>,
     /// The selected ruler guide on this page (Backspace deletes it).
     pub guide_sel: Option<usize>,
     /// Pressed a ruler (new guide on this axis) or an existing guide; a drag moves it.
@@ -289,6 +295,7 @@ impl App {
             renaming_page: None,
             guides: vec![],
             gap_marks: vec![],
+            zoom_hold: None,
             guide_sel: None,
             guide_grab: None,
             frame_labels: vec![],
@@ -2108,6 +2115,15 @@ impl App {
                 }
                 Event::Paste(t) if !typing => self.paste_text(&t),
                 Event::Key { key, pressed: true, modifiers: m, .. } => self.key(ctx, key, m, typing),
+                // Holding Z zooms for a moment, then hands back the previous tool (Figma).
+                Event::Key { key: Key::Z, pressed: false, .. } => {
+                    if let Some((prev, t0)) = self.zoom_hold.take()
+                        && ctx.input(|i| i.time) - t0 > 0.4
+                        && self.tool == Tool::Zoom
+                    {
+                        self.set_tool(prev);
+                    }
+                }
                 _ => {}
             }
         }
@@ -2300,6 +2316,14 @@ impl App {
             (false, false, false, Key::P) => self.set_tool(Tool::Pen),
             (false, false, false, Key::T) => self.set_tool(Tool::Text),
             (false, false, false, Key::C) => self.set_tool(Tool::Comment),
+            (false, false, false, Key::Z) => {
+                if self.tool != Tool::Zoom {
+                    self.zoom_hold = Some((self.tool, ctx.input(|i| i.time)));
+                    self.set_tool(Tool::Zoom);
+                }
+            }
+            (false, false, false, Key::N) => self.zoom_frame(ctx, 1),
+            (false, true, false, Key::N) => self.zoom_frame(ctx, -1),
             (false, true, false, Key::C) => self.show_comments = !self.show_comments,
             _ => {}
         }
@@ -2308,6 +2332,23 @@ impl App {
     pub fn zoom_step(&mut self, ctx: &egui::Context, f: f32) {
         let c = ctx.content_rect().center();
         self.view.zoom_at(c, f);
+    }
+
+    /// N / Shift N: zoom to the next / previous top-level frame, in layers-panel order (top
+    /// first), counting from the frame in view (or holding the selection).
+    pub fn zoom_frame(&mut self, ctx: &egui::Context, step: isize) {
+        let frames: Vec<NodeId> = self.doc.pages[self.page].children.iter().rev().copied().filter(|&f| self.doc.node(f).kind.is_frame() && self.doc.node(f).visible).collect();
+        if frames.is_empty() {
+            return;
+        }
+        let center = self.view.to_world(self.canvas_rect.unwrap_or(ctx.content_rect()).center());
+        let cur = frames
+            .iter()
+            .position(|&f| self.doc.node(f).aabb().contains(center))
+            .or_else(|| self.sel.first().and_then(|&s| frames.iter().position(|&f| f == crate::prototype::top_frame(&self.doc, s))));
+        let n = frames.len() as isize;
+        let i = cur.map_or(if step > 0 { 0 } else { n - 1 }, |c| (c as isize + step).rem_euclid(n));
+        self.zoom_to(ctx, Some(vec![frames[i as usize]]), false);
     }
 
     /// Zoom to fit `ids` (None = whole page); `actual` = 100% centered on content.
