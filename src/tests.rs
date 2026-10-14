@@ -2048,3 +2048,36 @@ fn color_picker_drags_and_escape_from_find_keeps_selection() {
     assert!(!h.state().find.0);
     assert_eq!(h.state().sel, vec![id], "selection kept");
 }
+
+#[test]
+fn layers_panel_shift_ranges_multi_drag_and_reveal() {
+    let mut h = harness();
+    let ids: Vec<NodeId> = (0..60).map(|i| h.state_mut().doc.insert(0, None, None, Node::new(Kind::Rectangle, r(i as f32 * 30., 0., 20., 20.)))).collect();
+    h.run_steps(2);
+    let row = |h: &Harness<App>, name: &str| h.get_by_label(name).rect();
+    let click_row = |h: &mut Harness<App>, name: &str, m| {
+        let p = row(h, name).center();
+        click(h, p, m);
+    };
+    // The list is top-first: Rectangle 60 is the top row.
+    click_row(&mut h, "Rectangle 60", Modifiers::NONE);
+    click_row(&mut h, "Rectangle 57", Modifiers::SHIFT);
+    let mut sel = h.state().sel.clone();
+    sel.sort();
+    assert_eq!(sel, ids[56..60].to_vec(), "Shift-click selects the range");
+    click_row(&mut h, "Rectangle 58", Modifiers::COMMAND);
+    assert_eq!(h.state().sel.len(), 3, "Cmd-click toggles one row");
+    // Drag two selected rows below Rectangle 55: both move, in their order.
+    h.state_mut().sel = vec![ids[59], ids[58]];
+    h.run_steps(2);
+    let (from, to) = (row(&h, "Rectangle 60").center(), row(&h, "Rectangle 55").center() + vec2(0.0, 8.0));
+    drag(&mut h, from, to, Modifiers::NONE);
+    let kids = &h.state().doc.pages[0].children;
+    assert_eq!(kids[54..57].to_vec(), vec![ids[58], ids[59], ids[54]], "moved together, order kept");
+    // Rows are virtualized: the bottom one isn't built until the selection scrolls it into view.
+    assert!(h.query_by_label("Rectangle 1").is_none());
+    h.state_mut().sel = vec![ids[0]];
+    h.run_steps(3);
+    let r1 = row(&h, "Rectangle 1");
+    assert!(r1.max.y <= 900.0 && r1.min.y > 0.0, "revealed at {r1:?}");
+}

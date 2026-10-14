@@ -527,7 +527,8 @@ impl App {
     // ---------- left: menu, pages, layers ----------
 
     pub fn left_panel(&mut self, ui: &mut Ui) {
-        if self.sel != self.prev_sel {
+        let reveal = self.sel != self.prev_sel;
+        if reveal {
             self.prev_sel = self.sel.clone();
             for id in self.sel.clone() {
                 for a in self.doc.ancestors(id) {
@@ -574,13 +575,23 @@ impl App {
             if let Some(q) = &mut self.layer_search {
                 ui.add(egui::TextEdit::singleline(q).hint_text("Find layers").desired_width(f32::INFINITY));
             }
-            // Only the rows in view are built, so huge files stay fast.
+            // Only the rows in view are built, so huge files stay fast. Figma's layer rows are
+            // 32 points tall; `show_rows` adds item spacing to each row, so there is none.
             let rows = self.layer_rows();
-            let row_h = 28.0;
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, row_h, rows.len(), |ui, range| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                self.layers(ui, &rows[range]);
-            });
+            let row_h = 32.0;
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let view_key = ui.id().with("layers-view");
+            let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+            // A new canvas selection scrolls its first row into view, as in Figma.
+            if reveal && let Some(i) = rows.iter().position(|(id, _)| self.sel.contains(id)) {
+                let (top, h): (f32, f32) = ui.data(|d| d.get_temp(view_key)).unwrap_or_default();
+                let y = i as f32 * row_h;
+                if y < top || y + row_h > top + h {
+                    area = area.vertical_scroll_offset((y + (row_h - h) / 2.0).max(0.0));
+                }
+            }
+            let out = area.show_rows(ui, row_h, rows.len(), |ui, range| self.layers(ui, &rows, range));
+            ui.data_mut(|d| d.insert_temp(view_key, (out.state.offset.y, out.inner_rect.height())));
         });
     }
 
@@ -1178,11 +1189,11 @@ impl App {
         out
     }
 
-    fn layers(&mut self, ui: &mut Ui, rows: &[(NodeId, usize)]) {
+    /// The rows in `range` of `rows` (all of them are needed for Shift-click ranges).
+    fn layers(&mut self, ui: &mut Ui, rows: &[(NodeId, usize)], range: std::ops::Range<usize>) {
         let mut rects: Vec<(NodeId, Rect)> = vec![];
-        let shift = ui.input(|i| i.modifiers.shift || i.modifiers.command);
-        for &(id, depth) in rows {
-            // Figma's layer rows are 32 points tall.
+        let (shift, cmd) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
+        for &(id, depth) in &rows[range] {
             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click_and_drag());
             rects.push((id, rect));
             let n = self.doc.node(id).clone();
@@ -1266,8 +1277,19 @@ impl App {
                 } else if at(chev.expand(4.0)) && !self.doc.node(id).children.is_empty() {
                     let n = self.doc.node_mut(id);
                     n.expanded = !n.expanded;
-                } else if shift {
+                } else if cmd {
                     if selected { self.sel.retain(|s| *s != id) } else { self.sel.push(id) }
+                } else if shift && let Some(anchor) = self.sel.last().and_then(|a| rows.iter().position(|r| r.0 == *a)) {
+                    // Shift-click selects the rows from the last selected one to this one; the
+                    // anchor stays last, so the next Shift-click extends from it again.
+                    let i = rows.iter().position(|r| r.0 == id).unwrap_or(anchor);
+                    let mut range: Vec<NodeId> = rows[i.min(anchor)..=i.max(anchor)].iter().map(|r| r.0).collect();
+                    if i > anchor {
+                        range.reverse();
+                    }
+                    self.sel = range;
+                } else if shift {
+                    self.sel.push(id);
                 } else {
                     self.end_text_edit();
                     self.sel = vec![id];
@@ -1288,9 +1310,11 @@ impl App {
         self.layer_drop(ui, &rects);
     }
 
-    /// Drag-and-drop reordering in the layers list.
+    /// Drag-and-drop reordering in the layers list. Dragging a selected row moves every selected
+    /// layer (their top-most roots), keeping their stacking order.
     fn layer_drop(&mut self, ui: &mut Ui, rects: &[(NodeId, Rect)]) {
         let Some(dragged) = self.layer_drag else { return };
+        let moving = if self.sel.contains(&dragged) { self.doc.sort_by_z(&self.sel_roots()) } else { vec![dragged] };
         let (ptr, released) = ui.input(|i| (i.pointer.hover_pos(), i.pointer.any_released()));
         let target = ptr.and_then(|p| {
             rects.iter().find(|(_, r)| p.y >= r.min.y && p.y < r.max.y).map(|&(id, r)| {
@@ -1300,7 +1324,7 @@ impl App {
                 (id, r, zone)
             })
         });
-        let valid = |id: NodeId| id != dragged && !self.doc.is_ancestor(dragged, id);
+        let valid = |id: NodeId| moving.iter().all(|&m| id != m && !self.doc.is_ancestor(m, id));
         if let Some((id, r, zone)) = target.filter(|t| valid(t.0)) {
             let p = ui.painter();
             match zone {
@@ -1316,17 +1340,22 @@ impl App {
                 self.checkpoint();
                 let n = self.doc.node(id);
                 let into_top = zone == 1 || (zone == 2 && n.expanded && !n.children.is_empty());
-                if into_top {
-                    self.doc.reparent(dragged, self.page, Some(id), None);
-                } else {
-                    let parent = n.parent;
-                    let list: Vec<NodeId> = self.doc.children_of(self.page, parent).iter().copied().filter(|c| *c != dragged).collect();
-                    let i = list.iter().position(|c| *c == id).unwrap_or(0);
-                    // The list is drawn top-first, so "above" means a higher z index.
-                    self.doc.reparent(dragged, self.page, parent, Some(if zone == 0 { i + 1 } else { i }));
+                let parent = if into_top { Some(id) } else { n.parent };
+                // Bottom-most first: each goes in just above the one before it.
+                let mut below: Option<NodeId> = None;
+                for &m in &moving {
+                    let list: Vec<NodeId> = self.doc.children_of(self.page, parent).iter().copied().filter(|c| *c != m).collect();
+                    let at = match below {
+                        Some(b) => list.iter().position(|c| *c == b).map_or(list.len(), |i| i + 1),
+                        None if into_top => list.len(),
+                        // The list is drawn top-first, so "above" means a higher z index.
+                        None => list.iter().position(|c| *c == id).map_or(0, |i| if zone == 0 { i + 1 } else { i }),
+                    };
+                    self.doc.reparent(m, self.page, parent, Some(at));
+                    below = Some(m);
                 }
                 self.doc.reflow();
-                self.sel = vec![dragged];
+                self.sel = moving;
             }
         }
         if released {
