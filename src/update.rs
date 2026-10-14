@@ -80,32 +80,39 @@ impl Updater {
         }
         let now = self.state.lock().unwrap().clone();
         let changed = now != self.seen;
-        if changed && let State::Ready(_) = &now {
-            restart();
-        }
         self.seen = now;
         changed
+    }
+
+    /// Installed and waiting for a restart.
+    pub fn ready(&self) -> bool {
+        matches!(self.seen, State::Ready(_))
+    }
+
+    /// Quit and start the installed version. Callers make sure nothing is unsaved first.
+    pub fn restart(&self) {
+        restart();
     }
 
     pub fn button_label(&self) -> Option<&'static str> {
         match &self.seen {
             State::Available { .. } => Some("Update now"),
             State::Installing(_) => Some("Updating…"),
-            State::Ready(_) => Some("Restarting…"),
+            State::Ready(_) => Some("Restart to update"),
             State::Failed(_) => Some("Update failed"),
             State::Idle => None,
         }
     }
 
     pub fn busy(&self) -> bool {
-        matches!(self.seen, State::Installing(_) | State::Ready(_))
+        matches!(self.seen, State::Installing(_))
     }
 
     pub fn tooltip(&self) -> String {
         match &self.seen {
             State::Available { version, .. } => format!("Katachi {version} is available. Installs and restarts."),
             State::Installing(v) => format!("Installing Katachi {v}"),
-            State::Ready(v) => format!("Katachi {v} installed"),
+            State::Ready(v) => format!("Katachi {v} is installed. Restart to use it."),
             State::Failed(e) => format!("{e}\nClick to try again."),
             State::Idle => String::new(),
         }
@@ -132,7 +139,7 @@ impl Updater {
         drop(s);
         let (state, wake) = (self.state.clone(), self.wake.clone());
         std::thread::spawn(move || {
-            let done = install(&url, &sig).map_or_else(|e| State::Failed(format!("Couldn't update: {e}")), |()| State::Ready(version));
+            let done = install(&url, &sig, &version).map_or_else(|e| State::Failed(format!("Couldn't update: {e}")), |()| State::Ready(version));
             *state.lock().unwrap() = done;
             if let Some(ctx) = wake.lock().unwrap().as_ref() {
                 ctx.request_repaint();
@@ -210,17 +217,23 @@ fn curl_text(url: &str) -> Result<String, String> {
     curl(&[url]).map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
-/// Whether `sig` (a .minisig file's text) is a valid signature of `data` by the release key.
-pub fn verified(data: &[u8], sig: &str) -> bool {
+/// Whether `sig` (a .minisig file's text) is a valid signature of `data` by the release key, and
+/// its signed comment names `comment` (CI signs "Katachi v0.4.0 <asset>"), so an older signed
+/// build can't be passed off as a newer one.
+pub fn verified(data: &[u8], sig: &str, comment: &str) -> bool {
     let Ok(pk) = minisign_verify::PublicKey::from_base64(PUBLIC_KEY) else { return false };
     let Ok(sig) = minisign_verify::Signature::decode(sig) else { return false };
-    pk.verify(data, &sig, false).is_ok()
+    pk.verify(data, &sig, false).is_ok() && sig.trusted_comment() == comment
 }
 
-fn install(url: &str, sig_url: &str) -> Result<(), String> {
+fn signed_comment(version: &str) -> String {
+    format!("Katachi v{version} {ASSET}")
+}
+
+fn install(url: &str, sig_url: &str, version: &str) -> Result<(), String> {
     let data = curl(&[url])?;
     let sig = curl_text(sig_url)?;
-    if !verified(&data, &sig) {
+    if !verified(&data, &sig, &signed_comment(version)) {
         return Err("the download's signature doesn't match".into());
     }
     let target = install_target()?;
@@ -312,7 +325,7 @@ mod tests {
     fn live_release_is_signed() {
         let Some(State::Available { version, url, sig }) = check("0.0.1").unwrap() else { panic!("no release with a signed {ASSET}") };
         let data = curl(&[&url]).unwrap();
-        assert!(verified(&data, &curl_text(&sig).unwrap()), "{version}: {ASSET} doesn't match its signature");
+        assert!(verified(&data, &curl_text(&sig).unwrap(), &signed_comment(&version)), "{version}: {ASSET} doesn't match its signature");
         eprintln!("Katachi {version}: {ASSET} ({} MB) verified", data.len() >> 20);
     }
 
@@ -330,8 +343,9 @@ mod tests {
     fn only_release_signed_downloads_install() {
         // Signed with the release key.
         let sig = "untrusted comment: signature from minisign secret key\nRUQKsFj9GVe/+3EEA6Zds7Ncw7J2OBBHvXGvAHELYzKbel7k//o880elLYk6u4oirUkDuaExd6f6Lz5wrT43umXI925K9GudQgY=\ntrusted comment: test\ndi06iVvvVOGA1NkFmpibCA7q+GPrDziuu/mBhwf1KgNUtzqpitYS+XqJCF6HMpocXjQtIV2p+J8fWTotP5XEDg==\n";
-        assert!(verified(b"hello katachi\n", sig));
-        assert!(!verified(b"hello katachi!\n", sig), "a changed download fails");
-        assert!(!verified(b"hello katachi\n", "garbage"));
+        assert!(verified(b"hello katachi\n", sig, "test"));
+        assert!(!verified(b"hello katachi!\n", sig, "test"), "a changed download fails");
+        assert!(!verified(b"hello katachi\n", "garbage", "test"));
+        assert!(!verified(b"hello katachi\n", sig, "Katachi v9.9.9 x"), "a signature for another version fails");
     }
 }

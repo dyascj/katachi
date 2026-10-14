@@ -378,6 +378,9 @@ impl Shell {
             self.tabs[i].toast(format!("Save {name} before updating"));
             return;
         }
+        if self.update.ready() {
+            return self.update.restart();
+        }
         self.update.install();
     }
 }
@@ -826,6 +829,10 @@ impl eframe::App for Shell {
         self.wants();
         self.close_guard(&ctx);
         if self.update.poll(&ctx) {
+            // Restart straight into the new version, unless work was changed while it downloaded.
+            if self.update.ready() && !self.tabs.iter().any(|t| t.dirty) {
+                self.update.restart();
+            }
             ctx.request_repaint();
         }
     }
