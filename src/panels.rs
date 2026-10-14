@@ -826,9 +826,19 @@ impl App {
                 self.select_all();
                 ui.close();
             }
+            if item(ui, "Select inverse", "⇧⌘A") {
+                self.select_inverse();
+                ui.close();
+            }
             if enabled(ui, has, "Select matching layers", "⌥⌘A") {
                 self.select_matching();
                 ui.close();
+            }
+            for (what, label) in crate::app::Same::MENU {
+                if enabled(ui, has, label, "") {
+                    self.select_same(what);
+                    ui.close();
+                }
             }
             if item(ui, "Find and replace…", "⌘F") {
                 self.find.0 = true;

@@ -68,6 +68,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Undo, redo", "⌘ Z, ⇧ ⌘ Z"),
     ("Copy, paste, cut, duplicate", "⌘ C, ⌘ V, ⌘ X, ⌘ D"),
     ("Copy and paste properties", "⌥ ⌘ C, ⌥ ⌘ V"),
+    ("Select all, inverse, matching layers", "⌘ A, ⇧ ⌘ A, ⌥ ⌘ A"),
     ("Group, frame selection, ungroup", "⌘ G, ⌥ ⌘ G, ⇧ ⌘ G"),
     ("Auto layout, remove auto layout", "⇧ A, ⌥ ⇧ A"),
     ("Create component, detach instance", "⌥ ⌘ K, ⌥ ⌘ B"),

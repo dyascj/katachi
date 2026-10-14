@@ -1,7 +1,7 @@
 //! Quick actions (Cmd / or Cmd K), as in Figma: type to find any command, tool, plugin or layer,
 //! arrow to pick, Enter to run.
 
-use crate::app::{App, Tool};
+use crate::app::{App, Same, Tool};
 use crate::doc::{BoolOp, NodeId};
 use egui::{Key, RichText};
 
@@ -51,7 +51,13 @@ const COMMANDS: &[(&str, &str, Run)] = &[
     ("Duplicate", "⌘D", |a, _| a.duplicate_selection()),
     ("Delete", "⌫", |a, _| a.delete_selection()),
     ("Select all", "⌘A", |a, _| a.select_all()),
+    ("Select inverse", "⇧⌘A", |a, _| a.select_inverse()),
     ("Select matching layers", "⌥⌘A", |a, _| a.select_matching()),
+    ("Select all with same fill", "", |a, _| a.select_same(Same::Fill)),
+    ("Select all with same stroke", "", |a, _| a.select_same(Same::Stroke)),
+    ("Select all with same effect", "", |a, _| a.select_same(Same::Effect)),
+    ("Select all with same font", "", |a, _| a.select_same(Same::Font)),
+    ("Select all with same instance", "", |a, _| a.select_same(Same::Instance)),
     ("Show/Hide selection", "⇧⌘H", |a, _| a.toggle_visible()),
     ("Lock/Unlock selection", "⇧⌘L", |a, _| a.toggle_locked()),
     ("Rulers", "⇧R", |a, _| a.rulers = !a.rulers),

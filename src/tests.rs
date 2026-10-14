@@ -2108,3 +2108,41 @@ fn undo_brings_back_the_selection_and_page() {
     assert_eq!((h.state().page, h.state().sel.clone()), (1, vec![b]));
     assert_eq!(rect(&h, b).min.y, 0.0);
 }
+
+#[test]
+fn select_all_inverse_and_same_properties() {
+    use crate::app::Same;
+    use crate::doc::{Paint, Rgba};
+    let mut h = harness();
+    let add = |h: &mut Harness<App>, kind, c| {
+        let mut n = Node::new(kind, r(0., 0., 20., 20.));
+        n.fills = vec![Paint::solid(c)];
+        h.state_mut().doc.insert(0, None, None, n)
+    };
+    let (red, blue) = (Rgba::rgb(255, 0, 0), Rgba::rgb(0, 0, 255));
+    let a = add(&mut h, Kind::Rectangle, red);
+    let b = add(&mut h, Kind::Ellipse, red);
+    let c = add(&mut h, Kind::Rectangle, blue);
+    let locked = add(&mut h, Kind::Rectangle, red);
+    h.state_mut().doc.node_mut(locked).locked = true;
+    key(&mut h, Modifiers::COMMAND, Key::A);
+    assert_eq!(h.state().sel, vec![a, b, c], "Cmd A skips locked layers");
+    h.state_mut().sel = vec![a];
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::A);
+    assert_eq!(h.state().sel, vec![b, c], "select inverse");
+    h.state_mut().sel = vec![a];
+    h.state_mut().select_same(Same::Fill);
+    assert_eq!(h.state().sel, vec![a, b], "same fill, any kind");
+    // No stroke on the layer: the selection stays.
+    h.state_mut().select_same(Same::Stroke);
+    assert_eq!(h.state().sel, vec![a, b]);
+    let text = |h: &mut Harness<App>, size| {
+        let mut t = Node::new(Kind::Text, r(0., 50., 80., 20.));
+        (t.text, t.font_size) = ("Hi".into(), size);
+        h.state_mut().doc.insert(0, None, None, t)
+    };
+    let (t1, _, t3) = (text(&mut h, 16.0), text(&mut h, 24.0), text(&mut h, 16.0));
+    h.state_mut().sel = vec![t1];
+    h.state_mut().select_same(Same::Font);
+    assert_eq!(h.state().sel, vec![t1, t3]);
+}

@@ -861,9 +861,20 @@ impl App {
         }
     }
 
+    /// Cmd A: the selection's siblings (or the page's layers), skipping locked ones as Figma does.
     pub fn select_all(&mut self) {
+        self.sel = self.unselected_siblings(&[]);
+    }
+
+    /// Shift Cmd A: the selection's siblings that aren't selected.
+    pub fn select_inverse(&mut self) {
+        let sel = self.sel.clone();
+        self.sel = self.unselected_siblings(&sel);
+    }
+
+    fn unselected_siblings(&self, except: &[NodeId]) -> Vec<NodeId> {
         let parent = self.sel.first().and_then(|&s| self.doc.node(s).parent);
-        self.sel = self.doc.children_of(self.page, parent).clone();
+        self.doc.children_of(self.page, parent).iter().copied().filter(|id| !except.contains(id) && !self.doc.node(*id).locked).collect()
     }
 
     pub fn nudge(&mut self, d: Vec2) {
@@ -1016,15 +1027,37 @@ impl App {
                 && b.shadows == a.shadows
                 && b.radius == a.radius
                 && b.component == a.component
-                && (a.kind != Kind::Text || (b.font_family == a.font_family && b.font_size == a.font_size && b.font_weight == a.font_weight))
+                && (a.kind != Kind::Text || same_font(&a, b))
         };
-        let page = self.doc.pages[self.page].children.clone();
+        self.select_where(same);
+    }
+
+    /// Edit > Select all with same fill, stroke, effect, font or instance (searches the page).
+    /// Does nothing when the selected layer has none of that property.
+    pub fn select_same(&mut self, what: Same) {
+        let Some(&first) = self.sel.first() else { return };
+        let a = self.doc.node(if what == Same::Instance { self.owning_instance(first).unwrap_or(first) } else { first }).clone();
+        let same = |b: &Node| match what {
+            Same::Fill => !a.fills.is_empty() && a.first_fill().map_or(b.fills == a.fills, |c| b.first_fill() == Some(c)),
+            Same::Stroke => !a.strokes.is_empty() && b.strokes == a.strokes && b.stroke_width == a.stroke_width,
+            Same::Effect => !a.shadows.is_empty() && b.shadows == a.shadows,
+            Same::Font => a.kind == Kind::Text && b.kind == Kind::Text && same_font(&a, b),
+            Same::Instance => a.kind == Kind::Instance && b.kind == Kind::Instance && b.component == a.component,
+        };
+        if same(&a) {
+            self.select_where(same);
+        }
+    }
+
+    /// Select every visible, unlocked layer on the page that passes `f`.
+    fn select_where(&mut self, f: impl Fn(&Node) -> bool) {
+        let page = &self.doc.pages[self.page].children;
         self.sel = page
             .iter()
             .flat_map(|&r| std::iter::once(r).chain(self.doc.descendants(r)))
             .filter(|&id| {
                 let n = self.doc.node(id);
-                n.visible && !n.locked && same(n)
+                n.visible && !n.locked && f(n)
             })
             .collect();
     }
@@ -2173,6 +2206,7 @@ impl App {
             (true, false, false, Key::Y) => self.outline_mode = !self.outline_mode,
             (true, false, true, Key::O) => self.outline_stroke_selection(),
             (true, false, true, Key::A) => self.select_matching(),
+            (true, true, false, Key::A) => self.select_inverse(),
             (true, true, false, Key::C) => self.copy_as(ctx, "png"),
             (true, false, false, Key::R) => {
                 if let Some(&id) = self.sel.first() {
@@ -2319,6 +2353,30 @@ impl App {
 }
 
 fn void(_: bool) {}
+
+fn same_font(a: &Node, b: &Node) -> bool {
+    b.font_family == a.font_family && b.font_size == a.font_size && b.font_weight == a.font_weight
+}
+
+/// What Edit > Select all with same... compares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Same {
+    Fill,
+    Stroke,
+    Effect,
+    Font,
+    Instance,
+}
+
+impl Same {
+    pub const MENU: [(Same, &str); 5] = [
+        (Same::Fill, "Select all with same fill"),
+        (Same::Stroke, "Select all with same stroke"),
+        (Same::Effect, "Select all with same effect"),
+        (Same::Font, "Select all with same font"),
+        (Same::Instance, "Select all with same instance"),
+    ];
+}
 
 impl eframe::App for App {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
