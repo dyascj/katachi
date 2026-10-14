@@ -404,7 +404,7 @@ impl App {
             self.press = Some(Press { world: w, target: None, handle: None, toggle_off: false });
             return;
         }
-        if tool == Tool::Move && self.vector_edit.is_some() && self.vector_press(s, mods.shift) {
+        if tool == Tool::Move && self.vector_edit.is_some() && self.vector_press(s, mods) {
             self.press = Some(Press { world: w, target: None, handle: None, toggle_off: false });
             return;
         }
@@ -449,6 +449,9 @@ impl App {
                     self.pending_frame = target;
                 }
             }
+            Tool::Pen if self.pen.is_empty() && self.pen_continue(s) => {
+                self.press = Some(Press { world: w, target: None, handle: None, toggle_off: false });
+            }
             Tool::Pen => {
                 let close = self.pen.len() >= 2 && self.view.to_screen(self.pen[0].p).distance(s) < 8.0;
                 if close {
@@ -486,8 +489,14 @@ impl App {
             return;
         }
         let start = press.world;
-        if self.vector_edit.is_some() {
-            self.drag = self.vector_drag_start();
+        if let Some(ve) = &self.vector_edit {
+            self.drag = match self.vector_grabbed {
+                None if ve.tool == crate::vector_edit::VTool::Move => {
+                    self.vector_outside = false;
+                    Some(Drag::PointMarquee { start, base_sel: ve.selected.clone() })
+                }
+                _ => self.vector_drag_start(),
+            };
             self.vector_start = start;
             return;
         }
@@ -722,6 +731,10 @@ impl App {
                 }
                 self.sel = sel;
             }
+            Drag::PointMarquee { start, base_sel } => {
+                let (r, base) = (Rect::from_two_pos(*start, w), base_sel.clone());
+                self.vector_marquee(r, &base);
+            }
             Drag::Vector { base, id, grab } => {
                 let (base, id, grab) = (base.clone(), *id, *grab);
                 self.vector_drag(&base, id, grab, self.vector_start, w, mods.alt);
@@ -839,7 +852,7 @@ impl App {
                 }
             }
             Some(Drag::Pencil { points }) => {
-                let pts = smooth_stroke(&points, 1.5 / self.view.zoom);
+                let pts = smooth_stroke(&points, self.prefs.pencil_smoothing / self.view.zoom);
                 if pts.len() >= 2 {
                     self.checkpoint();
                     let parent = self.frame_at(points[0], &[]);
@@ -911,6 +924,12 @@ impl App {
         }
         if self.vector_edit.is_some() {
             self.press = None;
+            if std::mem::take(&mut self.vector_outside) {
+                // A click on empty canvas outside the path leaves edit mode and selects as usual.
+                self.vector_edit = None;
+                self.on_press(self.view.to_screen(w), w, mods);
+                self.on_click(w, mods);
+            }
             return;
         }
         match self.tool {
@@ -990,7 +1009,7 @@ impl App {
             return;
         }
         if let [one] = self.sel[..]
-            && matches!(self.doc.node(one).kind, Kind::Vector | Kind::Rectangle | Kind::Ellipse)
+            && matches!(self.doc.node(one).kind, Kind::Vector | Kind::Rectangle | Kind::Ellipse | Kind::Polygon | Kind::Star)
                 && self.doc.node(one).aabb().expand(4.0 / self.view.zoom).contains(w)
             {
                 self.enter_vector_edit(one);
@@ -1494,8 +1513,12 @@ impl App {
             self.outline(painter, h, 2.0);
         }
         if self.vector_edit.is_some() {
-            self.draw_vector_edit(painter);
-            self.draw_pen(painter, ptr);
+            self.draw_vector_edit(painter, ptr);
+            if let (Some(Drag::PointMarquee { start, .. }), Some(p)) = (&self.drag, ptr) {
+                let r = Rect::from_two_pos(self.view.to_screen(*start), p);
+                painter.rect_filled(r, 0.0, BLUE.gamma_multiply(0.1));
+                painter.rect_stroke(r, 0.0, Stroke::new(1.0, BLUE), StrokeKind::Inside);
+            }
             return;
         }
         let roots = self.sel_roots();
@@ -2015,6 +2038,10 @@ impl App {
         }
         if item(ui, "Outline stroke", "⌥⌘O", has) {
             self.outline_stroke_selection();
+            ui.close();
+        }
+        if self.vector_edit.is_some() && item(ui, "Join selection", "⌘J", self.vector_edit.as_ref().is_some_and(|ve| ve.selected.len() == 2)) {
+            self.vector_join();
             ui.close();
         }
         if item(ui, "Flatten", "⌘E", has) {

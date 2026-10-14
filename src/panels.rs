@@ -1036,6 +1036,11 @@ impl App {
                 self.outline_stroke_selection();
                 ui.close();
             }
+            let two_points = self.vector_edit.as_ref().is_some_and(|ve| ve.selected.len() == 2);
+            if enabled(ui, two_points, "Join selection", "⌘J") {
+                self.vector_join();
+                ui.close();
+            }
             if enabled(ui, has, "Resize to fit", "⌥⇧⌘R") {
                 self.resize_to_fit();
                 ui.close();

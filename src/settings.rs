@@ -24,11 +24,13 @@ pub struct Prefs {
     pub pixel_grid: bool,
     /// Shift Cmd ': positions and sizes round to whole pixels.
     pub snap_to_pixels: bool,
+    /// Pencil: how far (screen points) a stroke may stray from the raw pointer path when simplified.
+    pub pencil_smoothing: f32,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { name: String::new(), snap_to_objects: true, highlight_on_hover: true, keep_tool_selected: false, show_dimensions: true, nudge: 1.0, big_nudge: 10.0, check_updates: true, system_title_bar: false, pixel_grid: true, snap_to_pixels: true }
+        Prefs { name: String::new(), snap_to_objects: true, highlight_on_hover: true, keep_tool_selected: false, show_dimensions: true, nudge: 1.0, big_nudge: 10.0, check_updates: true, system_title_bar: false, pixel_grid: true, snap_to_pixels: true, pencil_smoothing: 1.5 }
     }
 }
 
@@ -75,6 +77,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Frame, Section, Slice", "F or A, ⇧ S, S"),
     ("Rectangle, Line, Arrow, Ellipse", "R, L, ⇧ L, O"),
     ("Pen, Pencil, Text, Comment", "P, ⇧ P, T, C"),
+    ("Vector edit: move, pen, cut, join, bend", "V, P, Y, ⌘ J, ⌘ drag"),
     ("Undo, redo", "⌘ Z, ⇧ ⌘ Z"),
     ("Copy, paste, cut, duplicate", "⌘ C, ⌘ V, ⌘ X, ⌘ D"),
     ("Paste over selection, paste to replace", "⇧ ⌘ V, ⇧ ⌘ R"),
@@ -417,6 +420,9 @@ fn canvas_tab(ui: &mut Ui, p: &mut Prefs) {
     });
     row(ui, "Pixel grid", "Show pixel boundaries at 800% zoom and above", |ui| {
         toggle(ui, &mut p.pixel_grid);
+    });
+    row(ui, "Pencil smoothing", "Higher makes freehand strokes smoother, with fewer points", |ui| {
+        ui.add(egui::Slider::new(&mut p.pencil_smoothing, 0.5..=10.0).show_value(false));
     });
     section(ui, "Nudge amount");
     row(ui, "Small nudge", "Arrow keys", |ui| {

@@ -50,6 +50,12 @@ const COMMANDS: &[(&str, &str, Run)] = &[
     ("Exclude selection", "⌥⇧E", |a, _| a.boolean_selection(BoolOp::Exclude)),
     ("Flatten", "⌘E", |a, _| a.flatten_selection()),
     ("Outline stroke", "⌥⌘O", |a, _| a.outline_stroke_selection()),
+    ("Join selection (vector points)", "⌘J", |a, _| a.vector_join()),
+    ("Cut tool (vector edit)", "Y", |a, _| {
+        if let Some(ve) = a.vector_edit.as_mut() {
+            ve.tool = crate::vector_edit::VTool::Cut;
+        }
+    }),
     ("Use as mask", "⌃⌘M", |a, _| a.toggle_mask()),
     ("Resize to fit", "⌥⇧⌘R", |a, _| a.resize_to_fit()),
     ("Remove fill", "", |a, _| a.remove_fills()),

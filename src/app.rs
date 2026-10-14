@@ -61,6 +61,8 @@ pub enum Drag {
     Rotate { base: Document, center: Pos2, start_angle: f32, start_rot: f32, deg: f32 },
     Create { base: Document, start: Pos2, id: NodeId },
     Marquee { start: Pos2, base_sel: Vec<NodeId> },
+    /// Vector edit: selecting anchors in a box, added to `base_sel`.
+    PointMarquee { start: Pos2, base_sel: Vec<crate::vector_edit::PointRef> },
     Vector { base: Document, id: NodeId, grab: crate::vector_edit::Grab },
     PenHandle,
     Pencil { points: Vec<Pos2> },
@@ -209,6 +211,8 @@ pub struct App {
     pub vector_edit: Option<crate::vector_edit::VectorEdit>,
     pub vector_grabbed: Option<crate::vector_edit::Grab>,
     pub vector_start: Pos2,
+    /// Vector edit: the press landed on empty canvas outside the path (a click there leaves edit mode).
+    pub vector_outside: bool,
     /// Cmd+\ hides the side panels.
     pub ui_hidden: bool,
     pub rulers: bool,
@@ -331,6 +335,7 @@ impl App {
             vector_edit: None,
             vector_grabbed: None,
             vector_start: Pos2::ZERO,
+            vector_outside: false,
             ui_hidden: false,
             rulers: false,
             outline_mode: false,
@@ -2361,10 +2366,21 @@ impl App {
         if key == Key::Escape && self.editing_text.is_some() {
             return self.end_text_edit();
         }
-        if self.vector_edit.is_some() && !typing && !cmd {
-            match key {
-                Key::Escape | Key::Enter => return self.exit_vector_edit(),
-                Key::Delete | Key::Backspace => return self.vector_delete_points(),
+        if let Some(ve) = self.vector_edit.as_mut().filter(|_| !typing) {
+            use crate::vector_edit::VTool;
+            match (cmd, m.shift, key) {
+                (true, false, Key::J) => return self.vector_join(),
+                // Escape first ends the path being drawn, then drops back to Move, then leaves.
+                (false, _, Key::Escape) if ve.drawing.is_some() => return ve.drawing = None,
+                (false, _, Key::Escape) if ve.tool != VTool::Move => return ve.tool = VTool::Move,
+                (false, _, Key::Escape | Key::Enter) => return self.exit_vector_edit(),
+                (false, _, Key::Delete | Key::Backspace) => return self.vector_delete_points(),
+                (false, false, Key::V) => return ve.tool = VTool::Move,
+                (false, false, Key::P) => return ve.tool = VTool::Pen,
+                (false, false, Key::Y) => {
+                    ve.drawing = None;
+                    return ve.tool = VTool::Cut;
+                }
                 _ => {}
             }
         }
