@@ -67,6 +67,15 @@ pub fn weight_name(w: u16) -> &'static str {
     }
 }
 
+/// Figma's font style names: "Regular", "Italic", "Bold Italic".
+pub fn style_name(w: u16, italic: bool) -> String {
+    match (weight_name(w), italic) {
+        ("Regular", true) => "Italic".into(),
+        (name, true) => format!("{name} Italic"),
+        (name, false) => name.into(),
+    }
+}
+
 #[derive(Default)]
 struct Registry {
     /// Usable now.
@@ -185,7 +194,7 @@ pub fn job(ctx: &egui::Context, n: &Node, text: &str, zoom: f32, color: Color32)
             line_height: (n.line_height != LineHeight::Auto).then(|| line_pitch(n) * zoom),
             underline: if decoration == Decoration::Underline { deco } else { Stroke::NONE },
             strikethrough: if decoration == Decoration::Strikethrough { deco } else { Stroke::NONE },
-            italics: st.italic.unwrap_or(false),
+            italics: st.italic.unwrap_or(n.italic),
             ..Default::default()
         }
     };
@@ -208,6 +217,8 @@ pub fn job(ctx: &egui::Context, n: &Node, text: &str, zoom: f32, color: Color32)
             job.append(&apply_case(&piece, n.text_case), 0.0, format(&st));
         }
     }
+    // Justified rows stretch to the box, except each paragraph's last (Figma, and egui's justify).
+    job.justify = n.text_align == TextAlign::Justify;
     // List rows shift right by their indent afterwards, so they wrap that much narrower.
     let indent = (0..n.lists.len()).map(|p| list_indent(n, p)).fold(0.0, f32::max);
     job.wrap.max_width = match n.text_sizing {

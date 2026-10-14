@@ -388,6 +388,9 @@ impl Svg<'_> {
                         n.font_size,
                         n.font_weight
                     );
+                    if n.italic {
+                        attrs.push_str(r#" font-style="italic""#);
+                    }
                     if n.letter_spacing != 0.0 {
                         let _ = write!(attrs, r#" letter-spacing="{}""#, n.letter_spacing / 100.0 * n.font_size);
                     }
@@ -430,10 +433,17 @@ impl Svg<'_> {
                         }
                         cuts.sort();
                         cuts.dedup();
+                        // Justified lines (all but a paragraph's last) stretch their spaces to the box.
+                        // ponytail: only lines in one style run; mixed runs stay ragged in export.
+                        let justify = n.text_align == TextAlign::Justify && n.text_sizing != crate::doc::TextSizing::AutoWidth && !first && i + 1 < lines.len() && cuts.len() == 2;
                         for (k, w) in cuts.windows(2).enumerate() {
-                            let text: String = body[w[0]..w[1]].iter().collect();
+                            let mut text: String = body[w[0]..w[1]].iter().collect();
                             let (a, b) = (offset + w[0], offset + w[1]);
                             let mut style = String::new();
+                            if justify {
+                                text.truncate(text.trim_end().len());
+                                let _ = write!(style, r#" textLength="{}" lengthAdjust="spacing""#, r.width() - indent);
+                            }
                             if let Some(sp) = n.spans.iter().find(|sp| sp.start <= a && sp.end >= b) {
                                 let st = &sp.style;
                                 if let Some(w) = st.font_weight {
@@ -449,8 +459,10 @@ impl Svg<'_> {
                                     let (c, a) = color_parts(c);
                                     let _ = write!(style, r#" fill="{c}" fill-opacity="{a:.3}""#);
                                 }
-                                if st.italic == Some(true) {
-                                    style.push_str(r#" font-style="italic""#);
+                                match st.italic {
+                                    Some(true) => style.push_str(r#" font-style="italic""#),
+                                    Some(false) if n.italic => style.push_str(r#" font-style="normal""#),
+                                    _ => {}
                                 }
                                 match st.decoration {
                                     Some(Decoration::Underline) => style.push_str(r#" text-decoration="underline""#),

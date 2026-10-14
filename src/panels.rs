@@ -1063,6 +1063,24 @@ impl App {
                 ui.close();
             }
         });
+        ui.menu_button("Text", |ui| {
+            let text = self.editing_text.is_some() || self.sel.iter().any(|&i| self.doc.node(i).kind == Kind::Text);
+            for group in crate::canvas::TEXT_MENU {
+                for &(f, label, short) in *group {
+                    if enabled(ui, text, label, short) {
+                        self.format_text(&ctx, f);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+            }
+            for (kind, label, short) in [(crate::doc::ListKind::Bullet, "Bulleted list", "⇧⌘8"), (crate::doc::ListKind::Number, "Numbered list", "⇧⌘7")] {
+                if enabled(ui, text, label, short) {
+                    self.toggle_list(&ctx, kind);
+                    ui.close();
+                }
+            }
+        });
         ui.menu_button("Arrange", |ui| {
             for (order, label, short) in [(crate::doc::Order::Front, "Bring to front", "⌥⌘]"), (crate::doc::Order::Forward, "Bring forward", "⌘]"), (crate::doc::Order::Backward, "Send backward", "⌘["), (crate::doc::Order::Back, "Send to back", "⌥⌘[")] {
                 if enabled(ui, has, label, short) {
@@ -3417,8 +3435,13 @@ impl App {
         });
         // Alignment and resizing.
         ui.horizontal(|ui| {
-            for (a, icon) in [(TextAlign::Left, Icon::Align(Align::Left)), (TextAlign::Center, Icon::Align(Align::HCenter)), (TextAlign::Right, Icon::Align(Align::Right))] {
-                if icon_button(ui, icon, t.text_align == a, 24.0, &format!("Align {a:?}")).clicked() {
+            for (a, icon, tip) in [
+                (TextAlign::Left, Icon::Align(Align::Left), "Align left  ⌥⌘L"),
+                (TextAlign::Center, Icon::Align(Align::HCenter), "Align center  ⌥⌘T"),
+                (TextAlign::Right, Icon::Align(Align::Right), "Align right  ⌥⌘R"),
+                (TextAlign::Justify, Icon::Menu, "Justify  ⌥⌘J"),
+            ] {
+                if icon_button(ui, icon, t.text_align == a, 24.0, tip).clicked() {
                     t.text_align = a;
                 }
             }
@@ -3457,17 +3480,13 @@ impl App {
             });
         });
         ui.horizontal(|ui| {
-            if ui.selectable_label(false, RichText::new(" I ").italics()).on_hover_text("Italic (selected characters)").clicked() {
-                let on = self
-                    .text_selection(ui.ctx())
-                    .and_then(|(a, _)| n.spans.iter().find(|sp| sp.start <= a && sp.end > a))
-                    .and_then(|sp| sp.style.italic)
-                    .unwrap_or(false);
-                self.style_selection(ui.ctx(), crate::doc::SpanStyle { italic: Some(!on), ..Default::default() });
+            if ui.selectable_label(n.italic, RichText::new(" I ").italics()).on_hover_text(crate::chrome::keys("Italic  ⌘I")).clicked() {
+                self.format_text(ui.ctx(), crate::canvas::TextFmt::Italic);
+                return;
             }
-            for (d, label) in [(Decoration::Underline, RichText::new(" U ").underline()), (Decoration::Strikethrough, RichText::new(" S ").strikethrough())] {
+            for (d, label, tip) in [(Decoration::Underline, RichText::new(" U ").underline(), "Underline  ⌘U"), (Decoration::Strikethrough, RichText::new(" S ").strikethrough(), "Strikethrough  ⇧⌘X")] {
                 let on = t.decoration == d;
-                if ui.selectable_label(on, label).on_hover_text(format!("{d:?}")).clicked() {
+                if ui.selectable_label(on, label).on_hover_text(crate::chrome::keys(tip)).clicked() {
                     t.decoration = if on { Decoration::None } else { d };
                 }
             }

@@ -1805,6 +1805,98 @@ impl App {
         true
     }
 
+    /// Figma's text formatting shortcuts, while editing text or with text layers selected.
+    /// Returns whether one applied (the caller then drops the key's text and clipboard events).
+    pub fn text_shortcut(&mut self, ctx: &egui::Context, key: Key, m: egui::Modifiers, typing: bool) -> bool {
+        let Some(f) = text_fmt_key(key, m) else { return false };
+        // A panel field with focus keeps its keys; the canvas editor doesn't.
+        let editing = self.editing_text.is_some() && (!typing || ctx.memory(|mem| mem.has_focus(egui::Id::new(TEXT_EDIT_ID))));
+        let layers = !typing && self.sel.iter().any(|&i| self.doc.node(i).kind == Kind::Text);
+        (editing || layers) && self.format_text(ctx, f)
+    }
+
+    /// Apply a formatting command to the characters selected in the editor, else to the whole
+    /// edited or selected text layers. Toggles follow the first character or layer, as in Figma.
+    pub fn format_text(&mut self, ctx: &egui::Context, f: TextFmt) -> bool {
+        use crate::doc::{Decoration, LineHeight, SpanStyle};
+        let ids: Vec<NodeId> = match self.editing_text {
+            Some(id) => vec![id],
+            None => self.sel.iter().copied().filter(|&i| self.doc.node(i).kind == Kind::Text).collect(),
+        };
+        let Some(&first) = ids.first() else { return false };
+        let deco = |cur: Decoration, d: Decoration| if cur == d { Decoration::None } else { d };
+        if let (Some((a, b)), Some(id)) = (self.text_selection(ctx), self.editing_text) {
+            let n = self.doc.node(id);
+            let st = n.spans.iter().find(|sp| sp.start <= a && sp.end > a).map(|sp| sp.style.clone()).unwrap_or_default();
+            let family = st.font_family.clone().unwrap_or_else(|| n.font_family.clone());
+            let weight = st.font_weight.unwrap_or(n.font_weight);
+            let patch = match f {
+                TextFmt::Bold => Some(SpanStyle { font_weight: Some(bold_toggle(&family, weight)), ..Default::default() }),
+                TextFmt::Weight(d) => Some(SpanStyle { font_weight: Some(weight_step(&family, weight, d)), ..Default::default() }),
+                TextFmt::Italic => Some(SpanStyle { italic: Some(!st.italic.unwrap_or(n.italic)), ..Default::default() }),
+                TextFmt::Underline => Some(SpanStyle { decoration: Some(deco(st.decoration.unwrap_or(n.decoration), Decoration::Underline)), ..Default::default() }),
+                TextFmt::Strikethrough => Some(SpanStyle { decoration: Some(deco(st.decoration.unwrap_or(n.decoration), Decoration::Strikethrough)), ..Default::default() }),
+                TextFmt::Size(d) => Some(SpanStyle { font_size: Some((st.font_size.unwrap_or(n.font_size) + d).max(1.0)), ..Default::default() }),
+                // Alignment, letter spacing and line height belong to the whole layer here.
+                _ => None,
+            };
+            if let Some(p) = patch {
+                self.checkpoint();
+                let n = self.doc.node_mut(id);
+                n.spans = crate::doc::style_range(&n.spans, n.text.chars().count(), a, b, &p);
+                return true;
+            }
+        }
+        let n0 = self.doc.node(first).clone();
+        self.checkpoint();
+        for id in ids {
+            let n = self.doc.node_mut(id);
+            // Restyling a whole layer replaces that property's per-character overrides.
+            let clear = |n: &mut Node, f: fn(&mut SpanStyle)| {
+                n.spans.iter_mut().for_each(|sp| f(&mut sp.style));
+                n.spans.retain(|sp| !sp.style.is_empty());
+            };
+            match f {
+                TextFmt::Bold => {
+                    n.font_weight = bold_toggle(&n.font_family, if n0.font_weight >= 600 { 700 } else { 400 });
+                    clear(n, |s| s.font_weight = None);
+                }
+                TextFmt::Weight(d) => {
+                    n.font_weight = weight_step(&n.font_family, n.font_weight, d);
+                    clear(n, |s| s.font_weight = None);
+                }
+                TextFmt::Italic => {
+                    n.italic = !n0.italic;
+                    clear(n, |s| s.italic = None);
+                }
+                TextFmt::Underline | TextFmt::Strikethrough => {
+                    n.decoration = deco(n0.decoration, if f == TextFmt::Underline { Decoration::Underline } else { Decoration::Strikethrough });
+                    clear(n, |s| s.decoration = None);
+                }
+                TextFmt::Size(d) => {
+                    n.font_size = (n.font_size + d).max(1.0);
+                    for sp in &mut n.spans {
+                        sp.style.font_size = sp.style.font_size.map(|s| (s + d).max(1.0));
+                    }
+                }
+                TextFmt::Align(a) => n.text_align = a,
+                TextFmt::Letter(d) => n.letter_spacing += d,
+                TextFmt::Line(d) => {
+                    n.line_height = match n.line_height {
+                        LineHeight::Auto => LineHeight::Px((crate::text::line_pitch(n).round() + d).max(1.0)),
+                        LineHeight::Px(v) => LineHeight::Px((v + d).max(1.0)),
+                        LineHeight::Percent(p) => LineHeight::Percent((p + d).max(1.0)),
+                    }
+                }
+            }
+            // Changing a styled value by hand detaches the text style, like the panel.
+            if !matches!(f, TextFmt::Align(_)) {
+                n.text_style = None;
+            }
+        }
+        true
+    }
+
     pub fn context_menu(&mut self, ui: &mut Ui) {
         let has = !self.sel.is_empty();
         let ctx = ui.ctx().clone();
@@ -1996,13 +2088,100 @@ fn pill(painter: &Painter, at: Pos2, text: String, fill: Color32) {
     painter.galley(r.min + vec2(4.0, 2.0), g, Color32::WHITE);
 }
 
+/// A text formatting command (Figma's Text menu and its shortcuts).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TextFmt {
+    Bold,
+    Italic,
+    Underline,
+    Strikethrough,
+    Align(crate::doc::TextAlign),
+    /// Font size, in px.
+    Size(f32),
+    /// Steps through the family's installed weights.
+    Weight(i32),
+    /// Letter spacing, in percent.
+    Letter(f32),
+    /// Line height, in px (or percent when set as one).
+    Line(f32),
+}
+
+/// Figma's Text menu, in groups: command, label, shortcut. Also searchable in quick actions.
+pub const TEXT_MENU: &[&[(TextFmt, &str, &str)]] = {
+    use crate::doc::TextAlign;
+    &[
+        &[(TextFmt::Bold, "Bold", "⌘B"), (TextFmt::Italic, "Italic", "⌘I"), (TextFmt::Underline, "Underline", "⌘U"), (TextFmt::Strikethrough, "Strikethrough", "⇧⌘X")],
+        &[
+            (TextFmt::Align(TextAlign::Left), "Text align left", "⌥⌘L"),
+            (TextFmt::Align(TextAlign::Center), "Text align center", "⌥⌘T"),
+            (TextFmt::Align(TextAlign::Right), "Text align right", "⌥⌘R"),
+            (TextFmt::Align(TextAlign::Justify), "Text align justified", "⌥⌘J"),
+        ],
+        &[
+            (TextFmt::Size(1.0), "Increase font size", "⇧⌘>"),
+            (TextFmt::Size(-1.0), "Decrease font size", "⇧⌘<"),
+            (TextFmt::Weight(1), "Increase font weight", "⌥⌘>"),
+            (TextFmt::Weight(-1), "Decrease font weight", "⌥⌘<"),
+            (TextFmt::Letter(1.0), "Increase letter spacing", "⌥>"),
+            (TextFmt::Letter(-1.0), "Decrease letter spacing", "⌥<"),
+            (TextFmt::Line(1.0), "Increase line height", "⌥⇧>"),
+            (TextFmt::Line(-1.0), "Decrease line height", "⌥⇧<"),
+        ],
+    ]
+};
+
+/// Figma's text shortcuts. "<" and ">" are the comma and period keys.
+pub fn text_fmt_key(key: Key, m: egui::Modifiers) -> Option<TextFmt> {
+    use crate::doc::TextAlign;
+    if m.ctrl && !m.command {
+        return None;
+    }
+    Some(match (m.command, m.shift, m.alt, key) {
+        (true, false, false, Key::B) => TextFmt::Bold,
+        (true, false, false, Key::I) => TextFmt::Italic,
+        (true, false, false, Key::U) => TextFmt::Underline,
+        (true, true, false, Key::X) => TextFmt::Strikethrough,
+        (true, false, true, Key::L) => TextFmt::Align(TextAlign::Left),
+        (true, false, true, Key::T) => TextFmt::Align(TextAlign::Center),
+        (true, false, true, Key::R) => TextFmt::Align(TextAlign::Right),
+        (true, false, true, Key::J) => TextFmt::Align(TextAlign::Justify),
+        (true, true, false, Key::Period) => TextFmt::Size(1.0),
+        (true, true, false, Key::Comma) => TextFmt::Size(-1.0),
+        (true, false, true, Key::Period) => TextFmt::Weight(1),
+        (true, false, true, Key::Comma) => TextFmt::Weight(-1),
+        (false, false, true, Key::Period) => TextFmt::Letter(1.0),
+        (false, false, true, Key::Comma) => TextFmt::Letter(-1.0),
+        (false, true, true, Key::Period) => TextFmt::Line(1.0),
+        (false, true, true, Key::Comma) => TextFmt::Line(-1.0),
+        _ => return None,
+    })
+}
+
+/// The installed weight nearest `w`.
+fn nearest_weight(family: &str, w: u16) -> u16 {
+    crate::text::weights_for(family).into_iter().min_by_key(|x| (*x as i32 - w as i32).abs()).unwrap_or(w)
+}
+
+/// Cmd B: bold text goes back to regular, anything lighter to bold.
+fn bold_toggle(family: &str, w: u16) -> u16 {
+    nearest_weight(family, if w >= 600 { 400 } else { 700 })
+}
+
+/// The next installed weight up or down.
+fn weight_step(family: &str, w: u16, d: i32) -> u16 {
+    let ws = crate::text::weights_for(family);
+    let cur = nearest_weight(family, w);
+    let i = ws.iter().position(|x| *x == cur).unwrap_or(0) as i32;
+    ws.get((i + d).clamp(0, ws.len() as i32 - 1) as usize).copied().unwrap_or(w)
+}
+
 /// Everything that affects a text layer's measured size, hashed.
 fn text_key(ctx: &egui::Context, n: &Node) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::hash::DefaultHasher::new();
     n.text.hash(&mut h);
     format!("{:?}", crate::text::font_family(ctx, &n.font_family, n.font_weight)).hash(&mut h);
-    (n.font_size.to_bits(), n.letter_spacing.to_bits(), n.text_sizing as u8, n.text_case as u8).hash(&mut h);
+    (n.font_size.to_bits(), n.letter_spacing.to_bits(), n.text_sizing as u8, n.text_case as u8, n.italic).hash(&mut h);
     format!("{:?}", n.line_height).hash(&mut h);
     (n.truncate, n.max_lines, n.paragraph_spacing.to_bits()).hash(&mut h);
     format!("{:?}", n.lists).hash(&mut h);

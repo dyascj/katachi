@@ -108,6 +108,7 @@ const COMMANDS: &[(&str, &str, Run)] = &[
 #[derive(Clone)]
 enum Hit {
     Command(usize),
+    Text(crate::canvas::TextFmt),
     Plugin(crate::plugins::Installed),
     Layer(NodeId, usize),
 }
@@ -134,6 +135,11 @@ impl App {
             for (i, (label, short, _)) in COMMANDS.iter().enumerate() {
                 if matches(label, &q) {
                     hits.push((Hit::Command(i), label.to_string(), crate::chrome::keys(short)));
+                }
+            }
+            for &(f, label, short) in crate::canvas::TEXT_MENU.iter().copied().flatten() {
+                if matches(label, &q) {
+                    hits.push((Hit::Text(f), label.to_string(), crate::chrome::keys(short)));
                 }
             }
         }
@@ -221,6 +227,9 @@ impl App {
         }
         match run {
             Some(Hit::Command(i)) => (COMMANDS[i].2)(self, ctx),
+            Some(Hit::Text(f)) => {
+                self.format_text(ctx, f);
+            }
             Some(Hit::Plugin(p)) => match crate::plugins::load(&p) {
                 Ok((code, html, id)) => self.run_plugin(&p.name, Some(&id), &code, html.as_deref()),
                 Err(e) => self.toast(format!("Couldn't run {}: {e}", p.name)),

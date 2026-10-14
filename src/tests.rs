@@ -2670,3 +2670,88 @@ fn paste_to_replace_takes_layers_copied_in_another_tab() {
     assert!(!b.state().doc.nodes.contains_key(&t));
     assert_eq!((b.state().doc.node(new).kind, rect(&b, new).center()), (Kind::Ellipse, pos2(120., 120.)));
 }
+
+/// Put characters [a, b) of the text being edited under the editor's selection.
+fn select_chars(h: &mut Harness<App>, a: usize, b: usize) {
+    let edit_id = egui::Id::new("katachi-text-edit");
+    let mut state = egui::TextEdit::load_state(&h.ctx, edit_id).expect("editor state");
+    state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(a), egui::text::CCursor::new(b))));
+    state.store(&h.ctx, edit_id);
+}
+
+/// A clipboard event as egui-winit sends it: the chord's modifiers are only in the input state.
+fn clip_event(h: &mut Harness<App>, m: Modifiers, e: Event) {
+    h.input_mut().modifiers = m;
+    h.event_modifiers(e, m);
+    h.run_steps(2);
+    h.input_mut().modifiers = Modifiers::NONE;
+}
+
+#[test]
+fn text_formatting_shortcuts_style_layers_and_ranges() {
+    use crate::doc::{Decoration, LineHeight, TextAlign, TextSizing};
+    let mut h = harness();
+    let mut t = Node::new(Kind::Text, r(0., 0., 120., 10.));
+    t.text = "Hello world".into();
+    t.font_size = 20.;
+    t.text_sizing = TextSizing::AutoHeight;
+    let id = h.state_mut().doc.insert(0, None, None, t);
+    h.state_mut().sel = vec![id];
+    h.run_steps(2);
+    let node = |h: &Harness<App>| h.state().doc.node(id).clone();
+    // With the layer selected, shortcuts restyle all of it.
+    key(&mut h, Modifiers::COMMAND, Key::B);
+    assert_eq!(node(&h).font_weight, 700);
+    key(&mut h, Modifiers::COMMAND, Key::B);
+    assert_eq!(node(&h).font_weight, 400, "Cmd B toggles back");
+    key(&mut h, Modifiers::COMMAND, Key::I);
+    assert!(node(&h).italic);
+    key(&mut h, Modifiers::COMMAND, Key::U);
+    assert_eq!(node(&h).decoration, Decoration::Underline);
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::J);
+    assert_eq!(node(&h).text_align, TextAlign::Justify);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::Period);
+    assert_eq!(node(&h).font_size, 21.0);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::Comma);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::Comma);
+    assert_eq!(node(&h).font_size, 19.0);
+    key(&mut h, Modifiers::ALT, Key::Period);
+    assert_eq!(node(&h).letter_spacing, 1.0);
+    key(&mut h, Modifiers::ALT | Modifiers::SHIFT, Key::Period);
+    assert_eq!(node(&h).line_height, LineHeight::Px((19.0 * crate::text::NATURAL_LINE).round() + 1.0), "Auto becomes px");
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::Period);
+    assert_eq!(node(&h).font_weight, 500, "next installed weight");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(node(&h).font_weight, 400, "one undo step each");
+    // Shift Cmd X reaches the app as a cut: it strikes through instead of cutting the layer.
+    clip_event(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Event::Cut);
+    assert!(h.state().doc.nodes.contains_key(&id));
+    assert_eq!(node(&h).decoration, Decoration::Strikethrough);
+    // While editing with characters selected, they apply to the range only.
+    h.state_mut().editing_text = Some(id);
+    h.state_mut().focus_text = true;
+    h.run_steps(3);
+    select_chars(&mut h, 6, 11);
+    key(&mut h, Modifiers::COMMAND, Key::B);
+    let n = node(&h);
+    assert_eq!((n.font_weight, n.spans.len()), (400, 1));
+    assert_eq!((n.spans[0].start, n.spans[0].end, n.spans[0].style.font_weight), (6, 11, Some(700)));
+    clip_event(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Event::Cut);
+    let n = node(&h);
+    assert_eq!(n.text, "Hello world", "the editor didn't cut");
+    assert_eq!(n.spans[0].style.decoration, Some(Decoration::None), "strikethrough toggles off on the range");
+    // Justified rows fill the box but a paragraph's last row doesn't.
+    let mut j = n.clone();
+    j.text = "alpha beta gamma delta epsilon a".into();
+    j.spans.clear();
+    j.italic = false;
+    let painter = egui::Painter::new(h.ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+    let (g, _, _) = crate::text::layout(&painter, &j, 1.0, egui::Color32::BLACK);
+    assert!(g.rows.len() >= 2);
+    assert!((g.rows[0].size.x - 120.0).abs() < 0.5, "{}", g.rows[0].size.x);
+    assert!(g.rows.last().unwrap().size.x < 100.0, "{}", g.rows.last().unwrap().size.x);
+    let jid = h.state_mut().doc.insert(0, None, None, j);
+    h.run_steps(2);
+    let svg = crate::export::to_svg(&h.state().doc, &[jid]);
+    assert_eq!(svg.matches(r#"textLength="120""#).count(), h.state().doc.node(jid).lines.len() - 1, "{svg}");
+}

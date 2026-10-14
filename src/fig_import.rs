@@ -791,6 +791,7 @@ fn text_props(n: &mut Node, v: &Value) {
     if let Some(f) = v.get("fontName") {
         n.font_family = f.s("family").unwrap_or("Inter").to_string();
         n.font_weight = weight_of(f.s("style").unwrap_or("Regular"));
+        n.italic = f.s("style").unwrap_or("").to_lowercase().contains("italic");
     }
     if let Some(sz) = v.f("fontSize") {
         n.font_size = sz;

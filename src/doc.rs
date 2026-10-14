@@ -723,6 +723,8 @@ pub struct TextStyle {
     pub letter_spacing: f32,
     pub decoration: Decoration,
     pub text_case: TextCase,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub italic: bool,
 }
 
 impl TextStyle {
@@ -735,6 +737,7 @@ impl TextStyle {
             letter_spacing: n.letter_spacing,
             decoration: n.decoration,
             text_case: n.text_case,
+            italic: n.italic,
         }
     }
     pub fn apply(&self, n: &mut Node) {
@@ -745,6 +748,7 @@ impl TextStyle {
         n.letter_spacing = self.letter_spacing;
         n.decoration = self.decoration;
         n.text_case = self.text_case;
+        n.italic = self.italic;
     }
 }
 
@@ -1400,6 +1404,9 @@ pub struct Node {
     pub font_weight: u16,
     #[serde(skip_serializing_if = "dflt::font_family")]
     pub font_family: String,
+    /// The family's italic face (Figma's "Italic" font styles).
+    #[serde(skip_serializing_if = "dflt::italic")]
+    pub italic: bool,
     #[serde(skip_serializing_if = "dflt::text_sizing")]
     pub text_sizing: TextSizing,
     #[serde(skip_serializing_if = "dflt::text_align")]
@@ -1505,6 +1512,7 @@ mod dflt {
         font_size: f32,
         font_weight: u16,
         font_family: String,
+        italic: bool,
         text_sizing: TextSizing,
         text_align: TextAlign,
         text_valign: VAlign,
@@ -1590,6 +1598,7 @@ impl Default for Node {
             font_size: 12.0,
             font_weight: 400,
             font_family: "Inter".into(),
+            italic: false,
             text_sizing: TextSizing::AutoWidth,
             text_align: TextAlign::Left,
             text_valign: VAlign::Top,
@@ -3222,7 +3231,7 @@ fn merge_from(e: &mut Node, src: &Node) {
     }
     take!(
         name, visible, opacity, fills, strokes, stroke_width, stroke_sides, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, min_size, max_size, constraints, absolute,
-        paths, even_odd, text, font_size, font_weight, font_family, text_sizing, text_align, text_valign, line_height, letter_spacing,
+        paths, even_odd, text, font_size, font_weight, font_family, italic, text_sizing, text_align, text_valign, line_height, letter_spacing,
         decoration, text_case, paragraph_spacing, truncate, max_lines, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, overflow, scroll_pos, fill_style,
         stroke_style, text_style, effect_style, prop_bind, is_mask, blend, bindings, modes, spans, lists
     );

@@ -777,6 +777,7 @@ impl App {
             if n.kind == Kind::Text && src.kind == Kind::Text {
                 n.font_family = src.font_family.clone();
                 n.font_weight = src.font_weight;
+                n.italic = src.italic;
                 n.font_size = src.font_size;
                 n.line_height = src.line_height;
                 n.letter_spacing = src.letter_spacing;
@@ -2276,9 +2277,26 @@ impl App {
             return;
         }
         let typing = ctx.egui_wants_keyboard_input();
-        let (events, shift) = ctx.input(|i| (i.events.clone(), i.modifiers.shift));
+        let (events, m) = ctx.input(|i| (i.events.clone(), i.modifiers));
+        // A text shortcut eats its key's side effects this frame: Shift Cmd X's cut, Alt >'s "≥".
+        let mut swallow = false;
         for e in events {
             match e {
+                // egui turns every Cmd C, X and V into a clipboard event, Alt and Shift chords
+                // included, so those shortcuts (copy and paste properties, copy as PNG,
+                // strikethrough) arrive here instead of as keys.
+                Event::Copy | Event::Cut if m.alt || m.shift => {
+                    let key = if e == Event::Copy { Key::C } else { Key::X };
+                    if self.text_shortcut(ctx, key, m, typing) {
+                        swallow = true;
+                    } else {
+                        self.key(ctx, key, m, typing);
+                    }
+                }
+                Event::Paste(_) if m.alt => {
+                    self.pasted = true;
+                    self.key(ctx, Key::V, m, typing);
+                }
                 Event::Copy if !typing => self.copy(ctx),
                 Event::Cut if !typing => {
                     self.copy(ctx);
@@ -2286,19 +2304,23 @@ impl App {
                 }
                 Event::Paste(t) if !typing => {
                     self.pasted = true;
-                    self.paste_text(&t, shift);
+                    self.paste_text(&t, m.shift);
                 }
                 // Cmd V with no text on the clipboard (an image, say) reaches egui only as the V
                 // key's release: the press was taken as a paste that found nothing to deliver.
-                Event::Key { key: Key::V, pressed: false, .. } => {
+                Event::Key { key: Key::V, pressed: false, modifiers: km, .. } => {
                     let (seen, pasted) = (std::mem::take(&mut self.v_pressed), std::mem::take(&mut self.pasted));
                     if !typing && !seen && !pasted {
-                        self.paste_clipboard_image();
+                        if km.alt { self.key(ctx, Key::V, km, typing) } else { void(self.paste_clipboard_image()) }
                     }
                 }
                 Event::Key { key, pressed: true, modifiers: m, .. } => {
                     self.v_pressed |= key == Key::V;
-                    self.key(ctx, key, m, typing)
+                    if self.text_shortcut(ctx, key, m, typing) {
+                        swallow = true;
+                    } else {
+                        self.key(ctx, key, m, typing)
+                    }
                 }
                 // Holding Z zooms for a moment, then hands back the previous tool (Figma).
                 Event::Key { key: Key::Z, pressed: false, .. } => {
@@ -2311,6 +2333,9 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        if swallow {
+            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, Event::Text(_) | Event::Cut)));
         }
     }
 
