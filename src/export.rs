@@ -162,6 +162,11 @@ impl Svg<'_> {
 
     /// `fill="..."`-style attributes for a paint, adding gradient/pattern defs as needed.
     fn paint(&mut self, name: &str, p: &Paint, n: &Node) -> String {
+        let attrs = self.paint_source(name, p, n);
+        if p.blend == BlendMode::Normal { attrs } else { format!(r#"{attrs} style="mix-blend-mode:{}""#, p.blend.css()) }
+    }
+
+    fn paint_source(&mut self, name: &str, p: &Paint, n: &Node) -> String {
         let r = n.rect.translate(-self.o);
         match p.kind {
             PaintKind::Solid => {
@@ -864,6 +869,24 @@ mod tests {
         let svg = to_svg(&d, &[rad]);
         assert!(svg.contains(r#"<radialGradient id="paint1" cx="0" cy="0" r="1""#), "{svg}");
         assert!(px(&d, rad, 50, 76)[2] > 240 && px(&d, rad, 76, 50)[0] > 60);
+    }
+
+    #[test]
+    fn per_paint_blend_modes_export() {
+        let mut d = Document::default();
+        let mut n = Node::new(Kind::Rectangle, Rect::from_min_size(pos2(0., 0.), vec2(20., 20.)));
+        let mut top = Paint::solid(Rgba::rgb(255, 128, 0));
+        top.blend = BlendMode::Multiply;
+        n.fills = vec![Paint::solid(Rgba::rgb(128, 255, 255)), top];
+        let a = d.insert(0, None, None, n);
+        let svg = to_svg(&d, &[a]);
+        assert!(svg.contains(r##"fill="#FF8000" style="mix-blend-mode:multiply""##), "{svg}");
+        let px = image::load_from_memory(&to_png(&d, &[a], 1.0).unwrap()).unwrap().to_rgba8().get_pixel(10, 10).0;
+        // Multiply: (128, 255, 255) x (255, 128, 0) = (128, 128, 0).
+        assert!(px[0].abs_diff(128) < 3 && px[1].abs_diff(128) < 3 && px[2] < 3, "{px:?}");
+        let back: Paint = serde_json::from_str(&serde_json::to_string(&d.node(a).fills[1]).unwrap()).unwrap();
+        assert_eq!(back.blend, BlendMode::Multiply);
+        assert!(!serde_json::to_string(&d.node(a).fills[0]).unwrap().contains("blend"), "Normal stays out of files");
     }
 
     #[test]

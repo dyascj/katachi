@@ -304,6 +304,22 @@ impl App {
     }
 }
 
+/// The dotted handle that drags a paint row to reorder it.
+pub fn grip(ui: &mut Ui) -> egui::Response {
+    let (r, resp) = ui.allocate_exact_size(vec2(8.0, 20.0), Sense::drag());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "Drag to reorder"));
+    let c = if resp.hovered() || resp.dragged() { ui.visuals().text_color() } else { crate::appearance::faint(ui.ctx()) };
+    for dx in [-1.5, 1.5] {
+        for dy in [-4.0, 0.0, 4.0] {
+            ui.painter().circle_filled(r.center() + vec2(dx, dy), 1.0, c);
+        }
+    }
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+    resp
+}
+
 /// A small clickable color chip.
 fn chip(ui: &mut Ui, c: Rgba, tip: &str) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
@@ -588,14 +604,26 @@ pub fn paint_row(ui: &mut Ui, id: egui::Id, paint: &mut Paint, title: &str) -> P
 
 fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEvent> {
     let mut ev = None;
-    // Paint type as a dropdown, as in Figma's header.
-    crate::chrome::menu_button(ui, format!("{:?}", paint.kind), |ui| {
-        for k in PaintKind::ALL {
-            if ui.selectable_label(paint.kind == k, format!("{k:?}")).clicked() && paint.kind != k {
-                paint.convert(k);
-                ev = Some(PaintEvent::Changed);
+    // Paint type and blend mode as dropdowns, as in Figma's header.
+    ui.horizontal(|ui| {
+        crate::chrome::menu_button(ui, format!("{:?}", paint.kind), |ui| {
+            for k in PaintKind::ALL {
+                if ui.selectable_label(paint.kind == k, format!("{k:?}")).clicked() && paint.kind != k {
+                    paint.convert(k);
+                    ev = Some(PaintEvent::Changed);
+                }
             }
-        }
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            crate::chrome::menu_button(ui, format!("{:?}", paint.blend), |ui| {
+                for b in crate::doc::BlendMode::ALL {
+                    if ui.selectable_label(paint.blend == b, format!("{b:?}")).clicked() && paint.blend != b {
+                        paint.blend = b;
+                        ev = Some(PaintEvent::Changed);
+                    }
+                }
+            });
+        });
     });
     ui.separator();
     match paint.kind {

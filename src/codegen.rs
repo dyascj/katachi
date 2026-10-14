@@ -153,6 +153,10 @@ pub fn css(doc: &Document, id: NodeId) -> String {
             [one] => decl("background", one.clone()),
             many => decl("background", many.join(", ")),
         }
+        if n.fills.iter().any(|f| f.visible && f.blend != BlendMode::Normal) {
+            let modes: Vec<&str> = n.fills.iter().rev().filter(|f| f.visible).map(|f| f.blend.css()).collect();
+            decl("background-blend-mode", modes.join(", "));
+        }
     }
     if n.kind == Kind::Ellipse {
         decl("border-radius", "50%".into());

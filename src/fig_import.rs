@@ -160,6 +160,7 @@ fn paints(list: &[Value]) -> Vec<Paint> {
             _ => continue,
         };
         paint.visible = visible;
+        paint.blend = crate::doc::BlendMode::from_figma(p.s("blendMode"));
         out.push(paint);
     }
     out
@@ -849,10 +850,7 @@ fn text_props(n: &mut Node, v: &Value) {
 fn finish_common(n: &mut Node, v: &Value) {
     n.visible = v.b("visible").unwrap_or(true);
     n.opacity = v.f("opacity").unwrap_or(1.0);
-    n.blend = crate::doc::BlendMode::ALL
-        .into_iter()
-        .find(|b| Some(b.css().replace('-', "_").to_uppercase().as_str()) == v.s("blendMode"))
-        .unwrap_or_default();
+    n.blend = crate::doc::BlendMode::from_figma(v.s("blendMode"));
     n.is_mask = v.b("mask") == Some(true);
     n.cap = match v.s("strokeCap") {
         Some("ROUND") => Cap::Round,

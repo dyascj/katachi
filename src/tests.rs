@@ -2199,3 +2199,21 @@ fn paint_look() {
     h.run_steps(2);
     h.render().unwrap().save("target/look-eyedropper.png").unwrap();
 }
+
+#[test]
+fn paint_rows_reorder_by_dragging_their_grip() {
+    use crate::doc::{Paint, Rgba};
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (80.0, 80.0));
+    let (r, g, b) = (Rgba::rgb(255, 0, 0), Rgba::rgb(0, 255, 0), Rgba::rgb(0, 0, 255));
+    h.state_mut().doc.node_mut(id).fills = vec![Paint::solid(r), Paint::solid(g), Paint::solid(b)];
+    h.run_steps(2);
+    // Fill rows list topmost (blue) first: drag it below the last row (red).
+    let grips: Vec<Rect> = h.get_all_by_label("Drag to reorder").map(|n| n.rect()).collect();
+    assert_eq!(grips.len(), 3);
+    drag(&mut h, grips[0].center(), grips[2].center() + vec2(0.0, 14.0), Modifiers::NONE);
+    let order = |h: &Harness<App>| h.state().doc.node(id).fills.iter().map(|p| p.color).collect::<Vec<_>>();
+    assert_eq!(order(&h), vec![b, r, g], "blue is now the bottom paint");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(order(&h), vec![r, g, b], "one undo step");
+}

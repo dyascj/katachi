@@ -685,6 +685,10 @@ impl BlendMode {
         BlendMode::Color,
         BlendMode::Luminosity,
     ];
+    /// From Figma's name for it ("MULTIPLY", "COLOR_BURN"; anything else is Normal).
+    pub fn from_figma(name: Option<&str>) -> Self {
+        BlendMode::ALL.into_iter().find(|b| Some(b.css().replace('-', "_").to_uppercase().as_str()) == name).unwrap_or_default()
+    }
     /// CSS / SVG `mix-blend-mode` keyword.
     pub fn css(self) -> &'static str {
         match self {
@@ -994,6 +998,9 @@ pub struct Paint {
     /// Image paints: color adjustments.
     #[serde(default, skip_serializing_if = "is_default")]
     pub adjust: ImageAdjust,
+    /// How this paint mixes with the paints and layers under it (Figma's per-paint blend).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub blend: BlendMode,
 }
 
 /// Figma's image adjustments, each -1..=1 (0 = unchanged).
@@ -1059,6 +1066,7 @@ impl Paint {
             scale_mode: ScaleMode::Fill,
             tile_scale: 1.0,
             adjust: ImageAdjust::default(),
+            blend: BlendMode::Normal,
         }
     }
 

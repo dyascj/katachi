@@ -664,8 +664,12 @@ fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
         // Masks only shape what's above them.
         return;
     }
+    // Blend modes, of layers or of single paints, need real compositing: the top-level layer
+    // holding them is drawn through resvg (paint blends then mix only within that layer).
+    let paint_blend = |d: &Node| d.fills.iter().chain(&d.strokes).any(|p| p.visible && p.blend != crate::doc::BlendMode::Normal);
     let needs_compositing = n.children.iter().any(|c| sc.doc.node(*c).is_mask)
-        || (n.parent.is_none() && sc.doc.descendants(id).iter().any(|d| sc.doc.node(*d).blend != crate::doc::BlendMode::Normal));
+        || (n.parent.is_none()
+            && (paint_blend(n) || sc.doc.descendants(id).iter().any(|d| sc.doc.node(*d).blend != crate::doc::BlendMode::Normal || paint_blend(sc.doc.node(*d)))));
     if Some(id) != sc.hide && (needs_compositing || n.shadows.iter().any(|s| s.visible && matches!(s.kind, EffectKind::InnerShadow | EffectKind::LayerBlur))) {
         if !on_screen {
             return;

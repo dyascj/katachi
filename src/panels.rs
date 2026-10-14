@@ -3064,10 +3064,22 @@ impl App {
             }
         }
         let mut remove = None;
-        // Topmost paint first, as in Figma.
+        // Topmost paint first, as in Figma. Each row drags by its grip to reorder.
+        let (mut rows, mut dragging, mut dropped) = (vec![], None, None);
         for i in (0..paints.len()).rev() {
             let id = ui.id().with((stroke, i, first));
-            match paint_row(ui, id, &mut paints[i], if stroke { "Stroke" } else { "Fill" }) {
+            let row = ui.horizontal(|ui| {
+                let grip = crate::paint_ui::grip(ui);
+                if grip.dragged() {
+                    dragging = Some(i);
+                }
+                if grip.drag_stopped() {
+                    dropped = Some(i);
+                }
+                paint_row(ui, id, &mut paints[i], if stroke { "Stroke" } else { "Fill" })
+            });
+            rows.push((i, row.response.rect));
+            match row.inner {
                 PaintEvent::None => {}
                 PaintEvent::Changed => changed = true,
                 PaintEvent::Remove => remove = Some(i),
@@ -3080,6 +3092,19 @@ impl App {
             if self.sel.len() == 1 && paints[i].kind.is_gradient() && egui::Popup::is_id_open(ui.ctx(), id.with("popup")) {
                 let stop = ui.data(|d| d.get_temp(id.with("stop"))).unwrap_or(0);
                 self.gradient_edit = Some(crate::app::GradientEdit { stroke, index: i, ui: id, stop });
+            }
+        }
+        if let (Some(src), Some(y)) = (dragging.or(dropped), ui.ctx().pointer_interact_pos().map(|p| p.y)) {
+            // Where it lands: below every other row whose middle is above the pointer.
+            let others: Vec<Rect> = rows.iter().filter(|(j, _)| *j != src).map(|r| r.1).collect();
+            let above = others.iter().filter(|r| r.center().y < y).count();
+            if dropped.is_some() {
+                let p = paints.remove(src);
+                let dst = paints.len() - above;
+                paints.insert(dst, p);
+                changed |= dst != src;
+            } else if let Some(line) = if above == 0 { others.first().map(|r| r.min.y) } else { others.get(above - 1).map(|r| r.max.y) } {
+                ui.painter().hline(ui.max_rect().x_range(), line, Stroke::new(2.0, BLUE));
             }
         }
         if let Some(i) = remove {

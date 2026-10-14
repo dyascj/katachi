@@ -124,7 +124,7 @@ pub fn paint_json(p: &Paint, bound: Option<VarId>) -> Value {
         }
     };
     v["visible"] = json!(p.visible);
-    v["blendMode"] = json!("NORMAL");
+    v["blendMode"] = json!(if p.blend == BlendMode::Normal { "NORMAL".into() } else { blend_json(p.blend) });
     if let Some(id) = bound {
         v["boundVariables"] = json!({ "color": alias(id) });
     }
@@ -189,6 +189,7 @@ pub fn paint_from(v: &Value, doc: &Document, layer: Option<egui::Vec2>) -> Optio
         _ => return None,
     };
     p.visible = v["visible"].as_bool().unwrap_or(true);
+    p.blend = BlendMode::from_figma(v["blendMode"].as_str());
     Some(p)
 }
 
