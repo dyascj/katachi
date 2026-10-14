@@ -121,22 +121,37 @@ fn setup_style(ctx: &egui::Context) {
     appearance::apply(ctx, &appearance::load());
 }
 
+/// The file to serve: a new document if it doesn't exist yet, an error if it can't be read.
+fn load_or_new(file: Option<&std::path::Path>) -> Result<doc::Document, String> {
+    match file {
+        Some(f) if f.exists() => {
+            let text = std::fs::read_to_string(f).map_err(|e| format!("couldn't read {}: {e}", f.display()))?;
+            doc::parse_file(&text).map_err(|e| format!("couldn't open {}: {e}", f.display()))
+        }
+        _ => Ok(doc::Document::default()),
+    }
+}
+
 fn serve_headless(args: &[String]) {
     let port: u16 = args.iter().position(|a| a == "--port").and_then(|i| args.get(i + 1)).and_then(|p| p.parse().ok()).unwrap_or(7878);
     let file = args.iter().find(|a| !a.starts_with("--") && a.parse::<u16>().is_err()).map(std::path::PathBuf::from);
-    let doc = file
-        .as_ref()
-        .and_then(|f| std::fs::read_to_string(f).ok())
-        .and_then(|s| doc::parse_file(&s).ok())
-        .unwrap_or_default();
+    let doc = match load_or_new(file.as_deref()) {
+        Ok(d) => d,
+        Err(e) => {
+            // Saving over a file that didn't load would wipe it.
+            eprintln!("katachi serve: {e}");
+            std::process::exit(1);
+        }
+    };
     let listener = std::net::TcpListener::bind(("0.0.0.0", port)).expect("port in use");
-    let shared = collab::serve(listener, doc);
-    println!("Katachi session on {}:{port}", collab::local_ip());
+    let relay = collab::serve(listener, doc, collab::session_token());
+    println!("Katachi session on {}:{port}/{}", collab::local_ip(), relay.token);
+    println!("Share the whole address, code included: anyone without it is turned away.");
     let mut last = String::new();
     loop {
         std::thread::sleep(std::time::Duration::from_secs(5));
         if let Some(f) = &file {
-            let json = doc::file_json(&shared.lock().unwrap());
+            let json = doc::file_json(&relay.doc.lock().unwrap());
             if json != last {
                 let _ = files::write_atomic(f, json.as_bytes());
                 last = json;

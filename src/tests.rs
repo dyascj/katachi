@@ -2048,3 +2048,14 @@ fn color_picker_drags_and_escape_from_find_keeps_selection() {
     assert!(!h.state().find.0);
     assert_eq!(h.state().sel, vec![id], "selection kept");
 }
+
+#[test]
+fn serve_refuses_a_file_it_cannot_read() {
+    let dir = std::env::temp_dir().join(format!("katachi-serve-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bad = dir.join("bad.katachi");
+    std::fs::write(&bad, "not a katachi file").unwrap();
+    assert!(crate::load_or_new(Some(&bad)).is_err(), "a broken file isn't replaced with an empty one");
+    assert!(crate::load_or_new(Some(&dir.join("new.katachi"))).is_ok(), "a new file starts empty");
+    let _ = std::fs::remove_dir_all(&dir);
+}

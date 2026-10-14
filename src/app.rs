@@ -456,6 +456,10 @@ impl App {
         c.me.selection = self.sel.clone();
         c.me.cursor = self.pointer_world;
         let (touched, remote) = c.tick(&mut self.doc, now);
+        // Others' edits are changes to save too.
+        if !remote.is_empty() {
+            self.dirty = true;
+        }
         // A drag rebuilds the document from its starting copy every frame; that copy needs
         // others' changes too, or they'd vanish (and go out as deletions) mid-drag.
         if !remote.is_empty()
@@ -1783,6 +1787,9 @@ impl App {
                         ui.ctx().copy_text(c.address.clone());
                     }
                 });
+                if c.hosting {
+                    ui.label(egui::RichText::new("Others on your network join with this full address, code included.").small());
+                }
                 ui.separator();
                 ui.label(format!("{} (you)", c.me.name));
                 for p in c.peers.values() {
@@ -1814,7 +1821,7 @@ impl App {
                 ui.separator();
                 ui.label(egui::RichText::new("Join").strong());
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.collab_address).hint_text("192.168.1.20:7878").desired_width(180.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.collab_address).hint_text("192.168.1.20:7878/code").desired_width(180.0));
                     if ui.add_enabled(!self.collab_address.trim().is_empty(), egui::Button::new("Join")).clicked() {
                         action = Some("join");
                     }
@@ -1842,11 +1849,12 @@ impl App {
         match listener {
             Ok(l) => {
                 let port = l.local_addr().map_or(self.collab_port, |a| a.port());
-                crate::collab::serve(l, self.doc.clone());
-                let shared = format!("{}:{port}", crate::collab::local_ip());
-                self.join_session(ctx, &format!("127.0.0.1:{port}"), true);
+                let relay = crate::collab::serve(l, self.doc.clone(), crate::collab::session_token());
+                let shared = format!("{}:{port}/{}", crate::collab::local_ip(), relay.token);
+                self.join_session(ctx, &format!("127.0.0.1:{port}/{}", relay.token), true);
                 if let Some(c) = self.collab.as_mut() {
                     c.address = shared;
+                    c.relay = Some(relay);
                 }
             }
             Err(e) => self.toast(format!("Couldn't start a session: {e}")),
