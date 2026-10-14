@@ -1,7 +1,7 @@
 //! Infinite canvas: navigation, tools, selection, snapping, and on-canvas overlays.
 
 use crate::app::{App, Drag, Grip, Press, Tool};
-use crate::doc::{Kind, LayoutMode, Node, NodeId, Order, PathPoint, Sizing, rotate};
+use crate::doc::{Axis, Guide, Kind, LayoutMode, Node, NodeId, Order, PathPoint, Sizing, rotate};
 use crate::render::{self, View};
 use egui::{
     Color32, CornerRadius, CursorIcon, FontId, Key, Painter, PointerButton, Pos2, Rect, Sense, Stroke, StrokeKind,
@@ -13,6 +13,10 @@ const TEXT_EDIT_ID: &str = "katachi-text-edit";
 pub const BLUE: Color32 = Color32::from_rgb(0x0D, 0x99, 0xFF);
 pub const PURPLE: Color32 = Color32::from_rgb(0x97, 0x47, 0xFF);
 const SNAP: Color32 = Color32::from_rgb(0xF2, 0x48, 0x22);
+/// Ruler thickness, in screen points.
+const RULER: f32 = 20.0;
+/// Figma's pink for spacing: equal-gap markers and smart selection handles.
+const GAP: Color32 = Color32::from_rgb(0xFF, 0x24, 0xBD);
 
 pub fn num(v: f32) -> String {
     let r = (v * 100.0).round() / 100.0;
@@ -94,7 +98,7 @@ impl App {
         self.hover = None;
         if self.drag.is_none() && self.tool == Tool::Move && resp.hovered() && !panning
             && let (Some(s), Some(w)) = (ptr, world)
-                && self.handle_at(s).is_none() {
+                && self.handle_at(s).is_none() && self.guide_at(s).is_none() {
                     self.hover = self.target_at(w, s, mods.command);
                 }
 
@@ -149,7 +153,7 @@ impl App {
                 let w = self.view.to_world(p);
                 let size = self.doc.node(drop.0).rect.size();
                 let parent = self.frame_at(w, &[]);
-                let i = self.doc.instantiate(drop.0, self.page, parent, None, (w - size / 2.0).round());
+                let i = self.doc.instantiate(drop.0, self.page, parent, None, self.px(w - size / 2.0));
                 self.sel = vec![i];
             }
         }
@@ -161,6 +165,7 @@ impl App {
         if (mods.alt || self.dev_mode) && self.drag.is_none() {
             self.draw_measurements(&painter);
         }
+        self.draw_guides(&painter, rect);
         if self.rulers {
             self.draw_rulers(&painter, rect);
         }
@@ -358,6 +363,9 @@ impl App {
             (x, y) if x != 0 && y != 0 => return Some(Grip::Resize(x, y)),
             _ => {}
         }
+        if let Some(g) = self.smart_grip_at(s) {
+            return Some(g);
+        }
         let corner = [b.left_top(), b.right_top(), b.left_bottom(), b.right_bottom()]
             .iter()
             .any(|c| c.distance(s) < 20.0);
@@ -377,6 +385,18 @@ impl App {
                 self.start_comment(w);
                 return;
             }
+        }
+        // Rulers pull out new guides; the move tool grabs existing ones.
+        let ruler = self.ruler_at(s);
+        let guide = if ruler.is_none() { self.guide_at(s) } else { None };
+        self.guide_sel = guide;
+        if let Some(axis) = ruler.or(guide.map(|i| self.doc.pages[self.page].guides[i].axis)) {
+            if guide.is_some() {
+                self.sel.clear();
+            }
+            self.guide_grab = Some((axis, guide));
+            self.press = Some(Press { world: w, target: None, handle: None, toggle_off: false });
+            return;
         }
         if tool == Tool::Move && self.vector_edit.is_some() && self.vector_press(s, mods.shift) {
             self.press = Some(Press { world: w, target: None, handle: None, toggle_off: false });
@@ -433,7 +453,7 @@ impl App {
                     if let (true, Some(last)) = (mods.shift, self.pen.last()) {
                         p = snap_angle(last.p, p);
                     }
-                    self.pen.push(PathPoint { p: p.round(), ..Default::default() });
+                    self.pen.push(PathPoint { p: self.px(p), ..Default::default() });
                 }
             }
             _ => self.press = Some(Press { world: w, target: None, handle: None, toggle_off: false }),
@@ -448,6 +468,17 @@ impl App {
             return;
         };
         self.pending_frame = None;
+        if let Some((axis, index)) = self.guide_grab.take() {
+            self.checkpoint();
+            let guides = &mut self.doc.pages[self.page].guides;
+            let index = index.unwrap_or_else(|| {
+                guides.push(Guide { axis, offset: 0.0 });
+                guides.len() - 1
+            });
+            self.guide_sel = Some(index);
+            self.drag = Some(Drag::Guide { index });
+            return;
+        }
         let start = press.world;
         if self.vector_edit.is_some() {
             self.drag = self.vector_drag_start();
@@ -471,6 +502,10 @@ impl App {
                             let a = (start - c).angle();
                             Some(Drag::Rotate { base, center: c, start_angle: a, start_rot: rot, deg: 0.0 })
                         }
+                        Grip::Spacing(_) | Grip::Swap(_) => self.smart_selection().map(|(axis, items)| match grip {
+                            Grip::Swap(id) => Drag::Swap { base, id, axis, items, start },
+                            _ => Drag::Spacing { base, axis, gap: gap_of(&items, axis), items, start },
+                        }),
                     }
                 } else if press.target.is_some() && !self.sel.is_empty() {
                     self.checkpoint();
@@ -485,9 +520,10 @@ impl App {
                 }
             }
             Tool::Pencil => Some(Drag::Pencil { points: vec![start] }),
+            Tool::Zoom => Some(Drag::Zoom { start }),
             t if t.draws_shape() || t == Tool::Text => {
                 self.checkpoint();
-                let start = self.snap_point(start.round(), &[]);
+                let start = self.snap_point(self.px(start), &[]);
                 let parent = if t == Tool::Section { None } else { self.frame_at(start, &[]) };
                 let mut node = self.shape_for(t, Rect::from_min_size(start, Vec2::ZERO));
                 if t == Tool::Text {
@@ -520,6 +556,7 @@ impl App {
                     let now = self.doc.node(id).aabb().min;
                     self.doc.translate(id, from + (w - *start) - now);
                     self.guides.clear();
+                    self.gap_marks.clear();
                     self.drag = Some(drag);
                     return;
                 }
@@ -530,7 +567,7 @@ impl App {
                 }
                 let corr = self.snap(b.translate(d), &roots, [true; 3], [true; 3]);
                 d += corr;
-                let d = (b.min + d).round() - b.min;
+                let d = self.px(b.min + d) - b.min;
                 for id in roots {
                     self.doc.translate(id, d);
                 }
@@ -593,7 +630,7 @@ impl App {
                     if hy == -1 { nb.max.y = 2.0 * c.y - nb.min.y }
                     if hy == 1 { nb.min.y = 2.0 * c.y - nb.max.y }
                 }
-                let nb = Rect::from_two_pos(nb.min.round(), nb.max.round());
+                let nb = Rect::from_two_pos(self.px(nb.min), self.px(nb.max));
                 if rot != 0.0 {
                     // Keep the fixed side planted: move the new center back into world space.
                     let c = rotate(nb.center(), b.center(), rot);
@@ -645,7 +682,8 @@ impl App {
             Drag::Create { base, start, id } => {
                 self.doc = base.clone();
                 let a = *start;
-                let mut b = self.snap_point(w, &[*id]).round();
+                let p = self.snap_point(w, &[*id]);
+                let mut b = self.px(p);
                 if self.doc.node(*id).kind == Kind::Vector {
                     if mods.shift {
                         b = snap_angle(a, b);
@@ -696,13 +734,29 @@ impl App {
                     }
                 }
             }
-            Drag::Pan | Drag::Connect { .. } => {}
+            Drag::Guide { index } => {
+                if let Some(axis) = self.doc.pages[self.page].guides.get(*index).map(|g| g.axis) {
+                    self.doc.pages[self.page].guides[*index].offset = self.px1(if axis == Axis::X { w.x } else { w.y });
+                }
+            }
+            Drag::Spacing { base, axis, items, gap, start } => {
+                self.doc = base.clone();
+                let g = self.px1((*gap + (w - *start)[*axis]).max(0.0));
+                lay_out(&mut self.doc, *axis, items, items[0].1.min[*axis], g);
+            }
+            Drag::Swap { base, id, start, .. } => {
+                self.doc = base.clone();
+                let d = w - *start;
+                self.doc.translate(*id, vec2(self.px1(d.x), self.px1(d.y)));
+            }
+            Drag::Pan | Drag::Connect { .. } | Drag::Zoom { .. } => {}
         }
         self.drag = Some(drag);
     }
 
     fn on_drag_end(&mut self, w: Pos2) {
         self.guides.clear();
+        self.gap_marks.clear();
         self.vector_grabbed = None;
         match self.drag.take() {
             Some(Drag::Connect { from }) => {
@@ -715,6 +769,41 @@ impl App {
                 if let Some(t) = target {
                     self.checkpoint();
                     self.doc.node_mut(from).reactions.push(crate::doc::Reaction { action: crate::doc::Action::Navigate(t), ..Default::default() });
+                }
+            }
+            Some(Drag::Zoom { start }) => {
+                let r = Rect::from_two_pos(start, w);
+                if let Some(screen) = self.canvas_rect {
+                    if r.width().max(r.height()) * self.view.zoom > 4.0 {
+                        self.view = View::fit(r, screen, 256.0);
+                    } else {
+                        self.view.zoom_at(self.view.to_screen(w), 2.0);
+                    }
+                }
+            }
+            Some(Drag::Guide { index }) => {
+                // Dropped back on its ruler (or off the canvas that way): gone.
+                let (s, r) = (self.view.to_screen(w), self.canvas_rect.unwrap_or(Rect::EVERYTHING));
+                let guides = &mut self.doc.pages[self.page].guides;
+                let gone = guides.get(index).is_some_and(|g| match g.axis {
+                    Axis::X => s.x < r.min.x + RULER,
+                    Axis::Y => s.y < r.min.y + RULER,
+                });
+                if gone {
+                    guides.remove(index);
+                    self.guide_sel = None;
+                }
+            }
+            Some(Drag::Swap { base, id, axis, mut items, .. }) => {
+                // Dropped on another layer's slot: trade places. Anywhere else: snap back.
+                self.doc = base;
+                let i = items.iter().position(|(n, _)| *n == id);
+                let j = items.iter().position(|(n, r)| *n != id && r.contains(w));
+                if let (Some(i), Some(j)) = (i, j) {
+                    let g = gap_of(&items, axis);
+                    let first = items[0].1.min[axis];
+                    items.swap(i, j);
+                    lay_out(&mut self.doc, axis, &items, first, g);
                 }
             }
             Some(Drag::Pencil { points }) => {
@@ -784,6 +873,10 @@ impl App {
     }
 
     fn on_click(&mut self, w: Pos2, mods: egui::Modifiers) {
+        if self.guide_grab.take().is_some() {
+            self.press = None;
+            return;
+        }
         if self.vector_edit.is_some() {
             self.press = None;
             return;
@@ -801,11 +894,15 @@ impl App {
                     }
                 }
             }
+            Tool::Zoom => {
+                let at = self.view.to_screen(w);
+                self.view.zoom_at(at, if mods.alt { 0.5 } else { 2.0 });
+            }
             Tool::Text => {
                 // Created on release so the new field keeps keyboard focus.
                 self.checkpoint();
                 let parent = self.frame_at(w, &[]);
-                let n = Node::new(Kind::Text, Rect::from_min_size(w.round(), Vec2::ZERO));
+                let n = Node::new(Kind::Text, Rect::from_min_size(self.px(w), Vec2::ZERO));
                 let id = self.doc.insert(self.page, parent, None, n);
                 self.sel = vec![id];
                 self.editing_text = Some(id);
@@ -815,7 +912,7 @@ impl App {
             t if t.draws_shape() => {
                 // A click without a drag drops a default 100×100 shape.
                 self.checkpoint();
-                let p = w.round();
+                let p = self.px(w);
                 let parent = if t == Tool::Section { None } else { self.frame_at(p, &[]) };
                 let node = self.shape_for(t, Rect::from_min_size(p, vec2(100.0, 100.0)));
                 let id = self.doc.insert(self.page, parent, None, node);
@@ -941,17 +1038,22 @@ impl App {
 
     // ---------- snapping ----------
 
-    fn snap_targets(&self, exclude: &[NodeId]) -> Vec<Rect> {
+    /// Visible siblings of the first excluded layer: what it aligns and spaces against.
+    fn snap_siblings(&self, exclude: &[NodeId]) -> Vec<Rect> {
         let parent = exclude.first().and_then(|&e| self.doc.nodes.get(&e)).and_then(|n| n.parent);
-        let mut out: Vec<Rect> = self
-            .doc
+        self.doc
             .children_of(self.page, parent)
             .iter()
             .filter(|c| !exclude.contains(c))
             .map(|c| self.doc.node(*c))
             .filter(|n| n.visible)
             .map(|n| n.aabb())
-            .collect();
+            .collect()
+    }
+
+    fn snap_targets(&self, exclude: &[NodeId]) -> Vec<Rect> {
+        let parent = exclude.first().and_then(|&e| self.doc.nodes.get(&e)).and_then(|n| n.parent);
+        let mut out = self.snap_siblings(exclude);
         if let Some(p) = parent {
             let pn = self.doc.node(p);
             out.push(pn.aabb());
@@ -1025,44 +1127,58 @@ impl App {
         }
     }
 
-    /// Correction that snaps the masked edges of `moving` to nearby sibling edges/centers.
-    /// Records guide lines for display.
+    /// Correction that snaps the masked edges of `moving` to nearby sibling edges/centers, or
+    /// to a gap that repeats the spacing between its neighbors (Figma's smart spacing guides).
+    /// Records guide lines and gap markers for display.
     fn snap(&mut self, moving: Rect, exclude: &[NodeId], mx: [bool; 3], my: [bool; 3]) -> Vec2 {
-        if !self.prefs.snap_to_objects {
-            self.guides.clear();
-            return Vec2::ZERO;
-        }
+        self.guides.clear();
+        self.gap_marks.clear();
         let tol = 5.0 / self.view.zoom;
-        let targets = self.snap_targets(exclude);
-        let xs = |r: Rect| [r.min.x, r.center().x, r.max.x];
-        let ys = |r: Rect| [r.min.y, r.center().y, r.max.y];
-        let best = |m: [f32; 3], mask: [bool; 3], t: &dyn Fn(Rect) -> [f32; 3]| {
+        let objects = self.prefs.snap_to_objects;
+        let targets = if objects { self.snap_targets(exclude) } else { vec![] };
+        let sibs = if objects { self.snap_siblings(exclude) } else { vec![] };
+        // Ruler guides always snap.
+        let lines: Vec<Guide> = self.doc.pages[self.page].guides.clone();
+        let vals = |r: Rect, a: usize| [r.min[a], r.center()[a], r.max[a]];
+        let mut corr = Vec2::ZERO;
+        let mut gap_used = [None, None];
+        for (a, mask) in [mx, my].into_iter().enumerate() {
             let mut best: Option<f32> = None;
-            for r in &targets {
-                for (_, mv) in m.iter().enumerate().filter(|(i, _)| mask[*i]) {
-                    for tv in t(*r) {
-                        let d = tv - mv;
-                        if d.abs() < tol && best.is_none_or(|b| d.abs() < b.abs()) {
-                            best = Some(d);
-                        }
+            for (_, mv) in vals(moving, a).iter().enumerate().filter(|(i, _)| mask[*i]) {
+                let on_axis = lines.iter().filter(|g| g.axis as usize == a).map(|g| g.offset);
+                for tv in targets.iter().flat_map(|r| vals(*r, a)).chain(on_axis) {
+                    let d = tv - mv;
+                    if d.abs() < tol && best.is_none_or(|b| d.abs() < b.abs()) {
+                        best = Some(d);
                     }
                 }
             }
-            best
-        };
-        let corr = vec2(best(xs(moving), mx, &xs).unwrap_or(0.0), best(ys(moving), my, &ys).unwrap_or(0.0));
+            let gap = gap_snaps(moving, &sibs, a, mask).into_iter().filter(|(d, _)| d.abs() < tol).min_by(|x, y| x.0.abs().total_cmp(&y.0.abs()));
+            match (best, gap) {
+                (b, Some((d, g))) if b.is_none_or(|b| d.abs() <= b.abs()) => {
+                    corr[a] = d;
+                    gap_used[a] = Some(g);
+                }
+                (Some(b), _) => corr[a] = b,
+                _ => {}
+            }
+        }
         let m = moving.translate(corr);
-        self.guides.clear();
         for r in &targets {
-            for (i, mv) in xs(m).iter().enumerate() {
-                if mx[i] && xs(*r).iter().any(|t| (t - mv).abs() < 0.01) {
+            for (i, mv) in vals(m, 0).iter().enumerate() {
+                if mx[i] && vals(*r, 0).iter().any(|t| (t - mv).abs() < 0.01) {
                     self.guides.push([pos2(*mv, m.min.y.min(r.min.y)), pos2(*mv, m.max.y.max(r.max.y))]);
                 }
             }
-            for (i, mv) in ys(m).iter().enumerate() {
-                if my[i] && ys(*r).iter().any(|t| (t - mv).abs() < 0.01) {
+            for (i, mv) in vals(m, 1).iter().enumerate() {
+                if my[i] && vals(*r, 1).iter().any(|t| (t - mv).abs() < 0.01) {
                     self.guides.push([pos2(m.min.x.min(r.min.x), *mv), pos2(m.max.x.max(r.max.x), *mv)]);
                 }
+            }
+        }
+        for (a, g) in gap_used.into_iter().enumerate() {
+            if let Some(g) = g {
+                self.gap_marks.extend(equal_gaps(m, &sibs, a, g));
             }
         }
         corr
@@ -1070,7 +1186,86 @@ impl App {
 
     fn snap_point(&mut self, p: Pos2, exclude: &[NodeId]) -> Pos2 {
         let r = Rect::from_min_size(p, Vec2::ZERO);
-        p + self.snap(r, exclude, [true, false, false], [true, false, false])
+        p + self.snap(r, exclude, [true, false, true], [true, false, true])
+    }
+
+    // ---------- smart selection ----------
+
+    /// Figma's smart selection: 2+ selected layers in a row or column with equal gaps (within
+    /// 1px). Returns the axis (0 = row) and the layers in order along it.
+    pub fn smart_selection(&self) -> Option<(usize, Vec<(NodeId, Rect)>)> {
+        let roots = self.sel_roots();
+        if roots.len() < 2 || self.vector_edit.is_some() {
+            return None;
+        }
+        (0..2).find_map(|a| {
+            let mut items: Vec<(NodeId, Rect)> = roots.iter().map(|&i| (i, self.doc.node(i).aabb())).collect();
+            items.sort_by(|x, y| x.1.min[a].total_cmp(&y.1.min[a]));
+            let gaps: Vec<f32> = items.windows(2).map(|w| w[1].1.min[a] - w[0].1.max[a]).collect();
+            gaps.iter().all(|g| *g >= 0.0 && (g - gaps[0]).abs() <= 1.0).then_some((a, items))
+        })
+    }
+
+    /// Screen rects of the gaps between smart-selected layers, spanning the selection across.
+    fn smart_gaps(&self, a: usize, items: &[(NodeId, Rect)]) -> Vec<Rect> {
+        let b = self.doc.bounds(&items.iter().map(|(i, _)| *i).collect::<Vec<_>>());
+        items
+            .windows(2)
+            .map(|w| {
+                let (mut lo, mut hi) = (b.min, b.max);
+                lo[a] = w[0].1.max[a];
+                hi[a] = w[1].1.min[a];
+                self.view.rect_to_screen(Rect::from_min_max(lo, hi))
+            })
+            .collect()
+    }
+
+    /// The spacing handle mid-gap, or a layer's center knob, under screen point `s`.
+    fn smart_grip_at(&self, s: Pos2) -> Option<Grip> {
+        let (a, items) = self.smart_selection()?;
+        for g in self.smart_gaps(a, &items) {
+            let d = s - g.center();
+            if d[a].abs() <= 4.0 && d[1 - a].abs() <= 10.0 {
+                return Some(Grip::Spacing(a));
+            }
+        }
+        items.iter().find(|(_, r)| self.view.to_screen(r.center()).distance(s) <= 6.0).map(|(id, _)| Grip::Swap(*id))
+    }
+
+    /// With the pointer over a smart selection: knobs on each layer and a pink handle in each
+    /// gap; the hovered or dragged gaps light up with their size.
+    fn draw_smart_selection(&self, painter: &Painter, ptr: Option<Pos2>) {
+        let Some((a, items)) = self.smart_selection() else { return };
+        let gaps = self.smart_gaps(a, &items);
+        let b = self.view.rect_to_screen(self.doc.bounds(&self.sel_roots()));
+        let dragging = matches!(self.drag, Some(Drag::Spacing { .. }));
+        if !dragging && !ptr.is_some_and(|p| b.expand(4.0).contains(p)) {
+            return;
+        }
+        let hot = dragging || ptr.is_some_and(|p| gaps.iter().any(|g| g.expand(2.0).contains(p)));
+        for g in &gaps {
+            if hot {
+                painter.rect_filled(*g, 0.0, GAP.gamma_multiply(0.2));
+                let mut at = g.center();
+                at[1 - a] = g.max[1 - a] + 12.0;
+                pill(painter, at, num(g.size()[a] / self.view.zoom), GAP);
+            }
+            let mut half = Vec2::ZERO;
+            half[1 - a] = 6.0;
+            painter.line_segment([g.center() - half, g.center() + half], Stroke::new(2.0, GAP));
+        }
+        for (_, r) in &items {
+            painter.circle(self.view.to_screen(r.center()), 3.5, Color32::WHITE, Stroke::new(1.5, GAP));
+        }
+    }
+
+    /// `p` on whole pixels when snapping to the pixel grid (Shift Cmd '), else as is.
+    fn px(&self, p: Pos2) -> Pos2 {
+        if self.prefs.snap_to_pixels { p.round() } else { p }
+    }
+
+    fn px1(&self, v: f32) -> f32 {
+        if self.prefs.snap_to_pixels { v.round() } else { v }
     }
 
     // ---------- overlays ----------
@@ -1228,10 +1423,22 @@ impl App {
                 painter.galley(pill.min + vec2(4.0, 2.0), g, Color32::WHITE);
             }
         }
+        if self.editing_text.is_none() && self.tool.selects() && matches!(self.drag, None | Some(Drag::Spacing { .. } | Drag::Swap { .. })) {
+            self.draw_smart_selection(painter, ptr);
+        }
         for g in &self.guides {
             painter.line_segment([self.view.to_screen(g[0]), self.view.to_screen(g[1])], Stroke::new(1.0, SNAP));
         }
-        if let (Some(Drag::Marquee { start, .. }), Some(p)) = (&self.drag, ptr) {
+        // Equal gaps: a pink span with end ticks and the gap size, as in Figma.
+        for [a, b] in &self.gap_marks {
+            let (sa, sb) = (self.view.to_screen(*a), self.view.to_screen(*b));
+            let t = (sb - sa).normalized().rot90() * 4.0;
+            for seg in [[sa, sb], [sa - t, sa + t], [sb - t, sb + t]] {
+                painter.line_segment(seg, Stroke::new(1.0, GAP));
+            }
+            pill(painter, sa.lerp(sb, 0.5) + t * 3.0, num(a.distance(*b)), GAP);
+        }
+        if let (Some(Drag::Marquee { start, .. } | Drag::Zoom { start }), Some(p)) = (&self.drag, ptr) {
             let r = Rect::from_two_pos(self.view.to_screen(*start), p);
             painter.rect_filled(r, 0.0, BLUE.gamma_multiply(0.1));
             painter.rect_stroke(r, 0.0, Stroke::new(1.0, BLUE), StrokeKind::Inside);
@@ -1267,9 +1474,9 @@ impl App {
         }
     }
 
-    /// Figma shows a pixel grid from 800% zoom.
+    /// Figma shows a pixel grid from 800% zoom (Cmd ' turns it off).
     fn draw_pixel_grid(&self, painter: &Painter, rect: Rect) {
-        if self.view.zoom < 8.0 {
+        if self.view.zoom < 8.0 || !self.prefs.pixel_grid {
             return;
         }
         let (a, b) = (self.view.to_world(rect.min), self.view.to_world(rect.max));
@@ -1326,16 +1533,70 @@ impl App {
             }
             let (sa, sb) = (v.to_screen(a), v.to_screen(b));
             painter.line_segment([sa, sb], Stroke::new(1.0, red));
-            let g = painter.layout_no_wrap(num(d), FontId::proportional(11.0), Color32::WHITE);
-            let pill = Rect::from_center_size(sa.lerp(sb, 0.5), g.size() + vec2(8.0, 4.0));
-            painter.rect_filled(pill, 2.0, red);
-            painter.galley(pill.min + vec2(4.0, 2.0), g, Color32::WHITE);
+            pill(painter, sa.lerp(sb, 0.5), num(d), red);
+        }
+    }
+
+    /// The ruler under screen point `s`, as the axis of the guide it pulls out (top ruler: Y).
+    fn ruler_at(&self, s: Pos2) -> Option<Axis> {
+        let r = self.canvas_rect.filter(|_| self.rulers)?;
+        let (top, left) = (s.y < r.min.y + RULER, s.x < r.min.x + RULER);
+        match (top, left) {
+            (true, false) => Some(Axis::Y),
+            (false, true) => Some(Axis::X),
+            _ => None,
+        }
+    }
+
+    /// The ruler guide within grabbing distance of screen point `s` (move tool only).
+    fn guide_at(&self, s: Pos2) -> Option<usize> {
+        if !self.tool.selects() || self.vector_edit.is_some() {
+            return None;
+        }
+        self.doc.pages[self.page].guides.iter().position(|g| {
+            let at = self.view.to_screen(pos2(g.offset, g.offset));
+            match g.axis {
+                Axis::X => (at.x - s.x).abs() <= 3.0,
+                Axis::Y => (at.y - s.y).abs() <= 3.0,
+            }
+        })
+    }
+
+    pub fn delete_guide(&mut self) {
+        if let Some(i) = self.guide_sel.take().filter(|i| *i < self.doc.pages[self.page].guides.len()) {
+            self.checkpoint();
+            self.doc.pages[self.page].guides.remove(i);
+        }
+    }
+
+    pub fn remove_all_guides(&mut self) {
+        self.guide_sel = None;
+        if !self.doc.pages[self.page].guides.is_empty() {
+            self.checkpoint();
+            self.doc.pages[self.page].guides.clear();
+        }
+    }
+
+    /// Ruler guides: thin red lines across the canvas. The selected one is bolder and shows its
+    /// position next to the ruler.
+    fn draw_guides(&self, painter: &Painter, rect: Rect) {
+        for (i, g) in self.doc.pages[self.page].guides.iter().enumerate() {
+            let on = self.guide_sel == Some(i);
+            let at = self.view.to_screen(pos2(g.offset, g.offset));
+            let (line, label) = match g.axis {
+                Axis::X => ([pos2(at.x, rect.min.y), pos2(at.x, rect.max.y)], pos2(at.x, rect.min.y + RULER + 12.0)),
+                Axis::Y => ([pos2(rect.min.x, at.y), pos2(rect.max.x, at.y)], pos2(rect.min.x + RULER + 20.0, at.y)),
+            };
+            painter.line_segment(line, Stroke::new(if on { 1.5 } else { 1.0 }, SNAP));
+            if on {
+                pill(painter, label, num(g.offset), SNAP);
+            }
         }
     }
 
     /// Shift+R: top and left rulers with the selection's span highlighted.
     fn draw_rulers(&self, painter: &Painter, rect: Rect) {
-        const T: f32 = 20.0;
+        const T: f32 = RULER;
         let bg = painter.ctx().global_style().visuals.panel_fill.to_opaque();
         let line = crate::appearance::border(painter.ctx());
         let text = crate::appearance::muted(painter.ctx());
@@ -1378,8 +1639,16 @@ impl App {
 
     fn set_cursor(&self, ui: &Ui, ptr: Option<Pos2>, panning: bool) {
         let Some(p) = ptr.filter(|_| ui.ui_contains_pointer()) else { return };
+        let guide = match &self.drag {
+            Some(Drag::Guide { index }) => Some(*index),
+            None => self.guide_at(p),
+            _ => None,
+        };
+        let guide = guide.and_then(|i| self.doc.pages[self.page].guides.get(i)).map(|g| g.axis);
         let icon = if panning {
             if ui.input(|i| i.pointer.any_down()) { CursorIcon::Grabbing } else { CursorIcon::Grab }
+        } else if let Some(axis) = guide {
+            if axis == Axis::X { CursorIcon::ResizeHorizontal } else { CursorIcon::ResizeVertical }
         } else {
             match self.tool {
                 Tool::Move | Tool::Scale => match self.handle_at(p) {
@@ -1388,11 +1657,16 @@ impl App {
                     Some(Grip::Resize(_, 0)) => CursorIcon::ResizeHorizontal,
                     Some(Grip::Resize(0, _)) => CursorIcon::ResizeVertical,
                     Some(Grip::Rotate) => CursorIcon::Alias,
+                    Some(Grip::Spacing(0)) => CursorIcon::ResizeHorizontal,
+                    Some(Grip::Spacing(_)) => CursorIcon::ResizeVertical,
+                    Some(Grip::Swap(_)) => CursorIcon::Grab,
                     _ => CursorIcon::Default,
                 },
                 Tool::Text => CursorIcon::Text,
                 Tool::Comment => CursorIcon::Cell,
                 Tool::Hand => CursorIcon::Grab,
+                Tool::Zoom if ui.input(|i| i.modifiers.alt) => CursorIcon::ZoomOut,
+                Tool::Zoom => CursorIcon::ZoomIn,
                 _ => CursorIcon::Crosshair,
             }
         };
@@ -1687,7 +1961,23 @@ impl App {
             self.toggle_locked();
             ui.close();
         }
+        let guides = !self.doc.pages[self.page].guides.is_empty();
+        if guides {
+            ui.separator();
+            if item(ui, "Remove all guides", "", true) {
+                self.remove_all_guides();
+                ui.close();
+            }
+        }
     }
+}
+
+/// A small measurement label centered at `at`: white text on `fill`.
+fn pill(painter: &Painter, at: Pos2, text: String, fill: Color32) {
+    let g = painter.layout_no_wrap(text, FontId::proportional(11.0), Color32::WHITE);
+    let r = Rect::from_center_size(at, g.size() + vec2(8.0, 4.0));
+    painter.rect_filled(r, 2.0, fill);
+    painter.galley(r.min + vec2(4.0, 2.0), g, Color32::WHITE);
 }
 
 /// Everything that affects a text layer's measured size, hashed.
@@ -1769,6 +2059,88 @@ pub fn smooth_stroke(points: &[Pos2], tol: f32) -> Vec<PathPoint> {
             }
             let t = (simple[i + 1] - simple[i - 1]) / 6.0;
             PathPoint { p, h_in: -t, h_out: t }
+        })
+        .collect()
+}
+
+/// The (first) gap between consecutive `items` along axis `a`.
+fn gap_of(items: &[(NodeId, Rect)], a: usize) -> f32 {
+    items.get(1).map_or(0.0, |n| n.1.min[a] - items[0].1.max[a])
+}
+
+/// A vector of length `v` along axis `a`.
+fn axis_vec(a: usize, v: f32) -> Vec2 {
+    let mut d = Vec2::ZERO;
+    d[a] = v;
+    d
+}
+
+/// Space `items` (in order, from their recorded rects) `g` apart along axis `a`, starting at `from`.
+fn lay_out(doc: &mut crate::doc::Document, a: usize, items: &[(NodeId, Rect)], from: f32, g: f32) {
+    let mut cursor = from;
+    for (id, r) in items {
+        doc.translate(*id, axis_vec(a, cursor - r.min[a]));
+        cursor += r.max[a] - r.min[a] + g;
+    }
+    doc.reflow();
+}
+
+/// Whether `r` and `s` overlap across axis `a`: in the same row (a = 0) or column (a = 1).
+fn across(r: Rect, s: Rect, a: usize) -> bool {
+    let b = 1 - a;
+    r.min[b] < s.max[b] && s.min[b] < r.max[b]
+}
+
+/// Adjacent pairs along axis `a` with empty space between them: each rect and its nearest
+/// neighbor after it in the same row or column.
+fn neighbors(rs: &[Rect], a: usize) -> Vec<(Rect, Rect)> {
+    rs.iter()
+        .filter_map(|p| {
+            let q = rs.iter().filter(|q| q.min[a] > p.max[a] && across(*p, **q, a)).min_by(|x, y| x.min[a].total_cmp(&y.min[a]))?;
+            Some((*p, *q))
+        })
+        .collect()
+}
+
+/// Equal-spacing snaps for `m` along axis `a`: corrections that put a masked edge one existing
+/// gap (between neighbors in its row) away from the nearest neighbor, or center `m` between
+/// its two neighbors. Each is (correction, gap).
+fn gap_snaps(m: Rect, sibs: &[Rect], a: usize, mask: [bool; 3]) -> Vec<(f32, f32)> {
+    let row: Vec<Rect> = sibs.iter().copied().filter(|s| across(m, *s, a)).collect();
+    let gaps: Vec<f32> = neighbors(&row, a).iter().map(|(p, q)| q.min[a] - p.max[a]).collect();
+    let c = m.center()[a];
+    let before = row.iter().filter(|s| s.max[a] <= c).max_by(|x, y| x.max[a].total_cmp(&y.max[a]));
+    let after = row.iter().filter(|s| s.min[a] >= c).min_by(|x, y| x.min[a].total_cmp(&y.min[a]));
+    let mut out = vec![];
+    if let (true, Some(l)) = (mask[0], before) {
+        out.extend(gaps.iter().map(|g| (l.max[a] + g - m.min[a], *g)));
+    }
+    if let (true, Some(r)) = (mask[2], after) {
+        out.extend(gaps.iter().map(|g| (r.min[a] - g - m.max[a], *g)));
+    }
+    if let (true, Some(l), Some(r)) = (mask[1], before, after) {
+        let g = (r.min[a] - l.max[a] - (m.max[a] - m.min[a])) / 2.0;
+        if g > 0.0 {
+            out.push((l.max[a] + g - m.min[a], g));
+        }
+    }
+    out
+}
+
+/// Every gap of size `g` along axis `a` in `m`'s row, as world segments across the gap.
+fn equal_gaps(m: Rect, sibs: &[Rect], a: usize, g: f32) -> Vec<[Pos2; 2]> {
+    let mut row: Vec<Rect> = sibs.iter().copied().filter(|s| across(m, *s, a)).collect();
+    row.push(m);
+    let b = 1 - a;
+    neighbors(&row, a)
+        .into_iter()
+        .filter(|(p, q)| (q.min[a] - p.max[a] - g).abs() < 0.5)
+        .map(|(p, q)| {
+            let mut s = p.max;
+            s[b] = (p.min[b].max(q.min[b]) + p.max[b].min(q.max[b])) / 2.0;
+            let mut e = s;
+            e[a] = q.min[a];
+            [s, e]
         })
         .collect()
 }

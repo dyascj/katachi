@@ -20,11 +20,15 @@ pub struct Prefs {
     pub check_updates: bool,
     /// Linux: the desktop's own title bar above the tabs instead of tabs in the title bar.
     pub system_title_bar: bool,
+    /// Shift ': the pixel grid at 800% zoom and above.
+    pub pixel_grid: bool,
+    /// Shift Cmd ': positions and sizes round to whole pixels.
+    pub snap_to_pixels: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { name: String::new(), snap_to_objects: true, highlight_on_hover: true, keep_tool_selected: false, show_dimensions: true, nudge: 1.0, big_nudge: 10.0, check_updates: true, system_title_bar: false }
+        Prefs { name: String::new(), snap_to_objects: true, highlight_on_hover: true, keep_tool_selected: false, show_dimensions: true, nudge: 1.0, big_nudge: 10.0, check_updates: true, system_title_bar: false, pixel_grid: true, snap_to_pixels: true }
     }
 }
 
@@ -37,6 +41,10 @@ pub fn load() -> Prefs {
 }
 
 pub fn save(p: &Prefs) {
+    // Tests share one data folder and run in parallel: keep each one's preferences to itself.
+    if cfg!(test) {
+        return;
+    }
     let _ = crate::files::write_atomic(&path(), serde_json::to_string_pretty(p).unwrap_or_default().as_bytes());
 }
 
@@ -82,7 +90,9 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Show or hide, lock", "⇧ ⌘ H, ⇧ ⌘ L"),
     ("Next and previous layer, select parent", "Tab, ⇧ Tab, ⇧ ↵"),
     ("Zoom to fit, 100%, selection", "⇧ 1, ⇧ 0, ⇧ 2"),
+    ("Zoom tool, next and previous frame", "Z, N, ⇧ N"),
     ("Rulers, layout guides, hide UI, outline", "⇧ R, ⌃ G, ⌘ \\, ⌘ Y"),
+    ("Pixel grid, snap to pixel grid", "⇧ ', ⇧ ⌘ '"),
     ("Dev Mode, present", "⇧ D, ⌥ ⌘ ↵"),
     ("Save, open, place image, export", "⌘ S, ⌘ O, ⇧ ⌘ K, ⇧ ⌘ E"),
     ("Find and replace", "⌘ F"),
@@ -131,6 +141,13 @@ pub fn toggle(ui: &mut Ui, on: &mut bool) -> egui::Response {
 impl App {
     pub fn open_settings(&mut self, tab: Tab) {
         self.settings_tab = Some(tab);
+    }
+
+    /// Flip a canvas preference from a shortcut or menu, and remember it.
+    pub fn toggle_pref(&mut self, f: fn(&mut Prefs) -> &mut bool) {
+        let on = f(&mut self.prefs);
+        *on = !*on;
+        save(&self.prefs);
     }
 
     /// The Settings modal. Returns whether appearance changed (so the caller re-applies it).
@@ -390,6 +407,12 @@ fn canvas_tab(ui: &mut Ui, p: &mut Prefs) {
     });
     row(ui, "Snap to objects", "Smart guides to other layers' edges and centers", |ui| {
         toggle(ui, &mut p.snap_to_objects);
+    });
+    row(ui, "Snap to pixel grid", "Positions and sizes land on whole pixels", |ui| {
+        toggle(ui, &mut p.snap_to_pixels);
+    });
+    row(ui, "Pixel grid", "Show pixel boundaries at 800% zoom and above", |ui| {
+        toggle(ui, &mut p.pixel_grid);
     });
     section(ui, "Nudge amount");
     row(ui, "Small nudge", "Arrow keys", |ui| {

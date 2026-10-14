@@ -1858,7 +1858,7 @@ fn files_and_pages_reopen_where_they_were_viewed() {
     assert_eq!(g.state().view.zoom, 2.5);
     assert!((back - center).length() < 0.5, "{back:?} vs {center:?}");
     // Switching pages and back keeps each page's view.
-    g.state_mut().doc.pages.push(crate::doc::Page { name: "Two".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None });
+    g.state_mut().doc.pages.push(crate::doc::Page { name: "Two".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, guides: vec![] });
     g.state_mut().select_page(1);
     g.run_steps(2);
     g.state_mut().select_page(0);
@@ -2047,4 +2047,152 @@ fn color_picker_drags_and_escape_from_find_keeps_selection() {
     key(&mut h, Modifiers::NONE, Key::Escape);
     assert!(!h.state().find.0);
     assert_eq!(h.state().sel, vec![id], "selection kept");
+}
+
+#[test]
+fn snaps_to_equal_spacing_and_marks_gaps() {
+    let mut h = harness();
+    draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    draw(&mut h, Key::R, (150.0, 0.0), (250.0, 100.0));
+    let c = draw(&mut h, Key::R, (400.0, 0.0), (500.0, 100.0));
+    // Drop c 3px past the 50px gap that a and b already have: it lands one gap after b.
+    let (a, b) = (s(&h, 450., 50.), s(&h, 353., 50.));
+    move_to(&mut h, a, Modifiers::NONE);
+    press(&mut h, a, true, Modifiers::NONE);
+    for i in 1..=6 {
+        move_to(&mut h, a.lerp(b, i as f32 / 6.0), Modifiers::NONE);
+    }
+    assert_eq!(h.state().gap_marks.len(), 2, "both 50px gaps marked");
+    press(&mut h, b, false, Modifiers::NONE);
+    h.run_steps(2);
+    assert_eq!(rect(&h, c).min.x, 300.0);
+    assert!(h.state().gap_marks.is_empty());
+    // Centered between two neighbors: equal gaps on both sides.
+    let mut h = harness();
+    draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    draw(&mut h, Key::R, (300.0, 0.0), (400.0, 100.0));
+    let c = draw(&mut h, Key::R, (0.0, 300.0), (100.0, 400.0));
+    let (a, b) = (s(&h, 50., 350.), s(&h, 198., 50.));
+    drag(&mut h, a, b, Modifiers::NONE);
+    assert_eq!(rect(&h, c), r(150., 0., 100., 100.));
+}
+
+#[test]
+fn smart_selection_spacing_handle_and_swap() {
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    let b = draw(&mut h, Key::R, (150.0, 0.0), (250.0, 100.0));
+    let c = draw(&mut h, Key::R, (300.0, 0.0), (400.0, 100.0));
+    key(&mut h, Modifiers::COMMAND, Key::A);
+    assert!(h.state().smart_selection().is_some_and(|(axis, _)| axis == 0));
+    // The handle mid-gap widens every gap together.
+    let (p, q) = (s(&h, 125., 50.), s(&h, 145., 50.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    assert_eq!((rect(&h, a).min.x, rect(&h, b).min.x, rect(&h, c).min.x), (0., 170., 340.));
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!((rect(&h, b).min.x, rect(&h, c).min.x), (150., 300.), "one undo step");
+    // Dragging a's center knob onto c's slot swaps them.
+    let (p, q) = (s(&h, 50., 50.), s(&h, 350., 50.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    assert_eq!((rect(&h, a).min.x, rect(&h, b).min.x, rect(&h, c).min.x), (300., 150., 0.));
+    assert_eq!(h.state().sel.len(), 3, "selection kept");
+}
+
+#[test]
+fn ruler_guides_create_snap_move_and_delete() {
+    use crate::doc::{Axis, Guide};
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    key(&mut h, Modifiers::SHIFT, Key::R);
+    let top = h.state().canvas_rect.unwrap().min + vec2(400.0, 10.0);
+    // Pull a horizontal guide out of the top ruler down to y = 200.
+    let to = pos2(top.x, s(&h, 0., 200.).y);
+    drag(&mut h, top, to, Modifiers::NONE);
+    assert_eq!(h.state().doc.pages[0].guides, vec![Guide { axis: Axis::Y, offset: 200.0 }]);
+    // Layers snap to it: the bottom edge dropped 3px short lands on the guide.
+    let (a, b) = (s(&h, 50., 50.), s(&h, 50., 147.));
+    click(&mut h, a, Modifiers::NONE);
+    drag(&mut h, a, b, Modifiers::NONE);
+    assert_eq!(rect(&h, id).min.y, 100.0);
+    // Drag the guide itself, then select it and delete it with Backspace.
+    let (a, b) = (s(&h, 300., 200.), s(&h, 300., 250.));
+    drag(&mut h, a, b, Modifiers::NONE);
+    assert_eq!(h.state().doc.pages[0].guides[0].offset, 250.0);
+    let p = s(&h, 300., 250.);
+    click(&mut h, p, Modifiers::NONE);
+    assert_eq!(h.state().guide_sel, Some(0));
+    assert!(h.state().sel.is_empty(), "selecting a guide drops the layer selection");
+    key(&mut h, Modifiers::NONE, Key::Backspace);
+    assert!(h.state().doc.pages[0].guides.is_empty());
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().doc.pages[0].guides.len(), 1, "undoable");
+    // Dragging it back onto the ruler removes it; guides round-trip through the file.
+    let json = crate::doc::file_json(&h.state().doc);
+    assert_eq!(crate::doc::parse_file(&json).unwrap().pages[0].guides.len(), 1);
+    let a = s(&h, 300., 250.);
+    drag(&mut h, a, top, Modifiers::NONE);
+    assert!(h.state().doc.pages[0].guides.is_empty());
+    assert!(!crate::doc::file_json(&h.state().doc).contains("guides"), "no guides, no field");
+}
+
+#[test]
+fn zoom_tool_and_next_frame() {
+    let mut h = harness();
+    let center = |h: &Harness<App>| h.state().view.to_world(h.state().canvas_rect.unwrap().center());
+    // Z: click zooms in at the point, Alt-click zooms back out.
+    key(&mut h, Modifiers::NONE, Key::Z);
+    assert_eq!(h.state().tool, Tool::Zoom, "a tap keeps the zoom tool");
+    let p = s(&h, 100., 100.);
+    click(&mut h, p, Modifiers::NONE);
+    assert_eq!(h.state().view.zoom, 2.0);
+    assert!((s(&h, 100., 100.) - p).length() < 0.5, "the clicked point stays put");
+    click(&mut h, p, Modifiers::ALT);
+    assert_eq!(h.state().view.zoom, 1.0);
+    // Dragging a box zooms to fit it.
+    let (a, b) = (s(&h, 0., 0.), s(&h, 40., 40.));
+    drag(&mut h, a, b, Modifiers::NONE);
+    assert!(h.state().view.zoom > 10.0);
+    assert!((center(&h) - pos2(20., 20.)).length() < 0.5);
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    // N and Shift N walk the top-level frames in layers-panel order (top first).
+    let st = h.state_mut();
+    let f1 = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(0., 0., 100., 100.)));
+    let f2 = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(1000., 0., 100., 100.)));
+    st.zoom_target = Some(f1);
+    h.run_steps(2);
+    let c = |h: &Harness<App>, f: NodeId| (center(h) - h.state().doc.node(f).rect.center()).length() < 0.5;
+    assert!(c(&h, f1));
+    key(&mut h, Modifiers::NONE, Key::N);
+    assert!(c(&h, f2), "wraps from the bottom frame to the top one");
+    key(&mut h, Modifiers::NONE, Key::N);
+    assert!(c(&h, f1));
+    key(&mut h, Modifiers::SHIFT, Key::N);
+    assert!(c(&h, f2));
+    // Holding Z makes the zoom tool temporary: releasing it brings back the previous tool.
+    let z = |pressed| Event::Key { key: Key::Z, physical_key: None, pressed, repeat: false, modifiers: Modifiers::NONE };
+    h.event(z(true));
+    h.run_steps(40);
+    assert_eq!(h.state().tool, Tool::Zoom);
+    h.event(z(false));
+    h.run_steps(2);
+    assert_eq!(h.state().tool, Tool::Move);
+}
+
+#[test]
+fn pixel_grid_and_snap_to_pixel_toggles() {
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    // Snapping to the pixel grid (on by default) keeps a fractional drag on whole pixels.
+    let (a, b) = (s(&h, 50., 50.), s(&h, 80.25, 50.));
+    drag(&mut h, a, b, Modifiers::NONE);
+    assert_eq!(rect(&h, id).min.x, 30.0);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::Quote);
+    assert!(!h.state().prefs.snap_to_pixels);
+    let (a, b) = (s(&h, 50., 50.), s(&h, 50.5, 80.25));
+    drag(&mut h, a, b, Modifiers::NONE);
+    assert_eq!(rect(&h, id).min, pos2(30.5, 30.25), "free positioning with snap off");
+    key(&mut h, Modifiers::SHIFT, Key::Quote);
+    assert!(!h.state().prefs.pixel_grid);
+    key(&mut h, Modifiers::SHIFT, Key::Quote);
+    assert!(h.state().prefs.pixel_grid);
 }

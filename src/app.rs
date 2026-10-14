@@ -25,6 +25,8 @@ pub enum Tool {
     Text,
     /// C: drop comment pins.
     Comment,
+    /// Z: click zooms in, Alt-click out, drag a box to zoom to it.
+    Zoom,
 }
 
 impl Tool {
@@ -64,13 +66,27 @@ pub enum Drag {
     Pencil { points: Vec<Pos2> },
     /// Prototype tab: dragging a connection from a layer to a frame.
     Connect { from: NodeId },
+    /// Zoom tool: the box to zoom to.
+    Zoom { start: Pos2 },
+    /// A ruler guide being dragged (or just pulled out of a ruler).
+    Guide { index: usize },
+    /// Smart selection: a spacing handle sets every gap along `axis` (0 = row) at once.
+    Spacing { base: Document, axis: usize, items: Vec<(NodeId, Rect)>, gap: f32, start: Pos2 },
+    /// Smart selection: one layer dragged by its center knob onto another's slot swaps them.
+    Swap { base: Document, id: NodeId, axis: usize, items: Vec<(NodeId, Rect)>, start: Pos2 },
 }
 
 impl Drag {
     /// The document as it was when the drag began (drags re-apply themselves to it each frame).
     pub fn base_mut(&mut self) -> Option<&mut Document> {
         match self {
-            Drag::Move { base, .. } | Drag::Resize { base, .. } | Drag::Rotate { base, .. } | Drag::Create { base, .. } | Drag::Vector { base, .. } => Some(base),
+            Drag::Move { base, .. }
+            | Drag::Resize { base, .. }
+            | Drag::Rotate { base, .. }
+            | Drag::Create { base, .. }
+            | Drag::Vector { base, .. }
+            | Drag::Spacing { base, .. }
+            | Drag::Swap { base, .. } => Some(base),
             _ => None,
         }
     }
@@ -83,6 +99,10 @@ pub enum Grip {
     Resize(i8, i8),
     /// Just outside a corner.
     Rotate,
+    /// Smart selection: a gap's spacing handle along this axis (0 = row).
+    Spacing(usize),
+    /// Smart selection: a layer's center knob.
+    Swap(NodeId),
 }
 
 /// Mouse-down state for the move tool, resolved into a click or a drag.
@@ -145,6 +165,14 @@ pub struct App {
     pub renaming: Option<(NodeId, String)>,
     pub renaming_page: Option<(usize, String)>,
     pub guides: Vec<[Pos2; 2]>,
+    /// Equal-spacing markers while snapping: world segments across each matching gap.
+    pub gap_marks: Vec<[Pos2; 2]>,
+    /// Z held down: the tool to go back to on release, and when Z went down.
+    pub zoom_hold: Option<(Tool, f64)>,
+    /// The selected ruler guide on this page (Backspace deletes it).
+    pub guide_sel: Option<usize>,
+    /// Pressed a ruler (new guide on this axis) or an existing guide; a drag moves it.
+    pub guide_grab: Option<(crate::doc::Axis, Option<usize>)>,
     pub frame_labels: Vec<(NodeId, Rect)>,
     pub layer_drag: Option<NodeId>,
     pub canvas_rect: Option<Rect>,
@@ -265,6 +293,10 @@ impl App {
             renaming: None,
             renaming_page: None,
             guides: vec![],
+            gap_marks: vec![],
+            zoom_hold: None,
+            guide_sel: None,
+            guide_grab: None,
             frame_labels: vec![],
             layer_drag: None,
             canvas_rect: None,
@@ -579,6 +611,7 @@ impl App {
             self.end_text_edit();
             self.page = i;
             self.sel.clear();
+            self.guide_sel = None;
             self.view_ready = false;
         }
     }
@@ -2085,6 +2118,15 @@ impl App {
                 }
                 Event::Paste(t) if !typing => self.paste_text(&t),
                 Event::Key { key, pressed: true, modifiers: m, .. } => self.key(ctx, key, m, typing),
+                // Holding Z zooms for a moment, then hands back the previous tool (Figma).
+                Event::Key { key: Key::Z, pressed: false, .. } => {
+                    if let Some((prev, t0)) = self.zoom_hold.take()
+                        && ctx.input(|i| i.time) - t0 > 0.4
+                        && self.tool == Tool::Zoom
+                    {
+                        self.set_tool(prev);
+                    }
+                }
                 _ => {}
             }
         }
@@ -2155,6 +2197,8 @@ impl App {
             (true, false, true, Key::V) => self.paste_style(),
             (true, true, false, Key::R) => self.paste_to_replace(),
             (true, false, false, Key::Y) => self.outline_mode = !self.outline_mode,
+            (false, true, false, Key::Quote) => self.toggle_pref(|p| &mut p.pixel_grid),
+            (true, true, false, Key::Quote) => self.toggle_pref(|p| &mut p.snap_to_pixels),
             (true, false, true, Key::O) => self.outline_stroke_selection(),
             (true, false, true, Key::A) => self.select_matching(),
             (true, true, false, Key::C) => self.copy_as(ctx, "png"),
@@ -2226,6 +2270,7 @@ impl App {
                     self.zoom_to(ctx, Some(s), false)
                 }
             }
+            (false, _, _, Key::Delete | Key::Backspace) if self.guide_sel.is_some() => self.delete_guide(),
             (false, _, _, Key::Delete | Key::Backspace) => self.delete_selection(),
             (false, _, _, Key::ArrowLeft) => self.nudge(vec2(-step, 0.0)),
             (false, _, _, Key::ArrowRight) => self.nudge(vec2(step, 0.0)),
@@ -2276,6 +2321,14 @@ impl App {
             (false, false, false, Key::P) => self.set_tool(Tool::Pen),
             (false, false, false, Key::T) => self.set_tool(Tool::Text),
             (false, false, false, Key::C) => self.set_tool(Tool::Comment),
+            (false, false, false, Key::Z) => {
+                if self.tool != Tool::Zoom {
+                    self.zoom_hold = Some((self.tool, ctx.input(|i| i.time)));
+                    self.set_tool(Tool::Zoom);
+                }
+            }
+            (false, false, false, Key::N) => self.zoom_frame(ctx, 1),
+            (false, true, false, Key::N) => self.zoom_frame(ctx, -1),
             (false, true, false, Key::C) => self.show_comments = !self.show_comments,
             _ => {}
         }
@@ -2284,6 +2337,23 @@ impl App {
     pub fn zoom_step(&mut self, ctx: &egui::Context, f: f32) {
         let c = ctx.content_rect().center();
         self.view.zoom_at(c, f);
+    }
+
+    /// N / Shift N: zoom to the next / previous top-level frame, in layers-panel order (top
+    /// first), counting from the frame in view (or holding the selection).
+    pub fn zoom_frame(&mut self, ctx: &egui::Context, step: isize) {
+        let frames: Vec<NodeId> = self.doc.pages[self.page].children.iter().rev().copied().filter(|&f| self.doc.node(f).kind.is_frame() && self.doc.node(f).visible).collect();
+        if frames.is_empty() {
+            return;
+        }
+        let center = self.view.to_world(self.canvas_rect.unwrap_or(ctx.content_rect()).center());
+        let cur = frames
+            .iter()
+            .position(|&f| self.doc.node(f).aabb().contains(center))
+            .or_else(|| self.sel.first().and_then(|&s| frames.iter().position(|&f| f == crate::prototype::top_frame(&self.doc, s))));
+        let n = frames.len() as isize;
+        let i = cur.map_or(if step > 0 { 0 } else { n - 1 }, |c| (c as isize + step).rem_euclid(n));
+        self.zoom_to(ctx, Some(vec![frames[i as usize]]), false);
     }
 
     /// Zoom to fit `ids` (None = whole page); `actual` = 100% centered on content.

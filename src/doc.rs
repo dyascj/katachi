@@ -1646,6 +1646,23 @@ pub struct Page {
     /// Where the page was last viewed: world center x, y and zoom (saved in the file, as Figma does).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<[f32; 3]>,
+    /// Ruler guides dragged onto the page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guides: Vec<Guide>,
+}
+
+/// Which way a ruler guide runs: an X guide is a vertical line at an x offset, Y horizontal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Axis {
+    X,
+    Y,
+}
+
+/// A page guide from the rulers (Figma's `Guide`: an axis and a world offset).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Guide {
+    pub axis: Axis,
+    pub offset: f32,
 }
 
 pub const PAGE_BG: Rgba = Rgba::rgb(0xF5, 0xF5, 0xF5);
@@ -1767,7 +1784,7 @@ pub enum Order {
 impl Default for Document {
     fn default() -> Self {
         Self {
-            pages: vec![Page { name: "Page 1".into(), children: vec![], background: PAGE_BG, flows: vec![], view: None }],
+            pages: vec![Page { name: "Page 1".into(), children: vec![], background: PAGE_BG, flows: vec![], view: None, guides: vec![] }],
             nodes: HashMap::new(),
             next_id: 1,
             images: HashMap::new(),

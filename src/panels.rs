@@ -835,6 +835,18 @@ impl App {
                 self.rulers = !self.rulers;
                 ui.close();
             }
+            if enabled(ui, !self.doc.pages[self.page].guides.is_empty(), "     Remove all guides", "") {
+                self.remove_all_guides();
+                ui.close();
+            }
+            if check(ui, self.prefs.pixel_grid, "Pixel grid", "⇧'") {
+                self.toggle_pref(|p| &mut p.pixel_grid);
+                ui.close();
+            }
+            if check(ui, self.prefs.snap_to_pixels, "Snap to pixel grid", "⇧⌘'") {
+                self.toggle_pref(|p| &mut p.snap_to_pixels);
+                ui.close();
+            }
             if check(ui, self.outline_mode, "Outlines", "⌘Y") {
                 self.outline_mode = !self.outline_mode;
                 ui.close();
@@ -866,6 +878,18 @@ impl App {
             }
             if enabled(ui, has, "Zoom to selection", "⇧2") {
                 self.zoom_to(&ctx, Some(self.sel.clone()), false);
+                ui.close();
+            }
+            if item(ui, "Zoom to next frame", "N") {
+                self.zoom_frame(&ctx, 1);
+                ui.close();
+            }
+            if item(ui, "Zoom to previous frame", "⇧N") {
+                self.zoom_frame(&ctx, -1);
+                ui.close();
+            }
+            if item(ui, "Zoom tool", "Z") {
+                self.set_tool(crate::app::Tool::Zoom);
                 ui.close();
             }
             ui.separator();
@@ -1078,7 +1102,7 @@ impl App {
                 if icon_button(ui, Icon::Plus, false, 22.0, "Add page").clicked() {
                     self.checkpoint();
                     let n = self.doc.pages.len() + 1;
-                    self.doc.pages.push(Page { name: format!("Page {n}"), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None });
+                    self.doc.pages.push(Page { name: format!("Page {n}"), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, guides: vec![] });
                     self.select_page(n - 1);
                 }
             });
