@@ -240,7 +240,9 @@ impl Drop for Relay {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         // Dropping the senders ends every connection's pump.
-        self.state.lock().unwrap().clients.clear();
+        if let Ok(mut s) = self.state.lock() {
+            s.clients.clear();
+        }
         // Wake the accept loop so it sees the flag.
         let _ = TcpStream::connect_timeout(&(std::net::Ipv4Addr::LOCALHOST, self.port).into(), Duration::from_secs(1));
     }
