@@ -523,6 +523,12 @@ fn heading(ui: &mut Ui, title: &str) {
     ui.add_space(2.0);
 }
 
+/// A page named only with dashes ("---") is a divider in the pages list, as in Figma.
+pub fn is_divider(name: &str) -> bool {
+    let t = name.trim();
+    !t.is_empty() && t.chars().all(|c| c == '-')
+}
+
 /// Cmd R with several layers selected: Figma's batch rename.
 pub struct BatchRename {
     /// `$&` is the current name, `$n` an ascending number, `$N` a descending one. Empty keeps the name.
@@ -1154,11 +1160,47 @@ impl App {
                 }
             });
         });
-        let mut delete = None;
+        let (mut delete, mut duplicate, mut divider_at) = (None, None, None);
+        // Pages reorder by dragging: the page being dragged, kept across frames.
+        let drag_key = ui.id().with("page-drag");
+        let mut dragging: Option<usize> = ui.data(|d| d.get_temp(drag_key));
+        let mut rects = vec![];
         for i in 0..self.doc.pages.len() {
-            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
             let page_name = self.doc.pages[i].name.clone();
+            let divider = is_divider(&page_name);
+            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), if divider { 13.0 } else { 26.0 }), Sense::click_and_drag());
+            rects.push(rect);
+            if resp.drag_started() {
+                dragging = Some(i);
+            }
             resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, i == self.page, &page_name));
+            crate::chrome::context_menu(&resp, |ui| {
+                if ui.button("Rename").clicked() {
+                    self.renaming_page = Some((i, page_name.clone()));
+                    ui.close();
+                }
+                if !divider && ui.button("Duplicate page").clicked() {
+                    duplicate = Some(i);
+                    ui.close();
+                }
+                if ui.button("Add divider").clicked() {
+                    divider_at = Some(i + 1);
+                    ui.close();
+                }
+                if ui.add_enabled(self.doc.pages.len() > 1, egui::Button::new(if divider { "Delete divider" } else { "Delete page" })).clicked() {
+                    delete = Some(i);
+                    ui.close();
+                }
+            });
+            if divider && !matches!(&self.renaming_page, Some((pi, _)) if *pi == i) {
+                // Figma's page dividers: a line in the list, never opened.
+                let x = rect.x_range().shrink(10.0);
+                ui.painter().hline(x, rect.center().y, Stroke::new(1.0, theme::border(ui.ctx())));
+                if resp.double_clicked() {
+                    self.renaming_page = Some((i, page_name));
+                }
+                continue;
+            }
             if i == self.page {
                 ui.painter().rect_filled(rect, 4.0, theme::subtle(ui.ctx()));
             } else if resp.hovered() {
@@ -1194,16 +1236,37 @@ impl App {
             if resp.double_clicked() {
                 self.renaming_page = Some((i, self.doc.pages[i].name.clone()));
             }
-            crate::chrome::context_menu(&resp, |ui| {
-                if ui.button("Rename").clicked() {
-                    self.renaming_page = Some((i, self.doc.pages[i].name.clone()));
-                    ui.close();
+        }
+        if let Some(from) = dragging {
+            let (ptr, released) = ui.input(|i| (i.pointer.hover_pos(), i.pointer.any_released()));
+            let span = rects.first().map_or(Rect::NOTHING, |f| f.union(*rects.last().unwrap())).expand2(vec2(0.0, 8.0));
+            // The gap the page would go into: before the first row whose middle is below the pointer.
+            if let Some(p) = ptr.filter(|p| span.contains(*p)) {
+                let slot = rects.iter().position(|r| p.y < r.center().y).unwrap_or(rects.len());
+                if slot != from && slot != from + 1 {
+                    let y = rects.get(slot).map_or(span.max.y - 8.0, |r| r.min.y);
+                    ui.painter().hline(span.x_range(), y, Stroke::new(2.0, BLUE));
+                    if released {
+                        self.move_page(from, slot);
+                    }
                 }
-                if ui.add_enabled(self.doc.pages.len() > 1, egui::Button::new("Delete page")).clicked() {
-                    delete = Some(i);
-                    ui.close();
-                }
-            });
+            }
+            if released {
+                dragging = None;
+            }
+        }
+        ui.data_mut(|d| match dragging {
+            Some(i) => {
+                d.insert_temp(drag_key, i);
+            }
+            None => d.remove::<usize>(drag_key),
+        });
+        if let Some(i) = duplicate {
+            self.duplicate_page(i);
+        }
+        if let Some(at) = divider_at {
+            self.checkpoint();
+            self.insert_page(at, Page { name: "---".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None });
         }
         if let Some(i) = delete {
             self.checkpoint();
@@ -1215,6 +1278,47 @@ impl App {
             self.sel.clear();
             self.view_ready = false;
         }
+    }
+
+    /// Page indices (the open page, comments) after pages move around.
+    fn renumber_pages(&mut self, f: impl Fn(usize) -> usize) {
+        self.page = f(self.page);
+        for c in &mut self.doc.comments {
+            c.page = f(c.page);
+        }
+    }
+
+    fn insert_page(&mut self, at: usize, page: Page) {
+        self.renumber_pages(|p| if p >= at { p + 1 } else { p });
+        self.doc.pages.insert(at, page);
+    }
+
+    /// Move page `from` into the gap `slot` (0 = before the first page, len = after the last).
+    pub fn move_page(&mut self, from: usize, slot: usize) {
+        let to = if slot > from { slot - 1 } else { slot };
+        if to == from || to >= self.doc.pages.len() {
+            return;
+        }
+        self.checkpoint();
+        let p = self.doc.pages.remove(from);
+        self.doc.pages.insert(to, p);
+        self.renumber_pages(|p| match p {
+            p if p == from => to,
+            p if from < p && p <= to => p - 1,
+            p if to <= p && p < from => p + 1,
+            p => p,
+        });
+    }
+
+    /// A copy of a page and everything on it, right after it, opened.
+    pub fn duplicate_page(&mut self, i: usize) {
+        self.checkpoint();
+        let src = self.doc.pages[i].clone();
+        let frag = self.doc.extract(&src.children);
+        self.insert_page(i + 1, Page { name: format!("{} copy", src.name), children: vec![], flows: vec![], ..src });
+        self.doc.paste(&frag, i + 1, None, None);
+        self.doc.reflow();
+        self.select_page(i + 1);
     }
 
     fn layer_rows(&self) -> Vec<(NodeId, usize)> {

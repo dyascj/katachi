@@ -2268,6 +2268,39 @@ fn clipboard_images_paste_and_dropped_images_replace_fills() {
 }
 
 #[test]
+fn pages_reorder_by_dragging_duplicate_and_dividers() {
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (50.0, 50.0));
+    for name in ["Page 2", "---", "Page 3"] {
+        let mut pg = h.state().doc.pages[0].clone();
+        (pg.name, pg.children) = (name.into(), vec![]);
+        h.state_mut().doc.pages.push(pg);
+    }
+    h.run_steps(2);
+    let names = |h: &Harness<App>| h.state().doc.pages.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+    // A divider is a line in the list: clicking it opens nothing.
+    let divider = h.get_by_label("---").rect();
+    assert!(divider.height() < 20.0);
+    click(&mut h, divider.center(), Modifiers::NONE);
+    assert_eq!(h.state().page, 0);
+    // Drag Page 3 above Page 1; the open page stays open.
+    let (from, to) = (h.get_by_label("Page 3").rect().center(), h.get_by_label("Page 1").rect().min + vec2(20.0, 3.0));
+    drag(&mut h, from, to, Modifiers::NONE);
+    assert_eq!(names(&h), ["Page 3", "Page 1", "Page 2", "---"]);
+    assert_eq!(h.state().page, 1, "still on Page 1");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(names(&h)[0], "Page 1", "undoable");
+    h.state_mut().duplicate_page(0);
+    h.run_steps(2);
+    assert_eq!(names(&h)[..2], ["Page 1", "Page 1 copy"]);
+    assert_eq!(h.state().page, 1, "the copy opens");
+    let copy = h.state().doc.pages[1].children.clone();
+    assert_eq!(copy.len(), 1);
+    assert_ne!(copy[0], a);
+    assert_eq!(rect(&h, copy[0]), rect(&h, a));
+}
+
+#[test]
 fn paste_to_replace_takes_layers_copied_in_another_tab() {
     use crate::app::TEST_CLIPBOARD;
     let mut a = harness();
