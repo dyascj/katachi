@@ -502,14 +502,10 @@ impl App {
                             let a = (start - c).angle();
                             Some(Drag::Rotate { base, center: c, start_angle: a, start_rot: rot, deg: 0.0 })
                         }
-                        Grip::Spacing(_) | Grip::Swap(_) => {
-                            let (axis, items) = self.smart_selection().unwrap_or_default();
-                            match grip {
-                                Grip::Spacing(_) => Some(Drag::Spacing { base, axis, gap: gap_of(&items, axis), items, start }),
-                                Grip::Swap(id) => Some(Drag::Swap { base, id, axis, items, start }),
-                                _ => None,
-                            }
-                        }
+                        Grip::Spacing(_) | Grip::Swap(_) => self.smart_selection().map(|(axis, items)| match grip {
+                            Grip::Swap(id) => Drag::Swap { base, id, axis, items, start },
+                            _ => Drag::Spacing { base, axis, gap: gap_of(&items, axis), items, start },
+                        }),
                     }
                 } else if press.target.is_some() && !self.sel.is_empty() {
                     self.checkpoint();
