@@ -381,14 +381,16 @@ pub fn relative(dir: &Path, to: &Path) -> String {
     if common <= 1 {
         return to.to_string_lossy().into_owned();
     }
-    let rel: PathBuf = a[common..].iter().map(|_| std::path::Component::ParentDir).chain(b[common..].iter().copied()).collect();
-    rel.to_string_lossy().into_owned()
+    // Always with "/", which every platform reads, so a file shared between systems keeps its links.
+    let up = a[common..].iter().map(|_| "..".to_string());
+    let down = b[common..].iter().map(|c| c.as_os_str().to_string_lossy().into_owned());
+    up.chain(down).collect::<Vec<_>>().join("/")
 }
 
 /// A stored library path, resolved against this file's folder.
 pub fn resolve(dir: Option<&Path>, path: &str) -> PathBuf {
     match dir {
-        Some(d) if Path::new(path).is_relative() => d.join(path),
+        Some(d) if Path::new(path).is_relative() && !Path::new(path).has_root() => d.join(path),
         _ => PathBuf::from(path),
     }
 }
@@ -845,7 +847,7 @@ mod tests {
     fn paths_are_relative_to_the_file() {
         let p = |s: &str| PathBuf::from(s);
         assert_eq!(relative(&p("/work/app"), &p("/work/app/ui.katachi")), "ui.katachi");
-        assert_eq!(relative(&p("/work/app"), &p("/work/kit/ui.katachi")), p("../kit/ui.katachi").to_string_lossy());
+        assert_eq!(relative(&p("/work/app"), &p("/work/kit/ui.katachi")), "../kit/ui.katachi");
         assert_eq!(resolve(Some(&p("/work/app")), "../kit/ui.katachi"), p("/work/app/../kit/ui.katachi"));
         assert_eq!(resolve(Some(&p("/work/app")), "/abs/ui.katachi"), p("/abs/ui.katachi"));
     }
