@@ -7,6 +7,9 @@ use resvg::usvg::fontdb;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// Linked text, underlined in this color unless it has its own.
+pub const LINK: Color32 = Color32::from_rgb(0x0D, 0x99, 0xFF);
+
 /// Inter's line height in ems (hhea ascender - descender), egui's natural row height for it.
 pub const NATURAL_LINE: f32 = 1.2109375;
 pub const ASCENT: f32 = 0.96875;
@@ -236,7 +239,7 @@ pub fn job(ctx: &egui::Context, n: &Node, text: &str, zoom: f32, color: Color32)
     let alpha = color.a() as f32 / 255.0;
     let format = |st: &crate::doc::SpanStyle| {
         let size = st.font_size.unwrap_or(n.font_size) * zoom;
-        let c = st.color.map_or(color, |c| c.to32().gamma_multiply(alpha));
+        let c = st.color.map_or(if st.link.is_some() { LINK.gamma_multiply(alpha) } else { color }, |c| c.to32().gamma_multiply(alpha));
         let deco = Stroke::new((n.font_size / 14.0).max(1.0) * zoom, c);
         let decoration = st.decoration.unwrap_or(n.decoration);
         let family = st.font_family.as_deref().unwrap_or(&n.font_family);
@@ -246,7 +249,7 @@ pub fn job(ctx: &egui::Context, n: &Node, text: &str, zoom: f32, color: Color32)
             color: c,
             extra_letter_spacing: n.letter_spacing / 100.0 * size,
             line_height: (n.line_height != LineHeight::Auto).then(|| line_pitch(n) * zoom),
-            underline: if decoration == Decoration::Underline { deco } else { Stroke::NONE },
+            underline: if decoration == Decoration::Underline || st.link.is_some() { deco } else { Stroke::NONE },
             strikethrough: if decoration == Decoration::Strikethrough { deco } else { Stroke::NONE },
             italics: slant,
             ..Default::default()
@@ -405,6 +408,19 @@ pub fn draw_offset(n: &Node, rows: usize) -> Vec2 {
         0.0
     };
     vec2(0.0, v + half_leading)
+}
+
+/// The link under world point `p` on text layer `n`, for clicking it (presentation).
+pub fn link_at(painter: &egui::Painter, n: &Node, p: egui::Pos2) -> Option<String> {
+    if !n.spans.iter().any(|sp| sp.style.link.is_some()) {
+        return None;
+    }
+    let (galley, _, _) = layout(painter, n, 1.0, Color32::BLACK);
+    let local = crate::doc::rotate(p, n.rect.center(), -n.rotation) - (n.rect.min + draw_offset(n, galley.rows.len()));
+    if !galley.rect.contains(local.to_pos2()) {
+        return None;
+    }
+    crate::doc::link_at(&n.spans, galley.cursor_from_pos(local).index.0).map(|l| l.2)
 }
 
 /// Laid-out text for drawing, plus the content size at 100% and the wrapped lines.

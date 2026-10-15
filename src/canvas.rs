@@ -1727,21 +1727,21 @@ impl App {
             .fixed_pos(self.view.to_screen(local))
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut text)
-                        .id(egui::Id::new(TEXT_EDIT_ID))
-                        .layouter(&mut layouter)
-                        .frame(egui::Frame::NONE)
-                        .margin(egui::Margin::ZERO)
-                        .desired_width(width)
-                        .desired_rows(1),
-                )
+                egui::TextEdit::multiline(&mut text)
+                    .id(egui::Id::new(TEXT_EDIT_ID))
+                    .layouter(&mut layouter)
+                    .frame(egui::Frame::NONE)
+                    .margin(egui::Margin::ZERO)
+                    .desired_width(width)
+                    .desired_rows(1)
+                    .show(ui)
             })
             .inner;
         if self.focus_text {
-            out.request_focus();
+            out.response.request_focus();
             self.focus_text = false;
         }
+        self.link_popover(ui.ctx(), id, &out.galley, out.galley_pos);
         if text != n.text {
             let node = self.doc.node_mut(id);
             node.spans = crate::doc::shift_spans(&node.spans, &n.text, &text);
@@ -1752,6 +1752,58 @@ impl App {
             }
             node.text = text;
             self.dirty = true;
+        }
+    }
+
+    /// Cmd K while editing: a link field for the selected characters (showing their link, if any).
+    pub fn create_link(&mut self, ctx: &egui::Context) {
+        let (Some(id), Some((a, b))) = (self.editing_text, self.text_selection(ctx)) else { return };
+        let url = crate::doc::link_at(&self.doc.node(id).spans, a).map(|l| l.2).unwrap_or_default();
+        self.link_edit = Some((a, b, url));
+        self.focus_link = true;
+    }
+
+    /// Figma's link popover under the caret: the link there (open, edit, remove), or the field
+    /// for the link Cmd K is adding.
+    fn link_popover(&mut self, ctx: &egui::Context, id: NodeId, galley: &egui::Galley, origin: Pos2) {
+        let Some(caret) = egui::TextEdit::load_state(ctx, egui::Id::new(TEXT_EDIT_ID)).and_then(|s| s.cursor.char_range()).map(|r| r.primary.index) else { return };
+        let found = crate::doc::link_at(&self.doc.node(id).spans, caret.0);
+        let anchor = self.link_edit.as_ref().map(|e| e.0).or(found.as_ref().map(|l| l.0));
+        let Some(anchor) = anchor else { return };
+        let at = origin + galley.pos_from_cursor(egui::text::CCursor::new(anchor)).left_bottom().to_vec2() + vec2(0.0, 6.0);
+        let (mut apply, mut remove) = (None, None);
+        egui::Area::new(egui::Id::new("text-link")).fixed_pos(at).order(egui::Order::Foreground).show(ctx, |ui| {
+            crate::chrome::popover_frame(ui).inner_margin(8).show(ui, |ui| {
+                if let Some((a, b, url)) = &mut self.link_edit {
+                    let r = ui.add(egui::TextEdit::singleline(url).hint_text("Paste or type a link").desired_width(240.0));
+                    if std::mem::take(&mut self.focus_link) {
+                        r.request_focus();
+                    }
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        apply = Some((*a, *b, url.trim().to_string()));
+                    }
+                } else if let Some((a, b, url)) = &found {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Hyperlink::from_label_and_url(url.as_str(), url.as_str()).open_in_new_tab(true));
+                        if ui.small_button("Edit").clicked() {
+                            self.link_edit = Some((*a, *b, url.clone()));
+                            self.focus_link = true;
+                        }
+                        if ui.small_button("Remove link").clicked() {
+                            remove = Some((*a, *b));
+                        }
+                    });
+                }
+            });
+        });
+        // An empty field removes the link; a bare domain gets https, as in Figma.
+        let change = apply.map(|(a, b, url)| (a, b, if url.is_empty() || url.contains(':') { url } else { format!("https://{url}") })).or(remove.map(|(a, b)| (a, b, String::new())));
+        if let Some((a, b, url)) = change {
+            self.checkpoint();
+            let n = self.doc.node_mut(id);
+            n.spans = crate::doc::style_range(&n.spans, n.text.chars().count(), a, b, &crate::doc::SpanStyle { link: Some(url), ..Default::default() });
+            self.link_edit = None;
+            self.focus_text = true;
         }
     }
 

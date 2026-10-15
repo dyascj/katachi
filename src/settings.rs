@@ -104,6 +104,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Font size, font weight", "⇧ ⌘ < / >, ⌥ ⌘ < / >"),
     ("Letter spacing, line height", "⌥ < / >, ⌥ ⇧ < / >"),
     ("Bulleted and numbered list", "⇧ ⌘ 8, ⇧ ⌘ 7"),
+    ("Link the selected text (while editing)", "⌘ K"),
     ("Find and replace", "⌘ F"),
     ("Next and previous tab, close tab", "⌃ Tab, ⌃ ⇧ Tab, ⌘ W"),
     ("Settings", "⌘ ,"),

@@ -440,6 +440,7 @@ impl Svg<'_> {
                             let mut text: String = body[w[0]..w[1]].iter().collect();
                             let (a, b) = (offset + w[0], offset + w[1]);
                             let mut style = String::new();
+                            let mut href = None;
                             if justify {
                                 text.truncate(text.trim_end().len());
                                 let _ = write!(style, r#" textLength="{}" lengthAdjust="spacing""#, r.width() - indent);
@@ -458,20 +459,33 @@ impl Svg<'_> {
                                 if let Some(c) = st.color {
                                     let (c, a) = color_parts(c);
                                     let _ = write!(style, r#" fill="{c}" fill-opacity="{a:.3}""#);
+                                } else if st.link.is_some() {
+                                    let l = crate::text::LINK;
+                                    let (c, _) = color_parts(Rgba::rgb(l.r(), l.g(), l.b()));
+                                    let _ = write!(style, r#" fill="{c}""#);
                                 }
+                                href = st.link.clone();
                                 match st.italic {
                                     Some(true) => style.push_str(r#" font-style="italic""#),
                                     Some(false) if n.italic => style.push_str(r#" font-style="normal""#),
                                     _ => {}
                                 }
-                                match st.decoration {
-                                    Some(Decoration::Underline) => style.push_str(r#" text-decoration="underline""#),
-                                    Some(Decoration::Strikethrough) => style.push_str(r#" text-decoration="line-through""#),
+                                // Links are underlined, as on the canvas.
+                                match (st.decoration, href.is_some()) {
+                                    (Some(Decoration::Strikethrough), true) => style.push_str(r#" text-decoration="underline line-through""#),
+                                    (Some(Decoration::Underline), _) | (_, true) => style.push_str(r#" text-decoration="underline""#),
+                                    (Some(Decoration::Strikethrough), false) => style.push_str(r#" text-decoration="line-through""#),
                                     _ => {}
                                 }
                             }
                             let pos = if k == 0 { format!(r#" x="{lx}" y="{y}""#) } else { String::new() };
-                            let _ = write!(self.out, r#"<tspan{pos}{style}>{}</tspan>"#, esc(&text));
+                            let run = format!(r#"<tspan{pos}{style}>{}</tspan>"#, esc(&text));
+                            match href {
+                                Some(url) => {
+                                    let _ = write!(self.out, r#"<a href="{}">{run}</a>"#, esc(&url));
+                                }
+                                None => self.out.push_str(&run),
+                            }
                         }
                         offset += line.chars().count();
                     }

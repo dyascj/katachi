@@ -514,6 +514,9 @@ pub struct SpanStyle {
     pub color: Option<Rgba>,
     pub decoration: Option<Decoration>,
     pub italic: Option<bool>,
+    /// A hyperlink (URL) on these characters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 impl SpanStyle {
@@ -526,6 +529,12 @@ impl SpanStyle {
             color: patch.color.or(self.color),
             decoration: patch.decoration.or(self.decoration),
             italic: patch.italic.or(self.italic),
+            // An empty link in a patch removes the link.
+            link: match &patch.link {
+                Some(l) if l.is_empty() => None,
+                Some(l) => Some(l.clone()),
+                None => self.link.clone(),
+            },
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -539,6 +548,23 @@ pub struct TextSpan {
     pub start: usize,
     pub end: usize,
     pub style: SpanStyle,
+}
+
+/// The link run around char `c`, joining neighboring spans with the same link: start, end, URL.
+/// A caret just after a link still counts as in it.
+pub fn link_at(spans: &[TextSpan], c: usize) -> Option<(usize, usize, String)> {
+    let linked = |sp: &&TextSpan| sp.style.link.is_some();
+    let sp = spans.iter().filter(linked).find(|sp| sp.start <= c && c < sp.end).or_else(|| spans.iter().filter(linked).find(|sp| sp.start < c && c == sp.end))?;
+    let url = sp.style.link.clone()?;
+    let same = |s: &TextSpan| s.style.link.as_ref() == Some(&url);
+    let (mut a, mut b) = (sp.start, sp.end);
+    while let Some(s) = spans.iter().find(|s| s.end == a && same(s)) {
+        a = s.start;
+    }
+    while let Some(s) = spans.iter().find(|s| s.start == b && same(s)) {
+        b = s.end;
+    }
+    Some((a, b, url))
 }
 
 /// Apply a style patch to chars [start, end), splitting and merging spans as needed.

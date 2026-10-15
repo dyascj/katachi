@@ -1080,6 +1080,10 @@ impl App {
                     ui.close();
                 }
             }
+            if enabled(ui, self.text_selection(&ctx).is_some(), "Create link", "⌘K") {
+                self.create_link(&ctx);
+                ui.close();
+            }
             ui.separator();
             if item(ui, "Replace fonts…", "") {
                 self.open_replace_fonts();
@@ -2451,6 +2455,22 @@ impl App {
             heading(ui, "Typography");
             for t in type_styles {
                 ui.label(t);
+            }
+        }
+        // Text links, clickable.
+        let links: Vec<(String, String)> = ids
+            .iter()
+            .flat_map(|&d| {
+                let dn = self.doc.node(d);
+                let chars: Vec<char> = dn.text.chars().collect();
+                dn.spans.iter().filter_map(move |sp| Some((chars[sp.start.min(chars.len())..sp.end.min(chars.len())].iter().collect(), sp.style.link.clone()?))).collect::<Vec<_>>()
+            })
+            .collect();
+        if !links.is_empty() {
+            ui.separator();
+            heading(ui, "Links");
+            for (text, url) in links {
+                ui.add(egui::Hyperlink::from_label_and_url(text, &url).open_in_new_tab(true)).on_hover_text(url);
             }
         }
         ui.separator();

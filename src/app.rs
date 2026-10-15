@@ -250,6 +250,10 @@ pub struct App {
     pub style_clip: Option<Node>,
     pub layer_search: Option<String>,
     pub batch_rename: Option<crate::panels::BatchRename>,
+    /// Cmd K's link field while editing text: the characters it links and the URL typed so far.
+    pub link_edit: Option<(usize, usize, String)>,
+    /// Focus the link field on its next frame.
+    pub focus_link: bool,
     /// The Replace fonts dialog: each missing family and its chosen replacement.
     pub replace_fonts: Option<Vec<(String, String)>>,
     /// This session's crash-recovery autosave.
@@ -361,6 +365,8 @@ impl App {
             layer_search: None,
             batch_rename: None,
             replace_fonts: None,
+            link_edit: None,
+            focus_link: false,
             recovery: {
                 // Unique per window, even for two opened in the same millisecond.
                 static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1355,6 +1361,7 @@ impl App {
     // ---------- text & pen ----------
 
     pub fn end_text_edit(&mut self) {
+        self.link_edit = None;
         if let Some(id) = self.editing_text.take()
             && self.doc.nodes.get(&id).is_some_and(|n| n.text.trim().is_empty()) {
                 self.doc.remove(id);
@@ -2346,6 +2353,8 @@ impl App {
         let cmd = m.command;
         // Global shortcuts that work even while a field has focus.
         match (cmd, m.shift, key) {
+            // Figma: Cmd K links the characters selected in the text editor.
+            (true, false, Key::K) if !m.alt && self.text_selection(ctx).is_some() => return self.create_link(ctx),
             (true, false, Key::Slash | Key::K) if !m.alt => return self.toggle_quick_actions(),
             (true, false, Key::Comma) => return self.open_settings(crate::settings::Tab::Account),
             (true, false, Key::S) => return void(self.save(false)),
@@ -2361,6 +2370,11 @@ impl App {
             (true, true, Key::Num7) => return self.toggle_list(ctx, crate::doc::ListKind::Number),
             (true, true, Key::Num8) => return self.toggle_list(ctx, crate::doc::ListKind::Bullet),
             _ => {}
+        }
+        if key == Key::Escape && self.link_edit.is_some() {
+            self.link_edit = None;
+            self.focus_text = true;
+            return;
         }
         if key == Key::Escape && self.editing_text.is_some() {
             return self.end_text_edit();

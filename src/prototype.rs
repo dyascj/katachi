@@ -760,6 +760,9 @@ impl App {
                     if let Some(p) = self.presenting.as_mut() {
                         p.overlays.pop();
                     }
+                } else if let Some(url) = under.iter().find_map(|&id| crate::text::link_at(&content, doc.node(id), w)) {
+                    // Text links open in the browser, as in Figma's prototypes.
+                    ctx.open_url(egui::OpenUrl::new_tab(url));
                 } else if let Some((id, r)) = reaction_at(&doc, &under, |t| *t == Trigger::OnClick) {
                     self.perform(&doc, id, &r, &ctx, now);
                 } else if let Some(p) = self.presenting.as_mut() {

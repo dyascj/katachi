@@ -2817,6 +2817,67 @@ fn missing_fonts_show_and_replace_in_one_step() {
 }
 
 #[test]
+fn text_links_add_edit_remove_export_and_click_through() {
+    let mut h = harness();
+    let f = draw(&mut h, Key::F, (0.0, 0.0), (300.0, 100.0));
+    let mut t = Node::new(Kind::Text, r(10., 10., 10., 10.));
+    (t.text, t.font_size) = ("Visit site".into(), 20.0);
+    let id = h.state_mut().doc.insert(0, Some(f), None, t);
+    h.state_mut().sel = vec![id];
+    h.state_mut().editing_text = Some(id);
+    h.state_mut().focus_text = true;
+    h.run_steps(3);
+    // Cmd K on selected characters opens the link field instead of quick actions.
+    select_chars(&mut h, 6, 10);
+    key(&mut h, Modifiers::COMMAND, Key::K);
+    assert!(h.state().quick.is_none());
+    assert_eq!(h.state().link_edit, Some((6, 10, String::new())));
+    h.event(Event::Text("example.com".into()));
+    key(&mut h, Modifiers::NONE, Key::Enter);
+    let n = h.state().doc.node(id).clone();
+    assert_eq!(n.text, "Visit site");
+    assert_eq!(crate::doc::link_at(&n.spans, 7), Some((6, 10, "https://example.com".into())));
+    assert!(crate::doc::link_at(&n.spans, 2).is_none());
+    // Exported as an <a> around the same run.
+    let svg = crate::export::to_svg(&h.state().doc, &[id]);
+    assert!(svg.contains(r##"<a href="https://example.com"><tspan fill="#0D99FF" text-decoration="underline">site</tspan></a>"##), "{svg}");
+    assert!(svg.contains(">Visit </tspan>"), "{svg}");
+    // The caret in the link shows it, with Remove.
+    select_chars(&mut h, 8, 8);
+    h.run_steps(2);
+    assert!(h.query_by_label("https://example.com").is_some());
+    // Clicking it in presentation opens it.
+    h.state_mut().editing_text = None;
+    h.state_mut().sel = vec![f];
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::Enter);
+    h.run_steps(2);
+    let painter = egui::Painter::new(h.ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+    let n = h.state().doc.node(id).clone();
+    let (g, _, _) = crate::text::layout(&painter, &n, 1.0, egui::Color32::BLACK);
+    let w = n.rect.min + crate::text::draw_offset(&n, g.rows.len()) + g.pos_from_cursor(egui::text::CCursor::new(8)).center().to_vec2();
+    assert_eq!(crate::text::link_at(&painter, &n, w).as_deref(), Some("https://example.com"));
+    let at = ps(&h, w.x, w.y);
+    move_to(&mut h, at, Modifiers::NONE);
+    press(&mut h, at, true, Modifiers::NONE);
+    // Released in a single frame, so its output is the one to read.
+    h.input_mut().events.push(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+    h.step();
+    let opened = h.output().platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::OpenUrl(u) if u.url == "https://example.com"));
+    assert!(opened, "{:?}", h.output().platform_output.commands);
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    // Remove takes it off again, in one undo step.
+    h.state_mut().editing_text = Some(id);
+    h.state_mut().focus_text = true;
+    h.run_steps(3);
+    select_chars(&mut h, 8, 8);
+    h.run_steps(2);
+    h.get_by_label("Remove link").click();
+    h.run_steps(2);
+    assert!(crate::doc::link_at(&h.state().doc.node(id).spans, 8).is_none());
+    assert!(h.state().doc.node(id).spans.is_empty());
+}
+
+#[test]
 fn copy_and_paste_properties_survive_egui_clipboard_events() {
     use crate::app::TEST_CLIPBOARD;
     let mut h = harness();
