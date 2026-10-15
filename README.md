@@ -35,6 +35,8 @@ git clone https://github.com/dyascj/katachi && cd katachi
 cargo build --release && scripts/linux-install.sh   # needs only Rust and a C compiler
 ```
 
+![Katachi on Linux (Wayland), with tabs in the title bar](docs/linux.png)
+
 Good to know on Linux:
 - Shortcuts use Ctrl where macOS uses Cmd, and menus show them that way. A few follow Figma's
   Windows bindings: layout guides Ctrl Shift 4, use as mask Ctrl Alt M, distribute and tidy up
