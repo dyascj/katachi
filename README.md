@@ -74,46 +74,67 @@ package instead. Set `KATACHI_NO_UPDATE=1` to turn the check off.
 - Files and pages reopen where you left them
 
 **Canvas and tools**
-- Infinite canvas with pan, zoom, pixel grid at 800%+, rulers (Shift R), and smart guides
-- Move, Scale (K), Frame, Section, Slice, Rectangle, Line, Arrow, Ellipse, Polygon, Star, Pen, Pencil, Text, Comment
+- Infinite canvas with pan, zoom, pixel grid at 800%+ (Shift '), snap to pixel grid (Shift Cmd '), rulers (Shift R), and smart guides
+- Move, Scale (K), Hand, Zoom (Z), Frame, Section, Slice, Rectangle, Line, Arrow, Ellipse, Polygon, Star, Pen, Pencil, Text, Comment
 - Frame presets for phones, tablets, desktops, slides, watches, paper, and social posts
 - Figma's selection rules: click-through top-level frames, groups and instances select first, double-click to dive in, Cmd-click for deep select, pressing inside a selected parent drags the parent
 - Resize from any edge or corner, rotate past the corners (Shift snaps to 15°), Alt-drag to duplicate
-- Alt-hover distance measurements, flip (Shift H/V), distribute and tidy up, alignment
+- Smart guides that snap to edges, centers, and equal spacing, with pink gap markers
+- Smart selection: drag the pink handles between evenly spaced layers to respace them all, or drag a layer's center knob to swap places
+- Ruler guides: drag them out of the rulers, move them, drag them back to delete; layers snap to them
+- Alt-hover distance measurements, flip (Shift H/V), distribute and tidy up, alignment, N and Shift N to step through frames
+- Right-click: Select layer (everything under the pointer), Move to page, Select matching layers, Select all with same fill, stroke, effect, font, or instance, Select inverse (Shift Cmd A)
+
+**Layers and pages**
+- Shift-click ranges, multi-layer drag to reorder and reparent, and the list scrolls to the selection
+- Batch rename (Cmd R with several layers): rename to `$&`, `$n`, `$N`, and match and replace, with a preview
+- Undo and redo bring back the selection and page of each step
+- Pages: drag to reorder, duplicate, and dividers (a page named `---`)
+- Resize to fit (Alt Shift Cmd R), remove fill, lock and unlock all, paste over selection (Shift Cmd V), paste to replace (Shift Cmd R) across tabs, and paste images straight from the clipboard
 
 **Layout**
-- Auto layout: direction, wrap with row gap, gap or auto gap, padding, 3x3 alignment, hug / fill / fixed sizing, min and max width and height, strokes included in layout, absolute children, live drag reordering (Shift A)
+- Auto layout: horizontal, vertical, wrap, and grid (rows, columns, gaps, fill or fixed tracks, spans); gap or auto gap, padding, 3x3 alignment, text baseline alignment, canvas stacking order, hug / fill / fixed sizing, min and max width and height, strokes included in layout, absolute children (Shift A)
+- Drag gap and padding handles on the canvas; arrow keys move a child through the flow
 - Constraints (left, right, left and right, center, scale), with Cmd to resize without them
-- Layout guides: grids, columns, and rows, with snapping (Ctrl G to show or hide)
+- Layout guides: grids, columns, and rows, with snapping (Ctrl G on macOS, Ctrl Shift 4 elsewhere)
 
 **Design systems**
-- Components and instances that keep overrides through main-component edits
+- Components and instances that keep overrides through main-component edits; push an instance's changes to its main component, or reset one property at a time
 - Variants in component sets, with property dropdowns that keep overrides when switching
-- Boolean, text, and instance-swap component properties
-- Color, text, and effect styles
-- Variables with collections and modes (for example Light and Dark), aliases, and bindings for colors, sizes, spacing, radius, text, and visibility
-- Assets panel with component previews, grouped by page, to drag onto the canvas
-- Swap instances, add variants from the right-click menu, and group styles into folders with slash names
+- Boolean, text, and instance-swap component properties, with preferred values and exposed nested instances
+- Component descriptions, shown in Assets and Dev Mode
+- Color, text, effect, and grid styles, edited in place from Local styles and grouped into folders with slash names
+- Variables with collections, modes (for example Light and Dark), aliases, groups, scopes, and code syntax for web, iOS, and Android
+- Bind variables to colors, sizes, spacing, radius, text, typography (font, weight, line height, letter spacing), min and max sizes, effects, and visibility, with Figma's "Apply variable" button on fills and strokes
+- Assets panel with component previews, grouped by page; click or drag to place
 
 **Vectors**
-- Multi-contour paths with even-odd or non-zero fill, vector edit mode for anchors and handles (point position, bend, delete)
+- Multi-contour paths with even-odd or non-zero fill
+- Vector edit mode: move anchors and handles, marquee-select points, bend (Cmd-drag), cut (Y), join (Cmd J), continue a path with the pen, and edit polygons and stars
 - Ellipse arcs: start, sweep, and ratio for pies, donuts, and rings
 - Live boolean groups: union, subtract, intersect, exclude
 - Flatten (Cmd E), outline stroke (Alt Cmd O), SVG import by paste, drag-and-drop, or File > Place
 
 **Paint and effects**
-- Solid, linear, and radial gradient fills, and images (fill, fit, crop, stretch, tile) with exposure, contrast, saturation, temperature, tint, highlights, and shadows
+- Solid, linear, radial, angular, and diamond gradients (elliptical, with Figma's handles on the canvas), and images (fill, fit, crop, stretch, tile) with exposure, contrast, saturation, temperature, tint, highlights, and shadows
+- Figma's color picker: Hex, RGB, CSS, HSL, and HSB, colors on this page, color styles, and an eyedropper (I) with a loupe
+- Several fills and strokes per layer, reordered by dragging, each with its own blend mode; Shift X swaps fill and stroke; number keys set opacity (5 = 50%, 4 then 5 = 45%)
 - Strokes with inside / center / outside alignment, individual side weights, dashes, caps, joins, and arrow markers
 - Drop shadow, inner shadow, layer blur, background blur, blend modes, masks, independent corner radii
 - Selection colors: every color in a selection, editable in one place
 
 **Text**
-- System fonts, auto width / auto height / fixed boxes, alignment, line height, letter spacing, decoration, and case
+- System fonts with their real weights and italics, and a Replace fonts dialog for fonts that aren't installed
+- Auto width / auto height / fixed boxes, left / center / right / justified, line height, letter spacing, paragraph spacing and indent, vertical trim, decoration, and case
+- Rich text: mixed weights, sizes, colors, and italics within one text layer; bulleted and numbered lists (Shift Cmd 8, Shift Cmd 7); truncation with max lines; links (Cmd K while editing)
+- Figma's text shortcuts: Cmd B / I / U, Shift Cmd X, Alt Cmd L / T / R / J, and size, weight, letter spacing, and line height steps
 
 **Prototyping**
-- Interactions (click, hover, press, after delay) with navigate, back, overlays, and links
-- Transitions: instant, dissolve, smart animate, move in, push, slide in
-- Present mode (Cmd Alt Enter) with flows, hotspot hints, and overlays
+- Triggers: on click, while hovering, while pressing, mouse enter and leave, on drag, after delay, and key or gamepad
+- Actions: navigate, back, scroll to, open, swap, and close overlays, open link, set variable, and change to (interactive components)
+- Transitions: instant, dissolve, smart animate, move in, push, slide in; easing curves, custom bezier, and Gentle, Quick, Bouncy, and Slow springs
+- Overlay position, close on outside click, and background; scrolling frames (horizontal, vertical, both) with fixed and sticky layers
+- Present mode (Cmd Alt Enter) with flows, hotspot hints, overlays, and device frames (iPhone, Pixel, iPad, MacBook, Desktop)
 
 **Collaboration**
 - Real-time multiplayer: host a session from the app (Main menu > Collaborate) or run `katachi serve file.katachi`, and others join by address
@@ -121,13 +142,14 @@ package instead. Set `KATACHI_NO_UPDATE=1` to turn the check off.
 - Comments pinned to frames, with replies and resolve
 
 **Handoff**
-- Dev Mode (Shift D) with CSS, SwiftUI, and Jetpack Compose code, colors, and type
-- Rich text: mixed weights, sizes, colors, and italics within one text layer; bulleted and numbered lists (Shift Cmd 8, Shift Cmd 7); paragraph spacing; truncation with max lines
+- Dev Mode (Shift D) with CSS, Tailwind, SwiftUI, and Jetpack Compose code that uses your variable and style names, colors, type, and auto layout spacing on hover
+- Ready for dev status on frames, and annotations pinned to layers
+- Copy as PNG, SVG, CSS, or code
 
 **Files**
 - Open Figma `.fig` files (Main menu > Open, or drop one on the canvas): pages, frames, sections, components, component sets, instances with overrides and component properties, variables and modes, vectors, text, images, effects, auto layout, and constraints
-- `.katachi` files (JSON), atomic saves, crash-recovery autosave, version history, open recent
-- Export presets per layer to PNG, JPG, SVG, and PDF
+- `.katachi` files (JSON), durable atomic saves, crash-recovery autosave for every tab, version history, open recent
+- Export presets per layer to PNG, JPG, WebP, SVG, and PDF at any scale (2x, 2.5x) or size (512w, 512h), for several layers at once, and an Export dialog (Shift Cmd E) for everything on the page
 
 **Appearance**
 - Light, dark, or system theme (Main menu > Appearance). Pages left at the default canvas color follow the theme
@@ -149,35 +171,45 @@ package instead. Set `KATACHI_NO_UPDATE=1` to turn the check off.
 
 ## Shortcuts
 
+Cmd is Ctrl on Windows and Linux, and menus there show every shortcut with Ctrl, Alt, and Shift.
+
 | Action | Keys |
 | --- | --- |
-| Move, Scale, Hand | V, K, H |
+| Move, Scale, Hand, Zoom | V, K, H, Z |
 | Frame, Section, Slice | F or A, Shift S, S |
 | Rectangle, Line, Arrow, Ellipse | R, L, Shift L, O |
 | Pen, Pencil, Text, Comment | P, Shift P, T, C |
+| Eyedropper, swap fill and stroke, opacity | I, Shift X, 0 to 9 |
 | Undo, redo | Cmd Z, Shift Cmd Z |
 | Copy, paste, cut, duplicate | Cmd C, Cmd V, Cmd X, Cmd D |
-| Copy and paste properties | Alt Cmd C, Alt Cmd V |
+| Paste over selection, paste to replace | Shift Cmd V, Shift Cmd R |
+| Copy and paste properties, copy as PNG | Alt Cmd C, Alt Cmd V, Shift Cmd C |
+| Select all, inverse, matching layers | Cmd A, Shift Cmd A, Alt Cmd A |
+| Rename (several layers: batch rename) | Cmd R |
 | Group, frame selection, ungroup | Cmd G, Alt Cmd G, Shift Cmd G |
 | Auto layout, remove auto layout | Shift A, Alt Shift A |
+| Resize to fit | Alt Shift Cmd R |
 | Create component, detach instance | Alt Cmd K, Alt Cmd B |
 | Union, subtract, intersect, exclude | Alt Shift U, S, I, E |
-| Flatten, use as mask | Cmd E, Ctrl Cmd M |
+| Flatten, use as mask | Cmd E, Ctrl Cmd M (Ctrl Alt M on Windows and Linux) |
+| Join points, cut tool (vector edit) | Cmd J, Y |
 | Bring forward, send backward | Cmd ], Cmd [ (add Alt for front and back) |
 | Flip horizontal, vertical | Shift H, Shift V |
-| Distribute, tidy up | Ctrl Alt H / V, Ctrl Alt T |
+| Distribute, tidy up | Ctrl Alt H / V, Ctrl Alt T (Alt Shift H / V / T on Windows and Linux) |
 | Show or hide, lock | Shift Cmd H, Shift Cmd L |
 | Next and previous layer, select parent | Tab, Shift Tab, Shift Enter |
-| Zoom to fit, 100%, selection | Shift 1, Shift 0, Shift 2 |
-| Rulers, layout guides, hide UI, outline mode | Shift R, Ctrl G, Cmd \, Cmd Y |
+| Next and previous frame | N, Shift N |
+| Zoom to fit, 100%, selection, in, out | Shift 1, Shift 0, Shift 2, Cmd +, Cmd - |
+| Rulers, layout guides, pixel grid, snap to pixels | Shift R, Ctrl G (Ctrl Shift 4 on Windows and Linux), Shift ', Shift Cmd ' |
+| Hide UI, outline mode | Cmd \, Cmd Y |
+| Bold, italic, underline, strikethrough | Cmd B, Cmd I, Cmd U, Shift Cmd X |
+| Align text left, center, right, justified | Alt Cmd L, T, R, J |
+| Font size, weight, letter spacing, line height | Shift Cmd < >, Alt Cmd < >, Alt < >, Alt Shift < > |
+| Numbered, bulleted list, link | Shift Cmd 7, Shift Cmd 8, Cmd K (while editing text) |
 | Dev Mode, present | Shift D, Alt Cmd Enter |
 | Save, open, place image, export | Cmd S, Cmd O, Shift Cmd K, Shift Cmd E |
-| Quick actions | Cmd / or Cmd K |
-| Find and replace | Cmd F |
-| Next and previous tab, close tab | Ctrl Tab, Ctrl Shift Tab, Cmd W |
-| Copy as PNG, paste to replace, select matching layers | Shift Cmd C, Shift Cmd R, Alt Cmd A |
-| Copy and paste properties | Alt Cmd C, Alt Cmd V |
-| Numbered, bulleted list | Shift Cmd 7, Shift Cmd 8 |
+| Quick actions, find and replace | Cmd / or Cmd K, Cmd F |
+| Next and previous tab, close tab, quit | Ctrl Tab, Ctrl Shift Tab, Cmd W, Cmd Q |
 
 ## Roadmap
 
