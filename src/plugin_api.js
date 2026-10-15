@@ -159,9 +159,9 @@ const __NodeProto = {
     for (const k of Object.keys(props)) cp[k] = Object.assign({}, cp[k] || {}, { value: props[k] });
     this.componentProperties = cp;
   },
-  addComponentProperty(name, type, value) {
+  addComponentProperty(name, type, value, options) {
     this.componentPropertyDefinitions = this.componentPropertyDefinitions || {};
-    this.componentPropertyDefinitions[name] = { type, defaultValue: value };
+    this.componentPropertyDefinitions[name] = Object.assign({ type, defaultValue: value }, options && options.preferredValues ? { preferredValues: options.preferredValues } : {});
     return name;
   },
   editComponentProperty(name, def) {
@@ -171,6 +171,8 @@ const __NodeProto = {
     const next = def.name || name;
     delete d[name];
     d[next] = { type: old.type, defaultValue: def.defaultValue !== undefined ? def.defaultValue : old.defaultValue };
+    const preferred = def.preferredValues || old.preferredValues;
+    if (preferred) d[next].preferredValues = preferred;
     return next;
   },
   deleteComponentProperty(name) { delete (this.componentPropertyDefinitions || {})[name]; },
@@ -237,6 +239,8 @@ const __CollectionProto = {
 };
 const __VariableProto = {
   setValueForMode(modeId, value) { this.valuesByMode[modeId] = __copy(value); },
+  setVariableCodeSyntax(platform, value) { this.codeSyntax = Object.assign({}, this.codeSyntax, { [platform]: value }); },
+  removeVariableCodeSyntax(platform) { this.codeSyntax = Object.assign({}, this.codeSyntax); delete this.codeSyntax[platform]; },
   remove() { __variables = __variables.filter(v => v !== this); __removedVariables.push(this.id); },
   resolveForConsumer() { const c = __collections.find(c => c.id === this.variableCollectionId); return { value: this.valuesByMode[c.modes[0].modeId], resolvedType: this.resolvedType }; },
 };
@@ -353,7 +357,7 @@ const figma = {
       const c = typeof collection === "string" ? __byId(__collections, collection) : collection;
       if (!c) throw new Error("createVariable needs a collection");
       const zero = { COLOR: { r: 0, g: 0, b: 0, a: 1 }, FLOAT: 0, STRING: "", BOOLEAN: false }[type];
-      const v = Object.setPrototypeOf({ id: "VariableID:" + __newid(), name, variableCollectionId: c.id, resolvedType: type, valuesByMode: {}, description: "", scopes: ["ALL_SCOPES"] }, __VariableProto);
+      const v = Object.setPrototypeOf({ id: "VariableID:" + __newid(), name, variableCollectionId: c.id, resolvedType: type, valuesByMode: {}, description: "", scopes: ["ALL_SCOPES"], codeSyntax: {} }, __VariableProto);
       for (const m of c.modes) v.valuesByMode[m.modeId] = __copy(zero);
       __variables.push(v);
       return v;

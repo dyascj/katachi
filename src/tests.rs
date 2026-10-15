@@ -2362,8 +2362,57 @@ fn slash_named_styles_group_into_folders() {
     let mut h = harness();
     crate::plugins::run(&mut h.state_mut().doc, 0, &[], "for (const n of ['HUD / Title', 'HUD / Body', 'Accent']) { const s = figma.createPaintStyle(); s.name = n; s.paints = [figma.util.solidPaint('#8E72FF')]; }").unwrap();
     h.run_steps(2);
-    assert!(h.query_by_label("HUD").is_some(), "a HUD folder");
+    assert!(h.query_all_by_value("HUD").next().is_some(), "a HUD folder");
     assert!(h.query_by_label("HUD / Title").is_none(), "names show without the folder");
+    // The folder's name edits in place and renames everything in it.
+    h.get_all_by_value("HUD").next().unwrap().focus();
+    h.run_steps(1);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.get_all_by_value("HUD").next().unwrap().type_text("Game");
+    h.run_steps(1);
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    let mut names: Vec<String> = h.state().doc.styles.iter().map(|s| s.name.clone()).collect();
+    names.sort();
+    assert_eq!(names, ["Accent", "Game / Body", "Game / Title"]);
+}
+
+#[test]
+fn local_styles_edit_text_and_grid_styles_in_place() {
+    use crate::doc::{LayoutGrid, StyleValue, TextStyle};
+    let mut h = harness();
+    let t = draw(&mut h, Key::F, (0.0, 0.0), (200.0, 200.0));
+    let (ts, gs) = {
+        let d = &mut h.state_mut().doc;
+        let ts = d.add_style("Body".into(), StyleValue::Text(TextStyle::of(&Node::new(Kind::Text, r(0., 0., 1., 1.)))));
+        let gs = d.add_style("Columns".into(), StyleValue::Grid(vec![LayoutGrid::default()]));
+        d.node_mut(t).grid_style = Some(gs);
+        (ts, gs)
+    };
+    h.state_mut().doc.reflow();
+    assert_eq!(h.state().doc.node(t).grids, vec![LayoutGrid::default()], "the frame takes the grid style");
+    h.state_mut().sel.clear();
+    h.run_steps(2);
+    assert!(h.query_by_label("Grid styles").is_some());
+    // Open the text style's editor from the list and turn on a fixed line height.
+    h.get_all_by_label("Edit style").next().unwrap().click();
+    h.run_steps(2);
+    h.get_by_label("Auto").click();
+    h.run_steps(2);
+    let lh = match &h.state().doc.style(ts).unwrap().value {
+        StyleValue::Text(t) => t.line_height,
+        _ => unreachable!(),
+    };
+    assert!(matches!(lh, crate::doc::LineHeight::Px(_)), "{lh:?}");
+    // The grid style's editor: switching it to columns moves the linked frame's guides.
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    h.get_all_by_label("Edit style").nth(1).unwrap().click();
+    h.run_steps(2);
+    h.get_by_label("Columns").click();
+    h.run_steps(2);
+    assert_eq!(h.state().doc.node(t).grids[0].kind, crate::doc::GridKind::Columns);
+    let _ = gs;
 }
 
 #[test]
@@ -3575,4 +3624,222 @@ fn copy_and_paste_properties_survive_egui_clipboard_events() {
     TEST_CLIPBOARD.with(|c| c.borrow_mut().1 = None);
     assert_eq!(h.state().doc.node(b).opacity, 0.5);
     assert_eq!(h.state().doc.nodes.len(), 2, "no image pasted");
+}
+
+#[test]
+fn variables_table_groups_aliases_and_paint_hexagon() {
+    use crate::doc::{Bindable, Rgba, VarValue};
+    let mut h = harness();
+    let rect_id = draw(&mut h, Key::R, (0.0, 0.0), (80.0, 80.0));
+    let (primary, accent) = {
+        let d = &mut h.state_mut().doc;
+        let c = d.add_collection("Theme".into());
+        let p = d.add_variable(c, "color/primary".into(), VarValue::Color(Rgba::rgb(255, 0, 0)));
+        let a = d.add_variable(c, "color/accent".into(), VarValue::Color(Rgba::rgb(0, 0, 255)));
+        (p, a)
+    };
+    h.state_mut().show_variables = true;
+    h.run_steps(3);
+    // Slash names group under a "color" row and show their leaf names.
+    assert!(h.query_all_by_value("color").next().is_some() && h.query_all_by_value("primary").next().is_some());
+    // The first row's hexagon makes it an alias of the other color.
+    h.get_all_by_label("Create alias").next().unwrap().click();
+    h.run_steps(2);
+    h.get_by_label("color/accent").click();
+    h.run_steps(2);
+    assert_eq!(h.state().doc.variable(primary).unwrap().values[0], VarValue::Alias(accent));
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().doc.variable(primary).unwrap().values[0], VarValue::Color(Rgba::rgb(255, 0, 0)), "undoable");
+    // Collapsing the group hides its rows; renaming it moves every variable.
+    h.get_by_label("Collapse group").click();
+    h.run_steps(2);
+    assert!(h.query_all_by_value("primary").next().is_none());
+    h.get_all_by_value("color").next().unwrap().focus();
+    h.run_steps(1);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.get_all_by_value("color").next().unwrap().type_text("brand");
+    h.run_steps(1);
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    assert_eq!(h.state().doc.variable(accent).unwrap().name, "brand/accent", "renaming the group moves its variables");
+    h.state_mut().show_variables = false;
+    // Fill's hexagon binds a color variable, then shows it in place of the paint.
+    h.state_mut().sel = vec![rect_id];
+    h.run_steps(2);
+    h.get_all_by_label("Apply variable").next().unwrap().click();
+    h.run_steps(2);
+    h.get_by_label("■ brand/accent").click();
+    h.run_steps(2);
+    let n = h.state().doc.node(rect_id).clone();
+    assert_eq!((n.bindings.clone(), n.fills[0].color), (vec![(Bindable::Fill, accent)], Rgba::rgb(0, 0, 255)));
+    assert!(h.query_all_by_label("Detach variable").next().is_some());
+}
+
+#[test]
+fn plugin_variables_carry_scopes_and_code_syntax() {
+    let mut doc = crate::doc::Document::default();
+    crate::plugins::run(&mut doc, 0, &[], r##"
+        const col = figma.variables.createVariableCollection("Tokens");
+        const r = figma.variables.createVariable("radius/md", col, "FLOAT");
+        r.scopes = ["CORNER_RADIUS"];
+        r.setVariableCodeSyntax("WEB", "var(--radius-md)");
+    "##).unwrap();
+    let v = &doc.variables[0];
+    assert_eq!((v.scopes.clone(), v.code_syntax[0].as_str()), (vec![crate::doc::Bindable::Radius], "var(--radius-md)"));
+    // And back out again.
+    let out = crate::plugin_doc::snapshot(&doc, 0, &[], false);
+    assert_eq!(out["variables"][0]["scopes"], serde_json::json!(["CORNER_RADIUS"]));
+    assert_eq!(out["variables"][0]["codeSyntax"]["WEB"], "var(--radius-md)");
+}
+
+/// A "Card" component with a "Bg" rectangle and a "Title" text, and two instances of it.
+fn card_doc() -> crate::doc::Document {
+    let mut doc = crate::doc::Document::default();
+    crate::plugins::run(&mut doc, 0, &[], r##"
+        const c = figma.createComponent(); c.name = "Card"; c.resize(100, 60);
+        const bg = figma.createRectangle(); bg.name = "Bg"; bg.resize(100, 60); c.appendChild(bg);
+        bg.fills = [figma.util.solidPaint("#FF0000")];
+        const t = figma.createText(); t.name = "Title"; t.characters = "Hello"; c.appendChild(t);
+        c.createInstance().x = 200;
+        c.createInstance().x = 400;
+    "##).unwrap();
+    doc.reflow();
+    doc
+}
+
+#[test]
+fn instance_overrides_reset_one_at_a_time_and_push_to_main() {
+    use crate::doc::{Override, Rgba};
+    let mut doc = card_doc();
+    let insts: Vec<NodeId> = doc.pages[0].children.iter().copied().filter(|&i| doc.node(i).kind == Kind::Instance).collect();
+    let layer = |doc: &crate::doc::Document, inst: NodeId, name: &str| doc.descendants(inst).into_iter().find(|&d| doc.node(d).name == name).unwrap();
+    let (bg, title) = (layer(&doc, insts[0], "Bg"), layer(&doc, insts[0], "Title"));
+    doc.node_mut(bg).fills[0].color = Rgba::rgb(0, 0, 255);
+    doc.node_mut(title).text = "Changed".into();
+    doc.reflow();
+    assert_eq!(doc.instance_overrides(insts[0]), vec![Override::Fill, Override::Text]);
+    doc.reset_override(insts[0], Override::Fill);
+    let bg = layer(&doc, insts[0], "Bg");
+    assert_eq!(doc.node(bg).fills[0].color, Rgba::rgb(255, 0, 0), "fill back to the main's");
+    assert_eq!(doc.node(layer(&doc, insts[0], "Title")).text, "Changed", "the text override stays");
+    // Push the text to the main component: the other instance follows, and it is no longer an override.
+    doc.push_to_main(insts[0]);
+    assert_eq!(doc.node(layer(&doc, insts[1], "Title")).text, "Changed");
+    assert!(doc.instance_overrides(insts[0]).is_empty());
+}
+
+#[test]
+fn instance_menu_resets_a_property_and_assets_click_places_an_instance() {
+    let mut h = harness();
+    h.state_mut().doc = card_doc();
+    h.run_steps(2);
+    let inst = h.state().doc.pages[0].children.iter().copied().find(|&i| h.state().doc.node(i).kind == Kind::Instance).unwrap();
+    let bg = h.state().doc.descendants(inst).into_iter().find(|&d| h.state().doc.node(d).name == "Bg").unwrap();
+    h.state_mut().doc.node_mut(bg).opacity = 0.5;
+    h.state_mut().sel = vec![inst];
+    h.run_steps(2);
+    h.get_by_label("More instance options").click();
+    h.run_steps(2);
+    h.get_by_label("Reset opacity").click();
+    h.run_steps(2);
+    assert_eq!(h.state().doc.node(bg).opacity, 1.0);
+    // Assets: a click places an instance mid-screen, and the description shows on hover.
+    let comp = h.state().doc.nodes.values().find(|n| n.kind == Kind::Component).unwrap().id;
+    h.state_mut().doc.node_mut(comp).description = "A content card".into();
+    h.state_mut().sel.clear();
+    h.state_mut().left_tab_assets = true;
+    h.run_steps(3);
+    let before = h.state().doc.nodes.values().filter(|n| n.kind == Kind::Instance).count();
+    h.get_all_by_label("Card").max_by(|a, b| a.rect().height().total_cmp(&b.rect().height())).unwrap().click();
+    h.run_steps(2);
+    assert_eq!(h.state().doc.nodes.values().filter(|n| n.kind == Kind::Instance).count(), before + 1);
+    assert_eq!(h.state().doc.node(h.state().sel[0]).component, Some(comp));
+    // Dragging the tile onto the canvas still drops an instance there.
+    let tile = h.get_all_by_label("Card").max_by(|a, b| a.rect().height().total_cmp(&b.rect().height())).unwrap().rect().center();
+    // It lands over the instance placed above, so goes beside it rather than inside.
+    drag(&mut h, tile, pos2(800.0, 450.0), Modifiers::NONE);
+    assert_eq!(h.state().doc.nodes.values().filter(|n| n.kind == Kind::Instance).count(), before + 2);
+}
+
+#[test]
+fn exposed_nested_instance_props_show_on_the_outer_instance() {
+    let mut h = harness();
+    let mut doc = crate::doc::Document::default();
+    crate::plugins::run(&mut doc, 0, &[], r##"
+        const icon = figma.createComponent(); icon.name = "Icon"; icon.resize(20, 20);
+        const g = figma.createText(); g.name = "Glyph"; g.characters = "A"; icon.appendChild(g);
+        icon.addComponentProperty("Glyph", "TEXT", "A");
+        g.componentPropertyReferences = { characters: "Glyph" };
+        const b = figma.createComponent(); b.name = "Button"; b.resize(100, 40); b.y = 100;
+        const nested = icon.createInstance(); b.appendChild(nested);
+        nested.isExposedInstance = true;
+        b.description = "Primary action";
+        b.createInstance().x = 300;
+    "##).unwrap();
+    doc.reflow();
+    let button = doc.nodes.values().find(|n| n.name == "Button" && n.kind == Kind::Component).unwrap().id;
+    assert_eq!(doc.description_of(button), "Primary action");
+    let outer = doc.nodes.values().find(|n| n.kind == Kind::Instance && n.component == Some(button)).unwrap().id;
+    let nested = doc.descendants(outer).into_iter().find(|&d| doc.node(d).kind == Kind::Instance).unwrap();
+    assert!(doc.node(nested).exposed, "the copy carries the main's expose flag");
+    h.state_mut().doc = doc;
+    h.state_mut().sel = vec![outer];
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("↳ Icon").is_some(), "the nested instance's properties are listed");
+    assert!(h.query_by_label("Primary action").is_some(), "the description shows");
+    // Its property drives the nested layers, from the outer instance's panel.
+    h.state_mut().doc.node_mut(nested).prop_values = vec![("Glyph".into(), crate::doc::PropValue::Text("B".into()))];
+    h.state_mut().doc.reflow();
+    let glyph = h.state().doc.descendants(nested).into_iter().find(|&d| h.state().doc.node(d).kind == Kind::Text).unwrap();
+    assert_eq!(h.state().doc.node(glyph).text, "B");
+}
+
+#[test]
+fn plugin_preferred_swap_values_round_trip() {
+    let mut doc = crate::doc::Document::default();
+    crate::plugins::run(&mut doc, 0, &[], r##"
+        const a = figma.createComponent(); a.name = "Star";
+        const b = figma.createComponent(); b.name = "Heart";
+        const card = figma.createComponent(); card.name = "Card";
+        card.addComponentProperty("Icon", "INSTANCE_SWAP", a.id, { preferredValues: [{ type: "COMPONENT", key: b.id }] });
+    "##).unwrap();
+    let id = |n: &str| doc.nodes.values().find(|x| x.name == n).unwrap().id;
+    let card = doc.node(id("Card"));
+    assert_eq!(card.comp_props[0].preferred, vec![id("Heart")]);
+    let out = crate::plugin_doc::snapshot(&doc, 0, &[], false);
+    let c = out["pages"][0]["children"].as_array().unwrap().iter().find(|n| n["name"] == "Card").unwrap().clone();
+    assert_eq!(c["componentPropertyDefinitions"]["Icon"]["preferredValues"][0]["key"], id("Heart").to_string());
+}
+
+#[test]
+fn dev_mode_ready_for_dev_annotations_and_spacing() {
+    let mut h = harness();
+    let f = draw(&mut h, Key::F, (0.0, 0.0), (300.0, 120.0));
+    for x in [20.0, 120.0] {
+        h.state_mut().doc.insert(0, Some(f), None, Node::new(Kind::Rectangle, r(x, 20., 60., 60.)));
+    }
+    h.state_mut().sel = vec![f];
+    h.state_mut().add_auto_layout();
+    h.state_mut().dev_mode = true;
+    h.run_steps(2);
+    h.get_by_label("Mark as ready for dev").click();
+    h.run_steps(2);
+    assert!(h.state().doc.node(f).ready);
+    assert!(h.query_by_label("Ready for dev (1)").is_some(), "listed in Dev Mode's left panel");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert!(!h.state().doc.node(f).ready, "undoable");
+    // Annotations: add one from the panel; it's stored on the layer.
+    h.get_by_label("Add annotation").click();
+    h.run_steps(2);
+    assert_eq!(h.state().doc.node(f).annotations, ["Note"]);
+    // Padding and the gap between the two children, as hovering shows them.
+    let n = h.state().doc.node(f).clone();
+    let bands = crate::canvas::spacing_bands(&h.state().doc, f);
+    let pads = n.layout.padding.iter().filter(|p| **p > 0.0).count();
+    assert_eq!(bands.len(), pads + 1, "{bands:?}");
+    assert_eq!(bands.last().unwrap().1, n.layout.gap);
+    // Hovering it in Dev Mode draws them (and the annotation) without trouble.
+    let c = s(&h, n.rect.center().x, n.rect.min.y + 2.0);
+    move_to(&mut h, c, Modifiers::NONE);
+    h.run_steps(2);
 }

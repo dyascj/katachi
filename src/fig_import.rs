@@ -321,7 +321,7 @@ pub fn to_document(fig: &FigFile) -> Result<Document, String> {
         for d in v.arr("componentPropDefs") {
             let ty = d.s("type").unwrap_or("BOOL");
             if let Some(default) = props.value(d.get("initialValue"), ty) {
-                n.comp_props.push(CompProp { name: d.s("name").unwrap_or("").to_string(), default });
+                n.comp_props.push(CompProp { name: d.s("name").unwrap_or("").to_string(), default, preferred: vec![] });
             }
         }
         n.prop_bind = v.arr("componentPropRefs").iter().filter(|r| r.b("isDeleted") != Some(true)).filter_map(|r| {
@@ -426,6 +426,19 @@ fn import_variables(doc: &mut Document, changes: &[Value], by_guid: &HashMap<Gui
                 *v = value;
             }
         }
+        // "Show in" scopes and code syntax (WEB, ANDROID, iOS), as the plugin API names them.
+        let var = doc.variables.last_mut().unwrap();
+        var.scopes = n.arr("variableScopes").iter().filter_map(|s| match s { crate::kiwi::Value::Str(v) | crate::kiwi::Value::Enum(v) => Some(v.as_str()), _ => None }).flat_map(Bindable::from_scope).collect();
+        var.scopes.dedup();
+        for e in n.get("codeSyntax").map(|c| c.arr("entries")).unwrap_or_default() {
+            let slot = match e.s("platform") {
+                Some("WEB") => 0,
+                Some("iOS") => 1,
+                Some("ANDROID") => 2,
+                _ => continue,
+            };
+            var.code_syntax[slot] = e.s("value").unwrap_or_default().to_string();
+        }
         for r in refs(n) {
             vars.insert(r, id);
         }
@@ -461,6 +474,15 @@ fn import_variables(doc: &mut Document, changes: &[Value], by_guid: &HashMap<Gui
                 "FONT_SIZE" => Bindable::FontSize,
                 "TEXT_DATA" => Bindable::Text,
                 "VISIBLE" => Bindable::Visible,
+                "LINE_HEIGHT" => Bindable::LineHeight,
+                "LETTER_SPACING" => Bindable::LetterSpacing,
+                "PARAGRAPH_SPACING" => Bindable::ParagraphSpacing,
+                "FONT_FAMILY" => Bindable::FontFamily,
+                "FONT_WEIGHT" | "FONT_STYLE" => Bindable::FontWeight,
+                "MIN_WIDTH" => Bindable::MinWidth,
+                "MAX_WIDTH" => Bindable::MaxWidth,
+                "MIN_HEIGHT" => Bindable::MinHeight,
+                "MAX_HEIGHT" => Bindable::MaxHeight,
                 _ => continue,
             };
             if let Some(var) = bound(e.get("variableData")) {
@@ -876,6 +898,8 @@ fn text_props(n: &mut Node, v: &Value) {
 /// Properties every layer type shares.
 fn finish_common(n: &mut Node, v: &Value) {
     n.visible = v.b("visible").unwrap_or(true);
+    n.description = v.s("description").unwrap_or_default().to_string();
+    n.exposed = v.b("isExposedInstance") == Some(true);
     n.opacity = v.f("opacity").unwrap_or(1.0);
     n.blend = crate::doc::BlendMode::from_figma(v.s("blendMode"));
     n.is_mask = v.b("mask") == Some(true);

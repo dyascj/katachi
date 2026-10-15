@@ -56,6 +56,8 @@ pub enum Icon {
     Comment,
     Close,
     Eyedropper,
+    /// Figma's hexagon "Apply variable".
+    Variable,
 }
 
 use crate::appearance as theme;
@@ -331,6 +333,10 @@ pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
             p.line_segment([at(2., 2.), at(6., -2.)], s);
             p.line_segment([at(-1., -5.), at(1., 5.)], Stroke::new(1.0, color.gamma_multiply(0.7)));
         }
+        Icon::Variable => {
+            let pts: Vec<Pos2> = (0..6).map(|i| c + egui::Vec2::angled((i as f32 * 60.0 + 30.0).to_radians()) * 6.0).collect();
+            p.add(Shape::closed_line(pts, s));
+        }
         Icon::Play => {
             p.add(Shape::convex_polygon(vec![at(-3.5, -5.), at(5., 0.), at(-3.5, 5.)], color, Stroke::NONE));
         }
@@ -565,6 +571,122 @@ fn section_title(ui: &mut Ui, title: &str) -> bool {
     add
 }
 
+/// A name field that commits on Enter or blur, for renames that move rows around (a folder or
+/// group renamed per keystroke would lose its field mid-word). Returns the new text once.
+pub fn commit_field(ui: &mut Ui, id: egui::Id, current: &str, width: f32, framed: bool) -> Option<String> {
+    let mut buf: String = ui.data(|d| d.get_temp(id)).unwrap_or_else(|| current.to_string());
+    let mut field = egui::TextEdit::singleline(&mut buf).id(id).desired_width(width);
+    if !framed {
+        field = field.frame(egui::Frame::NONE);
+    }
+    let r = ui.add(field);
+    if r.has_focus() {
+        ui.data_mut(|d| d.insert_temp(id, buf.clone()));
+    } else {
+        ui.data_mut(|d| d.remove::<String>(id));
+    }
+    (r.lost_focus() && buf != current).then_some(buf)
+}
+
+/// One layout guide's settings (type, count or size, gutter, margin, color).
+fn grid_editor(ui: &mut Ui, id: egui::Id, g: &mut crate::doc::LayoutGrid) {
+    use crate::doc::{GridAlign, GridKind};
+    ui.horizontal(|ui| {
+        for k in [GridKind::Grid, GridKind::Columns, GridKind::Rows] {
+            ui.selectable_value(&mut g.kind, k, format!("{k:?}"));
+        }
+    });
+    egui::Grid::new(id.with("fields")).num_columns(2).show(ui, |ui| {
+        if g.kind == GridKind::Grid {
+            ui.label("Size");
+            ui.add(DragValue::new(&mut g.size).range(1.0..=1000.0));
+            ui.end_row();
+        } else {
+            ui.label("Count");
+            ui.add(DragValue::new(&mut g.count).range(1..=100));
+            ui.end_row();
+            // Figma names the alignments by side: Left/Right for columns, Top/Bottom for rows.
+            let cols = g.kind == GridKind::Columns;
+            let name = |a: GridAlign| match a {
+                GridAlign::Stretch => "Stretch",
+                GridAlign::Center => "Center",
+                GridAlign::Min if cols => "Left",
+                GridAlign::Min => "Top",
+                GridAlign::Max if cols => "Right",
+                GridAlign::Max => "Bottom",
+            };
+            ui.label("Type");
+            dropdown(ui, name(g.align), |ui| {
+                for a in [GridAlign::Stretch, GridAlign::Min, GridAlign::Center, GridAlign::Max] {
+                    ui.selectable_value(&mut g.align, a, name(a));
+                }
+            });
+            ui.end_row();
+            if g.align != GridAlign::Stretch {
+                ui.label(if cols { "Width" } else { "Height" });
+                ui.add(DragValue::new(&mut g.size).range(1.0..=10000.0));
+                ui.end_row();
+            }
+            ui.label("Gutter");
+            ui.add(DragValue::new(&mut g.gutter).range(0.0..=1000.0));
+            ui.end_row();
+            // Centered tracks have no offset in Figma.
+            if g.align != GridAlign::Center {
+                ui.label(if g.align == GridAlign::Stretch { "Margin" } else { "Offset" });
+                ui.add(DragValue::new(&mut g.margin).range(-1000.0..=1000.0));
+                ui.end_row();
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        hex_field(ui, id.with("color"), &mut g.color, 56.0);
+        crate::paint_ui::alpha_field(ui, &mut g.color);
+    });
+}
+
+/// A text style's typography: family, weight, size, line height, letter spacing.
+fn text_style_editor(ui: &mut Ui, id: egui::Id, t: &mut crate::doc::TextStyle) {
+    use crate::doc::LineHeight;
+    use crate::text::{families, weight_name, weights_for};
+    egui::ComboBox::from_id_salt(id.with("family")).selected_text(&t.font_family).width(200.0).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+        for f in families() {
+            ui.selectable_value(&mut t.font_family, f.clone(), f);
+        }
+    });
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt(id.with("weight")).selected_text(weight_name(t.font_weight)).width(110.0).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+            for w in weights_for(&t.font_family) {
+                ui.selectable_value(&mut t.font_weight, w, weight_name(w));
+            }
+        });
+        ui.add(DragValue::new(&mut t.font_size).range(1.0..=1000.0).speed(0.2).custom_formatter(|v, _| num(v as f32)));
+    });
+    ui.horizontal(|ui| {
+        ui.label("Line height");
+        let mut v = match t.line_height {
+            LineHeight::Auto => None,
+            LineHeight::Px(v) | LineHeight::Percent(v) => Some(v),
+        };
+        let mut pct = matches!(t.line_height, LineHeight::Percent(_));
+        let mut auto = v.is_none();
+        ui.checkbox(&mut auto, "Auto");
+        if !auto {
+            let x = v.get_or_insert(if pct { 120.0 } else { t.font_size * 1.2 });
+            ui.add(DragValue::new(x).range(0.0..=1000.0).speed(0.2).custom_formatter(|v, _| num(v as f32)));
+            ui.checkbox(&mut pct, "%");
+        }
+        t.line_height = match (auto, v) {
+            (false, Some(x)) if pct => LineHeight::Percent(x),
+            (false, Some(x)) => LineHeight::Px(x),
+            _ => LineHeight::Auto,
+        };
+    });
+    ui.horizontal(|ui| {
+        ui.label("Letter spacing");
+        ui.add(DragValue::new(&mut t.letter_spacing).speed(0.1).suffix("%").custom_formatter(|v, _| num(v as f32)));
+    });
+}
+
 /// Figma's frame presets: group, then (name, width, height).
 const FRAME_PRESETS: &[(&str, &[(&str, u32, u32)])] = &[
     ("Phone", &[("iPhone 16", 393, 852), ("iPhone 16 Pro", 402, 874), ("iPhone 16 Pro Max", 440, 956), ("iPhone 16 Plus", 430, 932), ("iPhone 14", 390, 844), ("iPhone SE", 320, 568), ("Android Compact", 412, 917), ("Android Medium", 700, 840)]),
@@ -666,6 +788,9 @@ impl App {
                 self.assets(ui);
                 return;
             }
+            if self.dev_mode {
+                self.ready_list(ui);
+            }
             self.pages_list(ui);
             ui.separator();
             ui.horizontal(|ui| {
@@ -697,6 +822,29 @@ impl App {
             let out = area.show_rows(ui, row_h, rows.len(), |ui, range| self.layers(ui, &rows, range));
             ui.data_mut(|d| d.insert_temp(view_key, (out.state.offset.y, out.inner_rect.height())));
         });
+    }
+
+    /// Dev Mode's "Ready for dev" list: frames and sections marked ready, on every page. A click
+    /// goes to one.
+    fn ready_list(&mut self, ui: &mut Ui) {
+        let mut ready: Vec<(usize, NodeId, String)> = self.doc.nodes.values().filter(|n| n.ready).map(|n| (self.doc.page_of(n.id), n.id, n.name.clone())).collect();
+        ready.sort_by(|a, b| (a.0, &a.2).cmp(&(b.0, &b.2)));
+        ui.label(RichText::new(format!("Ready for dev ({})", ready.len())).strong());
+        if ready.is_empty() {
+            ui.label(RichText::new("Mark frames ready from the canvas menu.").small().color(theme::muted(ui.ctx())));
+        }
+        for (page, id, name) in ready {
+            let green = Color32::from_rgb(0x14, 0xAE, 0x5C);
+            let text = format!("{name}  ·  {}", self.doc.pages[page].name);
+            if ui.add(egui::Button::selectable(self.sel.contains(&id), RichText::new(text).color(green))).clicked() {
+                if page != self.page {
+                    self.select_page(page);
+                }
+                self.sel = vec![id];
+                self.zoom_target = Some(id);
+            }
+        }
+        ui.separator();
     }
 
     /// Assets tab: every main component in the file. Drag one onto the canvas to place an instance.
@@ -756,32 +904,47 @@ impl App {
         }
     }
 
-    /// One component in the Assets grid: a preview over its name. Drag onto the canvas, or
-    /// double-click to place it mid-screen.
+    /// One component in the Assets grid: a preview over its name, with its description on hover.
+    /// Drag onto the canvas, or click to place an instance mid-screen, as in Figma.
     fn asset_tile(&mut self, ui: &mut Ui, id: NodeId, name: &str, size: f32, budget: &mut usize) {
         let tex = self.asset_thumb(ui.ctx(), id, budget);
-        let r = ui.dnd_drag_source(ui.id().with(("asset", id)), AssetDrag(id), |ui| {
-            ui.vertical(|ui| {
+        let desc = self.doc.description_of(id).to_string();
+        // Click and drag on one widget: egui's drag source starts dragging on press, which
+        // would swallow the click.
+        let clicked = ui
+            .vertical(|ui| {
                 ui.set_width(size);
-                let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
-                let p = ui.painter();
-                p.rect_filled(rect, 6.0, theme::subtle(ui.ctx()));
+                let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click_and_drag());
+                let thumb = |p: &Painter, rect: Rect| {
+                    p.rect_filled(rect, 6.0, theme::subtle(ui.ctx()));
+                    if let Some(tex) = &tex {
+                        let s = tex.size_vec2();
+                        let fit = ((size - 12.0) / s.x).min((size - 12.0) / s.y);
+                        p.image(tex.id(), Rect::from_center_size(rect.center(), s * fit), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+                    } else {
+                        paint_icon(p, Rect::from_center_size(rect.center(), vec2(18.0, 18.0)), Icon::Component, crate::canvas::PURPLE);
+                    }
+                };
+                thumb(ui.painter(), rect);
                 if resp.hovered() {
-                    p.rect_stroke(rect, 6.0, Stroke::new(1.0, BLUE), egui::StrokeKind::Inside);
+                    ui.painter().rect_stroke(rect, 6.0, Stroke::new(1.0, BLUE), egui::StrokeKind::Inside);
                 }
-                if let Some(tex) = &tex {
-                    let s = tex.size_vec2();
-                    let fit = ((size - 12.0) / s.x).min((size - 12.0) / s.y);
-                    p.image(tex.id(), Rect::from_center_size(rect.center(), s * fit), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
-                } else {
-                    paint_icon(p, Rect::from_center_size(rect.center(), vec2(18.0, 18.0)), Icon::Component, crate::canvas::PURPLE);
+                if resp.drag_started() {
+                    egui::DragAndDrop::set_payload(ui.ctx(), AssetDrag(id));
+                }
+                // The tile follows the pointer while dragging.
+                if resp.dragged()
+                    && let Some(p) = ui.ctx().pointer_interact_pos()
+                {
+                    thumb(&ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, ui.id().with(("asset-ghost", id)))), Rect::from_center_size(p, vec2(size, size)));
                 }
                 ui.add(egui::Label::new(RichText::new(name).small()).truncate());
                 resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
-            });
-        });
-        let r = r.response.on_hover_text(name);
-        if r.double_clicked() {
+                let tip = if desc.is_empty() { name.to_string() } else { format!("{name}\n{desc}") };
+                resp.on_hover_cursor(egui::CursorIcon::Grab).on_hover_text(tip).clicked()
+            })
+            .inner;
+        if clicked {
             let at = self.view_center_world();
             self.checkpoint();
             let size = self.doc.node(id).rect.size();
@@ -1071,6 +1234,15 @@ impl App {
             }
             if enabled(ui, has, "Detach instance", "⌥⌘B") {
                 self.detach_selection();
+                ui.close();
+            }
+            let inst = self.sel.iter().any(|&s| self.owning_instance(s).is_some());
+            if enabled(ui, inst, "Push changes to main component", "") {
+                self.push_selection_to_main();
+                ui.close();
+            }
+            if enabled(ui, inst, "Reset all changes", "") {
+                self.reset_selection_instances();
                 ui.close();
             }
             ui.separator();
@@ -1940,27 +2112,62 @@ impl App {
                 if icon_button(ui, Icon::Minus, false, 22.0, "Delete style").clicked() {
                     *delete = Some(st.id);
                 }
-                if let crate::doc::StyleValue::Paint(ps) = &st.value {
-                    let edit = icon_button(ui, Icon::Styles, false, 22.0, "Edit style");
-                    crate::chrome::popover(&edit, ui.id().with(("local-style", st.id)), "Edit style", 240.0, |ui| {
-                        let mut ps = ps.clone();
-                        let mut edited = false;
-                        for (i, p) in ps.iter_mut().enumerate().rev() {
-                            if !matches!(paint_row(ui, ui.id().with(("ls-paint", st.id, i)), p, "Fill"), PaintEvent::None) {
-                                edited = true;
-                            }
-                        }
-                        if edited {
-                            self.begin_edit();
-                            if let Some(x) = self.doc.styles.iter_mut().find(|x| x.id == st.id) {
-                                x.value = crate::doc::StyleValue::Paint(ps);
-                            }
-                            self.doc.reflow();
-                        }
-                    });
-                }
+                let edit = icon_button(ui, Icon::Styles, false, 22.0, "Edit style");
+                crate::chrome::popover(&edit, ui.id().with(("local-style", st.id)), "Edit style", 260.0, |ui| self.style_editor(ui, st));
             });
         });
+    }
+
+    /// Figma's style editor: the full name (slashes make folders) and the style's value. Every
+    /// layer using the style follows.
+    fn style_editor(&mut self, ui: &mut Ui, st: &crate::doc::Style) {
+        use crate::doc::StyleValue;
+        let mut name = st.name.clone();
+        let mut value = st.value.clone();
+        ui.add(egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY)).on_hover_text("Slashes put the style in folders, such as Brand / Primary");
+        ui.separator();
+        let id = ui.id().with(("style-edit", st.id));
+        match &mut value {
+            StyleValue::Paint(ps) => {
+                for (i, p) in ps.iter_mut().enumerate().rev() {
+                    paint_row(ui, id.with(i), p, "Fill");
+                }
+            }
+            StyleValue::Text(t) => text_style_editor(ui, id, t),
+            StyleValue::Effect(es) => {
+                let mut remove = None;
+                for (i, s) in es.iter_mut().enumerate().rev() {
+                    if shadow_row(ui, id.with(i), s).1 {
+                        remove = Some(i);
+                    }
+                }
+                if let Some(i) = remove {
+                    es.remove(i);
+                }
+                if ui.button("Add effect").clicked() {
+                    es.push(Shadow::default());
+                }
+            }
+            StyleValue::Grid(gs) => {
+                for (i, g) in gs.iter_mut().enumerate() {
+                    if i > 0 {
+                        ui.separator();
+                    }
+                    grid_editor(ui, id.with(i), g);
+                }
+                if ui.button("Add layout guide").clicked() {
+                    gs.push(crate::doc::LayoutGrid::default());
+                }
+            }
+        }
+        if name != st.name || value != st.value {
+            self.begin_edit();
+            if let Some(x) = self.doc.styles.iter_mut().find(|x| x.id == st.id) {
+                x.name = name;
+                x.value = value;
+            }
+            self.doc.reflow();
+        }
     }
 
     /// The Frame tool's sidebar: click a preset to add a frame that size.
@@ -2483,13 +2690,34 @@ impl App {
         let n = self.doc.node(id).clone();
         ui.label(RichText::new(&n.name).strong().size(14.0));
         ui.label(RichText::new(format!("{}  ·  {} × {}", n.kind.label(), num(n.rect.width()), num(n.rect.height()))).color(theme::muted(ui.ctx())));
+        // A component's (or an instance's main's) description, as Dev Mode shows it.
+        let main = match n.kind {
+            Kind::Component | Kind::ComponentSet => Some(id),
+            Kind::Instance => n.component.filter(|c| self.doc.nodes.contains_key(c)),
+            _ => None,
+        };
+        if let Some(desc) = main.map(|c| self.doc.description_of(c).to_string()).filter(|d| !d.is_empty()) {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.label(RichText::new(desc).color(theme::muted(ui.ctx())));
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+        }
+        if n.kind.is_frame() && n.kind != Kind::Instance {
+            let green = Color32::from_rgb(0x14, 0xAE, 0x5C);
+            let (label, fill) = if n.ready { ("Ready for dev", green) } else { ("Mark as ready for dev", theme::subtle(ui.ctx())) };
+            let text = if n.ready { RichText::new(label).color(Color32::WHITE) } else { RichText::new(label) };
+            if ui.add_sized([ui.available_width(), 24.0], egui::Button::new(text).fill(fill)).on_hover_text(if n.ready { "Click to mark as changed" } else { "" }).clicked() {
+                self.toggle_ready_for_dev();
+            }
+        }
         ui.separator();
         ui.horizontal(|ui| {
             ui.label(RichText::new("Code").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                for (lang, label) in [(Lang::Compose, "Compose"), (Lang::SwiftUi, "SwiftUI"), (Lang::Css, "CSS")] {
-                    ui.selectable_value(&mut self.code_lang, lang, label);
-                }
+                egui::ComboBox::from_id_salt("code-lang").selected_text(self.code_lang.label()).width(90.0).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+                    for lang in Lang::ALL {
+                        ui.selectable_value(&mut self.code_lang, lang, lang.label());
+                    }
+                });
             });
         });
         let code = generate(&self.doc, id, self.code_lang);
@@ -2559,8 +2787,39 @@ impl App {
                 ui.add(egui::Hyperlink::from_label_and_url(text, &url).open_in_new_tab(true)).on_hover_text(url);
             }
         }
+        self.annotations_section(ui, id);
         ui.separator();
         self.export_props(ui);
+    }
+
+    /// Dev Mode annotations on a layer: notes that label it on the canvas.
+    fn annotations_section(&mut self, ui: &mut Ui, id: NodeId) {
+        ui.separator();
+        let mut notes = self.doc.node(id).annotations.clone();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Annotations").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icon_button(ui, Icon::Plus, false, 22.0, "Add annotation").clicked() {
+                    notes.push("Note".into());
+                }
+            });
+        });
+        let mut remove = None;
+        for (i, note) in notes.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::multiline(note).desired_rows(1).desired_width(ui.available_width() - 28.0));
+                if icon_button(ui, Icon::Minus, false, 22.0, "Remove annotation").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            notes.remove(i);
+        }
+        if notes != self.doc.node(id).annotations {
+            self.begin_edit();
+            self.doc.node_mut(id).annotations = notes;
+        }
     }
 
     fn page_props(&mut self, ui: &mut Ui) {
@@ -2594,6 +2853,7 @@ impl App {
             ("Color styles", (|v: &StyleValue| matches!(v, StyleValue::Paint(_))) as fn(&StyleValue) -> bool),
             ("Text styles", |v: &StyleValue| matches!(v, StyleValue::Text(_))),
             ("Effect styles", |v: &StyleValue| matches!(v, StyleValue::Effect(_))),
+            ("Grid styles", |v: &StyleValue| matches!(v, StyleValue::Grid(_))),
         ] {
             let list: Vec<crate::doc::Style> = self.doc.styles.iter().filter(|s| is(&s.value)).cloned().collect();
             if list.is_empty() {
@@ -2621,11 +2881,27 @@ impl App {
                         }
                     }
                     Some(name) => {
-                        egui::CollapsingHeader::new(name).id_salt(("style-folder", label, name)).default_open(true).show(ui, |ui| {
-                            for st in items {
-                                self.local_style_row(ui, &st, &mut delete);
+                        // A collapsible folder whose name edits in place, renaming every style in it.
+                        let state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.id().with(("style-folder", label, name)), true);
+                        let mut rename = None;
+                        state
+                            .show_header(ui, |ui| {
+                                rename = commit_field(ui, ui.id().with(("folder-name", label, name)), name, 150.0, false);
+                            })
+                            .body(|ui| {
+                                for st in &items {
+                                    self.local_style_row(ui, st, &mut delete);
+                                }
+                            });
+                        if let Some(rename) = rename.map(|r| r.trim().trim_matches('/').trim().to_string()) {
+                            self.begin_edit();
+                            for st in &items {
+                                if let Some(x) = self.doc.styles.iter_mut().find(|x| x.id == st.id) {
+                                    let leaf = x.name.rsplit_once('/').map_or(x.name.as_str(), |(_, l)| l).trim().to_string();
+                                    x.name = if rename.is_empty() { leaf } else { format!("{rename} / {leaf}") };
+                                }
                             }
-                        });
+                        }
                     }
                 }
             }
@@ -2836,6 +3112,111 @@ impl App {
         false
     }
 
+    /// An instance's variant pickers and component property values. Edits apply to every
+    /// selected instance of the same component, or just this one when it is a nested instance.
+    fn instance_props(&mut self, ui: &mut Ui, i: NodeId, c: NodeId, nested: bool) {
+        use crate::doc::PropValue;
+        let pool: Vec<NodeId> = if nested { vec![i] } else { self.sel.clone() };
+        if let Some(set) = self.doc.node(c).parent.filter(|p| self.doc.node(*p).kind == Kind::ComponentSet) {
+            let current = crate::doc::variant_pairs(&self.doc.node(c).name);
+            for (prop, values) in self.doc.variant_props(set) {
+                let cur = current.iter().find(|(k, _)| *k == prop).map(|(_, v)| v.clone()).unwrap_or_default();
+                let mut pick = cur.clone();
+                ui.horizontal(|ui| {
+                    ui.label(&prop);
+                    egui::ComboBox::from_id_salt(("variant", i, &prop)).selected_text(&pick).width(110.0).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+                        for v in &values {
+                            ui.selectable_value(&mut pick, v.clone(), v);
+                        }
+                    });
+                });
+                if pick != cur {
+                    // Every selected instance of this set switches, each keeping its other properties.
+                    self.checkpoint();
+                    let targets: Vec<NodeId> = pool.iter().copied().filter(|&s| self.doc.node(s).component.and_then(|c| self.doc.nodes.get(&c)).and_then(|c| c.parent) == Some(set)).collect();
+                    for t in targets {
+                        let Some(tc) = self.doc.node(t).component else { continue };
+                        let mut want = crate::doc::variant_pairs(&self.doc.node(tc).name);
+                        want.retain(|(k, _)| *k != prop);
+                        want.push((prop.clone(), pick.clone()));
+                        if let Some(v) = self.doc.find_variant(set, &want) {
+                            self.doc.swap_component(t, v);
+                        }
+                    }
+                    self.doc.reflow();
+                }
+            }
+        }
+        // Component property values.
+        let props = self.doc.props_of(c);
+        let mut values = self.doc.node(i).prop_values.clone();
+        let mut changed = false;
+        for p in &props {
+            let cur = values.iter().find(|(k, _)| *k == p.name).map(|(_, v)| v.clone()).unwrap_or(p.default.clone());
+            let mut next = cur.clone();
+            ui.horizontal(|ui| {
+                ui.label(&p.name);
+                match &mut next {
+                    PropValue::Bool(b) => {
+                        ui.checkbox(b, "");
+                    }
+                    PropValue::Text(t) => {
+                        ui.text_edit_singleline(t);
+                    }
+                    PropValue::Swap(target) => {
+                        // Preferred values, when the property has them, are what the picker offers (as in Figma).
+                        let live: Vec<NodeId> = p.preferred.iter().copied().filter(|c| self.doc.nodes.contains_key(c)).collect();
+                        let mut comps: Vec<NodeId> = if live.is_empty() { self.doc.nodes.values().filter(|n| n.kind == Kind::Component).map(|n| n.id).collect() } else { live };
+                        comps.sort_by_key(|c| self.doc.node(*c).name.to_lowercase());
+                        egui::ComboBox::from_id_salt(("swap", i, &p.name)).selected_text(self.doc.nodes.get(target).map_or("Missing".into(), |n| n.name.clone())).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+                            for cid in comps {
+                                let name = self.doc.node(cid).name.clone();
+                                ui.selectable_value(target, cid, name);
+                            }
+                        });
+                    }
+                }
+            });
+            if next != cur {
+                values.retain(|(k, _)| *k != p.name);
+                values.push((p.name.clone(), next));
+                changed = true;
+            }
+        }
+        if changed {
+            self.begin_edit();
+            // Selected instances of the same component take the same values.
+            let targets: Vec<NodeId> = pool.iter().copied().filter(|&s| s == i || self.doc.node(s).component == Some(c)).collect();
+            for t in targets {
+                self.doc.node_mut(t).prop_values = values.clone();
+            }
+            self.doc.reflow();
+        }
+    }
+
+    /// Instance actions shared by the Design panel and the canvas menu: push overrides to the
+    /// main component, reset everything or one kind of override.
+    pub fn instance_menu(&mut self, ui: &mut Ui, inst: NodeId) {
+        let overrides = self.doc.instance_overrides(inst);
+        if ui.add_enabled(!overrides.is_empty(), egui::Button::new("Push changes to main component")).clicked() {
+            self.checkpoint();
+            self.doc.push_to_main(inst);
+            ui.close();
+        }
+        if ui.button("Reset all changes").clicked() {
+            self.checkpoint();
+            self.doc.reset_instance(inst);
+            ui.close();
+        }
+        for o in overrides {
+            if ui.button(o.label()).clicked() {
+                self.checkpoint();
+                self.doc.reset_override(inst, o);
+                ui.close();
+            }
+        }
+    }
+
     fn component_section(&mut self, ui: &mut Ui, id: NodeId) {
         use crate::doc::{CompProp, PropTarget, PropValue};
         let n = self.doc.node(id).clone();
@@ -2877,77 +3258,20 @@ impl App {
             let comp = self.doc.node(i).component.filter(|c| self.doc.nodes.contains_key(c));
             // Variant pickers when the main lives in a component set.
             if let Some(c) = comp {
-                if let Some(set) = self.doc.node(c).parent.filter(|p| self.doc.node(*p).kind == Kind::ComponentSet) {
-                    let current = crate::doc::variant_pairs(&self.doc.node(c).name);
-                    for (prop, values) in self.doc.variant_props(set) {
-                        let cur = current.iter().find(|(k, _)| *k == prop).map(|(_, v)| v.clone()).unwrap_or_default();
-                        let mut pick = cur.clone();
-                        ui.horizontal(|ui| {
-                            ui.label(&prop);
-                            egui::ComboBox::from_id_salt(("variant", i, &prop)).selected_text(&pick).width(110.0).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
-                                for v in &values {
-                                    ui.selectable_value(&mut pick, v.clone(), v);
-                                }
-                            });
-                        });
-                        if pick != cur {
-                            // Every selected instance of this set switches, each keeping its other properties.
-                            self.checkpoint();
-                            let targets: Vec<NodeId> = self.sel.iter().copied().filter(|&s| self.doc.node(s).component.and_then(|c| self.doc.nodes.get(&c)).and_then(|c| c.parent) == Some(set)).collect();
-                            for t in targets {
-                                let Some(tc) = self.doc.node(t).component else { continue };
-                                let mut want = crate::doc::variant_pairs(&self.doc.node(tc).name);
-                                want.retain(|(k, _)| *k != prop);
-                                want.push((prop.clone(), pick.clone()));
-                                if let Some(v) = self.doc.find_variant(set, &want) {
-                                    self.doc.swap_component(t, v);
-                                }
-                            }
-                            self.doc.reflow();
-                        }
-                    }
+                let desc = self.doc.description_of(c);
+                if !desc.is_empty() {
+                    ui.label(RichText::new(desc).small().color(theme::muted(ui.ctx())));
                 }
-                // Component property values.
-                let props = self.doc.props_of(c);
-                let mut values = self.doc.node(i).prop_values.clone();
-                let mut changed = false;
-                for p in &props {
-                    let cur = values.iter().find(|(k, _)| *k == p.name).map(|(_, v)| v.clone()).unwrap_or(p.default.clone());
-                    let mut next = cur.clone();
-                    ui.horizontal(|ui| {
-                        ui.label(&p.name);
-                        match &mut next {
-                            PropValue::Bool(b) => {
-                                ui.checkbox(b, "");
-                            }
-                            PropValue::Text(t) => {
-                                ui.text_edit_singleline(t);
-                            }
-                            PropValue::Swap(target) => {
-                                let comps: Vec<NodeId> = self.doc.nodes.values().filter(|n| n.kind == Kind::Component).map(|n| n.id).collect();
-                                egui::ComboBox::from_id_salt(("swap", i, &p.name)).selected_text(self.doc.nodes.get(target).map_or("Missing".into(), |n| n.name.clone())).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
-                                    for cid in comps {
-                                        let name = self.doc.node(cid).name.clone();
-                                        ui.selectable_value(target, cid, name);
-                                    }
-                                });
-                            }
-                        }
-                    });
-                    if next != cur {
-                        values.retain(|(k, _)| *k != p.name);
-                        values.push((p.name.clone(), next));
-                        changed = true;
-                    }
-                }
-                if changed {
-                    self.begin_edit();
-                    // Selected instances of the same component take the same values.
-                    let targets: Vec<NodeId> = self.sel.iter().copied().filter(|&s| s == i || self.doc.node(s).component == Some(c)).collect();
-                    for t in targets {
-                        self.doc.node_mut(t).prop_values = values.clone();
-                    }
-                    self.doc.reflow();
+                self.instance_props(ui, i, c, false);
+                // Nested instances the main component exposes show their properties here too.
+                let nested: Vec<NodeId> = self.doc.descendants(i).into_iter().filter(|&d| {
+                    let n = self.doc.node(d);
+                    n.kind == Kind::Instance && n.exposed && n.component.is_some_and(|c| self.doc.nodes.contains_key(&c))
+                }).collect();
+                for d in nested {
+                    ui.label(RichText::new(format!("↳ {}", self.doc.node(d).name)).small().color(theme::muted(ui.ctx())));
+                    let dc = self.doc.node(d).component.unwrap();
+                    self.instance_props(ui, d, dc, true);
                 }
             }
             ui.horizontal(|ui| {
@@ -2962,6 +3286,8 @@ impl App {
                     self.checkpoint();
                     self.doc.detach_instance(i);
                 }
+                let more = icon_button(ui, Icon::Menu, false, 22.0, "More instance options");
+                egui::Popup::menu(&more).id(ui.id().with(("inst-more", i))).style(crate::chrome::menu_style).show(|ui| self.instance_menu(ui, i));
             });
         } else if let Some(o) = owner.filter(|_| inst.is_none()) {
             let on = self.doc.node(o).clone();
@@ -2989,7 +3315,7 @@ impl App {
                                 ui.close();
                             }
                             if ui.button("Boolean").clicked() {
-                                props.push(CompProp { name: fresh(&props, "Show"), default: PropValue::Bool(true) });
+                                props.push(CompProp { name: fresh(&props, "Show"), default: PropValue::Bool(true), preferred: vec![] });
                                 changed = true;
                                 ui.close();
                             }
@@ -3009,12 +3335,12 @@ impl App {
                                 } else {
                                     "Text".into()
                                 };
-                                props.push(CompProp { name, default: PropValue::Text(default) });
+                                props.push(CompProp { name, default: PropValue::Text(default), preferred: vec![] });
                                 changed = true;
                                 ui.close();
                             }
                             if ui.button("Instance swap").clicked() {
-                                props.push(CompProp { name: fresh(&props, "Icon"), default: PropValue::Swap(o) });
+                                props.push(CompProp { name: fresh(&props, "Icon"), default: PropValue::Swap(o), preferred: vec![] });
                                 changed = true;
                                 ui.close();
                             }
@@ -3029,7 +3355,22 @@ impl App {
                             PropValue::Bool(b) => changed |= ui.checkbox(b, "").changed(),
                             PropValue::Text(t) => changed |= ui.add(egui::TextEdit::singleline(t).desired_width(70.0)).changed(),
                             PropValue::Swap(_) => {
-                                ui.label("Instance");
+                                // Figma's "Preferred values": the components this swap offers.
+                                let label = if p.preferred.is_empty() { "Preferred".to_string() } else { format!("Preferred ({})", p.preferred.len()) };
+                                crate::chrome::menu_button(ui, label, |ui| {
+                                    let mut comps: Vec<(NodeId, String)> = self.doc.nodes.values().filter(|n| n.kind == Kind::Component).map(|n| (n.id, n.name.clone())).collect();
+                                    comps.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+                                    for (cid, name) in comps {
+                                        let mut on = p.preferred.contains(&cid);
+                                        if ui.checkbox(&mut on, name).changed() {
+                                            p.preferred.retain(|x| *x != cid);
+                                            if on {
+                                                p.preferred.push(cid);
+                                            }
+                                            changed = true;
+                                        }
+                                    }
+                                });
                             }
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3042,6 +3383,12 @@ impl App {
                 if let Some(k) = remove {
                     props.remove(k);
                     changed = true;
+                }
+                // Figma's component description, shown in Assets and Dev Mode.
+                let mut desc = self.doc.node(def).description.clone();
+                if ui.add(egui::TextEdit::multiline(&mut desc).hint_text("Description").desired_rows(2).desired_width(f32::INFINITY)).changed() {
+                    self.begin_edit();
+                    self.doc.node_mut(def).description = desc;
                 }
                 if changed {
                     self.begin_edit();
@@ -3117,6 +3464,15 @@ impl App {
                     self.checkpoint();
                     self.doc.node_mut(id).prop_bind = bind;
                     self.doc.reflow();
+                }
+                // A nested instance can show its own properties on instances of this component.
+                if n.kind == Kind::Instance {
+                    let mut on = n.exposed;
+                    if ui.checkbox(&mut on, "Expose properties").on_hover_text("Show this nested instance's properties on instances of the component").changed() {
+                        self.checkpoint();
+                        self.doc.node_mut(id).exposed = on;
+                        self.doc.reflow();
+                    }
                 }
             }
         }
@@ -3848,15 +4204,48 @@ impl App {
         let mut paints = if stroke { n.strokes.clone() } else { n.fills.clone() };
         let mut changed = false;
         let link = if stroke { n.stroke_style } else { n.fill_style };
+        let prop = if stroke { crate::doc::Bindable::Stroke } else { crate::doc::Bindable::Fill };
         let mut add = false;
         let mut pick = None;
+        let mut var_pick = None;
         ui.horizontal(|ui| {
             ui.label(RichText::new(if stroke { "Stroke" } else { "Fill" }).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 add = icon_button(ui, Icon::Plus, false, 22.0, "").clicked();
                 pick = style_menu(ui, ui.id().with(("paint-styles", stroke)), &self.doc.styles, |v| matches!(v, StyleValue::Paint(_)));
+                // Figma's hexagon: apply a color variable to the paint.
+                if !self.doc.variables.is_empty() {
+                    let vb = icon_button(ui, Icon::Variable, false, 22.0, "Apply variable");
+                    egui::Popup::menu(&vb).id(ui.id().with(("paint-var", stroke))).style(crate::chrome::menu_style).show(|ui| {
+                        var_pick = self.variable_menu(ui, prop);
+                    });
+                }
             });
         });
+        if let Some(v) = var_pick {
+            self.bind_selection(prop, v);
+            return;
+        }
+        // A bound paint shows the variable's name in place of its value, with detach.
+        let bound = n.bindings.iter().find(|(b, _)| *b == prop).map(|(_, v)| *v);
+        if let Some(var) = bound {
+            let name = self.doc.variable(var).map_or("Missing variable".into(), |v| v.name.clone());
+            ui.horizontal(|ui| {
+                if let Some(p) = paints.last() {
+                    let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+                    ui.painter().rect_filled(r.shrink(2.0), 3.0, p.color.to32());
+                }
+                ui.label(RichText::new(name).color(BLUE));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, Icon::Detach, false, 22.0, "Detach variable").clicked() {
+                        self.checkpoint();
+                        for &s in &self.sel.clone() {
+                            self.doc.node_mut(s).bindings.retain(|(b, _)| *b != prop);
+                        }
+                    }
+                });
+            });
+        }
         let set_link = |app: &mut App, v: Option<crate::doc::StyleId>| {
             for &id in &app.sel.clone() {
                 let t = app.doc.node_mut(id);
@@ -3923,7 +4312,7 @@ impl App {
         let mut remove = None;
         // Topmost paint first, as in Figma. Each row drags by its grip to reorder.
         let (mut rows, mut dragging, mut dropped) = (vec![], None, None);
-        for i in (0..paints.len()).rev() {
+        for i in (0..paints.len()).rev().filter(|_| bound.is_none()) {
             let id = ui.id().with((stroke, i, first));
             let row = ui.horizontal(|ui| {
                 let grip = crate::paint_ui::grip(ui);
@@ -4110,10 +4499,56 @@ impl App {
     }
 
     fn layout_guides(&mut self, ui: &mut Ui, id: NodeId) {
-        use crate::doc::{GridAlign, GridKind, LayoutGrid};
+        use crate::doc::{GridKind, LayoutGrid};
+        use crate::doc::StyleValue;
+        use crate::paint_ui::{StylePick, style_menu, style_preview};
         let mut grids = self.doc.node(id).grids.clone();
         let before = grids.clone();
-        if section_title(ui, "Layout guide") {
+        let (mut add, mut pick) = (false, None);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Layout guide").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                add = icon_button(ui, Icon::Plus, false, 22.0, "").clicked();
+                pick = style_menu(ui, ui.id().with("grid-styles"), &self.doc.styles, |v| matches!(v, StyleValue::Grid(_)));
+            });
+        });
+        let set_link = |app: &mut App, v: Option<crate::doc::StyleId>| {
+            for &s in &app.sel.clone() {
+                if app.doc.node(s).kind.is_frame() {
+                    app.doc.node_mut(s).grid_style = v;
+                }
+            }
+            app.doc.reflow();
+        };
+        match pick {
+            Some(StylePick::Apply(sid)) => {
+                self.checkpoint();
+                set_link(self, Some(sid));
+                return;
+            }
+            Some(StylePick::Create(name)) => {
+                self.checkpoint();
+                let sid = self.doc.add_style(name, StyleValue::Grid(grids));
+                set_link(self, Some(sid));
+                return;
+            }
+            None => {}
+        }
+        // A linked grid style shows as one row, with detach, as in Figma.
+        if let Some(style) = self.doc.node(id).grid_style.and_then(|sid| self.doc.style(sid)).cloned() {
+            ui.horizontal(|ui| {
+                style_preview(ui, &style.value);
+                ui.label(&style.name);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, Icon::Detach, false, 22.0, "Detach style").clicked() {
+                        self.checkpoint();
+                        set_link(self, None);
+                    }
+                });
+            });
+            return;
+        }
+        if add {
             grids.push(LayoutGrid::default());
         }
         let mut remove = None;
@@ -4125,59 +4560,7 @@ impl App {
                     GridKind::Rows => format!("{} rows", g.count),
                 };
                 let open = ui.add(egui::Button::new(label).frame(false));
-                crate::chrome::popover(&open, ui.id().with(("grid", id, i)), "Layout guide", 240.0, |ui| {
-                    ui.horizontal(|ui| {
-                        for k in [GridKind::Grid, GridKind::Columns, GridKind::Rows] {
-                            ui.selectable_value(&mut g.kind, k, format!("{k:?}"));
-                        }
-                    });
-                    egui::Grid::new(ui.id().with(("grid-fields", id, i))).num_columns(2).show(ui, |ui| {
-                        if g.kind == GridKind::Grid {
-                            ui.label("Size");
-                            ui.add(DragValue::new(&mut g.size).range(1.0..=1000.0));
-                            ui.end_row();
-                        } else {
-                            ui.label("Count");
-                            ui.add(DragValue::new(&mut g.count).range(1..=100));
-                            ui.end_row();
-                            // Figma names the alignments by side: Left/Right for columns, Top/Bottom for rows.
-                            let cols = g.kind == GridKind::Columns;
-                            let name = |a: GridAlign| match a {
-                                GridAlign::Stretch => "Stretch",
-                                GridAlign::Center => "Center",
-                                GridAlign::Min if cols => "Left",
-                                GridAlign::Min => "Top",
-                                GridAlign::Max if cols => "Right",
-                                GridAlign::Max => "Bottom",
-                            };
-                            ui.label("Type");
-                            dropdown(ui, name(g.align), |ui| {
-                                for a in [GridAlign::Stretch, GridAlign::Min, GridAlign::Center, GridAlign::Max] {
-                                    ui.selectable_value(&mut g.align, a, name(a));
-                                }
-                            });
-                            ui.end_row();
-                            if g.align != GridAlign::Stretch {
-                                ui.label(if cols { "Width" } else { "Height" });
-                                ui.add(DragValue::new(&mut g.size).range(1.0..=10000.0));
-                                ui.end_row();
-                            }
-                            ui.label("Gutter");
-                            ui.add(DragValue::new(&mut g.gutter).range(0.0..=1000.0));
-                            ui.end_row();
-                            // Centered tracks have no offset in Figma.
-                            if g.align != GridAlign::Center {
-                                ui.label(if g.align == GridAlign::Stretch { "Margin" } else { "Offset" });
-                                ui.add(DragValue::new(&mut g.margin).range(-1000.0..=1000.0));
-                                ui.end_row();
-                            }
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        hex_field(ui, ui.id().with(("grid-color", id, i)), &mut g.color, 56.0);
-                        crate::paint_ui::alpha_field(ui, &mut g.color);
-                    });
-                });
+                crate::chrome::popover(&open, ui.id().with(("grid", id, i)), "Layout guide", 240.0, |ui| grid_editor(ui, ui.id().with(("grid-fields", id, i)), g));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if icon_button(ui, Icon::Minus, false, 22.0, "Remove").clicked() {
                         remove = Some(i);

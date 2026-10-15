@@ -1499,6 +1499,49 @@ impl App {
         }
     }
 
+    /// Selected instances (or the instances selected layers sit in), each once.
+    fn selected_instances(&self) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = self.sel.iter().filter_map(|&s| self.owning_instance(s)).collect();
+        out.dedup();
+        out
+    }
+
+    /// "Push changes to main component" for every selected instance, as one undo step.
+    pub fn push_selection_to_main(&mut self) {
+        let insts = self.selected_instances();
+        if insts.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for i in insts {
+            self.doc.push_to_main(i);
+        }
+    }
+
+    /// "Reset all changes" on every selected instance.
+    pub fn reset_selection_instances(&mut self) {
+        let insts = self.selected_instances();
+        if insts.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for i in insts {
+            self.doc.reset_instance(i);
+        }
+    }
+
+    /// Dev Mode's "Mark as ready for dev" on the selected frames and sections (or clear it when
+    /// the first already is), as one undo step.
+    pub fn toggle_ready_for_dev(&mut self) {
+        let frames: Vec<NodeId> = self.sel.iter().copied().filter(|&s| self.doc.node(s).kind.is_frame() && self.doc.node(s).kind != Kind::Instance).collect();
+        let Some(&first) = frames.first() else { return };
+        let on = !self.doc.node(first).ready;
+        self.checkpoint();
+        for f in frames {
+            self.doc.node_mut(f).ready = on;
+        }
+    }
+
     /// The instance a layer belongs to (itself or nearest instance ancestor).
     pub fn owning_instance(&self, id: NodeId) -> Option<NodeId> {
         std::iter::once(id).chain(self.doc.ancestors(id)).find(|a| self.doc.node(*a).kind == Kind::Instance)

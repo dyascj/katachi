@@ -382,6 +382,86 @@ pub enum PropValue {
 pub struct CompProp {
     pub name: String,
     pub default: PropValue,
+    /// Instance swap: Figma's "Preferred values", the components the swap picker offers first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preferred: Vec<NodeId>,
+}
+
+/// Instance overrides that can be reset one at a time (Figma's "Reset fill", "Reset text"...).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Override {
+    Name,
+    Visibility,
+    Opacity,
+    Fill,
+    Stroke,
+    Effects,
+    CornerRadius,
+    Text,
+    TextStyle,
+}
+
+impl Override {
+    pub const ALL: [Override; 9] = [
+        Override::Name,
+        Override::Visibility,
+        Override::Opacity,
+        Override::Fill,
+        Override::Stroke,
+        Override::Effects,
+        Override::CornerRadius,
+        Override::Text,
+        Override::TextStyle,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Override::Name => "Reset name",
+            Override::Visibility => "Reset visibility",
+            Override::Opacity => "Reset opacity",
+            Override::Fill => "Reset fill",
+            Override::Stroke => "Reset stroke",
+            Override::Effects => "Reset effects",
+            Override::CornerRadius => "Reset corner radius",
+            Override::Text => "Reset text",
+            Override::TextStyle => "Reset text style",
+        }
+    }
+
+    /// Whether layer `n` overrides this against `snap`, what it last copied from the main.
+    pub fn differs(self, n: &Node, snap: &Node) -> bool {
+        match self {
+            Override::Name => n.name != snap.name,
+            Override::Visibility => n.visible != snap.visible,
+            Override::Opacity => n.opacity != snap.opacity,
+            Override::Fill => n.fills != snap.fills || n.fill_style != snap.fill_style,
+            Override::Stroke => n.strokes != snap.strokes || n.stroke_style != snap.stroke_style || n.stroke_width != snap.stroke_width,
+            Override::Effects => n.shadows != snap.shadows || n.effect_style != snap.effect_style,
+            Override::CornerRadius => n.radius != snap.radius || n.corner_radii != snap.corner_radii,
+            Override::Text => n.text != snap.text || n.spans != snap.spans,
+            Override::TextStyle => {
+                n.font_family != snap.font_family || n.font_size != snap.font_size || n.font_weight != snap.font_weight || n.line_height != snap.line_height || n.letter_spacing != snap.letter_spacing || n.text_style != snap.text_style
+            }
+        }
+    }
+
+    /// Copy this property group from `from` onto `to`.
+    pub fn copy(self, from: &Node, to: &mut Node) {
+        match self {
+            Override::Name => to.name = from.name.clone(),
+            Override::Visibility => to.visible = from.visible,
+            Override::Opacity => to.opacity = from.opacity,
+            Override::Fill => (to.fills, to.fill_style) = (from.fills.clone(), from.fill_style),
+            Override::Stroke => (to.strokes, to.stroke_style, to.stroke_width) = (from.strokes.clone(), from.stroke_style, from.stroke_width),
+            Override::Effects => (to.shadows, to.effect_style) = (from.shadows.clone(), from.effect_style),
+            Override::CornerRadius => (to.radius, to.corner_radii) = (from.radius, from.corner_radii),
+            Override::Text => (to.text, to.spans) = (from.text.clone(), from.spans.clone()),
+            Override::TextStyle => {
+                to.font_family = from.font_family.clone();
+                (to.font_size, to.font_weight, to.line_height, to.letter_spacing, to.text_style) = (from.font_size, from.font_weight, from.line_height, from.letter_spacing, from.text_style);
+            }
+        }
+    }
 }
 
 /// Which property of a layer a component property drives.
@@ -428,10 +508,24 @@ pub enum VarValue {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Variable {
     pub id: VarId,
+    /// Slashes group variables in the table, as in Figma ("color/brand/primary").
     pub name: String,
     pub collection: u64,
     /// One value per mode of the collection.
     pub values: Vec<VarValue>,
+    /// Figma's "Show in": the properties whose pickers offer this variable (empty = all supported).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<Bindable>,
+    /// Code syntax for Dev Mode: Web, iOS, Android (empty = derived from the name).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub code_syntax: [String; 3],
+}
+
+impl Variable {
+    /// Whether the bind pickers for `prop` offer this variable.
+    pub fn shows_in(&self, prop: Bindable) -> bool {
+        self.scopes.is_empty() || self.scopes.contains(&prop)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -456,6 +550,21 @@ pub enum Bindable {
     FontSize,
     Text,
     Visible,
+    LineHeight,
+    LetterSpacing,
+    ParagraphSpacing,
+    FontFamily,
+    FontWeight,
+    MinWidth,
+    MaxWidth,
+    MinHeight,
+    MaxHeight,
+    /// The first effect's color, blur, spread and offsets.
+    EffectColor,
+    EffectBlur,
+    EffectSpread,
+    EffectX,
+    EffectY,
 }
 
 impl Bindable {
@@ -474,10 +583,57 @@ impl Bindable {
             Bindable::FontSize => "Font size",
             Bindable::Text => "Text",
             Bindable::Visible => "Visibility",
+            Bindable::LineHeight => "Line height",
+            Bindable::LetterSpacing => "Letter spacing",
+            Bindable::ParagraphSpacing => "Paragraph spacing",
+            Bindable::FontFamily => "Font family",
+            Bindable::FontWeight => "Font weight",
+            Bindable::MinWidth => "Min width",
+            Bindable::MaxWidth => "Max width",
+            Bindable::MinHeight => "Min height",
+            Bindable::MaxHeight => "Max height",
+            Bindable::EffectColor => "Effect color",
+            Bindable::EffectBlur => "Effect blur",
+            Bindable::EffectSpread => "Effect spread",
+            Bindable::EffectX => "Effect X",
+            Bindable::EffectY => "Effect Y",
         }
     }
 
-    pub const ALL: [Bindable; 12] = [
+    /// Figma's variable scope for the property (`VariableScope`).
+    pub fn scope(self) -> &'static str {
+        match self {
+            Bindable::Fill => "ALL_FILLS",
+            Bindable::Stroke => "STROKE_COLOR",
+            Bindable::Opacity => "OPACITY",
+            Bindable::Radius => "CORNER_RADIUS",
+            Bindable::Width | Bindable::Height | Bindable::MinWidth | Bindable::MaxWidth | Bindable::MinHeight | Bindable::MaxHeight => "WIDTH_HEIGHT",
+            Bindable::Gap | Bindable::Padding => "GAP",
+            Bindable::StrokeWidth => "STROKE_FLOAT",
+            Bindable::FontSize => "FONT_SIZE",
+            Bindable::Text => "TEXT_CONTENT",
+            Bindable::Visible => "ALL_SCOPES",
+            Bindable::LineHeight => "LINE_HEIGHT",
+            Bindable::LetterSpacing => "LETTER_SPACING",
+            Bindable::ParagraphSpacing => "PARAGRAPH_SPACING",
+            Bindable::FontFamily => "FONT_FAMILY",
+            Bindable::FontWeight => "FONT_WEIGHT",
+            Bindable::EffectColor => "EFFECT_COLOR",
+            Bindable::EffectBlur | Bindable::EffectSpread | Bindable::EffectX | Bindable::EffectY => "EFFECT_FLOAT",
+        }
+    }
+
+    /// Properties covered by a Figma scope name (the inverse of `scope`).
+    pub fn from_scope(s: &str) -> Vec<Bindable> {
+        match s {
+            "FRAME_FILL" | "SHAPE_FILL" | "TEXT_FILL" => vec![Bindable::Fill],
+            "FONT_STYLE" => vec![Bindable::FontWeight],
+            "ALL_SCOPES" => vec![],
+            _ => Bindable::ALL.into_iter().filter(|b| b.scope() == s).collect(),
+        }
+    }
+
+    pub const ALL: [Bindable; 26] = [
         Bindable::Fill,
         Bindable::Stroke,
         Bindable::Opacity,
@@ -490,12 +646,26 @@ impl Bindable {
         Bindable::FontSize,
         Bindable::Text,
         Bindable::Visible,
+        Bindable::LineHeight,
+        Bindable::LetterSpacing,
+        Bindable::ParagraphSpacing,
+        Bindable::FontFamily,
+        Bindable::FontWeight,
+        Bindable::MinWidth,
+        Bindable::MaxWidth,
+        Bindable::MinHeight,
+        Bindable::MaxHeight,
+        Bindable::EffectColor,
+        Bindable::EffectBlur,
+        Bindable::EffectSpread,
+        Bindable::EffectX,
+        Bindable::EffectY,
     ];
     /// Whether a value of this kind fits the property.
     pub fn accepts(self, v: &VarValue) -> bool {
         match self {
-            Bindable::Fill | Bindable::Stroke => matches!(v, VarValue::Color(_)),
-            Bindable::Text => matches!(v, VarValue::Text(_)),
+            Bindable::Fill | Bindable::Stroke | Bindable::EffectColor => matches!(v, VarValue::Color(_)),
+            Bindable::Text | Bindable::FontFamily => matches!(v, VarValue::Text(_)),
             Bindable::Visible => matches!(v, VarValue::Bool(_)),
             _ => matches!(v, VarValue::Number(_)),
         }
@@ -822,6 +992,8 @@ pub enum StyleValue {
     Paint(Vec<Paint>),
     Text(TextStyle),
     Effect(Vec<Shadow>),
+    /// Figma's grid styles: a frame's layout guides.
+    Grid(Vec<LayoutGrid>),
 }
 
 /// A shared style that layers link to; editing it updates every user.
@@ -1561,6 +1733,8 @@ pub struct Node {
     pub text_style: Option<StyleId>,
     #[serde(skip_serializing_if = "dflt::effect_style")]
     pub effect_style: Option<StyleId>,
+    #[serde(skip_serializing_if = "dflt::grid_style")]
+    pub grid_style: Option<StyleId>,
     /// Components and sets: property definitions.
     #[serde(skip_serializing_if = "dflt::comp_props")]
     pub comp_props: Vec<CompProp>,
@@ -1638,6 +1812,19 @@ pub struct Node {
     pub lines: Vec<String>,
     #[serde(skip_serializing_if = "dflt::expanded")]
     pub expanded: bool,
+    /// Components and sets: the description shown in Assets and Dev Mode.
+    #[serde(skip_serializing_if = "dflt::description")]
+    pub description: String,
+    /// A nested instance inside a component whose properties show on the component's instances
+    /// (Figma's "Expose properties from nested instances").
+    #[serde(skip_serializing_if = "dflt::exposed")]
+    pub exposed: bool,
+    /// Frames and sections: Dev Mode's "Ready for dev" status.
+    #[serde(skip_serializing_if = "dflt::ready")]
+    pub ready: bool,
+    /// Dev Mode annotations: notes pinned to the layer, labeled on the canvas.
+    #[serde(skip_serializing_if = "dflt::annotations")]
+    pub annotations: Vec<String>,
 }
 
 /// Serialization leaves out fields at `Node::default()`'s values; `#[serde(default)]` fills
@@ -1697,6 +1884,7 @@ mod dflt {
         stroke_style: Option<StyleId>,
         text_style: Option<StyleId>,
         effect_style: Option<StyleId>,
+        grid_style: Option<StyleId>,
         comp_props: Vec<CompProp>,
         prop_bind: Vec<(String, PropTarget)>,
         prop_values: Vec<(String, PropValue)>,
@@ -1725,6 +1913,10 @@ mod dflt {
         spans: Vec<TextSpan>,
         lists: Vec<ListLine>,
         expanded: bool,
+        description: String,
+        exposed: bool,
+        ready: bool,
+        annotations: Vec<String>,
     );
 }
 
@@ -1786,6 +1978,7 @@ impl Default for Node {
             stroke_style: None,
             text_style: None,
             effect_style: None,
+            grid_style: None,
             comp_props: vec![],
             prop_bind: vec![],
             prop_values: vec![],
@@ -1815,6 +2008,10 @@ impl Default for Node {
             lists: vec![],
             lines: vec![],
             expanded: true,
+            description: String::new(),
+            exposed: false,
+            ready: false,
+            annotations: vec![],
         }
     }
 }
@@ -2502,6 +2699,37 @@ impl Document {
         self.variables.iter().find(|v| v.id == id)
     }
 
+    /// A variable's value in its first mode, following aliases (its type, for pickers).
+    pub fn resolve_first(&self, id: VarId) -> Option<VarValue> {
+        let mut cur = id;
+        for _ in 0..8 {
+            match self.variable(cur)?.values.first()? {
+                VarValue::Alias(next) => cur = *next,
+                v => return Some(v.clone()),
+            }
+        }
+        None
+    }
+
+    /// Whether `id` is `target` or reaches it through aliases in any mode (an alias to it would loop).
+    pub fn aliases_to(&self, id: VarId, target: VarId) -> bool {
+        let mut seen = vec![];
+        let mut todo = vec![id];
+        while let Some(cur) = todo.pop() {
+            if cur == target {
+                return true;
+            }
+            if seen.contains(&cur) {
+                continue;
+            }
+            seen.push(cur);
+            if let Some(v) = self.variable(cur) {
+                todo.extend(v.values.iter().filter_map(|x| if let VarValue::Alias(a) = x { Some(*a) } else { None }));
+            }
+        }
+        false
+    }
+
     pub fn add_collection(&mut self, name: String) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -2513,7 +2741,7 @@ impl Document {
         let id = self.next_id;
         self.next_id += 1;
         let modes = self.collections.iter().find(|c| c.id == collection).map_or(1, |c| c.modes.len());
-        self.variables.push(Variable { id, name, collection, values: vec![value; modes] });
+        self.variables.push(Variable { id, name, collection, values: vec![value; modes], scopes: vec![], code_syntax: Default::default() });
         id
     }
 
@@ -2595,6 +2823,20 @@ impl Document {
                 (Bindable::FontSize, VarValue::Number(v)) => n.font_size = v.max(1.0),
                 (Bindable::Text, VarValue::Text(t)) => n.text = t,
                 (Bindable::Visible, VarValue::Bool(b)) => n.visible = b,
+                (Bindable::LineHeight, VarValue::Number(v)) => n.line_height = LineHeight::Px(v.max(0.0)),
+                (Bindable::LetterSpacing, VarValue::Number(v)) => n.letter_spacing = v,
+                (Bindable::ParagraphSpacing, VarValue::Number(v)) => n.paragraph_spacing = v.max(0.0),
+                (Bindable::FontFamily, VarValue::Text(t)) => n.font_family = t,
+                (Bindable::FontWeight, VarValue::Number(v)) => n.font_weight = v.clamp(1.0, 1000.0) as u16,
+                (Bindable::MinWidth, VarValue::Number(v)) => n.min_size[0] = Some(v.max(0.0)),
+                (Bindable::MaxWidth, VarValue::Number(v)) => n.max_size[0] = Some(v.max(0.0)),
+                (Bindable::MinHeight, VarValue::Number(v)) => n.min_size[1] = Some(v.max(0.0)),
+                (Bindable::MaxHeight, VarValue::Number(v)) => n.max_size[1] = Some(v.max(0.0)),
+                (Bindable::EffectColor, VarValue::Color(c)) => n.shadows.iter_mut().take(1).for_each(|s| s.color = c),
+                (Bindable::EffectBlur, VarValue::Number(v)) => n.shadows.iter_mut().take(1).for_each(|s| s.blur = v.max(0.0)),
+                (Bindable::EffectSpread, VarValue::Number(v)) => n.shadows.iter_mut().take(1).for_each(|s| s.spread = v),
+                (Bindable::EffectX, VarValue::Number(v)) => n.shadows.iter_mut().take(1).for_each(|s| s.offset.x = v),
+                (Bindable::EffectY, VarValue::Number(v)) => n.shadows.iter_mut().take(1).for_each(|s| s.offset.y = v),
                 _ => {}
             }
         }
@@ -2615,6 +2857,14 @@ impl Document {
             Bindable::FontSize => a.font_size != b.font_size,
             Bindable::Text => a.text != b.text,
             Bindable::Visible => a.visible != b.visible,
+            Bindable::LineHeight => a.line_height != b.line_height,
+            Bindable::LetterSpacing => a.letter_spacing != b.letter_spacing,
+            Bindable::ParagraphSpacing => a.paragraph_spacing != b.paragraph_spacing,
+            Bindable::FontFamily => a.font_family != b.font_family,
+            Bindable::FontWeight => a.font_weight != b.font_weight,
+            Bindable::MinWidth | Bindable::MinHeight => a.min_size != b.min_size,
+            Bindable::MaxWidth | Bindable::MaxHeight => a.max_size != b.max_size,
+            Bindable::EffectColor | Bindable::EffectBlur | Bindable::EffectSpread | Bindable::EffectX | Bindable::EffectY => a.shadows != b.shadows,
         }
     }
 
@@ -2633,6 +2883,20 @@ impl Document {
             (Bindable::FontSize, VarValue::Number(v)) => n.font_size == v.max(1.0),
             (Bindable::Text, VarValue::Text(t)) => n.text == *t,
             (Bindable::Visible, VarValue::Bool(b)) => n.visible == *b,
+            (Bindable::LineHeight, VarValue::Number(v)) => n.line_height == LineHeight::Px(v.max(0.0)),
+            (Bindable::LetterSpacing, VarValue::Number(v)) => n.letter_spacing == *v,
+            (Bindable::ParagraphSpacing, VarValue::Number(v)) => n.paragraph_spacing == v.max(0.0),
+            (Bindable::FontFamily, VarValue::Text(t)) => n.font_family == *t,
+            (Bindable::FontWeight, VarValue::Number(v)) => n.font_weight == v.clamp(1.0, 1000.0) as u16,
+            (Bindable::MinWidth, VarValue::Number(v)) => n.min_size[0] == Some(v.max(0.0)),
+            (Bindable::MaxWidth, VarValue::Number(v)) => n.max_size[0] == Some(v.max(0.0)),
+            (Bindable::MinHeight, VarValue::Number(v)) => n.min_size[1] == Some(v.max(0.0)),
+            (Bindable::MaxHeight, VarValue::Number(v)) => n.max_size[1] == Some(v.max(0.0)),
+            (Bindable::EffectColor, VarValue::Color(c)) => n.shadows.first().is_none_or(|s| s.color == *c),
+            (Bindable::EffectBlur, VarValue::Number(v)) => n.shadows.first().is_none_or(|s| s.blur == v.max(0.0)),
+            (Bindable::EffectSpread, VarValue::Number(v)) => n.shadows.first().is_none_or(|s| s.spread == *v),
+            (Bindable::EffectX, VarValue::Number(v)) => n.shadows.first().is_none_or(|s| s.offset.x == *v),
+            (Bindable::EffectY, VarValue::Number(v)) => n.shadows.first().is_none_or(|s| s.offset.y == *v),
             _ => true,
         }
     }
@@ -2651,12 +2915,13 @@ impl Document {
 
     /// Push style values into every linked layer; links to deleted styles fall away.
     pub fn apply_styles(&mut self) {
-        if self.styles.is_empty() && self.nodes.values().all(|n| n.fill_style.is_none() && n.stroke_style.is_none() && n.text_style.is_none() && n.effect_style.is_none()) {
+        let linked = |n: &Node| n.fill_style.is_some() || n.stroke_style.is_some() || n.text_style.is_some() || n.effect_style.is_some() || n.grid_style.is_some();
+        if self.styles.is_empty() && !self.nodes.values().any(|n| linked(n)) {
             return;
         }
         let styles: HashMap<StyleId, StyleValue> = self.styles.iter().map(|s| (s.id, s.value.clone())).collect();
         for arc in self.nodes.values_mut() {
-            if arc.fill_style.is_none() && arc.stroke_style.is_none() && arc.text_style.is_none() && arc.effect_style.is_none() {
+            if !linked(arc) {
                 continue;
             }
             // Work on a copy and only write back real changes, so layers stay shared with undo.
@@ -2707,6 +2972,14 @@ impl Document {
                 }
             }
             _ => n.effect_style = None,
+        }
+        match n.grid_style.and_then(|id| styles.get(&id)) {
+            Some(StyleValue::Grid(g)) => {
+                if n.synced.as_ref().is_none_or(|s| s.grids == n.grids) {
+                    n.grids = g.clone()
+                }
+            }
+            _ => n.grid_style = None,
         }
     }
 
@@ -2762,6 +3035,51 @@ impl Document {
             n.rect = Rect::from_min_size(n.rect.min, size);
         }
         self.sync_instance(inst);
+        self.reflow();
+    }
+
+    /// The instance's own layers (itself and its descendants outside nested instances).
+    fn own_layers(&self, inst: NodeId) -> Vec<NodeId> {
+        std::iter::once(inst)
+            .chain(self.descendants(inst).into_iter().filter(|&d| !self.ancestors(d).iter().take_while(|a| **a != inst).any(|a| self.nodes[a].kind == Kind::Instance)))
+            .collect()
+    }
+
+    /// Which property groups an instance overrides anywhere in its layers.
+    pub fn instance_overrides(&self, inst: NodeId) -> Vec<Override> {
+        let layers: Vec<NodeId> = std::iter::once(inst).chain(self.descendants(inst)).collect();
+        Override::ALL
+            .into_iter()
+            .filter(|o| layers.iter().any(|d| self.nodes[d].synced.as_deref().is_some_and(|s| o.differs(&self.nodes[d], s))))
+            .collect()
+    }
+
+    /// Drop one kind of override across an instance (Figma's "Reset fill" and the like).
+    pub fn reset_override(&mut self, inst: NodeId, o: Override) {
+        for d in std::iter::once(inst).chain(self.descendants(inst)) {
+            let Some(snap) = self.nodes[&d].synced.as_deref().filter(|s| o.differs(&self.nodes[&d], s)).cloned() else { continue };
+            o.copy(&snap, self.node_mut(d));
+        }
+        self.sync_instance(inst);
+        self.reflow();
+    }
+
+    /// Figma's "Push changes to main component": the instance's overrides become the main
+    /// component's values, so every other instance picks them up too.
+    pub fn push_to_main(&mut self, inst: NodeId) {
+        if self.nodes[&inst].component.is_none_or(|c| !self.nodes.contains_key(&c)) {
+            return;
+        }
+        for d in self.own_layers(inst) {
+            let n = self.nodes[&d].clone();
+            let (Some(snap), Some(src)) = (n.synced.as_deref(), n.source.filter(|s| self.nodes.contains_key(s))) else { continue };
+            for o in Override::ALL.into_iter().filter(|o| o.differs(&n, snap) && !(d == inst && *o == Override::Name)) {
+                o.copy(&n, self.node_mut(src));
+            }
+            if n.layout != snap.layout {
+                self.node_mut(src).layout = n.layout;
+            }
+        }
         self.reflow();
     }
 
@@ -2925,6 +3243,15 @@ impl Document {
     fn mark_synced(&self, inst: NodeId, revs: &mut HashMap<NodeId, u64>) {
         if let Some(key) = self.inst_key(inst, revs) {
             self.cache.0.lock().unwrap().insts.insert(inst, key);
+        }
+    }
+
+    /// A component's description: its own, or its component set's.
+    pub fn description_of(&self, comp: NodeId) -> &str {
+        let c = &self.nodes[&comp];
+        match c.parent.map(|p| &self.nodes[&p]) {
+            Some(set) if set.kind == Kind::ComponentSet && c.description.is_empty() => &set.description,
+            _ => &c.description,
         }
     }
 
@@ -3750,7 +4077,7 @@ fn merge_from(e: &mut Node, src: &Node) {
         name, visible, opacity, fills, strokes, stroke_width, stroke_sides, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, min_size, max_size, constraints, absolute,
         paths, even_odd, text, font_size, font_weight, font_family, italic, text_sizing, text_align, text_valign, line_height, letter_spacing,
         decoration, text_case, paragraph_spacing, paragraph_indent, vertical_trim, truncate, max_lines, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, overflow, scroll_pos, fill_style,
-        stroke_style, text_style, effect_style, prop_bind, is_mask, blend, bindings, modes, spans, lists
+        stroke_style, text_style, effect_style, grid_style, prop_bind, is_mask, blend, bindings, modes, spans, lists, exposed
     );
     e.synced = Some(Box::new(Node { children: vec![], synced: None, ..src.clone() }));
 }
@@ -4503,8 +4830,8 @@ mod tests {
         assert_eq!(d.node(i).name, d.node(set).name, "named after the set");
         // Boolean and text properties drive bound layers.
         d.node_mut(set).comp_props = vec![
-            CompProp { name: "Show label".into(), default: PropValue::Bool(true) },
-            CompProp { name: "Label".into(), default: PropValue::Text("Go".into()) },
+            CompProp { name: "Show label".into(), default: PropValue::Bool(true), preferred: vec![] },
+            CompProp { name: "Label".into(), default: PropValue::Text("Go".into()), preferred: vec![] },
         ];
         for c in [a, b] {
             let lbl = d.node(c).children[1];
@@ -4596,5 +4923,33 @@ mod tests {
         let g = d.insert(0, Some(f), None, Node::new(Kind::Frame, r(0., 0., 50., 50.)));
         d.reparent(f, 0, Some(g), None);
         assert_eq!(d.node(f).parent, None);
+    }
+
+    #[test]
+    fn aliases_text_bindings_and_scopes() {
+        let mut d = Document::default();
+        let c = d.add_collection("Theme".into());
+        let base = d.add_variable(c, "size/base".into(), VarValue::Number(20.0));
+        let lh = d.add_variable(c, "text/line".into(), VarValue::Alias(base));
+        let fam = d.add_variable(c, "font/body".into(), VarValue::Text("Georgia".into()));
+        let shade = d.add_variable(c, "shadow".into(), VarValue::Color(Rgba::rgb(1, 2, 3)));
+        assert_eq!(d.resolve_first(lh), Some(VarValue::Number(20.0)), "aliases resolve to the target's value");
+        assert!(d.aliases_to(lh, base) && !d.aliases_to(base, lh), "an alias back would loop");
+        let mut t = Node::new(Kind::Text, r(0., 0., 50., 20.));
+        t.shadows = vec![Shadow::default()];
+        t.bindings = vec![(Bindable::LineHeight, lh), (Bindable::FontFamily, fam), (Bindable::MinWidth, base), (Bindable::EffectColor, shade)];
+        let t = d.insert(0, None, None, t);
+        d.apply_variables();
+        let n = d.node(t);
+        assert_eq!((n.line_height, n.font_family.as_str(), n.min_size[0], n.shadows[0].color), (LineHeight::Px(20.0), "Georgia", Some(20.0), Rgba::rgb(1, 2, 3)));
+        d.variables.iter_mut().find(|v| v.id == base).unwrap().values[0] = VarValue::Number(24.0);
+        d.apply_variables();
+        assert_eq!(d.node(t).line_height, LineHeight::Px(24.0), "editing the target moves the alias");
+        // Scopes: "Show in" limits which pickers offer a variable.
+        let v = d.variables.iter_mut().find(|v| v.id == base).unwrap();
+        v.scopes = Bindable::from_scope("CORNER_RADIUS");
+        assert!(v.shows_in(Bindable::Radius) && !v.shows_in(Bindable::Gap));
+        assert_eq!(Bindable::from_scope("WIDTH_HEIGHT").len(), 6);
+        assert!(Bindable::from_scope("ALL_SCOPES").is_empty());
     }
 }
