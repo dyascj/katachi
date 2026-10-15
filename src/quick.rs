@@ -99,6 +99,9 @@ const COMMANDS: &[(&str, &str, Run)] = &[
     ("Spotlight me", "", |a, _| a.toggle_spotlight()),
     ("Multiplayer session", "", |a, _| a.show_collab = true),
     ("Local variables", "", |a, _| a.show_variables = true),
+    ("Libraries", "", |a, _| a.show_libraries = true),
+    ("Publish library", "", |a, _| a.publish_library()),
+    ("Review library updates", "", |a, _| a.review_updates = true),
     ("Replace fonts", "", |a, _| a.open_replace_fonts()),
     ("Create link", "⌘K", |a, c| a.create_link(c)),
     ("Find and replace", "⌘F", |a, _| {

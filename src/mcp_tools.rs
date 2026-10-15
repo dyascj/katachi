@@ -197,13 +197,24 @@ impl App {
                         }
                     }
                 }
+                // Enabled libraries' components; execute_code places one with
+                // `(await figma.importComponentByKeyAsync(key)).createInstance()`.
+                for (r, lib) in self.enabled_libs() {
+                    for (page, id, name) in crate::library::components(&lib) {
+                        let n = lib.node(id);
+                        out.push(json!({
+                            "key": format!("{}:{id}", r.id), "type": "COMPONENT", "name": name, "library": r.name, "page": lib.pages[page].name,
+                            "width": n.rect.width(), "height": n.rect.height(),
+                        }));
+                    }
+                }
                 text(Value::Array(out).to_string())
             }
             "execute_code" => {
                 let code = args["code"].as_str().ok_or("missing code")?;
                 let before = self.doc.clone();
-                let sel = self.sel.clone();
-                let out = match crate::plugins::Session::start(&mut self.doc, self.page, &sel, "MCP", None, code, None) {
+                let (sel, libs) = (self.sel.clone(), self.plugin_libs());
+                let out = match crate::plugins::Session::start(&mut self.doc, self.page, &sel, "MCP", None, code, None, libs) {
                     Ok((_, out)) => out,
                     Err(e) => {
                         self.doc = before;

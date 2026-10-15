@@ -835,6 +835,8 @@ pub fn shadow_row(ui: &mut Ui, id: egui::Id, s: &mut Shadow) -> (bool, bool) {
 pub enum StylePick {
     Apply(crate::doc::StyleId),
     Create(String),
+    /// A library's style: (library id, style id there).
+    Library(String, crate::doc::StyleId),
 }
 
 /// Small preview of a style's value.
@@ -866,8 +868,9 @@ pub fn style_preview(ui: &mut Ui, v: &crate::doc::StyleValue) {
     }
 }
 
-/// Styles button with a popover: pick an existing style of this kind, or name and create one.
-pub fn style_menu(ui: &mut Ui, id: egui::Id, styles: &[crate::doc::Style], same_kind: impl Fn(&crate::doc::StyleValue) -> bool) -> Option<StylePick> {
+/// Styles button with a popover: pick an existing style of this kind (this file's, or an enabled
+/// library's: name, id, styles), or name and create one.
+pub fn style_menu(ui: &mut Ui, id: egui::Id, styles: &[crate::doc::Style], libs: &[(String, String, Vec<crate::doc::Style>)], same_kind: impl Fn(&crate::doc::StyleValue) -> bool) -> Option<StylePick> {
     let mut pick = None;
     let btn = icon_button(ui, Icon::Styles, false, 22.0, "Styles");
     crate::chrome::popover(&btn, id, "Styles", 240.0, |ui| {
@@ -898,6 +901,23 @@ pub fn style_menu(ui: &mut Ui, id: egui::Id, styles: &[crate::doc::Style], same_
         }
         if !any {
             ui.label(egui::RichText::new("No styles yet").color(crate::appearance::faint(ui.ctx())));
+        }
+        // Library styles under their library's name, as in Figma.
+        for (name, lib, list) in libs {
+            let list: Vec<&crate::doc::Style> = list.iter().filter(|s| same_kind(&s.value)).collect();
+            if list.is_empty() {
+                continue;
+            }
+            ui.label(egui::RichText::new(name).strong());
+            for s in list {
+                ui.horizontal(|ui| {
+                    style_preview(ui, &s.value);
+                    if ui.add(egui::Button::new(&s.name).frame(false)).clicked() {
+                        pick = Some(StylePick::Library(lib.clone(), s.id));
+                        ui.close();
+                    }
+                });
+            }
         }
         ui.separator();
         let name_id = id.with("new-name");

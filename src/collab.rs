@@ -209,10 +209,12 @@ pub fn repair(doc: &mut Document) {
         }
     }
     for id in ordered {
+        // Library components stay off the pages.
+        let remote = doc.nodes[&id].remote.is_some();
         match doc.nodes[&id].parent {
             Some(p) if !ids.contains(&p) => {
                 doc.node_mut(id).parent = None;
-                if !doc.pages.iter().any(|pg| pg.children.contains(&id)) {
+                if !remote && !doc.pages.iter().any(|pg| pg.children.contains(&id)) {
                     doc.pages[0].children.push(id);
                 }
             }
@@ -222,7 +224,7 @@ pub fn repair(doc: &mut Document) {
                 }
             }
             None => {
-                if !doc.pages.iter().any(|pg| pg.children.contains(&id)) {
+                if !remote && !doc.pages.iter().any(|pg| pg.children.contains(&id)) {
                     doc.pages[0].children.push(id);
                 }
             }

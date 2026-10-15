@@ -745,6 +745,8 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
             defs.insert(p.name.clone(), def);
         }
         v["description"] = json!(n.description);
+        // What importComponentByKeyAsync takes: "libraryId:nodeId" for a library's component.
+        v["key"] = json!(n.remote.as_ref().map_or(id.to_string(), |r| format!("{}:{}", r.lib, r.key)));
         if n.kind == Kind::ComponentSet {
             for (k, opts) in doc.variant_props(id) {
                 defs.insert(k, json!({ "type": "VARIANT", "defaultValue": opts.first(), "variantOptions": opts }));
@@ -832,16 +834,19 @@ fn var_value_json(v: &VarValue) -> Value {
 }
 
 /// Pages (the current one, or all of them), styles, and variables as Figma-shaped JSON.
-pub fn snapshot(doc: &Document, page: usize, sel: &[NodeId], all_pages: bool) -> Value {
-    fn tree(doc: &Document, id: NodeId) -> Value {
-        let mut v = node_json(doc, id);
-        let n = doc.node(id);
-        if n.kind.is_container() {
-            v["children"] = json!(n.children.iter().map(|&c| tree(doc, c)).collect::<Vec<_>>());
-        }
-        v
+/// A layer and its descendants as plugin JSON.
+pub fn tree(doc: &Document, id: NodeId) -> Value {
+    let mut v = node_json(doc, id);
+    let n = doc.node(id);
+    if n.kind.is_container() {
+        v["children"] = json!(n.children.iter().map(|&c| tree(doc, c)).collect::<Vec<_>>());
     }
+    v
+}
+
+pub fn snapshot(doc: &Document, page: usize, sel: &[NodeId], all_pages: bool) -> Value {
     json!({
+        "remote": doc.nodes.values().filter(|n| n.parent.is_none() && n.remote.is_some()).map(|n| tree(doc, n.id)).collect::<Vec<_>>(),
         "pages": doc.pages.iter().enumerate().map(|(i, p)| {
             let loaded = all_pages || i == page;
             json!({ "name": p.name, "loaded": loaded, "children": if loaded { p.children.iter().map(|&c| tree(doc, c)).collect::<Vec<_>>() } else { vec![] },

@@ -2315,10 +2315,10 @@ fn assets_show_component_previews_and_search_filters_sets() {
     assert_eq!(h.state().asset_thumbs.len(), 2, "the Button set and Chip");
     // Editing a component re-renders just its preview.
     let chip = h.state().doc.nodes.values().find(|n| n.name == "Chip").unwrap().id;
-    let before = h.state().asset_thumbs[&chip].0;
+    let before = h.state().asset_thumbs[&(String::new(), chip)].0;
     h.state_mut().doc.node_mut(chip).radius = 12.0;
     h.run_steps(31);
-    assert_ne!(h.state().asset_thumbs[&chip].0, before);
+    assert_ne!(h.state().asset_thumbs[&(String::new(), chip)].0, before);
 }
 
 #[test]
@@ -4060,4 +4060,177 @@ fn session_window_shows_status_and_the_host_removes_someone() {
     b.get_by_label("Leave session").click();
     b.run_steps(2);
     assert!(b.state().collab.is_none());
+}
+
+/// A library file `kit.katachi` in `dir`: a Button component filled by a color style, and a
+/// hidden component. Ids come out the same each time, as in a real file saved again.
+fn write_library(dir: &std::path::Path, color: crate::doc::Rgba, published: u32) -> (std::path::PathBuf, NodeId) {
+    use crate::doc::{Document, Paint, StyleValue};
+    let mut lib = Document { id: "kit-id".into(), published: (published, 0), ..Default::default() };
+    let brand = lib.add_style("Brand".into(), StyleValue::Paint(vec![Paint::solid(color)]));
+    let mut b = Node::new(Kind::Component, r(0., 0., 80., 30.));
+    b.name = "Button".into();
+    b.fill_style = Some(brand);
+    let b = lib.insert(0, None, None, b);
+    let mut t = Node::new(Kind::Text, r(10., 5., 40., 20.));
+    (t.name, t.text) = ("Label".into(), "OK".into());
+    lib.insert(0, Some(b), None, t);
+    let mut hidden = Node::new(Kind::Component, r(200., 0., 10., 10.));
+    hidden.name = ".Internal".into();
+    lib.insert(0, None, None, hidden);
+    lib.reflow();
+    let path = dir.join("kit.katachi");
+    crate::files::write_atomic(&path, crate::doc::file_json(&lib).as_bytes()).unwrap();
+    (path, b)
+}
+
+fn temp_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("katachi-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn library_components_place_update_detach_and_relink() {
+    use crate::doc::Rgba;
+    let (blue, red) = (Rgba::rgb(0, 0, 255), Rgba::rgb(255, 0, 0));
+    let dir = temp_dir("libs");
+    let (kit, _) = write_library(&dir, blue, 0);
+    let mut h = harness();
+    assert!(h.state_mut().save_to(dir.join("app.katachi")));
+    assert!(!h.state().doc.id.is_empty(), "the first save gives the file an id");
+    h.state_mut().add_library(kit.clone());
+    assert_eq!(h.state().doc.libraries[0].path, "kit.katachi", "stored relative to the file");
+    // Assets lists the library's components (not hidden ones); a click places an instance.
+    h.state_mut().left_tab_assets = true;
+    h.run_steps(3);
+    assert!(h.query_by_label(".Internal").is_none(), "hidden components aren't offered");
+    h.get_all_by_label("Button").max_by(|a, b| a.rect().height().total_cmp(&b.rect().height())).unwrap().click();
+    h.run_steps(2);
+    let inst = h.state().sel[0];
+    let comp = h.state().doc.node(inst).component.unwrap();
+    let st = h.state();
+    assert!(st.doc.node(comp).remote.is_some() && !st.doc.pages[0].children.contains(&comp), "the main is a hidden library copy");
+    assert_eq!(st.doc.node(inst).fills[0].color, blue);
+    assert!(st.doc.styles.iter().any(|s| s.name == "Brand" && s.remote.is_some()), "its style came along");
+    // Dragging a tile works too.
+    let tile = h.get_all_by_label("Button").max_by(|a, b| a.rect().height().total_cmp(&b.rect().height())).unwrap().rect().center();
+    drag(&mut h, tile, pos2(900.0, 600.0), Modifiers::NONE);
+    assert_eq!(h.state().doc.nodes.values().filter(|n| n.component == Some(comp) && n.kind == Kind::Instance).count(), 2, "both use one copy");
+    // Override the label; then the library changes on disk.
+    let label = h.state().doc.node(inst).children[0];
+    h.state_mut().doc.node_mut(label).text = "Buy".into();
+    write_library(&dir, red, 0);
+    // Regaining focus re-checks libraries and shows the notice.
+    h.state_mut().focused = false;
+    h.run_steps(2);
+    assert!(h.state().lib_updates.iter().any(|c| c.name == "Brand"), "{:?}", h.state().lib_updates);
+    h.get_by_label("Review").click();
+    // A few frames for the dialog to settle where it's centered.
+    h.run_steps(5);
+    h.get_by_label("Update all").click();
+    h.run_steps(2);
+    let st = h.state();
+    assert!(st.lib_updates.is_empty(), "{:?}", st.lib_updates);
+    assert_eq!(st.doc.node(inst).fills[0].color, red, "the instance follows the library");
+    assert_eq!(st.doc.node(label).text, "Buy", "and keeps its override");
+    // Go to main component opens the library file instead.
+    h.state_mut().go_to_main(inst);
+    assert_eq!(h.state().want, Some(crate::app::Want::Open(kit.clone())));
+    // A renamed library is found again by its id.
+    let moved = dir.join("design-system.katachi");
+    std::fs::rename(&kit, &moved).unwrap();
+    h.state_mut().refresh_libraries();
+    assert_eq!(h.state().doc.libraries[0].path, "design-system.katachi");
+    // A deleted one shows as missing in the Libraries dialog; the file still renders.
+    std::fs::remove_file(&moved).unwrap();
+    h.state_mut().refresh_libraries();
+    h.state_mut().show_libraries = true;
+    h.run_steps(2);
+    assert!(h.query_by_label("Missing").is_some() && h.query_by_label("Relink…").is_some());
+    assert_eq!(h.state().doc.node(inst).fills[0].color, red);
+    // Detaching a library instance leaves a plain frame.
+    h.state_mut().show_libraries = false;
+    h.state_mut().sel = vec![inst];
+    h.state_mut().detach_selection();
+    assert_eq!(h.state().doc.node(inst).kind, Kind::Frame);
+}
+
+#[test]
+fn library_styles_apply_and_move_to_this_file() {
+    let dir = temp_dir("lib-styles");
+    let (kit, _) = write_library(&dir, crate::doc::Rgba::rgb(0, 128, 0), 0);
+    let mut h = harness();
+    h.state_mut().add_library(kit);
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (50.0, 50.0));
+    // The fill's Styles menu lists the library's styles under its name.
+    h.get_all_by_label("Styles").next().unwrap().click();
+    h.run_steps(2);
+    assert!(h.query_by_label("kit").is_some(), "the library's section");
+    h.get_by_label("Brand").click();
+    h.run_steps(2);
+    let st = h.state();
+    let sid = st.doc.node(id).fill_style.unwrap();
+    assert!(st.doc.style(sid).unwrap().remote.is_some());
+    assert_eq!(st.doc.node(id).fills[0].color, crate::doc::Rgba::rgb(0, 128, 0));
+    // With nothing selected, Library styles offer "Move to this file".
+    h.state_mut().sel.clear();
+    h.run_steps(2);
+    h.get_by_label("Move to this file").click();
+    h.run_steps(2);
+    assert!(h.state().doc.style(sid).unwrap().remote.is_none(), "now a local style");
+}
+
+#[test]
+fn publishing_a_library_saves_a_version_consumers_wait_for() {
+    let dir = temp_dir("publish");
+    let mut h = harness();
+    crate::plugins::run(&mut h.state_mut().doc, 0, &[], "const k = figma.createComponent(); k.name = 'Chip';").unwrap();
+    let path = dir.join("lib.katachi");
+    assert!(h.state_mut().save_to(path.clone()));
+    h.state_mut().left_tab_assets = true;
+    h.run_steps(2);
+    h.get_by_label("Publish library").click();
+    h.run_steps(2);
+    let saved = crate::library::read(&path).unwrap();
+    assert_eq!(saved.published.0, 1);
+    assert_eq!(saved.id, h.state().doc.id);
+    // A file using it takes Chip; an unpublished edit isn't offered, the next publish is.
+    let mut doc = crate::doc::Document::default();
+    let chip = saved.nodes.values().find(|n| n.name == "Chip").unwrap().id;
+    crate::library::Import::new(&doc, &saved.id, &saved).component(&mut doc, chip).unwrap();
+    h.state_mut().doc.node_mut(chip).radius = 8.0;
+    assert!(h.state_mut().save_to(path.clone()));
+    assert!(crate::library::changes(&doc, &saved.id, &crate::library::read(&path).unwrap()).is_empty());
+    h.state_mut().publish_library();
+    assert_eq!(crate::library::changes(&doc, &saved.id, &crate::library::read(&path).unwrap()).len(), 1);
+}
+
+#[test]
+fn plugins_and_agents_import_library_components_by_key() {
+    isolate_data();
+    let dir = temp_dir("lib-plugin");
+    let (kit, button) = write_library(&dir, crate::doc::Rgba::rgb(0, 0, 255), 0);
+    let mut app = App::new(None);
+    app.add_library(kit);
+    let ctx = egui::Context::default();
+    ctx.begin_pass(Default::default());
+    let _ = ctx.end_pass();
+    let list = app.mcp_tool(&ctx, "get_components", &serde_json::json!({}));
+    let text = list["content"][0]["text"].as_str().unwrap();
+    let key = format!("kit-id:{button}");
+    assert!(text.contains(&key) && text.contains("\"library\":\"kit\"") && !text.contains("Internal"), "{text}");
+    let code = format!("const c = await figma.importComponentByKeyAsync('{key}'); const i = c.createInstance(); i.x = 40; figma.currentPage.appendChild(i); return c.key;");
+    let out = app.mcp_tool(&ctx, "execute_code", &serde_json::json!({ "code": code }));
+    assert_ne!(out["isError"], true, "{out}");
+    let inst = app.doc.pages[0].children[0];
+    let comp = app.doc.node(inst).component.unwrap();
+    assert!(app.doc.node(comp).remote.is_some(), "the instance uses the library copy");
+    assert_eq!(app.doc.node(inst).rect.min.x, 40.0);
+    // Already copied: found straight away (and its instances' mainComponent too).
+    let again = app.mcp_tool(&ctx, "execute_code", &serde_json::json!({ "code": format!("const c = await figma.importComponentByKeyAsync('{key}'); return [c.name, figma.currentPage.children[0].mainComponent.key];") }));
+    assert!(again["content"][0]["text"].as_str().unwrap().contains(&key), "{again}");
+    let bad = app.mcp_tool(&ctx, "execute_code", &serde_json::json!({ "code": "await figma.importComponentByKeyAsync('nope:1')" }));
+    assert_eq!(bad["isError"], true);
 }

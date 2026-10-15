@@ -415,6 +415,34 @@ figma.setCurrentPageAsync = (p) => { __currentPage = p; return Promise.resolve()
 figma.loadAllPagesAsync = () => Promise.resolve();
 figma.createPage = () => { const p = __page("Page " + (figma.root.children.length + 1), "page:" + __newid(), true); figma.root.children.push(p); p.parent = figma.root; return p; };
 
+// Library components ("libraryId:nodeId" keys). One this file doesn't have yet is copied in by
+// Katachi once the script is waiting on it (__importKeys, then __resolveImports).
+let __imports = [];
+function __byKey(key) {
+  for (const n of __nodes.values()) if (n.type === "COMPONENT" && n.key === key) return n;
+  return null;
+}
+figma.importComponentByKeyAsync = (key) => {
+  const n = __byKey(key);
+  return n ? Promise.resolve(n) : new Promise((resolve, reject) => __imports.push({ key, resolve, reject }));
+};
+function __importKeys() { return JSON.stringify(__imports.map(i => i.key)); }
+function __resolveImports(trees) {
+  for (const t of trees) __linkTree(t, null);
+  const pending = __imports;
+  __imports = [];
+  for (const i of pending) {
+    const n = __byKey(i.key);
+    if (n) i.resolve(n); else i.reject(new Error("No library component with key " + i.key));
+  }
+}
+function __linkTree(raw, parent) {
+  const n = __link(raw);
+  n.parent = parent;
+  if (raw.children) n.children = raw.children.map(c => __linkTree(c, n));
+  return n;
+}
+
 function __load(snap) {
   __nodes.clear();
   const link = (raw, parent) => {
@@ -432,6 +460,9 @@ function __load(snap) {
     return p;
   });
   figma.root = root;
+  // Library components this file uses: on no page, but instances' mainComponent finds them.
+  for (const r of snap.remote || []) __linkTree(r, null);
+  __imports = [];
   __currentPage = root.children[snap.current];
   __currentPage.selection = snap.selection.map(id => __nodes.get(id)).filter(Boolean);
   __styles = snap.styles.map(s => Object.setPrototypeOf(s, __StyleProto));
