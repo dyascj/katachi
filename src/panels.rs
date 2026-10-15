@@ -506,6 +506,109 @@ fn section_title(ui: &mut Ui, title: &str) -> bool {
     add
 }
 
+/// A name field that commits on Enter or blur, for renames that move rows around (a folder or
+/// group renamed per keystroke would lose its field mid-word). Returns the new text once.
+pub fn commit_field(ui: &mut Ui, id: egui::Id, current: &str, width: f32, framed: bool) -> Option<String> {
+    let mut buf: String = ui.data(|d| d.get_temp(id)).unwrap_or_else(|| current.to_string());
+    let mut field = egui::TextEdit::singleline(&mut buf).id(id).desired_width(width);
+    if !framed {
+        field = field.frame(egui::Frame::NONE);
+    }
+    let r = ui.add(field);
+    if r.has_focus() {
+        ui.data_mut(|d| d.insert_temp(id, buf.clone()));
+    } else {
+        ui.data_mut(|d| d.remove::<String>(id));
+    }
+    (r.lost_focus() && buf != current).then_some(buf)
+}
+
+/// One layout guide's settings (type, count or size, gutter, margin, color).
+fn grid_editor(ui: &mut Ui, id: egui::Id, g: &mut crate::doc::LayoutGrid) {
+    use crate::doc::{GridAlign, GridKind};
+    ui.horizontal(|ui| {
+        for k in [GridKind::Grid, GridKind::Columns, GridKind::Rows] {
+            ui.selectable_value(&mut g.kind, k, format!("{k:?}"));
+        }
+    });
+    egui::Grid::new(id.with("fields")).num_columns(2).show(ui, |ui| {
+        if g.kind == GridKind::Grid {
+            ui.label("Size");
+            ui.add(DragValue::new(&mut g.size).range(1.0..=1000.0));
+            ui.end_row();
+        } else {
+            ui.label("Count");
+            ui.add(DragValue::new(&mut g.count).range(1..=100));
+            ui.end_row();
+            ui.label("Type");
+            dropdown(ui, format!("{:?}", g.align), |ui| {
+                for a in [GridAlign::Stretch, GridAlign::Min, GridAlign::Center, GridAlign::Max] {
+                    ui.selectable_value(&mut g.align, a, format!("{a:?}"));
+                }
+            });
+            ui.end_row();
+            if g.align != GridAlign::Stretch {
+                ui.label("Width");
+                ui.add(DragValue::new(&mut g.size).range(1.0..=10000.0));
+                ui.end_row();
+            }
+            ui.label("Gutter");
+            ui.add(DragValue::new(&mut g.gutter).range(0.0..=1000.0));
+            ui.end_row();
+            ui.label(if g.align == GridAlign::Stretch { "Margin" } else { "Offset" });
+            ui.add(DragValue::new(&mut g.margin).range(-1000.0..=1000.0));
+            ui.end_row();
+        }
+    });
+    ui.horizontal(|ui| {
+        hex_field(ui, id.with("color"), &mut g.color, 56.0);
+        crate::paint_ui::alpha_field(ui, &mut g.color);
+    });
+}
+
+/// A text style's typography: family, weight, size, line height, letter spacing.
+fn text_style_editor(ui: &mut Ui, id: egui::Id, t: &mut crate::doc::TextStyle) {
+    use crate::doc::LineHeight;
+    use crate::text::{families, weight_name, weights_for};
+    egui::ComboBox::from_id_salt(id.with("family")).selected_text(&t.font_family).width(200.0).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+        for f in families() {
+            ui.selectable_value(&mut t.font_family, f.clone(), f);
+        }
+    });
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt(id.with("weight")).selected_text(weight_name(t.font_weight)).width(110.0).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+            for w in weights_for(&t.font_family) {
+                ui.selectable_value(&mut t.font_weight, w, weight_name(w));
+            }
+        });
+        ui.add(DragValue::new(&mut t.font_size).range(1.0..=1000.0).speed(0.2).custom_formatter(|v, _| num(v as f32)));
+    });
+    ui.horizontal(|ui| {
+        ui.label("Line height");
+        let mut v = match t.line_height {
+            LineHeight::Auto => None,
+            LineHeight::Px(v) | LineHeight::Percent(v) => Some(v),
+        };
+        let mut pct = matches!(t.line_height, LineHeight::Percent(_));
+        let mut auto = v.is_none();
+        ui.checkbox(&mut auto, "Auto");
+        if !auto {
+            let x = v.get_or_insert(if pct { 120.0 } else { t.font_size * 1.2 });
+            ui.add(DragValue::new(x).range(0.0..=1000.0).speed(0.2).custom_formatter(|v, _| num(v as f32)));
+            ui.checkbox(&mut pct, "%");
+        }
+        t.line_height = match (auto, v) {
+            (false, Some(x)) if pct => LineHeight::Percent(x),
+            (false, Some(x)) => LineHeight::Px(x),
+            _ => LineHeight::Auto,
+        };
+    });
+    ui.horizontal(|ui| {
+        ui.label("Letter spacing");
+        ui.add(DragValue::new(&mut t.letter_spacing).speed(0.1).suffix("%").custom_formatter(|v, _| num(v as f32)));
+    });
+}
+
 /// Figma's frame presets: group, then (name, width, height).
 const FRAME_PRESETS: &[(&str, &[(&str, u32, u32)])] = &[
     ("Phone", &[("iPhone 16", 393, 852), ("iPhone 16 Pro", 402, 874), ("iPhone 16 Pro Max", 440, 956), ("iPhone 16 Plus", 430, 932), ("iPhone 14", 390, 844), ("iPhone SE", 320, 568), ("Android Compact", 412, 917), ("Android Medium", 700, 840)]),
@@ -1807,27 +1910,62 @@ impl App {
                 if icon_button(ui, Icon::Minus, false, 22.0, "Delete style").clicked() {
                     *delete = Some(st.id);
                 }
-                if let crate::doc::StyleValue::Paint(ps) = &st.value {
-                    let edit = icon_button(ui, Icon::Styles, false, 22.0, "Edit style");
-                    crate::chrome::popover(&edit, ui.id().with(("local-style", st.id)), "Edit style", 240.0, |ui| {
-                        let mut ps = ps.clone();
-                        let mut edited = false;
-                        for (i, p) in ps.iter_mut().enumerate().rev() {
-                            if !matches!(paint_row(ui, ui.id().with(("ls-paint", st.id, i)), p, "Fill"), PaintEvent::None) {
-                                edited = true;
-                            }
-                        }
-                        if edited {
-                            self.begin_edit();
-                            if let Some(x) = self.doc.styles.iter_mut().find(|x| x.id == st.id) {
-                                x.value = crate::doc::StyleValue::Paint(ps);
-                            }
-                            self.doc.reflow();
-                        }
-                    });
-                }
+                let edit = icon_button(ui, Icon::Styles, false, 22.0, "Edit style");
+                crate::chrome::popover(&edit, ui.id().with(("local-style", st.id)), "Edit style", 260.0, |ui| self.style_editor(ui, st));
             });
         });
+    }
+
+    /// Figma's style editor: the full name (slashes make folders) and the style's value. Every
+    /// layer using the style follows.
+    fn style_editor(&mut self, ui: &mut Ui, st: &crate::doc::Style) {
+        use crate::doc::StyleValue;
+        let mut name = st.name.clone();
+        let mut value = st.value.clone();
+        ui.add(egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY)).on_hover_text("Slashes put the style in folders, such as Brand / Primary");
+        ui.separator();
+        let id = ui.id().with(("style-edit", st.id));
+        match &mut value {
+            StyleValue::Paint(ps) => {
+                for (i, p) in ps.iter_mut().enumerate().rev() {
+                    paint_row(ui, id.with(i), p, "Fill");
+                }
+            }
+            StyleValue::Text(t) => text_style_editor(ui, id, t),
+            StyleValue::Effect(es) => {
+                let mut remove = None;
+                for (i, s) in es.iter_mut().enumerate().rev() {
+                    if shadow_row(ui, id.with(i), s).1 {
+                        remove = Some(i);
+                    }
+                }
+                if let Some(i) = remove {
+                    es.remove(i);
+                }
+                if ui.button("Add effect").clicked() {
+                    es.push(Shadow::default());
+                }
+            }
+            StyleValue::Grid(gs) => {
+                for (i, g) in gs.iter_mut().enumerate() {
+                    if i > 0 {
+                        ui.separator();
+                    }
+                    grid_editor(ui, id.with(i), g);
+                }
+                if ui.button("Add layout guide").clicked() {
+                    gs.push(crate::doc::LayoutGrid::default());
+                }
+            }
+        }
+        if name != st.name || value != st.value {
+            self.begin_edit();
+            if let Some(x) = self.doc.styles.iter_mut().find(|x| x.id == st.id) {
+                x.name = name;
+                x.value = value;
+            }
+            self.doc.reflow();
+        }
     }
 
     /// The Frame tool's sidebar: click a preset to add a frame that size.
@@ -2447,6 +2585,7 @@ impl App {
             ("Color styles", (|v: &StyleValue| matches!(v, StyleValue::Paint(_))) as fn(&StyleValue) -> bool),
             ("Text styles", |v: &StyleValue| matches!(v, StyleValue::Text(_))),
             ("Effect styles", |v: &StyleValue| matches!(v, StyleValue::Effect(_))),
+            ("Grid styles", |v: &StyleValue| matches!(v, StyleValue::Grid(_))),
         ] {
             let list: Vec<crate::doc::Style> = self.doc.styles.iter().filter(|s| is(&s.value)).cloned().collect();
             if list.is_empty() {
@@ -2474,11 +2613,27 @@ impl App {
                         }
                     }
                     Some(name) => {
-                        egui::CollapsingHeader::new(name).id_salt(("style-folder", label, name)).default_open(true).show(ui, |ui| {
-                            for st in items {
-                                self.local_style_row(ui, &st, &mut delete);
+                        // A collapsible folder whose name edits in place, renaming every style in it.
+                        let state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.id().with(("style-folder", label, name)), true);
+                        let mut rename = None;
+                        state
+                            .show_header(ui, |ui| {
+                                rename = commit_field(ui, ui.id().with(("folder-name", label, name)), name, 150.0, false);
+                            })
+                            .body(|ui| {
+                                for st in &items {
+                                    self.local_style_row(ui, st, &mut delete);
+                                }
+                            });
+                        if let Some(rename) = rename.map(|r| r.trim().trim_matches('/').trim().to_string()) {
+                            self.begin_edit();
+                            for st in &items {
+                                if let Some(x) = self.doc.styles.iter_mut().find(|x| x.id == st.id) {
+                                    let leaf = x.name.rsplit_once('/').map_or(x.name.as_str(), |(_, l)| l).trim().to_string();
+                                    x.name = if rename.is_empty() { leaf } else { format!("{rename} / {leaf}") };
+                                }
                             }
-                        });
+                        }
                     }
                 }
             }
@@ -3923,10 +4078,56 @@ impl App {
     }
 
     fn layout_guides(&mut self, ui: &mut Ui, id: NodeId) {
-        use crate::doc::{GridAlign, GridKind, LayoutGrid};
+        use crate::doc::{GridKind, LayoutGrid};
+        use crate::doc::StyleValue;
+        use crate::paint_ui::{StylePick, style_menu, style_preview};
         let mut grids = self.doc.node(id).grids.clone();
         let before = grids.clone();
-        if section_title(ui, "Layout guide") {
+        let (mut add, mut pick) = (false, None);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Layout guide").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                add = icon_button(ui, Icon::Plus, false, 22.0, "").clicked();
+                pick = style_menu(ui, ui.id().with("grid-styles"), &self.doc.styles, |v| matches!(v, StyleValue::Grid(_)));
+            });
+        });
+        let set_link = |app: &mut App, v: Option<crate::doc::StyleId>| {
+            for &s in &app.sel.clone() {
+                if app.doc.node(s).kind.is_frame() {
+                    app.doc.node_mut(s).grid_style = v;
+                }
+            }
+            app.doc.reflow();
+        };
+        match pick {
+            Some(StylePick::Apply(sid)) => {
+                self.checkpoint();
+                set_link(self, Some(sid));
+                return;
+            }
+            Some(StylePick::Create(name)) => {
+                self.checkpoint();
+                let sid = self.doc.add_style(name, StyleValue::Grid(grids));
+                set_link(self, Some(sid));
+                return;
+            }
+            None => {}
+        }
+        // A linked grid style shows as one row, with detach, as in Figma.
+        if let Some(style) = self.doc.node(id).grid_style.and_then(|sid| self.doc.style(sid)).cloned() {
+            ui.horizontal(|ui| {
+                style_preview(ui, &style.value);
+                ui.label(&style.name);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, Icon::Detach, false, 22.0, "Detach style").clicked() {
+                        self.checkpoint();
+                        set_link(self, None);
+                    }
+                });
+            });
+            return;
+        }
+        if add {
             grids.push(LayoutGrid::default());
         }
         let mut remove = None;
@@ -3938,46 +4139,7 @@ impl App {
                     GridKind::Rows => format!("{} rows", g.count),
                 };
                 let open = ui.add(egui::Button::new(label).frame(false));
-                crate::chrome::popover(&open, ui.id().with(("grid", id, i)), "Layout guide", 240.0, |ui| {
-                    ui.horizontal(|ui| {
-                        for k in [GridKind::Grid, GridKind::Columns, GridKind::Rows] {
-                            ui.selectable_value(&mut g.kind, k, format!("{k:?}"));
-                        }
-                    });
-                    egui::Grid::new(ui.id().with(("grid-fields", id, i))).num_columns(2).show(ui, |ui| {
-                        if g.kind == GridKind::Grid {
-                            ui.label("Size");
-                            ui.add(DragValue::new(&mut g.size).range(1.0..=1000.0));
-                            ui.end_row();
-                        } else {
-                            ui.label("Count");
-                            ui.add(DragValue::new(&mut g.count).range(1..=100));
-                            ui.end_row();
-                            ui.label("Type");
-                            dropdown(ui, format!("{:?}", g.align), |ui| {
-                                for a in [GridAlign::Stretch, GridAlign::Min, GridAlign::Center, GridAlign::Max] {
-                                    ui.selectable_value(&mut g.align, a, format!("{a:?}"));
-                                }
-                            });
-                            ui.end_row();
-                            if g.align != GridAlign::Stretch {
-                                ui.label("Width");
-                                ui.add(DragValue::new(&mut g.size).range(1.0..=10000.0));
-                                ui.end_row();
-                            }
-                            ui.label("Gutter");
-                            ui.add(DragValue::new(&mut g.gutter).range(0.0..=1000.0));
-                            ui.end_row();
-                            ui.label(if g.align == GridAlign::Stretch { "Margin" } else { "Offset" });
-                            ui.add(DragValue::new(&mut g.margin).range(-1000.0..=1000.0));
-                            ui.end_row();
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        hex_field(ui, ui.id().with(("grid-color", id, i)), &mut g.color, 56.0);
-                        crate::paint_ui::alpha_field(ui, &mut g.color);
-                    });
-                });
+                crate::chrome::popover(&open, ui.id().with(("grid", id, i)), "Layout guide", 240.0, |ui| grid_editor(ui, ui.id().with(("grid-fields", id, i)), g));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if icon_button(ui, Icon::Minus, false, 22.0, "Remove").clicked() {
                         remove = Some(i);

@@ -462,6 +462,15 @@ pub fn style_preview(ui: &mut Ui, v: &crate::doc::StyleValue) {
         StyleValue::Text(t) => {
             ui.add_sized([20.0, 20.0], egui::Label::new(egui::RichText::new("Ag").size(11.0).strong())).on_hover_text(format!("{} {}", t.font_family, num(t.font_size)));
         }
+        StyleValue::Grid(_) => {
+            let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+            let (r, s) = (r.shrink(4.0), Stroke::new(1.0, crate::appearance::muted(ui.ctx())));
+            ui.painter().rect_stroke(r, 1.0, s, StrokeKind::Inside);
+            for t in [1.0 / 3.0, 2.0 / 3.0] {
+                ui.painter().vline(r.min.x + r.width() * t, r.y_range(), s);
+                ui.painter().hline(r.x_range(), r.min.y + r.height() * t, s);
+            }
+        }
         StyleValue::Effect(_) => {
             let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
             ui.painter().rect_filled(r.shrink(3.0).translate(vec2(1.0, 2.0)), 3.0, Color32::from_black_alpha(60));

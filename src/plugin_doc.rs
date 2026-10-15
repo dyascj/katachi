@@ -716,6 +716,8 @@ fn style_json(s: &Style) -> Value {
             v["type"] = json!("PAINT");
             v["paints"] = json!(p.iter().map(|p| paint_json(p, None)).collect::<Vec<_>>());
         }
+        // The plugin API's layout grids aren't modeled; grid styles show by name only.
+        StyleValue::Grid(_) => v["type"] = json!("GRID"),
         StyleValue::Effect(e) => {
             v["type"] = json!("EFFECT");
             v["effects"] = json!(e.iter().map(effect_json).collect::<Vec<_>>());

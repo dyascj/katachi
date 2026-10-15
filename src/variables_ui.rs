@@ -178,20 +178,20 @@ impl App {
                     }
                     ui.end_row();
                     let mut delete = None;
-                    for (gi, group) in groups.iter().enumerate() {
+                    for group in &groups {
                         let rows: Vec<usize> = mine.iter().copied().filter(|&vi| group_of(&self.doc.variables[vi].name).0 == group.as_deref()).collect();
                         if let Some(g) = group {
                             // Group row: collapse toggle and the group's name; renaming moves every variable in it.
                             let shut = collapsed.contains(g);
-                            let mut name = g.clone();
+                            let mut rename = None;
                             ui.horizontal(|ui| {
                                 if icon_button(ui, Icon::Chevron(!shut), false, 18.0, if shut { "Expand group" } else { "Collapse group" }).clicked() {
                                     if shut { collapsed.retain(|x| x != g) } else { collapsed.push(g.clone()) }
                                 }
-                                ui.add(egui::TextEdit::singleline(&mut name).id(ui.id().with(("var-group", current, gi))).desired_width(130.0).font(egui::TextStyle::Body));
+                                rename = crate::panels::commit_field(ui, ui.id().with(("var-group", current, g)), g, 130.0, true);
                             });
                             ui.end_row();
-                            if name != *g {
+                            if let Some(name) = rename {
                                 let name = name.trim().trim_matches('/').to_string();
                                 for &vi in &rows {
                                     let v = &mut self.doc.variables[vi];

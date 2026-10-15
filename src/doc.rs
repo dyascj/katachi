@@ -923,6 +923,8 @@ pub enum StyleValue {
     Paint(Vec<Paint>),
     Text(TextStyle),
     Effect(Vec<Shadow>),
+    /// Figma's grid styles: a frame's layout guides.
+    Grid(Vec<LayoutGrid>),
 }
 
 /// A shared style that layers link to; editing it updates every user.
@@ -1538,6 +1540,8 @@ pub struct Node {
     pub text_style: Option<StyleId>,
     #[serde(skip_serializing_if = "dflt::effect_style")]
     pub effect_style: Option<StyleId>,
+    #[serde(skip_serializing_if = "dflt::grid_style")]
+    pub grid_style: Option<StyleId>,
     /// Components and sets: property definitions.
     #[serde(skip_serializing_if = "dflt::comp_props")]
     pub comp_props: Vec<CompProp>,
@@ -1676,6 +1680,7 @@ mod dflt {
         stroke_style: Option<StyleId>,
         text_style: Option<StyleId>,
         effect_style: Option<StyleId>,
+        grid_style: Option<StyleId>,
         comp_props: Vec<CompProp>,
         prop_bind: Vec<(String, PropTarget)>,
         prop_values: Vec<(String, PropValue)>,
@@ -1765,6 +1770,7 @@ impl Default for Node {
             stroke_style: None,
             text_style: None,
             effect_style: None,
+            grid_style: None,
             comp_props: vec![],
             prop_bind: vec![],
             prop_values: vec![],
@@ -2548,12 +2554,13 @@ impl Document {
 
     /// Push style values into every linked layer; links to deleted styles fall away.
     pub fn apply_styles(&mut self) {
-        if self.styles.is_empty() && self.nodes.values().all(|n| n.fill_style.is_none() && n.stroke_style.is_none() && n.text_style.is_none() && n.effect_style.is_none()) {
+        let linked = |n: &Node| n.fill_style.is_some() || n.stroke_style.is_some() || n.text_style.is_some() || n.effect_style.is_some() || n.grid_style.is_some();
+        if self.styles.is_empty() && !self.nodes.values().any(|n| linked(n)) {
             return;
         }
         let styles: HashMap<StyleId, StyleValue> = self.styles.iter().map(|s| (s.id, s.value.clone())).collect();
         for arc in self.nodes.values_mut() {
-            if arc.fill_style.is_none() && arc.stroke_style.is_none() && arc.text_style.is_none() && arc.effect_style.is_none() {
+            if !linked(arc) {
                 continue;
             }
             // Work on a copy and only write back real changes, so layers stay shared with undo.
@@ -2604,6 +2611,14 @@ impl Document {
                 }
             }
             _ => n.effect_style = None,
+        }
+        match n.grid_style.and_then(|id| styles.get(&id)) {
+            Some(StyleValue::Grid(g)) => {
+                if n.synced.as_ref().is_none_or(|s| s.grids == n.grids) {
+                    n.grids = g.clone()
+                }
+            }
+            _ => n.grid_style = None,
         }
     }
 
@@ -3536,7 +3551,7 @@ fn merge_from(e: &mut Node, src: &Node) {
         name, visible, opacity, fills, strokes, stroke_width, stroke_sides, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, min_size, max_size, constraints, absolute,
         paths, even_odd, text, font_size, font_weight, font_family, text_sizing, text_align, text_valign, line_height, letter_spacing,
         decoration, text_case, paragraph_spacing, truncate, max_lines, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, overflow, scroll_pos, fill_style,
-        stroke_style, text_style, effect_style, prop_bind, is_mask, blend, bindings, modes, spans, lists, exposed
+        stroke_style, text_style, effect_style, grid_style, prop_bind, is_mask, blend, bindings, modes, spans, lists, exposed
     );
     e.synced = Some(Box::new(Node { children: vec![], synced: None, ..src.clone() }));
 }

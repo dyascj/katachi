@@ -2042,8 +2042,57 @@ fn slash_named_styles_group_into_folders() {
     let mut h = harness();
     crate::plugins::run(&mut h.state_mut().doc, 0, &[], "for (const n of ['HUD / Title', 'HUD / Body', 'Accent']) { const s = figma.createPaintStyle(); s.name = n; s.paints = [figma.util.solidPaint('#8E72FF')]; }").unwrap();
     h.run_steps(2);
-    assert!(h.query_by_label("HUD").is_some(), "a HUD folder");
+    assert!(h.query_all_by_value("HUD").next().is_some(), "a HUD folder");
     assert!(h.query_by_label("HUD / Title").is_none(), "names show without the folder");
+    // The folder's name edits in place and renames everything in it.
+    h.get_all_by_value("HUD").next().unwrap().focus();
+    h.run_steps(1);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.get_all_by_value("HUD").next().unwrap().type_text("Game");
+    h.run_steps(1);
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    let mut names: Vec<String> = h.state().doc.styles.iter().map(|s| s.name.clone()).collect();
+    names.sort();
+    assert_eq!(names, ["Accent", "Game / Body", "Game / Title"]);
+}
+
+#[test]
+fn local_styles_edit_text_and_grid_styles_in_place() {
+    use crate::doc::{LayoutGrid, StyleValue, TextStyle};
+    let mut h = harness();
+    let t = draw(&mut h, Key::F, (0.0, 0.0), (200.0, 200.0));
+    let (ts, gs) = {
+        let d = &mut h.state_mut().doc;
+        let ts = d.add_style("Body".into(), StyleValue::Text(TextStyle::of(&Node::new(Kind::Text, r(0., 0., 1., 1.)))));
+        let gs = d.add_style("Columns".into(), StyleValue::Grid(vec![LayoutGrid::default()]));
+        d.node_mut(t).grid_style = Some(gs);
+        (ts, gs)
+    };
+    h.state_mut().doc.reflow();
+    assert_eq!(h.state().doc.node(t).grids, vec![LayoutGrid::default()], "the frame takes the grid style");
+    h.state_mut().sel.clear();
+    h.run_steps(2);
+    assert!(h.query_by_label("Grid styles").is_some());
+    // Open the text style's editor from the list and turn on a fixed line height.
+    h.get_all_by_label("Edit style").next().unwrap().click();
+    h.run_steps(2);
+    h.get_by_label("Auto").click();
+    h.run_steps(2);
+    let lh = match &h.state().doc.style(ts).unwrap().value {
+        StyleValue::Text(t) => t.line_height,
+        _ => unreachable!(),
+    };
+    assert!(matches!(lh, crate::doc::LineHeight::Px(_)), "{lh:?}");
+    // The grid style's editor: switching it to columns moves the linked frame's guides.
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    h.get_all_by_label("Edit style").nth(1).unwrap().click();
+    h.run_steps(2);
+    h.get_by_label("Columns").click();
+    h.run_steps(2);
+    assert_eq!(h.state().doc.node(t).grids[0].kind, crate::doc::GridKind::Columns);
+    let _ = gs;
 }
 
 #[test]
@@ -2699,13 +2748,21 @@ fn variables_table_groups_aliases_and_paint_hexagon() {
     h.get_by_label("Collapse group").click();
     h.run_steps(2);
     assert!(h.query_all_by_value("primary").next().is_none());
+    h.get_all_by_value("color").next().unwrap().focus();
+    h.run_steps(1);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.get_all_by_value("color").next().unwrap().type_text("brand");
+    h.run_steps(1);
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    assert_eq!(h.state().doc.variable(accent).unwrap().name, "brand/accent", "renaming the group moves its variables");
     h.state_mut().show_variables = false;
     // Fill's hexagon binds a color variable, then shows it in place of the paint.
     h.state_mut().sel = vec![rect_id];
     h.run_steps(2);
     h.get_all_by_label("Apply variable").next().unwrap().click();
     h.run_steps(2);
-    h.get_by_label("■ color/accent").click();
+    h.get_by_label("■ brand/accent").click();
     h.run_steps(2);
     let n = h.state().doc.node(rect_id).clone();
     assert_eq!((n.bindings.clone(), n.fills[0].color), (vec![(Bindable::Fill, accent)], Rgba::rgb(0, 0, 255)));
