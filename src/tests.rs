@@ -2878,6 +2878,32 @@ fn text_links_add_edit_remove_export_and_click_through() {
 }
 
 #[test]
+fn paragraph_indent_moves_first_lines_in() {
+    use crate::doc::TextSizing;
+    let mut h = harness();
+    let mut n = Node::new(Kind::Text, r(0., 0., 10., 10.));
+    (n.text, n.font_size) = ("alpha beta gamma\nsecond".into(), 10.0);
+    let plain = h.state_mut().doc.insert(0, None, None, n.clone());
+    n.paragraph_indent = 20.0;
+    let id = h.state_mut().doc.insert(0, None, None, n.clone());
+    // Wrapped: only each paragraph's first row starts in.
+    n.text_sizing = TextSizing::AutoHeight;
+    n.rect = r(0., 100., 70., 10.);
+    let wrapped = h.state_mut().doc.insert(0, None, None, n);
+    h.run_steps(3);
+    let w = |id| h.state().doc.node(id).rect.width();
+    assert!((w(id) - w(plain) - 20.0).abs() < 0.5, "auto width grows by the indent: {} vs {}", w(id), w(plain));
+    let painter = egui::Painter::new(h.ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+    let t = h.state().doc.node(wrapped).clone();
+    let (g, _, _) = crate::text::layout(&painter, &t, 1.0, egui::Color32::BLACK);
+    let starts: Vec<f32> = g.rows.iter().map(|r| r.pos.x + r.glyphs[0].pos.x).collect();
+    assert!(starts.len() >= 3, "{:?}", t.lines);
+    assert!((starts[0] - 20.0).abs() < 0.5 && starts[1] < 1.0 && (starts.last().unwrap() - 20.0).abs() < 0.5, "{starts:?}");
+    let svg = crate::export::to_svg(&h.state().doc, &[id]);
+    assert_eq!(svg.matches(r#"x="20""#).count(), 2, "{svg}");
+}
+
+#[test]
 fn copy_and_paste_properties_survive_egui_clipboard_events() {
     use crate::app::TEST_CLIPBOARD;
     let mut h = harness();

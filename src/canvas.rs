@@ -2235,7 +2235,7 @@ fn text_key(ctx: &egui::Context, n: &Node) -> u64 {
     format!("{:?}", crate::text::font_family(ctx, &n.font_family, n.font_weight, n.italic)).hash(&mut h);
     (n.font_size.to_bits(), n.letter_spacing.to_bits(), n.text_sizing as u8, n.text_case as u8).hash(&mut h);
     format!("{:?}", n.line_height).hash(&mut h);
-    (n.truncate, n.max_lines, n.paragraph_spacing.to_bits()).hash(&mut h);
+    (n.truncate, n.max_lines, n.paragraph_spacing.to_bits(), n.paragraph_indent.to_bits()).hash(&mut h);
     format!("{:?}", n.lists).hash(&mut h);
     if n.truncate && n.text_sizing == crate::doc::TextSizing::Fixed {
         n.rect.height().to_bits().hash(&mut h);

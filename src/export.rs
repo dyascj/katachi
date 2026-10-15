@@ -413,7 +413,9 @@ impl Svg<'_> {
                     for (i, line) in lines.iter().enumerate() {
                         let y = top + n.font_size * crate::text::ASCENT + pitch * i as f32 + n.paragraph_spacing * para as f32;
                         let indent = crate::text::list_indent(n, para);
-                        let lx = if anchor == "start" { x + indent } else { x };
+                        // Paragraph indent: the first line starts further in (its row is that much wider when centered).
+                        let pin = if first { n.paragraph_indent * if anchor == "start" { 1.0 } else if anchor == "middle" { 0.5 } else { 0.0 } } else { 0.0 };
+                        let lx = if anchor == "start" { x + indent + pin } else { x + pin };
                         if first && let Some(m) = markers.get(para).filter(|m| !m.is_empty()) {
                             let _ = write!(self.out, r#"<tspan x="{}" y="{y}">{}</tspan>"#, r.min.x + indent - n.font_size * 1.2, esc(m));
                         }
@@ -443,7 +445,7 @@ impl Svg<'_> {
                             let mut href = None;
                             if justify {
                                 text.truncate(text.trim_end().len());
-                                let _ = write!(style, r#" textLength="{}" lengthAdjust="spacing""#, r.width() - indent);
+                                let _ = write!(style, r#" textLength="{}" lengthAdjust="spacing""#, r.width() - indent - pin);
                             }
                             if let Some(sp) = n.spans.iter().find(|sp| sp.start <= a && sp.end >= b) {
                                 let st = &sp.style;

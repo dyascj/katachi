@@ -116,6 +116,9 @@ pub fn css(doc: &Document, id: NodeId) -> String {
         if n.text_align != TextAlign::Left {
             decl("text-align", format!("{:?}", n.text_align).to_lowercase());
         }
+        if n.paragraph_indent > 0.0 {
+            decl("text-indent", format!("{}px", num(n.paragraph_indent)));
+        }
         match n.text_case {
             TextCase::Upper => decl("text-transform", "uppercase".into()),
             TextCase::Lower => decl("text-transform", "lowercase".into()),

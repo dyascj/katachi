@@ -256,22 +256,29 @@ pub fn job(ctx: &egui::Context, n: &Node, text: &str, zoom: f32, color: Color32)
         }
     };
     let mut job = LayoutJob::default();
-    if n.spans.is_empty() {
-        job.append(&apply_case(text, n.text_case), 0.0, format(&Default::default()));
+    let indent = n.paragraph_indent * zoom;
+    if text.is_empty() || (n.spans.is_empty() && indent == 0.0) {
+        job.append(&apply_case(text, n.text_case), indent, format(&Default::default()));
     } else {
-        // One section per styled run; char indices are clamped while the editor is a frame ahead.
+        // One section per styled run, and per paragraph for the indent (egui's leading space
+        // starts a section that far in). Char indices are clamped while the editor is a frame ahead.
+        // ponytail: justified rows drop the indent (egui's justify realigns from the first glyph).
         let chars: Vec<char> = text.chars().collect();
         let mut cuts: Vec<usize> = vec![0, chars.len()];
         for sp in &n.spans {
             cuts.push(sp.start.min(chars.len()));
             cuts.push(sp.end.min(chars.len()));
         }
+        if indent > 0.0 {
+            cuts.extend(chars.iter().enumerate().filter(|(_, c)| **c == '\n').map(|(i, _)| i + 1));
+        }
         cuts.sort();
         cuts.dedup();
         for w in cuts.windows(2) {
             let piece: String = chars[w[0]..w[1]].iter().collect();
             let st = n.spans.iter().find(|sp| sp.start <= w[0] && sp.end >= w[1]).map(|sp| sp.style.clone()).unwrap_or_default();
-            job.append(&apply_case(&piece, n.text_case), 0.0, format(&st));
+            let lead = if w[0] == 0 || chars[w[0] - 1] == '\n' { indent } else { 0.0 };
+            job.append(&apply_case(&piece, n.text_case), lead, format(&st));
         }
     }
     // Justified rows stretch to the box, except each paragraph's last (Figma, and egui's justify).

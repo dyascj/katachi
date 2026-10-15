@@ -1472,6 +1472,9 @@ pub struct Node {
     /// Extra space after each paragraph.
     #[serde(skip_serializing_if = "dflt::paragraph_spacing")]
     pub paragraph_spacing: f32,
+    /// How far each paragraph's first line starts in (Figma's paragraph indent).
+    #[serde(skip_serializing_if = "dflt::paragraph_indent")]
+    pub paragraph_indent: f32,
     /// End overflowing text with an ellipsis.
     #[serde(skip_serializing_if = "dflt::truncate")]
     pub truncate: bool,
@@ -1568,6 +1571,7 @@ mod dflt {
         decoration: Decoration,
         text_case: TextCase,
         paragraph_spacing: f32,
+        paragraph_indent: f32,
         truncate: bool,
         max_lines: u32,
         spans: Vec<TextSpan>,
@@ -1654,6 +1658,7 @@ impl Default for Node {
             decoration: Decoration::None,
             text_case: TextCase::Original,
             paragraph_spacing: 0.0,
+            paragraph_indent: 0.0,
             truncate: false,
             max_lines: 0,
             spans: vec![],
@@ -3279,7 +3284,7 @@ fn merge_from(e: &mut Node, src: &Node) {
     take!(
         name, visible, opacity, fills, strokes, stroke_width, stroke_sides, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, min_size, max_size, constraints, absolute,
         paths, even_odd, text, font_size, font_weight, font_family, italic, text_sizing, text_align, text_valign, line_height, letter_spacing,
-        decoration, text_case, paragraph_spacing, truncate, max_lines, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, overflow, scroll_pos, fill_style,
+        decoration, text_case, paragraph_spacing, paragraph_indent, truncate, max_lines, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, overflow, scroll_pos, fill_style,
         stroke_style, text_style, effect_style, prop_bind, is_mask, blend, bindings, modes, spans, lists
     );
     e.synced = Some(Box::new(Node { children: vec![], synced: None, ..src.clone() }));

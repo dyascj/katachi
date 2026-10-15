@@ -3585,6 +3585,19 @@ impl App {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Figma's type details: the paragraph settings that don't fit the main rows.
+                let more = ui.button("···").on_hover_text("Type details");
+                crate::chrome::popover(&more, ui.id().with("type-details"), "Type details", 220.0, |ui| {
+                    let row = |ui: &mut Ui, label: &str, add: &mut dyn FnMut(&mut Ui)| {
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| add(ui));
+                        });
+                    };
+                    row(ui, "Paragraph indent", &mut |ui| {
+                        num_field(ui, &mut t.paragraph_indent, "", 0.0, 64.0);
+                    });
+                });
                 num_field(ui, &mut t.paragraph_spacing, "¶", 0.0, 64.0);
             });
         });
@@ -3616,6 +3629,7 @@ impl App {
             || t.text_case != n.text_case
             || t.truncate != n.truncate
             || t.paragraph_spacing != n.paragraph_spacing
+            || t.paragraph_indent != n.paragraph_indent
             || t.max_lines != n.max_lines;
         // With characters selected in the editor, changes style just that range (rich text).
         if changed && self.text_selection(ui.ctx()).is_some() {
@@ -3651,6 +3665,7 @@ impl App {
                 d.text_case = t.text_case;
                 d.truncate = t.truncate;
                 d.paragraph_spacing = t.paragraph_spacing.max(0.0);
+                d.paragraph_indent = t.paragraph_indent.max(0.0);
                 d.max_lines = t.max_lines;
             }
         }
