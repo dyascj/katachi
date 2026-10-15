@@ -50,6 +50,12 @@ const COMMANDS: &[(&str, &str, Run)] = &[
     ("Exclude selection", "⌥⇧E", |a, _| a.boolean_selection(BoolOp::Exclude)),
     ("Flatten", "⌘E", |a, _| a.flatten_selection()),
     ("Outline stroke", "⌥⌘O", |a, _| a.outline_stroke_selection()),
+    ("Join selection (vector points)", "⌘J", |a, _| a.vector_join()),
+    ("Cut tool (vector edit)", "Y", |a, _| {
+        if let Some(ve) = a.vector_edit.as_mut() {
+            ve.tool = crate::vector_edit::VTool::Cut;
+        }
+    }),
     ("Use as mask", "⌃⌘M", |a, _| a.toggle_mask()),
     ("Resize to fit", "⌥⇧⌘R", |a, _| a.resize_to_fit()),
     ("Remove fill", "", |a, _| a.remove_fills()),
@@ -97,7 +103,12 @@ const COMMANDS: &[(&str, &str, Run)] = &[
     ("Keyboard shortcuts", "", |a, _| a.open_settings(crate::settings::Tab::Shortcuts)),
     ("Manage plugins", "", |a, _| a.open_settings(crate::settings::Tab::Plugins)),
     ("Run script (plugin console)", "", |a, _| a.show_console = true),
-    ("Export selection", "⇧⌘E", |a, c| a.export(c)),
+    ("Export…", "⇧⌘E", |a, _| a.export_dialog = Some(Default::default())),
+    ("Export selection", "", |a, c| a.export(c)),
+    ("Copy as PNG", "⇧⌘C", |a, c| a.copy_as(c, "png")),
+    ("Copy as SVG", "", |a, c| a.copy_as(c, "svg")),
+    ("Copy as CSS", "", |a, c| a.copy_as(c, "css")),
+    ("Copy as code", "", |a, c| a.copy_as(c, "code")),
     ("Place image", "⇧⌘K", |a, _| a.import_dialog()),
     ("Save", "⌘S", |a, _| {
         a.save(false);

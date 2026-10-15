@@ -554,7 +554,7 @@ impl Svg<'_> {
             }
             // A mask layer clips everything above it in this parent (alpha mask, like Figma).
             let mut masks_open = 0;
-            for &c in &n.children {
+            for c in n.paint_order() {
                 let cn = doc.node(c);
                 if cn.is_mask && cn.visible {
                     let mid = self.id("mask");
@@ -720,12 +720,28 @@ pub fn to_png(doc: &Document, ids: &[NodeId], scale: f32) -> Result<Vec<u8>, Str
     svg_to_png(doc, &to_svg(doc, ids), scale)
 }
 
-/// Encode export SVG in a format: SVG as-is, PNG/JPG rasterized at `scale`, PDF as vectors.
+/// Encode export SVG in a format: SVG as-is, PNG/JPG/WebP rasterized at `scale`, PDF as vectors.
 pub fn encode(doc: &Document, svg: &str, format: crate::doc::ExportFormat, scale: f32) -> Result<Vec<u8>, String> {
+    encode_with(doc, svg, format, scale, 92)
+}
+
+/// Encode export SVG of content `size` big with an export preset: its format, size, and JPG quality.
+pub fn encode_preset(doc: &Document, svg: &str, p: &crate::doc::ExportSetting, size: egui::Vec2) -> Result<Vec<u8>, String> {
+    encode_with(doc, svg, p.format, p.scale_for(size), p.quality)
+}
+
+fn encode_with(doc: &Document, svg: &str, format: crate::doc::ExportFormat, scale: f32, quality: u8) -> Result<Vec<u8>, String> {
     use crate::doc::ExportFormat;
     match format {
         ExportFormat::Svg => Ok(svg.as_bytes().to_vec()),
         ExportFormat::Png => svg_to_png(doc, svg, scale),
+        ExportFormat::Webp => {
+            let png = svg_to_png(doc, svg, scale)?;
+            let img = image::load_from_memory(&png).map_err(|e| e.to_string())?.to_rgba8();
+            let mut out = std::io::Cursor::new(vec![]);
+            image::codecs::webp::WebPEncoder::new_lossless(&mut out).encode(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::Rgba8).map_err(|e| e.to_string())?;
+            Ok(out.into_inner())
+        }
         ExportFormat::Jpg => {
             // JPEG has no alpha: flatten onto white.
             let png = svg_to_png(doc, svg, scale)?;
@@ -737,7 +753,7 @@ pub fn encode(doc: &Document, svg: &str, format: crate::doc::ExportFormat, scale
                 rgb.put_pixel(x, y, image::Rgb([c(p.0[0]), c(p.0[1]), c(p.0[2])]));
             }
             let mut out = std::io::Cursor::new(vec![]);
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 92).encode_image(&rgb).map_err(|e| e.to_string())?;
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality.clamp(1, 100)).encode_image(&rgb).map_err(|e| e.to_string())?;
             Ok(out.into_inner())
         }
         ExportFormat::Pdf => {
@@ -1000,6 +1016,36 @@ mod tests {
         assert_eq!(&jpg[..2], &[0xFF, 0xD8], "JPEG magic");
         let pdf = encode(&d, &svg, ExportFormat::Pdf, 1.0).unwrap();
         assert!(pdf.starts_with(b"%PDF"), "PDF magic");
+    }
+
+    #[test]
+    fn presets_size_by_scale_width_or_height_and_encode_webp() {
+        use crate::doc::{ExportFormat, ExportSetting, ExportSize};
+        let mut p = ExportSetting::default();
+        assert!(p.set_size("2.5x") && p.size == ExportSize::Scale && p.scale == 2.5);
+        assert_eq!(p.size_label(), "2.5x");
+        assert!(p.set_size("3") && p.scale == 3.0);
+        assert!(p.set_size("512 W") && p.size == ExportSize::Width(512.0));
+        assert_eq!(p.size_label(), "512w");
+        assert!(!p.set_size("big") && !p.set_size("-2x"), "nonsense leaves it alone");
+        assert_eq!(p.size, ExportSize::Width(512.0));
+        let mut d = Document::default();
+        let a = d.insert(0, None, None, Node::new(Kind::Ellipse, Rect::from_min_size(pos2(0., 0.), vec2(40., 20.))));
+        let svg = to_svg(&d, &[a]);
+        let dims = |p: &ExportSetting| image::load_from_memory(&encode_preset(&d, &svg, p, vec2(40., 20.)).unwrap()).unwrap().to_rgba8().dimensions();
+        assert_eq!(dims(&p), (512, 256));
+        p.set_size("100h");
+        assert_eq!(dims(&p), (200, 100));
+        p.format = ExportFormat::Webp;
+        p.set_size("1x");
+        let webp = encode_preset(&d, &svg, &p, vec2(40., 20.)).unwrap();
+        assert_eq!(&webp[8..12], b"WEBP");
+        assert_eq!(image::load_from_memory(&webp).unwrap().to_rgba8().dimensions(), (40, 20));
+        // JPG quality changes the bytes.
+        p.format = ExportFormat::Jpg;
+        let hi = encode_preset(&d, &svg, &p, vec2(40., 20.)).unwrap();
+        p.quality = 10;
+        assert!(encode_preset(&d, &svg, &p, vec2(40., 20.)).unwrap().len() < hi.len());
     }
 
     #[test]

@@ -31,6 +31,8 @@ pub enum Icon {
     ArrowRight,
     /// Auto layout wrap: across, then back on the next row.
     Wrap,
+    /// Grid auto layout: a 2x2 of cells.
+    Grid,
     Opacity,
     Radius,
     PadH,
@@ -211,6 +213,11 @@ pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
             }
             p.line_segment([at(-5., 3.), at(-2., 0.)], s);
             p.line_segment([at(-5., 3.), at(-2., 6.)], s);
+        }
+        Icon::Grid => {
+            for (x, y) in [(-3.5, -3.5), (3.5, -3.5), (-3.5, 3.5), (3.5, 3.5)] {
+                p.rect_stroke(Rect::from_center_size(at(x, y), vec2(5.0, 5.0)), 1.0, s, egui::StrokeKind::Middle);
+            }
         }
         Icon::Opacity => {
             p.circle_stroke(c, 5.0, s);
@@ -455,14 +462,65 @@ fn sizing_menu(ui: &mut Ui, id: egui::Id, mode: &mut Sizing, can_hug: bool, can_
     changed
 }
 
+/// One export preset row: Figma's size field (type "2x", "1.5", "512w" or "512h", or pick
+/// one), suffix, format, and JPG quality. Returns true when its remove button was clicked.
+fn export_row(ui: &mut Ui, id: egui::Id, p: &mut crate::doc::ExportSetting, removable: bool) -> bool {
+    use crate::doc::ExportFormat;
+    let mut remove = false;
+    ui.horizontal(|ui| {
+        if p.format.raster() {
+            let tid = id.with("size");
+            let mut text = ui.data(|d| d.get_temp::<String>(tid)).unwrap_or_else(|| p.size_label());
+            let r = ui.add(egui::TextEdit::singleline(&mut text).id(tid).desired_width(40.0)).on_hover_text("Scale (2x), width (512w) or height (512h)");
+            if r.has_focus() {
+                ui.data_mut(|d| d.insert_temp(tid, text));
+            } else {
+                if r.lost_focus() {
+                    p.set_size(&text);
+                }
+                ui.data_mut(|d| d.remove::<String>(tid));
+            }
+            let m = icon_button(ui, Icon::Chevron(true), false, 16.0, "Export size");
+            egui::Popup::menu(&m).id(id.with("sizes")).style(crate::chrome::menu_style).show(|ui| {
+                for v in ["0.5x", "0.75x", "1x", "1.5x", "2x", "3x", "4x", "512w", "512h"] {
+                    if ui.selectable_label(p.size_label() == v, v).clicked() {
+                        p.set_size(v);
+                    }
+                }
+            });
+        }
+        if removable {
+            ui.add(egui::TextEdit::singleline(&mut p.suffix).hint_text("Suffix").desired_width(52.0));
+        }
+        egui::ComboBox::from_id_salt(id.with("fmt")).width(56.0).selected_text(p.format.ext().to_uppercase()).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+            for k in ExportFormat::ALL {
+                ui.selectable_value(&mut p.format, k, k.ext().to_uppercase());
+            }
+        });
+        if removable {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                remove = icon_button(ui, Icon::Minus, false, 20.0, "Remove").clicked();
+            });
+        }
+    });
+    if p.format == ExportFormat::Jpg {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Quality").small());
+            ui.add(egui::Slider::new(&mut p.quality, 1..=100).suffix("%"));
+        });
+    }
+    remove
+}
+
 /// 3x3 alignment picker for auto layout (rows = vertical, columns = horizontal position).
 fn align_grid(ui: &mut Ui, l: &mut AutoLayout) {
     let (rect, resp) = ui.allocate_exact_size(vec2(64.0, 64.0), Sense::click());
     let p = ui.painter();
     p.rect_filled(rect, 4.0, theme::subtle(ui.ctx()));
-    let h = l.mode == LayoutMode::Horizontal;
+    // Grids align their children in each cell like a horizontal layout: main = x, cross = y.
+    let h = l.mode != LayoutMode::Vertical;
     let idx = |a: AxisAlign| match a {
-        AxisAlign::Min => 0,
+        AxisAlign::Min | AxisAlign::Baseline => 0,
         AxisAlign::Center => 1,
         AxisAlign::Max => 2,
     };
@@ -823,6 +881,10 @@ impl App {
                 ui.close();
             }
             if item(ui, "Export…", "⇧⌘E") {
+                self.export_dialog = Some(Default::default());
+                ui.close();
+            }
+            if enabled(ui, has, "Export selection", "") {
                 self.export(&ctx);
                 ui.close();
             }
@@ -844,6 +906,10 @@ impl App {
             ui.separator();
             if enabled(ui, has, "Copy", "⌘C") {
                 self.copy(&ctx);
+                ui.close();
+            }
+            if enabled(ui, has, "Copy as code", "") {
+                self.copy_as(&ctx, "code");
                 ui.close();
             }
             if item(ui, "Paste", "⌘V") {
@@ -1033,6 +1099,11 @@ impl App {
             }
             if enabled(ui, has, "Outline stroke", "⌥⌘O") {
                 self.outline_stroke_selection();
+                ui.close();
+            }
+            let two_points = self.vector_edit.as_ref().is_some_and(|ve| ve.selected.len() == 2);
+            if enabled(ui, two_points, "Join selection", "⌘J") {
+                self.vector_join();
                 ui.close();
             }
             if enabled(ui, has, "Resize to fit", "⌥⇧⌘R") {
@@ -3131,6 +3202,25 @@ impl App {
                 self.doc.reflow();
             }
         }
+        // Grid children span columns and rows.
+        if parent_al && roots.len() == 1 && n.parent.is_some_and(|p| self.doc.node(p).layout.mode == LayoutMode::Grid) {
+            let mut span = n.grid_span;
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                for (i, label) in [(0, "Col span"), (1, "Row span")] {
+                    let mut v = span[i].max(1) as f32;
+                    if num_field(ui, &mut v, label, 1.0, half(ui) - 4.0) {
+                        span[i] = v.round().clamp(1.0, 100.0) as u32;
+                        changed = true;
+                    }
+                }
+            });
+            if changed {
+                self.begin_edit();
+                self.doc.node_mut(first).grid_span = span;
+                self.doc.reflow();
+            }
+        }
         if n.kind.is_frame() {
             let mut clip = n.clip;
             if ui.checkbox(&mut clip, "Clip content").changed() {
@@ -3147,30 +3237,85 @@ impl App {
     fn auto_layout_controls(&mut self, ui: &mut Ui, f: NodeId) {
         let mut l = self.doc.node(f).layout;
         let before = l;
+        let kids = self.doc.node(f).children.len().max(1) as f32;
         ui.horizontal(|ui| {
             for (m, wrap, icon, tip) in [
                 (LayoutMode::Vertical, false, Icon::ArrowDown, "Vertical layout"),
                 (LayoutMode::Horizontal, false, Icon::ArrowRight, "Horizontal layout"),
                 (LayoutMode::Horizontal, true, Icon::Wrap, "Wrap"),
+                (LayoutMode::Grid, false, Icon::Grid, "Grid"),
             ] {
-                let on = l.mode == m && (m == LayoutMode::Vertical || l.wrap == wrap);
+                let on = l.mode == m && (m != LayoutMode::Horizontal || l.wrap == wrap);
                 if icon_button(ui, icon, on, 26.0, tip).clicked() {
                     l.mode = m;
                     l.wrap = wrap;
+                    // A new grid starts about square around the children it already has.
+                    if m == LayoutMode::Grid && l.grid[0] == 0 {
+                        let cols = kids.sqrt().ceil();
+                        l.grid = [cols as u32, (kids / cols).ceil() as u32];
+                    }
                 }
             }
         });
+        let grid = l.mode == LayoutMode::Grid;
+        if grid {
+            ui.horizontal(|ui| {
+                for (i, label) in [(0, "Columns"), (1, "Rows")] {
+                    let mut v = l.grid[i].max(1) as f32;
+                    if num_field(ui, &mut v, label, 1.0, half(ui) - 4.0) {
+                        l.grid[i] = v.round().clamp(1.0, 100.0) as u32;
+                    }
+                }
+            });
+            // Track sizing: every column (row) shares the space (Fill) or has one fixed size.
+            ui.horizontal(|ui| {
+                for (i, what) in [(0, "Col"), (1, "Row")] {
+                    let shown = if l.tracks[i].is_some() { format!("{what} Fixed") } else { format!("{what} Fill") };
+                    dropdown(ui, shown, |ui| {
+                        if ui.selectable_label(l.tracks[i].is_none(), "Fill").clicked() {
+                            l.tracks[i] = None;
+                        }
+                        if ui.selectable_label(l.tracks[i].is_some(), "Fixed").clicked() && l.tracks[i].is_none() {
+                            l.tracks[i] = Some(100.0);
+                        }
+                    });
+                    if let Some(t) = &mut l.tracks[i] {
+                        num_field(ui, t, "", 0.0, 44.0);
+                    }
+                }
+            });
+        }
         ui.horizontal(|ui| {
             align_grid(ui, &mut l);
             ui.vertical(|ui| {
-                ui.add_enabled_ui(!l.space_between, |ui| {
-                    num_field(ui, &mut l.gap, if l.mode == LayoutMode::Horizontal { "@gaph" } else { "@gapv" }, 0.0, (ui.available_width()).min(110.0));
+                ui.add_enabled_ui(!l.space_between || grid, |ui| {
+                    num_field(ui, &mut l.gap, if l.mode == LayoutMode::Vertical { "@gapv" } else { "@gaph" }, 0.0, (ui.available_width()).min(110.0));
                 });
-                if l.wrap && l.mode == LayoutMode::Horizontal {
+                if (l.wrap && l.mode == LayoutMode::Horizontal) || grid {
                     num_field(ui, &mut l.cross_gap, "@gapv", 0.0, (ui.available_width()).min(110.0));
                 }
-                ui.checkbox(&mut l.space_between, "Auto gap");
+                if !grid {
+                    ui.checkbox(&mut l.space_between, "Auto gap");
+                }
                 ui.checkbox(&mut l.strokes_included, "Include strokes").on_hover_text("Strokes take up space in the layout");
+            });
+        });
+        // Advanced settings: text baselines (horizontal flows) and canvas stacking.
+        ui.horizontal(|ui| {
+            if l.mode == LayoutMode::Horizontal {
+                let mut base = l.cross == AxisAlign::Baseline;
+                if ui.checkbox(&mut base, "Text baseline").on_hover_text("Align the first lines of text along the row").changed() {
+                    l.cross = if base { AxisAlign::Baseline } else { AxisAlign::Min };
+                }
+            }
+            dropdown(ui, if l.reverse_z { "First on top" } else { "Last on top" }, |ui| {
+                ui.label(RichText::new("Canvas stacking").small());
+                if ui.selectable_label(!l.reverse_z, "Last on top").clicked() {
+                    l.reverse_z = false;
+                }
+                if ui.selectable_label(l.reverse_z, "First on top").clicked() {
+                    l.reverse_z = true;
+                }
             });
         });
         let [t, r, b, lft] = &mut l.padding;
@@ -3855,24 +4000,37 @@ impl App {
                             ui.label("Count");
                             ui.add(DragValue::new(&mut g.count).range(1..=100));
                             ui.end_row();
+                            // Figma names the alignments by side: Left/Right for columns, Top/Bottom for rows.
+                            let cols = g.kind == GridKind::Columns;
+                            let name = |a: GridAlign| match a {
+                                GridAlign::Stretch => "Stretch",
+                                GridAlign::Center => "Center",
+                                GridAlign::Min if cols => "Left",
+                                GridAlign::Min => "Top",
+                                GridAlign::Max if cols => "Right",
+                                GridAlign::Max => "Bottom",
+                            };
                             ui.label("Type");
-                            dropdown(ui, format!("{:?}", g.align), |ui| {
+                            dropdown(ui, name(g.align), |ui| {
                                 for a in [GridAlign::Stretch, GridAlign::Min, GridAlign::Center, GridAlign::Max] {
-                                    ui.selectable_value(&mut g.align, a, format!("{a:?}"));
+                                    ui.selectable_value(&mut g.align, a, name(a));
                                 }
                             });
                             ui.end_row();
                             if g.align != GridAlign::Stretch {
-                                ui.label("Width");
+                                ui.label(if cols { "Width" } else { "Height" });
                                 ui.add(DragValue::new(&mut g.size).range(1.0..=10000.0));
                                 ui.end_row();
                             }
                             ui.label("Gutter");
                             ui.add(DragValue::new(&mut g.gutter).range(0.0..=1000.0));
                             ui.end_row();
-                            ui.label(if g.align == GridAlign::Stretch { "Margin" } else { "Offset" });
-                            ui.add(DragValue::new(&mut g.margin).range(-1000.0..=1000.0));
-                            ui.end_row();
+                            // Centered tracks have no offset in Figma.
+                            if g.align != GridAlign::Center {
+                                ui.label(if g.align == GridAlign::Stretch { "Margin" } else { "Offset" });
+                                ui.add(DragValue::new(&mut g.margin).range(-1000.0..=1000.0));
+                                ui.end_row();
+                            }
                         }
                     });
                     ui.horizontal(|ui| {
@@ -3972,76 +4130,57 @@ impl App {
         }
     }
 
+    /// The Export section. With several layers selected it edits all their presets at once
+    /// (mixed presets can be replaced with +), and exports each of them.
     fn export_props(&mut self, ui: &mut Ui) {
-        use crate::doc::{ExportFormat, ExportSetting};
+        use crate::doc::ExportSetting;
         let roots = self.sel_roots();
-        let single = (roots.len() == 1).then(|| roots[0]);
+        let lists: Vec<Vec<ExportSetting>> = roots.iter().map(|&id| self.doc.node(id).exports.clone()).collect();
+        let mixed = lists.windows(2).any(|w| w[0] != w[1]);
+        let presets = if mixed { vec![] } else { lists.first().cloned().unwrap_or_default() };
         ui.horizontal(|ui| {
             ui.label(RichText::new("Export").strong());
-            if let Some(id) = single {
+            if !roots.is_empty() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if icon_button(ui, Icon::Plus, false, 22.0, "Add export setting").clicked() {
                         self.checkpoint();
-                        let n = self.doc.node_mut(id);
-                        // Figma adds the next common scale.
-                        let next = match n.exports.last().map(|e| e.scale) {
+                        // Figma adds the next common scale; mixed presets are replaced.
+                        let next = match presets.last().map(|e| e.scale) {
                             None => 1.0,
                             Some(s) if s < 2.0 => 2.0,
                             Some(s) => s + 1.0,
                         };
-                        n.exports.push(ExportSetting { scale: next, ..Default::default() });
+                        let mut list = presets.clone();
+                        list.push(ExportSetting { scale: next, ..Default::default() });
+                        for &id in &roots {
+                            self.doc.node_mut(id).exports = list.clone();
+                        }
                     }
                 });
             }
         });
-        let fmt_combo = |ui: &mut Ui, id: egui::Id, f: &mut ExportFormat| {
-            let mut changed = false;
-            egui::ComboBox::from_id_salt(id).width(56.0).selected_text(f.ext().to_uppercase()).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
-                for k in [ExportFormat::Png, ExportFormat::Jpg, ExportFormat::Svg, ExportFormat::Pdf] {
-                    changed |= ui.selectable_value(f, k, k.ext().to_uppercase()).changed();
-                }
-            });
-            changed
-        };
-        let scale_combo = |ui: &mut Ui, id: egui::Id, s: &mut f32| {
-            let mut changed = false;
-            egui::ComboBox::from_id_salt(id).width(48.0).selected_text(format!("{}x", num(*s))).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
-                for v in [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0] {
-                    changed |= ui.selectable_value(s, v, format!("{}x", num(v))).changed();
-                }
-            });
-            changed
-        };
-        let presets = single.map(|id| self.doc.node(id).exports.clone()).unwrap_or_default();
-        if presets.is_empty() {
-            ui.horizontal(|ui| {
-                scale_combo(ui, ui.id().with("export-scale"), &mut self.export_scale);
-                let mut f = if self.export_svg { ExportFormat::Svg } else { ExportFormat::Png };
-                if fmt_combo(ui, ui.id().with("export-format"), &mut f) {
-                    self.export_svg = f == ExportFormat::Svg;
-                }
-            });
-        } else if let Some(id) = single {
+        if mixed {
+            ui.label(RichText::new("Mixed export settings. Click + to replace them.").small().color(theme::muted(ui.ctx())));
+        } else if presets.is_empty() {
+            let mut p = self.export_default.clone();
+            export_row(ui, ui.id().with("export-default"), &mut p, false);
+            self.export_default = p;
+        } else {
             let mut list = presets.clone();
             let mut remove = None;
             for (i, p) in list.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    scale_combo(ui, ui.id().with(("ex-scale", id, i)), &mut p.scale);
-                    ui.add(egui::TextEdit::singleline(&mut p.suffix).hint_text("Suffix").desired_width(60.0));
-                    fmt_combo(ui, ui.id().with(("ex-fmt", id, i)), &mut p.format);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if icon_button(ui, Icon::Minus, false, 20.0, "Remove").clicked() {
-                            remove = Some(i);
-                        }
-                    });
-                });
+                if export_row(ui, ui.id().with(("ex", i)), p, true) {
+                    remove = Some(i);
+                }
             }
             if let Some(i) = remove {
                 list.remove(i);
             }
             if list != presets {
                 self.begin_edit();
-                self.doc.node_mut(id).exports = list;
+                for &id in &roots {
+                    self.doc.node_mut(id).exports = list.clone();
+                }
             }
         }
         let label = match roots.as_slice() {
@@ -4051,6 +4190,68 @@ impl App {
         };
         if ui.add_sized([ui.available_width(), 26.0], egui::Button::new(label)).clicked() {
             self.export(&ui.ctx().clone());
+        }
+    }
+
+    /// Shift Cmd E: every layer on the page with export presets, ticked to export, with a
+    /// preview of each, as in Figma's Export dialog.
+    pub fn export_window(&mut self, ctx: &egui::Context) {
+        let Some(mut off) = self.export_dialog.take() else { return };
+        let ids: Vec<NodeId> = self.doc.pages[self.page]
+            .children
+            .iter()
+            .flat_map(|&r| std::iter::once(r).chain(self.doc.descendants(r)))
+            .filter(|&id| !self.doc.node(id).exports.is_empty())
+            .collect();
+        let (mut open, mut go) = (true, false);
+        let mut budget = 4;
+        crate::chrome::window(ctx, "Export", &mut open, 340.0, |ui| {
+            let muted = theme::muted(ui.ctx());
+            if ids.is_empty() {
+                ui.label(RichText::new("No layers on this page have export settings. Add them in the Design panel's Export section.").color(muted));
+                return;
+            }
+            egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+                for &id in &ids {
+                    let tex = self.asset_thumb(ui.ctx(), id, &mut budget);
+                    let n = self.doc.node(id);
+                    ui.horizontal(|ui| {
+                        let mut on = !off.contains(&id);
+                        if ui.checkbox(&mut on, "").on_hover_text(&n.name).changed() {
+                            if on { off.remove(&id) } else { off.insert(id) };
+                        }
+                        let (rect, _) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::hover());
+                        ui.painter().rect_filled(rect, 4.0, theme::subtle(ui.ctx()));
+                        if let Some(tex) = &tex {
+                            let s = tex.size_vec2();
+                            let fit = (32.0 / s.x).min(32.0 / s.y);
+                            ui.painter().image(tex.id(), Rect::from_center_size(rect.center(), s * fit), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+                        }
+                        ui.vertical(|ui| {
+                            ui.add(egui::Label::new(&n.name).truncate());
+                            let what: Vec<String> = n.exports.iter().map(|p| format!("{} {}", if p.format.raster() { p.size_label() } else { String::new() }, p.format.ext().to_uppercase()).trim().to_string()).collect();
+                            ui.label(RichText::new(what.join(", ")).small().color(muted));
+                        });
+                    });
+                }
+            });
+            let files: usize = ids.iter().filter(|id| !off.contains(id)).map(|&id| self.doc.node(id).exports.len()).sum();
+            ui.add_space(6.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), 26.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let label = if files == 1 { "Export 1 file".to_string() } else { format!("Export {files} files") };
+                go = ui.add_enabled(files > 0, egui::Button::new(RichText::new(label).color(Color32::WHITE)).fill(BLUE).corner_radius(6)).clicked();
+            });
+        });
+        if budget == 0 {
+            ctx.request_repaint();
+        }
+        if go {
+            let chosen: Vec<NodeId> = ids.into_iter().filter(|id| !off.contains(id)).collect();
+            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                self.export_layers_to(ctx, &chosen, &dir);
+            }
+        } else if open {
+            self.export_dialog = Some(off);
         }
     }
 

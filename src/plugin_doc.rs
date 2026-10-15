@@ -292,17 +292,57 @@ fn sizing_json(s: Sizing) -> &'static str {
         Sizing::Fill => "FILL",
     }
 }
+fn export_json(e: &crate::doc::ExportSetting) -> Value {
+    use crate::doc::{ExportFormat, ExportSize};
+    let format = match e.format {
+        ExportFormat::Png => "PNG",
+        ExportFormat::Jpg => "JPG",
+        ExportFormat::Svg => "SVG",
+        ExportFormat::Pdf => "PDF",
+        ExportFormat::Webp => "WEBP",
+    };
+    let (kind, value) = match e.size {
+        ExportSize::Scale => ("SCALE", e.scale),
+        ExportSize::Width(w) => ("WIDTH", w),
+        ExportSize::Height(h) => ("HEIGHT", h),
+    };
+    let mut v = json!({ "format": format, "suffix": e.suffix });
+    if e.format.raster() {
+        v["constraint"] = json!({ "type": kind, "value": value });
+    }
+    v
+}
+fn export_from(v: &Value) -> crate::doc::ExportSetting {
+    use crate::doc::{ExportFormat, ExportSetting, ExportSize};
+    let mut e = ExportSetting { suffix: v["suffix"].as_str().unwrap_or("").to_string(), ..Default::default() };
+    e.format = match v["format"].as_str().unwrap_or("") {
+        "JPG" => ExportFormat::Jpg,
+        "SVG" => ExportFormat::Svg,
+        "PDF" => ExportFormat::Pdf,
+        "WEBP" => ExportFormat::Webp,
+        _ => ExportFormat::Png,
+    };
+    let value = v["constraint"]["value"].as_f64().map(|x| x as f32).filter(|x| *x > 0.0).unwrap_or(1.0);
+    match v["constraint"]["type"].as_str().unwrap_or("SCALE") {
+        "WIDTH" => e.size = ExportSize::Width(value),
+        "HEIGHT" => e.size = ExportSize::Height(value),
+        _ => e.scale = value,
+    }
+    e
+}
 fn align_json(a: AxisAlign) -> &'static str {
     match a {
         AxisAlign::Min => "MIN",
         AxisAlign::Center => "CENTER",
         AxisAlign::Max => "MAX",
+        AxisAlign::Baseline => "BASELINE",
     }
 }
 fn align_from(s: &str) -> AxisAlign {
     match s {
         "CENTER" => AxisAlign::Center,
         "MAX" => AxisAlign::Max,
+        "BASELINE" => AxisAlign::Baseline,
         _ => AxisAlign::Min,
     }
 }
@@ -538,6 +578,7 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
         "topLeftRadius": corners[0], "topRightRadius": corners[1], "bottomRightRadius": corners[2], "bottomLeftRadius": corners[3],
         "constraints": { "horizontal": constraint_json(n.constraints[0]), "vertical": constraint_json(n.constraints[1]) },
         "layoutPositioning": if n.absolute { "ABSOLUTE" } else { "AUTO" },
+        "exportSettings": n.exports.iter().map(export_json).collect::<Vec<_>>(),
         "layoutSizingHorizontal": sizing_json(n.sizing[0]), "layoutSizingVertical": sizing_json(n.sizing[1]),
         "minWidth": n.min_size[0], "minHeight": n.min_size[1], "maxWidth": n.max_size[0], "maxHeight": n.max_size[1],
         "fillStyleId": n.fill_style.map(|s| format!("S:{s}")).unwrap_or_default(),
@@ -551,6 +592,8 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
     let (main, cross) = if parent_mode == LayoutMode::Horizontal { (0, 1) } else { (1, 0) };
     v["layoutGrow"] = json!(if parent_mode != LayoutMode::None && n.sizing[main] == Sizing::Fill { 1 } else { 0 });
     v["layoutAlign"] = json!(if parent_mode != LayoutMode::None && n.sizing[cross] == Sizing::Fill { "STRETCH" } else { "INHERIT" });
+    v["gridColumnSpan"] = json!(n.grid_span[0]);
+    v["gridRowSpan"] = json!(n.grid_span[1]);
     if let Some(s) = n.stroke_sides {
         for (k, w) in ["strokeTopWeight", "strokeRightWeight", "strokeBottomWeight", "strokeLeftWeight"].iter().zip(s) {
             v[*k] = json!(w);
@@ -606,7 +649,13 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
             LayoutMode::None => "NONE",
             LayoutMode::Horizontal => "HORIZONTAL",
             LayoutMode::Vertical => "VERTICAL",
+            LayoutMode::Grid => "GRID",
         });
+        v["itemReverseZIndex"] = json!(l.reverse_z);
+        v["gridColumnCount"] = json!(l.grid[0].max(1));
+        v["gridRowCount"] = json!(l.grid[1]);
+        v["gridColumnGap"] = json!(l.gap);
+        v["gridRowGap"] = json!(l.cross_gap);
         v["layoutWrap"] = json!(if l.wrap { "WRAP" } else { "NO_WRAP" });
         v["itemSpacing"] = json!(l.gap);
         v["counterAxisSpacing"] = json!(l.cross_gap);
@@ -1052,6 +1101,14 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
     if changed("layoutPositioning") {
         n.absolute = s("layoutPositioning") == "ABSOLUTE";
     }
+    if changed("exportSettings") {
+        n.exports = v["exportSettings"].as_array().into_iter().flatten().map(export_from).collect();
+    }
+    for (k, i) in [("gridColumnSpan", 0), ("gridRowSpan", 1)] {
+        if changed(k) {
+            n.grid_span[i] = num(k).unwrap_or(1.0).max(1.0) as u32;
+        }
+    }
     for (k, i, max) in [("minWidth", 0, false), ("minHeight", 1, false), ("maxWidth", 0, true), ("maxHeight", 1, true)] {
         if changed(k) {
             let val = num(k).filter(|x| x.is_finite() && *x > 0.0);
@@ -1065,8 +1122,26 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
             l.mode = match s("layoutMode") {
                 "HORIZONTAL" => LayoutMode::Horizontal,
                 "VERTICAL" => LayoutMode::Vertical,
+                "GRID" => LayoutMode::Grid,
                 _ => LayoutMode::None,
             };
+            if l.mode == LayoutMode::Grid && l.grid[0] == 0 {
+                l.grid = [2, 2];
+            }
+        }
+        if changed("itemReverseZIndex") {
+            l.reverse_z = v["itemReverseZIndex"].as_bool().unwrap_or(false);
+        }
+        for (k, i) in [("gridColumnCount", 0), ("gridRowCount", 1)] {
+            if changed(k) {
+                l.grid[i] = num(k).unwrap_or(0.0).max(0.0) as u32;
+            }
+        }
+        if changed("gridColumnGap") {
+            l.gap = num("gridColumnGap").unwrap_or(0.0);
+        }
+        if changed("gridRowGap") {
+            l.cross_gap = num("gridRowGap").unwrap_or(0.0);
         }
         if changed("layoutWrap") {
             l.wrap = s("layoutWrap") == "WRAP";

@@ -59,6 +59,13 @@ pub fn css(doc: &Document, id: NodeId) -> String {
         decl("left", format!("{}px", num(n.rect.min.x - origin.x)));
         decl("top", format!("{}px", num(n.rect.min.y - origin.y)));
     }
+    if in_flow && parent.is_some_and(|p| p.layout.mode == LayoutMode::Grid) {
+        for (span, prop) in n.grid_span.iter().zip(["grid-column", "grid-row"]) {
+            if *span > 1 {
+                decl(prop, format!("span {span}"));
+            }
+        }
+    }
     let (w, h) = (n.rect.width(), n.rect.height());
     match n.sizing[0] {
         Sizing::Fill if in_flow => decl("flex", "1 0 0".into()),
@@ -78,12 +85,26 @@ pub fn css(doc: &Document, id: NodeId) -> String {
             decl(&format!("max-{dim}"), format!("{}px", num(v)));
         }
     }
-    if n.layout.mode != LayoutMode::None {
+    if n.layout.mode == LayoutMode::Grid {
+        let l = n.layout;
+        let track = |t: Option<f32>| t.map_or("1fr".to_string(), |v| format!("{}px", num(v)));
+        decl("display", "grid".into());
+        decl("grid-template-columns", format!("repeat({}, {})", l.grid[0].max(1), track(l.tracks[0])));
+        if l.grid[1] > 0 {
+            decl("grid-template-rows", format!("repeat({}, {})", l.grid[1], track(l.tracks[1])));
+        }
+        decl("gap", format!("{}px {}px", num(l.cross_gap), num(l.gap)));
+        let [t, r, b, lf] = l.padding;
+        if [t, r, b, lf] != [0.0; 4] {
+            decl("padding", format!("{}px {}px {}px {}px", num(t), num(r), num(b), num(lf)));
+        }
+    } else if n.layout.mode != LayoutMode::None {
         let l = n.layout;
         decl("display", "flex".into());
         decl("flex-direction", if l.mode == LayoutMode::Horizontal { "row" } else { "column" }.into());
         let a = |x: AxisAlign| match x {
             AxisAlign::Min => "flex-start",
+            AxisAlign::Baseline => "baseline",
             AxisAlign::Center => "center",
             AxisAlign::Max => "flex-end",
         };
@@ -306,6 +327,12 @@ pub fn compose(doc: &Document, id: NodeId) -> String {
     match n.layout.mode {
         LayoutMode::Horizontal => format!("Row(\n    modifier = {m},\n    horizontalArrangement = Arrangement.spacedBy({}.dp)\n) {{ }}", num(n.layout.gap)),
         LayoutMode::Vertical => format!("Column(\n    modifier = {m},\n    verticalArrangement = Arrangement.spacedBy({}.dp)\n) {{ }}", num(n.layout.gap)),
+        LayoutMode::Grid => format!(
+            "LazyVerticalGrid(\n    columns = GridCells.Fixed({}),\n    modifier = {m},\n    horizontalArrangement = Arrangement.spacedBy({}.dp),\n    verticalArrangement = Arrangement.spacedBy({}.dp)\n) {{ }}",
+            n.layout.grid[0].max(1),
+            num(n.layout.gap),
+            num(n.layout.cross_gap)
+        ),
         LayoutMode::None => format!("Box(\n    modifier = {m}\n)"),
     }
 }

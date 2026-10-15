@@ -801,6 +801,53 @@ fn shift_a_wraps_in_auto_layout_and_drag_reorders() {
 }
 
 #[test]
+fn arrow_keys_reorder_auto_layout_children() {
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (40.0, 40.0));
+    let b = draw(&mut h, Key::R, (60.0, 0.0), (100.0, 40.0));
+    let c = draw(&mut h, Key::R, (120.0, 0.0), (160.0, 40.0));
+    h.state_mut().sel = vec![a, b, c];
+    key(&mut h, Modifiers::SHIFT, Key::A);
+    let f = h.state().sel[0];
+    h.state_mut().sel = vec![a];
+    key(&mut h, Modifiers::NONE, Key::ArrowRight);
+    assert_eq!(h.state().doc.node(f).children, vec![b, a, c], "moves one place along the row");
+    assert_eq!(rect(&h, a).min.x, 50.0);
+    key(&mut h, Modifiers::NONE, Key::ArrowDown);
+    assert_eq!(h.state().doc.node(f).children, vec![b, a, c], "across the flow does nothing");
+    key(&mut h, Modifiers::NONE, Key::ArrowLeft);
+    assert_eq!(h.state().doc.node(f).children, vec![a, b, c]);
+    // Outside auto layout, arrows still nudge.
+    h.state_mut().sel = vec![f];
+    key(&mut h, Modifiers::NONE, Key::ArrowDown);
+    assert_eq!(rect(&h, f).min.y, 1.0);
+}
+
+#[test]
+fn drag_auto_layout_gap_and_padding_handles() {
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (40.0, 40.0));
+    let b = draw(&mut h, Key::R, (60.0, 0.0), (100.0, 40.0));
+    h.state_mut().sel = vec![a, b];
+    key(&mut h, Modifiers::SHIFT, Key::A);
+    let f = h.state().sel[0];
+    assert_eq!(rect(&h, f), r(0., 0., 90., 40.));
+    // The gap handle sits mid-gap; dragging it right widens the gap.
+    let (from, to) = (s(&h, 45., 20.), s(&h, 55., 20.));
+    drag(&mut h, from, to, Modifiers::NONE);
+    assert_eq!(h.state().doc.node(f).layout.gap, 20.0);
+    assert_eq!(rect(&h, b).min.x, 60.0);
+    assert_eq!(h.state().sel, vec![f], "the frame stays selected");
+    // Top padding (0) has a sliver handle; Shift sets every side.
+    let (from, to) = (s(&h, 50., 7.), s(&h, 50., 19.));
+    drag(&mut h, from, to, Modifiers::SHIFT);
+    assert_eq!(h.state().doc.node(f).layout.padding, [12.0; 4]);
+    assert_eq!(rect(&h, f), r(0., 0., 124., 64.));
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().doc.node(f).layout.padding, [0.0; 4], "one undo step per drag");
+}
+
+#[test]
 fn components_instances_via_shortcuts() {
     let mut h = harness();
     let rect_id = draw(&mut h, Key::R, (0.0, 0.0), (80.0, 40.0));
@@ -965,6 +1012,191 @@ fn vector_edit_moves_adds_and_deletes_points() {
 }
 
 #[test]
+fn vector_edit_marquee_selects_points_and_polygons_convert() {
+    let mut h = harness();
+    draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    let p = s(&h, 50., 50.);
+    double_click(&mut h, p);
+    let v = h.state().sel[0];
+    // A box around the left edge picks its two anchors; Shift adds the top-right one.
+    let (a, b) = (s(&h, -20., -20.), s(&h, 30., 120.));
+    drag(&mut h, a, b, Modifiers::NONE);
+    assert_eq!(h.state().vector_edit.as_ref().unwrap().selected.len(), 2);
+    let (a, b) = (s(&h, 80., -20.), s(&h, 120., 20.));
+    drag(&mut h, a, b, Modifiers::SHIFT);
+    assert_eq!(h.state().vector_edit.as_ref().unwrap().selected.len(), 3);
+    // Dragging one moves all three.
+    let (a, b) = (s(&h, 0., 0.), s(&h, -10., 0.));
+    drag(&mut h, a, b, Modifiers::NONE);
+    let pts: Vec<Pos2> = h.state().doc.node(v).paths[0].points.iter().map(|q| q.p + h.state().doc.node(v).rect.min.to_vec2()).collect();
+    assert_eq!(pts.iter().filter(|q| q.x == -10.0).count(), 2);
+    assert!(pts.contains(&pos2(90., 0.)));
+    // A click on empty canvas outside the path leaves edit mode.
+    let p = s(&h, 300., 300.);
+    click(&mut h, p, Modifiers::NONE);
+    assert!(h.state().vector_edit.is_none());
+    assert!(h.state().sel.is_empty());
+    // Polygons and stars become paths on their first edit.
+    h.state_mut().set_tool(Tool::Polygon);
+    let (a, b) = (s(&h, 200., 0.), s(&h, 300., 100.));
+    drag(&mut h, a, b, Modifiers::NONE);
+    let p = s(&h, 250., 70.);
+    double_click(&mut h, p);
+    let poly = h.state().sel[0];
+    assert!(h.state().vector_edit.is_some());
+    assert_eq!(h.state().doc.node(poly).kind, Kind::Vector);
+    assert_eq!(h.state().doc.node(poly).paths[0].points.len(), 3);
+}
+
+#[test]
+fn vector_cut_join_and_pen_continue() {
+    use crate::doc::PathPoint;
+    let mut h = harness();
+    let pt = |x: f32, y: f32| PathPoint { p: pos2(x, y), ..Default::default() };
+    let mut n = Node::vector_paths(vec![
+        crate::doc::SubPath { points: vec![pt(0., 0.), pt(100., 0.)], closed: false },
+        crate::doc::SubPath { points: vec![pt(100., 50.), pt(0., 50.)], closed: false },
+    ]);
+    n.name = "Lines".into();
+    let v = h.state_mut().doc.insert(0, None, None, n);
+    h.state_mut().enter_vector_edit(v);
+    // Join the two paths' right ends: one path, (0,0) -> (100,0) -> (100,50) -> (0,50).
+    h.state_mut().vector_edit.as_mut().unwrap().selected = vec![(0, 1), (1, 0)];
+    key(&mut h, Modifiers::COMMAND, Key::J);
+    let paths = h.state().doc.node(v).paths.clone();
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].points.iter().map(|q| q.p).collect::<Vec<_>>(), vec![pos2(0., 0.), pos2(100., 0.), pos2(100., 50.), pos2(0., 50.)]);
+    // Both ends of one path: closes it.
+    h.state_mut().vector_edit.as_mut().unwrap().selected = vec![(0, 0), (0, 3)];
+    key(&mut h, Modifiers::COMMAND, Key::J);
+    assert!(h.state().doc.node(v).paths[0].closed);
+    // Cut tool: clicking the top edge opens the path there.
+    key(&mut h, Modifiers::NONE, Key::Y);
+    let p = s(&h, 50., 0.);
+    click(&mut h, p, Modifiers::NONE);
+    let sp = h.state().doc.node(v).paths[0].clone();
+    assert!(!sp.closed);
+    assert_eq!(sp.points.len(), 6);
+    assert_eq!(sp.points[0].p, sp.points[5].p, "both new ends sit at the cut");
+    // Leave, then continue the open path with the pen from its end.
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    assert!(h.state().vector_edit.is_none());
+    key(&mut h, Modifiers::NONE, Key::P);
+    let end = s(&h, 50., 0.);
+    click(&mut h, end, Modifiers::NONE);
+    assert!(h.state().vector_edit.as_ref().is_some_and(|ve| ve.drawing.is_some()), "continues from the end");
+    let p = s(&h, 50., -40.);
+    click(&mut h, p, Modifiers::NONE);
+    let sp = h.state().doc.node(v).paths[0].clone();
+    assert_eq!(sp.points.len(), 7);
+    assert_eq!(h.state().doc.node(v).rect.min.y, -40.0);
+}
+
+#[test]
+fn pencil_smoothing_preference_simplifies_strokes() {
+    let wobble: Vec<Pos2> = (0..60).map(|i| pos2(i as f32 * 4.0, if i % 2 == 0 { 0.0 } else { 3.0 })).collect();
+    let mut h = harness();
+    let mut count = |smoothing: f32| {
+        h.state_mut().prefs.pencil_smoothing = smoothing;
+        key(&mut h, Modifiers::SHIFT, Key::P);
+        let pts: Vec<Pos2> = wobble.iter().map(|p| s(&h, p.x, p.y)).collect();
+        move_to(&mut h, pts[0], Modifiers::NONE);
+        press(&mut h, pts[0], true, Modifiers::NONE);
+        for p in &pts[1..] {
+            move_to(&mut h, *p, Modifiers::NONE);
+        }
+        press(&mut h, pts[59], false, Modifiers::NONE);
+        h.run_steps(2);
+        let id = h.state().sel[0];
+        h.state().doc.node(id).paths[0].points.len()
+    };
+    let (rough, smooth) = (count(0.5), count(10.0));
+    assert!(smooth < rough, "{smooth} vs {rough}");
+}
+
+#[test]
+fn cmd_drag_bends_a_segment() {
+    let mut h = harness();
+    let v = draw(&mut h, Key::L, (0.0, 0.0), (100.0, 0.0));
+    h.state_mut().enter_vector_edit(v);
+    let (a, b) = (s(&h, 50., 0.), s(&h, 50., 30.));
+    drag(&mut h, a, b, Modifiers::COMMAND);
+    let n = h.state().doc.node(v).clone();
+    let [p0, p1] = [n.paths[0].points[0], n.paths[0].points[1]];
+    assert!(p0.h_out.y > 0.0 && p1.h_in.y > 0.0, "both handles pulled down");
+    assert!((n.rect.max.y - 30.0).abs() < 1.0, "the curve passes through the pointer: {:?}", n.rect);
+}
+
+#[test]
+fn export_presets_edit_several_layers_and_the_export_dialog() {
+    use crate::doc::{ExportFormat, ExportSetting, ExportSize};
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (40.0, 20.0));
+    let b = draw(&mut h, Key::R, (60.0, 0.0), (100.0, 40.0));
+    h.state_mut().sel = vec![a, b];
+    h.run_steps(2);
+    h.get_by_label("Add export setting").click();
+    h.run_steps(2);
+    h.get_by_label("Add export setting").click();
+    h.run_steps(2);
+    let both = |h: &Harness<App>| [a, b].map(|id| h.state().doc.node(id).exports.iter().map(|e| e.scale).collect::<Vec<_>>());
+    assert_eq!(both(&h), [vec![1., 2.], vec![1., 2.]], "presets go on every selected layer");
+    // Different presets read as mixed; + replaces them on all.
+    h.state_mut().doc.node_mut(a).exports.push(ExportSetting { format: ExportFormat::Svg, ..Default::default() });
+    h.run_steps(2);
+    assert!(h.query_by_label("Mixed export settings. Click + to replace them.").is_some());
+    h.get_by_label("Add export setting").click();
+    h.run_steps(2);
+    assert_eq!(both(&h), [vec![1.], vec![1.]]);
+    // Shift Cmd E lists the page's layers with presets.
+    let c = draw(&mut h, Key::R, (0.0, 100.0), (10.0, 110.0));
+    h.state_mut().doc.node_mut(b).exports = vec![ExportSetting { size: ExportSize::Width(80.), ..Default::default() }, ExportSetting { format: ExportFormat::Webp, suffix: "-w".into(), ..Default::default() }];
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::E);
+    assert!(h.state().export_dialog.is_some());
+    assert!(h.query_by_label("Export 3 files").is_some());
+    assert!(h.query_by_label("80w PNG, 1x WEBP").is_some());
+    // Export them to a folder: sizes and suffixes kept; a layer without presets uses the panel default.
+    let dir = std::env::temp_dir().join(format!("katachi-export-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ctx = h.ctx.clone();
+    h.state_mut().export_layers_to(&ctx, &[a, b, c], &dir);
+    let dims = |f: &str| image::open(dir.join(f)).unwrap_or_else(|e| panic!("{f}: {e}")).to_rgba8().dimensions();
+    assert_eq!(dims("Rectangle 1.png"), (40, 20));
+    assert_eq!(dims("Rectangle 2.png"), (80, 80));
+    assert_eq!(dims("Rectangle 2-w.webp"), (40, 40));
+    assert_eq!(dims("Rectangle 3.png"), (10, 10));
+    std::fs::remove_dir_all(&dir).ok();
+    // Copy as code follows Dev Mode's language.
+    h.state_mut().sel = vec![c];
+    h.state_mut().code_lang = crate::codegen::Lang::SwiftUi;
+    h.state_mut().copy_as(&ctx, "code");
+    h.step();
+    let copied = h.output().platform_output.commands.iter().find_map(|c| match c {
+        egui::OutputCommand::CopyText(t) => Some(t.clone()),
+        _ => None,
+    });
+    assert!(copied.is_some_and(|t| t.contains(".frame(width: 10, height: 10)")), "SwiftUI code copied");
+}
+
+#[test]
+fn layers_snap_to_uniform_layout_grid_lines() {
+    let mut h = harness();
+    let f = draw(&mut h, Key::F, (0.0, 0.0), (300.0, 300.0));
+    let k = draw(&mut h, Key::R, (100.0, 100.0), (130.0, 130.0));
+    h.state_mut().doc.node_mut(f).grids = vec![crate::doc::LayoutGrid { size: 40., ..Default::default() }];
+    // 23px right puts the left edge 3px past the 120 line: it snaps there.
+    let (p, q) = (s(&h, 115., 115.), s(&h, 138., 115.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    assert_eq!(rect(&h, k).min.x, 120.0);
+    // Hidden guides (Ctrl G) don't snap.
+    h.state_mut().show_grids = false;
+    let (p, q) = (s(&h, 135., 115.), s(&h, 158., 115.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    assert_eq!(rect(&h, k).min.x, 143.0);
+}
+
+#[test]
 fn paste_svg_and_flatten() {
     let mut h = harness();
     h.event(Event::Paste(r##"<svg width="24" height="24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="10" fill="#f00"/></svg>"##.into()));
@@ -1073,19 +1305,17 @@ fn autosave_and_recovery_roundtrip() {
     a.doc.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 0., 10., 10.)));
     a.dirty = true;
     a.autosave(100.0);
-    // Written in the background; names start with the writer's process id.
+    // Written in the background; names start with the writer's process id. (Other tests autosave
+    // into the same folder in parallel, so look for this app's own file.)
     let own = format!("{}-", std::process::id());
-    let mut mine = None;
+    let mine = a.recovery_path().to_path_buf();
     for _ in 0..200 {
-        mine = std::fs::read_dir(crate::files::recovery_dir())
-            .ok()
-            .and_then(|rd| rd.flatten().map(|e| e.path()).find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&own) && p.extension().is_some_and(|e| e == "katachi"))));
-        if mine.is_some() {
+        if mine.exists() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    let mine = mine.expect("autosave written");
+    assert!(mine.exists(), "autosave written");
     assert!(!crate::files::orphaned_recoveries(std::path::Path::new("none")).contains(&mine), "a running session's autosave isn't offered");
     // Once the process that wrote it is gone, a new session can recover it as unsaved work.
     let p = mine.with_file_name(mine.file_name().unwrap().to_string_lossy().replacen(&own, "4000000000-", 1));

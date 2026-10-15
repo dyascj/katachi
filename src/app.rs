@@ -61,6 +61,8 @@ pub enum Drag {
     Rotate { base: Document, center: Pos2, start_angle: f32, start_rot: f32, deg: f32 },
     Create { base: Document, start: Pos2, id: NodeId },
     Marquee { start: Pos2, base_sel: Vec<NodeId> },
+    /// Vector edit: selecting anchors in a box, added to `base_sel`.
+    PointMarquee { start: Pos2, base_sel: Vec<crate::vector_edit::PointRef> },
     Vector { base: Document, id: NodeId, grab: crate::vector_edit::Grab },
     PenHandle,
     Pencil { points: Vec<Pos2> },
@@ -76,6 +78,8 @@ pub enum Drag {
     Swap { base: Document, id: NodeId, axis: usize, items: Vec<(NodeId, Rect)>, start: Pos2 },
     /// A gradient handle or stop on the canvas.
     Gradient { grab: GradGrab },
+    /// An auto layout frame's gap or padding handle (`Grip::Gap` / `Grip::Padding`).
+    LayoutSpacing { base: Document, id: NodeId, grip: Grip, start: Pos2 },
 }
 
 impl Drag {
@@ -88,10 +92,21 @@ impl Drag {
             | Drag::Create { base, .. }
             | Drag::Vector { base, .. }
             | Drag::Spacing { base, .. }
+            | Drag::LayoutSpacing { base, .. }
             | Drag::Swap { base, .. } => Some(base),
             _ => None,
         }
     }
+}
+
+/// One file to export: the layers to render, the base file name, and the preset.
+pub type ExportJob = (Vec<NodeId>, String, crate::doc::ExportSetting);
+
+/// "Name" + suffix + "@2x" for scaled rasters, with the format's extension.
+pub fn export_file_name(name: &str, p: &crate::doc::ExportSetting) -> String {
+    let scaled = p.format.raster() && p.size == crate::doc::ExportSize::Scale && p.scale != 1.0;
+    let scale = if scaled { format!("@{}x", crate::canvas::num(p.scale)) } else { String::new() };
+    format!("{}.{}", crate::export::safe_name(&format!("{name}{}{scale}", p.suffix)), p.format.ext())
 }
 
 /// What the pointer grabbed on the selection frame.
@@ -105,6 +120,10 @@ pub enum Grip {
     Spacing(usize),
     /// Smart selection: a layer's center knob.
     Swap(NodeId),
+    /// A selected auto layout frame's gap handle.
+    Gap,
+    /// A selected auto layout frame's padding handle: top, right, bottom, left.
+    Padding(usize),
     /// A handle of the gradient being edited.
     Gradient(GradGrab),
 }
@@ -230,6 +249,8 @@ pub struct App {
     pub vector_edit: Option<crate::vector_edit::VectorEdit>,
     pub vector_grabbed: Option<crate::vector_edit::Grab>,
     pub vector_start: Pos2,
+    /// Vector edit: the press landed on empty canvas outside the path (a click there leaves edit mode).
+    pub vector_outside: bool,
     /// Cmd+\ hides the side panels.
     pub ui_hidden: bool,
     pub rulers: bool,
@@ -307,8 +328,10 @@ pub struct App {
     pub draft_name: Option<String>,
     pub want: Option<Want>,
     pub dirty: bool,
-    pub export_scale: f32,
-    pub export_svg: bool,
+    /// The Export section's preset for layers that have none of their own.
+    pub export_default: crate::doc::ExportSetting,
+    /// Shift Cmd E's Export dialog, while open: the layers unticked in it.
+    pub export_dialog: Option<std::collections::HashSet<NodeId>>,
     pub confirm: Option<After>,
     pub prev_sel: Vec<NodeId>,
     pub gradient_edit: Option<GradientEdit>,
@@ -358,6 +381,7 @@ impl App {
             vector_edit: None,
             vector_grabbed: None,
             vector_start: Pos2::ZERO,
+            vector_outside: false,
             ui_hidden: false,
             rulers: false,
             outline_mode: false,
@@ -422,8 +446,8 @@ impl App {
             draft_name: None,
             want: None,
             dirty: false,
-            export_scale: 1.0,
-            export_svg: false,
+            export_default: Default::default(),
+            export_dialog: None,
             confirm: None,
             prev_sel: vec![],
             allow_close: false,
@@ -497,6 +521,11 @@ impl App {
                 }
             });
         }
+    }
+
+    #[cfg(test)]
+    pub fn recovery_path(&self) -> &std::path::Path {
+        &self.recovery
     }
 
     /// The work is saved or deliberately discarded: drop this session's autosave.
@@ -1054,8 +1083,25 @@ impl App {
             return;
         }
         self.checkpoint();
-        for id in self.sel_roots() {
-            self.doc.translate(id, d);
+        // Later layers first when stepping forward, so a run of selected siblings moves together.
+        let mut roots = self.doc.sort_by_z(&self.sel_roots());
+        if d.x + d.y > 0.0 {
+            roots.reverse();
+        }
+        for id in roots {
+            // Children of auto layout step through the flow instead of moving (Figma).
+            let flow = self.doc.node(id).parent.map(|p| self.doc.node(p).layout).filter(|l| l.mode != LayoutMode::None && !self.doc.node(id).absolute);
+            let Some(l) = flow else {
+                self.doc.translate(id, d);
+                continue;
+            };
+            let sign = |v: f32| (v > 0.0) as isize - (v < 0.0) as isize;
+            let step = match l.mode {
+                LayoutMode::Horizontal => sign(d.x),
+                LayoutMode::Vertical => sign(d.y),
+                _ => sign(d.x) + sign(d.y) * l.grid[0].max(1) as isize,
+            };
+            self.doc.step_in_flow(id, step);
         }
         self.doc.reflow();
     }
@@ -1296,7 +1342,7 @@ impl App {
             .collect();
     }
 
-    /// Copy the selection as SVG markup, a PNG image, or CSS.
+    /// Copy the selection as SVG markup, a PNG image, CSS, or code in Dev Mode's language.
     pub fn copy_as(&mut self, ctx: &egui::Context, what: &str) {
         let roots = self.sel_roots();
         if roots.is_empty() {
@@ -1305,6 +1351,7 @@ impl App {
         match what {
             "svg" => ctx.copy_text(crate::export::to_svg(&self.doc, &roots)),
             "css" => ctx.copy_text(roots.iter().map(|&id| crate::codegen::css(&self.doc, id)).collect::<Vec<_>>().join("\n\n")),
+            "code" => ctx.copy_text(roots.iter().map(|&id| crate::codegen::generate(&self.doc, id, self.code_lang)).collect::<Vec<_>>().join("\n\n")),
             _ => match crate::export::encode(&self.doc, &crate::export::to_svg(&self.doc, &roots), crate::doc::ExportFormat::Png, 2.0).ok().and_then(|png| image::load_from_memory(&png).ok()) {
                 Some(img) => {
                     let rgba = img.to_rgba8();
@@ -1587,65 +1634,75 @@ impl App {
         }
     }
 
+    /// Export jobs for `ids`: each layer's presets, or the panel's default when it has none.
+    pub fn export_jobs(&self, ids: &[NodeId]) -> Vec<ExportJob> {
+        let mut jobs = vec![];
+        for &id in ids {
+            let n = self.doc.node(id);
+            let presets = if n.exports.is_empty() { vec![self.export_default.clone()] } else { n.exports.clone() };
+            for p in presets {
+                jobs.push((vec![id], n.name.clone(), p));
+            }
+        }
+        jobs
+    }
+
     /// Export the selection (or page) with each layer's presets, or the panel's default.
     pub fn export(&mut self, ctx: &egui::Context) {
         self.fit_all_texts(ctx);
-        use crate::doc::{ExportFormat, ExportSetting};
-        let ids = if self.sel.is_empty() { self.doc.pages[self.page].children.clone() } else { self.sel_roots() };
-        if ids.is_empty() {
-            return;
-        }
-        let fallback = ExportSetting { scale: self.export_scale, format: if self.export_svg { ExportFormat::Svg } else { ExportFormat::Png }, suffix: String::new() };
-        // Each job: (ids to render, base name, preset).
-        let mut jobs: Vec<(Vec<NodeId>, String, ExportSetting)> = vec![];
-        if self.sel.is_empty() {
-            jobs.push((ids.clone(), self.doc.pages[self.page].name.clone(), fallback.clone()));
-        } else {
-            for &id in &ids {
-                let n = self.doc.node(id);
-                let presets = if n.exports.is_empty() { vec![fallback.clone()] } else { n.exports.clone() };
-                for p in presets {
-                    jobs.push((vec![id], n.name.clone(), p));
-                }
+        let jobs = if self.sel.is_empty() {
+            let page = &self.doc.pages[self.page];
+            if page.children.is_empty() {
+                return;
             }
-        }
-        let file_name = |name: &str, p: &ExportSetting| {
-            let scale = if p.format.raster() && p.scale != 1.0 { format!("@{}x", crate::canvas::num(p.scale)) } else { String::new() };
-            format!("{}.{}", crate::export::safe_name(&format!("{name}{}{scale}", p.suffix)), p.format.ext())
+            vec![(page.children.clone(), page.name.clone(), self.export_default.clone())]
+        } else {
+            self.export_jobs(&self.sel_roots())
         };
         // One file: ask where. Several: ask for a folder.
-        let targets: Vec<std::path::PathBuf> = if jobs.len() == 1 {
-            let (_, name, p) = &jobs[0];
+        let targets: Vec<PathBuf> = if let [(_, name, p)] = &jobs[..] {
             let ext = p.format.ext();
-            match rfd::FileDialog::new().add_filter(ext.to_uppercase(), &[ext]).set_file_name(file_name(name, p)).save_file() {
+            match rfd::FileDialog::new().add_filter(ext.to_uppercase(), &[ext]).set_file_name(export_file_name(name, p)).save_file() {
                 Some(path) => vec![path],
                 None => return,
             }
         } else {
             match rfd::FileDialog::new().pick_folder() {
-                Some(dir) => crate::export::unique_names(jobs.iter().map(|(_, name, p)| file_name(name, p)).collect()).into_iter().map(|f| dir.join(f)).collect(),
+                Some(dir) => crate::export::unique_names(jobs.iter().map(|(_, name, p)| export_file_name(name, p)).collect()).into_iter().map(|f| dir.join(f)).collect(),
                 None => return,
             }
         };
+        self.write_exports(&jobs, &targets);
+    }
+
+    /// Export `ids` with their presets into `dir`, as the Export dialog does.
+    pub fn export_layers_to(&mut self, ctx: &egui::Context, ids: &[NodeId], dir: &std::path::Path) {
+        self.fit_all_texts(ctx);
+        let jobs = self.export_jobs(ids);
+        let targets: Vec<PathBuf> = crate::export::unique_names(jobs.iter().map(|(_, name, p)| export_file_name(name, p)).collect()).into_iter().map(|f| dir.join(f)).collect();
+        self.write_exports(&jobs, &targets);
+    }
+
+    /// Render each job and write it to its path; a toast says how it went.
+    fn write_exports(&mut self, jobs: &[ExportJob], targets: &[PathBuf]) {
         let mut done = 0;
-        for ((ids, _, p), path) in jobs.iter().zip(&targets) {
+        for ((ids, _, p), path) in jobs.iter().zip(targets) {
             // A slice exports whatever lies inside it.
-            let svg = match ids.as_slice() {
+            let (svg, size) = match ids.as_slice() {
                 [one] if self.doc.node(*one).kind == Kind::Slice => {
                     let n = self.doc.node(*one);
-                    crate::export::region_svg(&self.doc, self.page, n.aabb(), n.id)
+                    (crate::export::region_svg(&self.doc, self.page, n.aabb(), n.id), n.aabb().size())
                 }
-                _ => crate::export::to_svg(&self.doc, ids),
+                _ => (crate::export::to_svg(&self.doc, ids), crate::export::export_bounds(&self.doc, ids).size()),
             };
-            match crate::export::encode(&self.doc, &svg, p.format, p.scale).and_then(|d| std::fs::write(path, d).map_err(|e| e.to_string())) {
+            match crate::export::encode_preset(&self.doc, &svg, p, size).and_then(|d| std::fs::write(path, d).map_err(|e| e.to_string())) {
                 Ok(()) => done += 1,
                 Err(e) => return self.toast(format!("Export failed: {e}")),
             }
         }
-        self.toast(if done == 1 {
-            format!("Exported {}", targets[0].file_name().unwrap_or_default().to_string_lossy())
-        } else {
-            format!("Exported {done} files")
+        self.toast(match targets {
+            [one] if done == 1 => format!("Exported {}", one.file_name().unwrap_or_default().to_string_lossy()),
+            _ => format!("Exported {done} files"),
         });
     }
 
@@ -2455,7 +2512,7 @@ impl App {
             (true, true, Key::S) => return void(self.save(true)),
             (true, false, Key::O) => return self.request_open(),
             (true, false, Key::N) => return self.request_new(),
-            (true, true, Key::E) => return self.export(ctx),
+            (true, true, Key::E) => return self.export_dialog = Some(Default::default()),
             (true, false, Key::F) => {
                 self.find.0 = true;
                 self.find.3 = true;
@@ -2468,10 +2525,21 @@ impl App {
         if key == Key::Escape && self.editing_text.is_some() {
             return self.end_text_edit();
         }
-        if self.vector_edit.is_some() && !typing && !cmd {
-            match key {
-                Key::Escape | Key::Enter => return self.exit_vector_edit(),
-                Key::Delete | Key::Backspace => return self.vector_delete_points(),
+        if let Some(ve) = self.vector_edit.as_mut().filter(|_| !typing) {
+            use crate::vector_edit::VTool;
+            match (cmd, m.shift, key) {
+                (true, false, Key::J) => return self.vector_join(),
+                // Escape first ends the path being drawn, then drops back to Move, then leaves.
+                (false, _, Key::Escape) if ve.drawing.is_some() => return ve.drawing = None,
+                (false, _, Key::Escape) if ve.tool != VTool::Move => return ve.tool = VTool::Move,
+                (false, _, Key::Escape | Key::Enter) => return self.exit_vector_edit(),
+                (false, _, Key::Delete | Key::Backspace) => return self.vector_delete_points(),
+                (false, false, Key::V) => return ve.tool = VTool::Move,
+                (false, false, Key::P) => return ve.tool = VTool::Pen,
+                (false, false, Key::Y) => {
+                    ve.drawing = None;
+                    return ve.tool = VTool::Cut;
+                }
                 _ => {}
             }
         }
@@ -2780,6 +2848,7 @@ impl eframe::App for App {
         self.recovery_prompt(&ctx);
         self.console_window(&ctx);
         self.batch_rename_window(&ctx);
+        self.export_window(&ctx);
         self.quick_actions(&ctx);
         self.plugin_frame(&ctx, frame);
         self.appearance_frame(&ctx, frame);

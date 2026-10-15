@@ -376,7 +376,7 @@ impl App {
             (x, y) if x != 0 && y != 0 => return Some(Grip::Resize(x, y)),
             _ => {}
         }
-        if let Some(g) = self.smart_grip_at(s) {
+        if let Some(g) = self.smart_grip_at(s).or_else(|| self.layout_grip_at(s)) {
             return Some(g);
         }
         let corner = [b.left_top(), b.right_top(), b.left_bottom(), b.right_bottom()]
@@ -563,7 +563,7 @@ impl App {
             self.press = Some(Press { world: w, target: None, handle: None, toggle_off: false });
             return;
         }
-        if tool == Tool::Move && self.vector_edit.is_some() && self.vector_press(s, mods.shift) {
+        if tool == Tool::Move && self.vector_edit.is_some() && self.vector_press(s, mods) {
             self.press = Some(Press { world: w, target: None, handle: None, toggle_off: false });
             return;
         }
@@ -612,6 +612,9 @@ impl App {
                     self.pending_frame = target;
                 }
             }
+            Tool::Pen if self.pen.is_empty() && self.pen_continue(s) => {
+                self.press = Some(Press { world: w, target: None, handle: None, toggle_off: false });
+            }
             Tool::Pen => {
                 let close = self.pen.len() >= 2 && self.view.to_screen(self.pen[0].p).distance(s) < 8.0;
                 if close {
@@ -649,8 +652,14 @@ impl App {
             return;
         }
         let start = press.world;
-        if self.vector_edit.is_some() {
-            self.drag = self.vector_drag_start();
+        if let Some(ve) = &self.vector_edit {
+            self.drag = match self.vector_grabbed {
+                None if ve.tool == crate::vector_edit::VTool::Move => {
+                    self.vector_outside = false;
+                    Some(Drag::PointMarquee { start, base_sel: ve.selected.clone() })
+                }
+                _ => self.vector_drag_start(),
+            };
             self.vector_start = start;
             return;
         }
@@ -676,6 +685,7 @@ impl App {
                             let a = (start - c).angle();
                             Some(Drag::Rotate { base, center: c, start_angle: a, start_rot: rot, deg: 0.0 })
                         }
+                        Grip::Gap | Grip::Padding(_) => Some(Drag::LayoutSpacing { base, id: self.sel[0], grip, start }),
                         Grip::Spacing(_) | Grip::Swap(_) => self.smart_selection().map(|(axis, items)| match grip {
                             Grip::Swap(id) => Drag::Swap { base, id, axis, items, start },
                             _ => Drag::Spacing { base, axis, gap: gap_of(&items, axis), items, start },
@@ -890,6 +900,10 @@ impl App {
                 }
                 self.sel = sel;
             }
+            Drag::PointMarquee { start, base_sel } => {
+                let (r, base) = (Rect::from_two_pos(*start, w), base_sel.clone());
+                self.vector_marquee(r, &base);
+            }
             Drag::Vector { base, id, grab } => {
                 let (base, id, grab) = (base.clone(), *id, *grab);
                 self.vector_drag(&base, id, grab, self.vector_start, w, mods.alt);
@@ -925,6 +939,31 @@ impl App {
                 self.doc.translate(*id, vec2(self.px1(d.x), self.px1(d.y)));
             }
             Drag::Gradient { grab } => self.drag_gradient(grab, w),
+            Drag::LayoutSpacing { base, id, grip, start } => {
+                self.doc = base.clone();
+                let d = w - *start;
+                let mut l = self.doc.node(*id).layout;
+                let a = if l.mode == LayoutMode::Vertical { 1 } else { 0 };
+                match *grip {
+                    Grip::Gap => {
+                        l.gap = self.px1((l.gap + d[a]).max(0.0));
+                        l.space_between = false;
+                    }
+                    Grip::Padding(side) => {
+                        // Dragging inward adds padding. Alt mirrors to the opposite side, Shift sets all four.
+                        let inward = [d.y, -d.x, -d.y, d.x][side];
+                        let v = self.px1((l.padding[side] + inward).max(0.0));
+                        for s in 0..4 {
+                            if s == side || mods.shift || (mods.alt && s == (side + 2) % 4) {
+                                l.padding[s] = v;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                self.doc.node_mut(*id).layout = l;
+                self.doc.reflow();
+            }
             Drag::Pan | Drag::Connect { .. } | Drag::Zoom { .. } => {}
         }
         self.drag = Some(drag);
@@ -983,7 +1022,7 @@ impl App {
                 }
             }
             Some(Drag::Pencil { points }) => {
-                let pts = smooth_stroke(&points, 1.5 / self.view.zoom);
+                let pts = smooth_stroke(&points, self.prefs.pencil_smoothing / self.view.zoom);
                 if pts.len() >= 2 {
                     self.checkpoint();
                     let parent = self.frame_at(points[0], &[]);
@@ -1055,6 +1094,12 @@ impl App {
         }
         if self.vector_edit.is_some() {
             self.press = None;
+            if std::mem::take(&mut self.vector_outside) {
+                // A click on empty canvas outside the path leaves edit mode and selects as usual.
+                self.vector_edit = None;
+                self.on_press(self.view.to_screen(w), w, mods);
+                self.on_click(w, mods);
+            }
             return;
         }
         match self.tool {
@@ -1138,7 +1183,7 @@ impl App {
             return;
         }
         if let [one] = self.sel[..]
-            && matches!(self.doc.node(one).kind, Kind::Vector | Kind::Rectangle | Kind::Ellipse)
+            && matches!(self.doc.node(one).kind, Kind::Vector | Kind::Rectangle | Kind::Ellipse | Kind::Polygon | Kind::Star)
                 && self.doc.node(one).aabb().expand(4.0 / self.view.zoom).contains(w)
             {
                 self.enter_vector_edit(one);
@@ -1187,8 +1232,13 @@ impl App {
             if !k.visible || k.absolute {
                 continue;
             }
-            let center = k.aabb().center();
-            let before = if h { center.x < w.x } else { center.y < w.y };
+            let (b, center) = (k.aabb(), k.aabb().center());
+            let before = match pn.layout.mode {
+                // Grids read row by row: rows above, then cells to the left on the pointer's row.
+                LayoutMode::Grid => b.max.y < w.y || (b.min.y <= w.y && center.x < w.x),
+                _ if h => center.x < w.x,
+                _ => center.y < w.y,
+            };
             if before {
                 index = i + 1;
             }
@@ -1254,7 +1304,22 @@ impl App {
                                 out.push(Rect::from_min_max(pos2(r.min.x, b), pos2(r.max.x, b)));
                             }
                         }
-                        crate::doc::GridKind::Grid => {}
+                        // Uniform grids snap on their lines, unless they're too dense to be useful.
+                        crate::doc::GridKind::Grid => {
+                            let step = g.size.max(1.0);
+                            if (r.width() + r.height()) / step <= 400.0 {
+                                let mut x = r.min.x;
+                                while x <= r.max.x {
+                                    out.push(Rect::from_min_max(pos2(x, r.min.y), pos2(x, r.max.y)));
+                                    x += step;
+                                }
+                                let mut y = r.min.y;
+                                while y <= r.max.y {
+                                    out.push(Rect::from_min_max(pos2(r.min.x, y), pos2(r.max.x, y)));
+                                    y += step;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1439,6 +1504,76 @@ impl App {
         }
     }
 
+    // ---------- auto layout spacing handles ----------
+
+    /// A lone selected auto layout frame's spacing bands in world space, each with its grip and
+    /// thin axis: the gaps between in-flow children and the four padding bands.
+    fn layout_bands(&self) -> Vec<(Grip, Rect, usize)> {
+        let [id] = self.sel[..] else { return vec![] };
+        let n = self.doc.node(id);
+        if !n.kind.is_frame() || n.rotation != 0.0 || !matches!(n.layout.mode, LayoutMode::Horizontal | LayoutMode::Vertical) || self.vector_edit.is_some() {
+            return vec![];
+        }
+        let l = n.layout;
+        let a = if l.mode == LayoutMode::Horizontal { 0 } else { 1 };
+        let [pt, pr, pb, pl] = l.padding;
+        let inner = Rect::from_min_max(n.rect.min + vec2(pl, pt), n.rect.max - vec2(pr, pb));
+        let kids: Vec<Rect> = n.children.iter().map(|c| self.doc.node(*c)).filter(|k| k.visible && !k.absolute).map(|k| k.aabb()).collect();
+        let mut out = vec![];
+        for w in kids.windows(2) {
+            // Wrapped rows: only neighbors on the same row have a gap between them.
+            let same_row = w[0].min[1 - a] < w[1].max[1 - a] && w[1].min[1 - a] < w[0].max[1 - a];
+            if w[1].min[a] > w[0].max[a] && same_row {
+                let mut r = if l.wrap { w[0].union(w[1]) } else { inner };
+                (r.min[a], r.max[a]) = (w[0].max[a], w[1].min[a]);
+                out.push((Grip::Gap, r, a));
+            }
+        }
+        // Zero padding still gets a grabbable sliver.
+        let r = n.rect;
+        let t = |v: f32| v.max(14.0 / self.view.zoom);
+        out.push((Grip::Padding(0), Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + t(pt))), 1));
+        out.push((Grip::Padding(1), Rect::from_min_max(pos2(r.max.x - t(pr), r.min.y), r.max), 0));
+        out.push((Grip::Padding(2), Rect::from_min_max(pos2(r.min.x, r.max.y - t(pb)), r.max), 1));
+        out.push((Grip::Padding(3), Rect::from_min_max(r.min, pos2(r.min.x + t(pl), r.max.y)), 0));
+        out
+    }
+
+    /// The gap or padding handle (mid-band, as in Figma) under screen point `s`.
+    fn layout_grip_at(&self, s: Pos2) -> Option<Grip> {
+        self.layout_bands().into_iter().find_map(|(g, r, t)| {
+            let r = self.view.rect_to_screen(r);
+            let d = s - r.center();
+            (d[t].abs() <= (r.size()[t] / 2.0).max(4.0) && d[1 - t].abs() <= 10.0).then_some(g)
+        })
+    }
+
+    /// Hovering a selected auto layout frame's gap lights up every gap in pink with its size;
+    /// hovering a padding band lights up that band. Each shows a handle to drag.
+    fn draw_layout_spacing(&self, painter: &Painter, ptr: Option<Pos2>) {
+        let bands = self.layout_bands();
+        let hot = match &self.drag {
+            Some(Drag::LayoutSpacing { grip, .. }) => Some(*grip),
+            _ => ptr.and_then(|p| bands.iter().find(|(_, r, _)| self.view.rect_to_screen(*r).contains(p)).map(|(g, _, _)| *g)),
+        };
+        let Some(hot) = hot else { return };
+        let l = self.doc.node(self.sel[0]).layout;
+        for (g, r, t) in bands.iter().filter(|(g, _, _)| *g == hot) {
+            let r = self.view.rect_to_screen(*r);
+            painter.rect_filled(r, 0.0, GAP.gamma_multiply(0.2));
+            let mut half = Vec2::ZERO;
+            half[1 - t] = 6.0;
+            painter.line_segment([r.center() - half, r.center() + half], Stroke::new(2.0, GAP));
+            let v = match g {
+                Grip::Padding(side) => l.padding[*side],
+                _ => l.gap,
+            };
+            let mut at = r.center();
+            at[1 - t] += 16.0;
+            pill(painter, at, num(v), GAP);
+        }
+    }
+
     /// `p` on whole pixels when snapping to the pixel grid (Shift Cmd '), else as is.
     fn px(&self, p: Pos2) -> Pos2 {
         if self.prefs.snap_to_pixels { p.round() } else { p }
@@ -1567,8 +1702,12 @@ impl App {
             self.outline(painter, h, 2.0);
         }
         if self.vector_edit.is_some() {
-            self.draw_vector_edit(painter);
-            self.draw_pen(painter, ptr);
+            self.draw_vector_edit(painter, ptr);
+            if let (Some(Drag::PointMarquee { start, .. }), Some(p)) = (&self.drag, ptr) {
+                let r = Rect::from_two_pos(self.view.to_screen(*start), p);
+                painter.rect_filled(r, 0.0, BLUE.gamma_multiply(0.1));
+                painter.rect_stroke(r, 0.0, Stroke::new(1.0, BLUE), StrokeKind::Inside);
+            }
             return;
         }
         let roots = self.sel_roots();
@@ -1607,6 +1746,9 @@ impl App {
             self.draw_smart_selection(painter, ptr);
         }
         self.draw_gradient_handles(painter);
+        if self.editing_text.is_none() && self.tool.selects() && matches!(self.drag, None | Some(Drag::LayoutSpacing { .. })) {
+            self.draw_layout_spacing(painter, ptr);
+        }
         for g in &self.guides {
             painter.line_segment([self.view.to_screen(g[0]), self.view.to_screen(g[1])], Stroke::new(1.0, SNAP));
         }
@@ -1842,6 +1984,9 @@ impl App {
                     Some(Grip::Spacing(0)) => CursorIcon::ResizeHorizontal,
                     Some(Grip::Spacing(_)) => CursorIcon::ResizeVertical,
                     Some(Grip::Swap(_)) => CursorIcon::Grab,
+                    Some(Grip::Gap) if self.sel.first().is_some_and(|&f| self.doc.node(f).layout.mode == LayoutMode::Vertical) => CursorIcon::ResizeVertical,
+                    Some(Grip::Gap | Grip::Padding(1 | 3)) => CursorIcon::ResizeHorizontal,
+                    Some(Grip::Padding(_)) => CursorIcon::ResizeVertical,
                     _ => CursorIcon::Default,
                 },
                 Tool::Text => CursorIcon::Text,
@@ -1997,7 +2142,7 @@ impl App {
         }
         ui.add_enabled_ui(has, |ui| {
             ui.menu_button("Copy/Paste as", |ui| {
-                for (label, short, what) in [("Copy as PNG", "⇧⌘C", "png"), ("Copy as SVG", "", "svg"), ("Copy as CSS", "", "css")] {
+                for (label, short, what) in [("Copy as PNG", "⇧⌘C", "png"), ("Copy as SVG", "", "svg"), ("Copy as CSS", "", "css"), ("Copy as code", "", "code")] {
                     if ui.add(egui::Button::new(label).shortcut_text(crate::chrome::keys(short))).clicked() {
                         self.copy_as(&ctx, what);
                         ui.close();
@@ -2098,6 +2243,10 @@ impl App {
         }
         if item(ui, "Outline stroke", "⌥⌘O", has) {
             self.outline_stroke_selection();
+            ui.close();
+        }
+        if self.vector_edit.is_some() && item(ui, "Join selection", "⌘J", self.vector_edit.as_ref().is_some_and(|ve| ve.selected.len() == 2)) {
+            self.vector_join();
             ui.close();
         }
         if item(ui, "Flatten", "⌘E", has) {
