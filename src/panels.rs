@@ -3955,24 +3955,37 @@ impl App {
                             ui.label("Count");
                             ui.add(DragValue::new(&mut g.count).range(1..=100));
                             ui.end_row();
+                            // Figma names the alignments by side: Left/Right for columns, Top/Bottom for rows.
+                            let cols = g.kind == GridKind::Columns;
+                            let name = |a: GridAlign| match a {
+                                GridAlign::Stretch => "Stretch",
+                                GridAlign::Center => "Center",
+                                GridAlign::Min if cols => "Left",
+                                GridAlign::Min => "Top",
+                                GridAlign::Max if cols => "Right",
+                                GridAlign::Max => "Bottom",
+                            };
                             ui.label("Type");
-                            dropdown(ui, format!("{:?}", g.align), |ui| {
+                            dropdown(ui, name(g.align), |ui| {
                                 for a in [GridAlign::Stretch, GridAlign::Min, GridAlign::Center, GridAlign::Max] {
-                                    ui.selectable_value(&mut g.align, a, format!("{a:?}"));
+                                    ui.selectable_value(&mut g.align, a, name(a));
                                 }
                             });
                             ui.end_row();
                             if g.align != GridAlign::Stretch {
-                                ui.label("Width");
+                                ui.label(if cols { "Width" } else { "Height" });
                                 ui.add(DragValue::new(&mut g.size).range(1.0..=10000.0));
                                 ui.end_row();
                             }
                             ui.label("Gutter");
                             ui.add(DragValue::new(&mut g.gutter).range(0.0..=1000.0));
                             ui.end_row();
-                            ui.label(if g.align == GridAlign::Stretch { "Margin" } else { "Offset" });
-                            ui.add(DragValue::new(&mut g.margin).range(-1000.0..=1000.0));
-                            ui.end_row();
+                            // Centered tracks have no offset in Figma.
+                            if g.align != GridAlign::Center {
+                                ui.label(if g.align == GridAlign::Stretch { "Margin" } else { "Offset" });
+                                ui.add(DragValue::new(&mut g.margin).range(-1000.0..=1000.0));
+                                ui.end_row();
+                            }
                         }
                     });
                     ui.horizontal(|ui| {

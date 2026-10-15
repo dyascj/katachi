@@ -1130,7 +1130,22 @@ impl App {
                                 out.push(Rect::from_min_max(pos2(r.min.x, b), pos2(r.max.x, b)));
                             }
                         }
-                        crate::doc::GridKind::Grid => {}
+                        // Uniform grids snap on their lines, unless they're too dense to be useful.
+                        crate::doc::GridKind::Grid => {
+                            let step = g.size.max(1.0);
+                            if (r.width() + r.height()) / step <= 400.0 {
+                                let mut x = r.min.x;
+                                while x <= r.max.x {
+                                    out.push(Rect::from_min_max(pos2(x, r.min.y), pos2(x, r.max.y)));
+                                    x += step;
+                                }
+                                let mut y = r.min.y;
+                                while y <= r.max.y {
+                                    out.push(Rect::from_min_max(pos2(r.min.x, y), pos2(r.max.x, y)));
+                                    y += step;
+                                }
+                            }
+                        }
                     }
                 }
             }

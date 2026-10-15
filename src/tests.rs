@@ -1130,6 +1130,23 @@ fn export_presets_edit_several_layers_and_the_export_dialog() {
 }
 
 #[test]
+fn layers_snap_to_uniform_layout_grid_lines() {
+    let mut h = harness();
+    let f = draw(&mut h, Key::F, (0.0, 0.0), (300.0, 300.0));
+    let k = draw(&mut h, Key::R, (100.0, 100.0), (130.0, 130.0));
+    h.state_mut().doc.node_mut(f).grids = vec![crate::doc::LayoutGrid { size: 40., ..Default::default() }];
+    // 23px right puts the left edge 3px past the 120 line: it snaps there.
+    let (p, q) = (s(&h, 115., 115.), s(&h, 138., 115.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    assert_eq!(rect(&h, k).min.x, 120.0);
+    // Hidden guides (Ctrl G) don't snap.
+    h.state_mut().show_grids = false;
+    let (p, q) = (s(&h, 135., 115.), s(&h, 158., 115.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    assert_eq!(rect(&h, k).min.x, 143.0);
+}
+
+#[test]
 fn paste_svg_and_flatten() {
     let mut h = harness();
     h.event(Event::Paste(r##"<svg width="24" height="24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="10" fill="#f00"/></svg>"##.into()));

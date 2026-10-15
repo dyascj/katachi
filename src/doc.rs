@@ -985,7 +985,7 @@ impl LayoutGrid {
             GridAlign::Stretch => (((hi - lo) - 2.0 * self.margin - gutters) / n as f32, lo + self.margin),
             GridAlign::Min => (self.size, lo + self.margin),
             GridAlign::Max => (self.size, hi - self.margin - (self.size * n as f32 + gutters)),
-            GridAlign::Center => (self.size, (lo + hi) / 2.0 - (self.size * n as f32 + gutters) / 2.0 + self.margin),
+            GridAlign::Center => (self.size, (lo + hi) / 2.0 - (self.size * n as f32 + gutters) / 2.0),
         };
         (0..n).map(|i| {
             let a = start + i as f32 * (track + self.gutter);
