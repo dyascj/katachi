@@ -13,6 +13,8 @@ pub const LINK: Color32 = Color32::from_rgb(0x0D, 0x99, 0xFF);
 /// Inter's line height in ems (hhea ascender - descender), egui's natural row height for it.
 pub const NATURAL_LINE: f32 = 1.2109375;
 pub const ASCENT: f32 = 0.96875;
+/// Inter's cap height in ems.
+pub const CAP: f32 = 0.727;
 
 /// Installed fonts, loaded on first use (takes a moment on machines with many fonts).
 pub fn system_fonts() -> &'static fontdb::Database {
@@ -398,12 +400,25 @@ pub fn marker_galley(painter: &egui::Painter, n: &Node, marker: &str, zoom: f32,
     painter.layout_job(job(painter.ctx(), &m, marker, zoom, color))
 }
 
+/// Vertical trim: the space cut above the first line's capitals and below the last line's
+/// baseline (world units), or nothing for Standard.
+/// ponytail: Inter's metrics for every font; read each face's cap height if trims look off.
+pub fn trim(n: &Node) -> (f32, f32) {
+    if !n.vertical_trim {
+        return (0.0, 0.0);
+    }
+    let pitch = line_pitch(n);
+    let half_leading = (pitch - n.font_size * NATURAL_LINE) / 2.0;
+    (half_leading + (ASCENT - CAP) * n.font_size, pitch - half_leading - ASCENT * n.font_size)
+}
+
 /// Offset (world units) from the box's top-left to where the galley is drawn:
 /// Figma centers glyphs in each line box, and fixed boxes align vertically.
 pub fn draw_offset(n: &Node, rows: usize) -> Vec2 {
     let pitch = line_pitch(n);
     let half_leading = if n.line_height == LineHeight::Auto { 0.0 } else { (pitch - n.font_size * NATURAL_LINE) / 2.0 };
-    let text_h = pitch * rows.max(1) as f32 + n.paragraph_spacing * n.text.matches('\n').count() as f32;
+    let (top, bottom) = trim(n);
+    let text_h = pitch * rows.max(1) as f32 + n.paragraph_spacing * n.text.matches('\n').count() as f32 - top - bottom;
     let v = if n.text_sizing == TextSizing::Fixed {
         let f = match n.text_valign {
             VAlign::Top => 0.0,
@@ -414,7 +429,7 @@ pub fn draw_offset(n: &Node, rows: usize) -> Vec2 {
     } else {
         0.0
     };
-    vec2(0.0, v + half_leading)
+    vec2(0.0, v + half_leading - top)
 }
 
 /// The link under world point `p` on text layer `n`, for clicking it (presentation).
@@ -450,6 +465,7 @@ pub fn layout(painter: &egui::Painter, n: &Node, zoom: f32, color: Color32) -> (
     let width = galley.rows.iter().zip(row_paragraphs(&galley)).map(|(r, p)| r.size.x + list_indent(n, p) * zoom).fold(0.0, f32::max) / zoom;
     // Mixed sizes make rows taller than the base pitch; take whichever is larger.
     let laid_out = if n.spans.is_empty() { 0.0 } else { galley.size().y / zoom };
-    let size = vec2(width, (line_pitch(n) * rows.max(1) as f32).max(laid_out) + n.paragraph_spacing * n.text.matches('\n').count() as f32);
+    let (top, bottom) = trim(n);
+    let size = vec2(width, (line_pitch(n) * rows.max(1) as f32).max(laid_out) + n.paragraph_spacing * n.text.matches('\n').count() as f32 - top - bottom);
     (align_rows(galley, n, zoom), size, lines)
 }

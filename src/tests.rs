@@ -2904,6 +2904,41 @@ fn paragraph_indent_moves_first_lines_in() {
 }
 
 #[test]
+fn vertical_trim_fits_the_box_from_cap_height_to_baseline() {
+    use crate::doc::LineHeight;
+    use crate::text::CAP;
+    let mut h = harness();
+    let mut n = Node::new(Kind::Text, r(0., 0., 10., 10.));
+    (n.text, n.font_size, n.vertical_trim) = ("Hamburg".into(), 100.0, true);
+    let one = h.state_mut().doc.insert(0, None, None, n.clone());
+    (n.text, n.line_height) = ("Two\nlines".into(), LineHeight::Px(150.0));
+    n.rect = r(0., 300., 10., 10.);
+    let two = h.state_mut().doc.insert(0, None, None, n);
+    h.run_steps(3);
+    let height = |id| h.state().doc.node(id).rect.height();
+    assert!((height(one) - CAP * 100.0).abs() < 0.01, "{}", height(one));
+    assert!((height(two) - (150.0 + CAP * 100.0)).abs() < 0.01, "{}", height(two));
+    // The first baseline sits at the cap height from the top, in export too.
+    let svg = crate::export::to_svg(&h.state().doc, &[one]);
+    let y: f32 = svg.split(" y=\"").nth(1).unwrap().split('"').next().unwrap().parse().unwrap();
+    assert!((y - CAP * 100.0).abs() < 0.01, "{svg}");
+    let css = crate::codegen::css(&h.state().doc, one);
+    assert!(css.contains("text-box: trim-both cap alphabetic"), "{css}");
+    // Set from Typography's Type details popover.
+    h.state_mut().doc.node_mut(two).vertical_trim = false;
+    h.state_mut().sel = vec![two];
+    h.run_steps(2);
+    h.get_by_label("···").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Paragraph indent").is_some(), "popover open");
+    h.get_by_label_contains("Standard").click();
+    h.run_steps(2);
+    h.get_by_label("Cap height to baseline").click();
+    h.run_steps(2);
+    assert!(h.state().doc.node(two).vertical_trim);
+}
+
+#[test]
 fn copy_and_paste_properties_survive_egui_clipboard_events() {
     use crate::app::TEST_CLIPBOARD;
     let mut h = harness();

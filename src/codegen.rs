@@ -119,6 +119,9 @@ pub fn css(doc: &Document, id: NodeId) -> String {
         if n.paragraph_indent > 0.0 {
             decl("text-indent", format!("{}px", num(n.paragraph_indent)));
         }
+        if n.vertical_trim {
+            decl("text-box", "trim-both cap alphabetic".into());
+        }
         match n.text_case {
             TextCase::Upper => decl("text-transform", "uppercase".into()),
             TextCase::Lower => decl("text-transform", "lowercase".into()),

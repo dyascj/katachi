@@ -3597,6 +3597,13 @@ impl App {
                     row(ui, "Paragraph indent", &mut |ui| {
                         num_field(ui, &mut t.paragraph_indent, "", 0.0, 64.0);
                     });
+                    row(ui, "Vertical trim", &mut |ui| {
+                        let shown = if t.vertical_trim { "Cap height to baseline" } else { "Standard" };
+                        dropdown(ui, shown, |ui| {
+                            ui.selectable_value(&mut t.vertical_trim, false, "Standard");
+                            ui.selectable_value(&mut t.vertical_trim, true, "Cap height to baseline");
+                        });
+                    });
                 });
                 num_field(ui, &mut t.paragraph_spacing, "¶", 0.0, 64.0);
             });
@@ -3630,6 +3637,7 @@ impl App {
             || t.truncate != n.truncate
             || t.paragraph_spacing != n.paragraph_spacing
             || t.paragraph_indent != n.paragraph_indent
+            || t.vertical_trim != n.vertical_trim
             || t.max_lines != n.max_lines;
         // With characters selected in the editor, changes style just that range (rich text).
         if changed && self.text_selection(ui.ctx()).is_some() {
@@ -3666,6 +3674,7 @@ impl App {
                 d.truncate = t.truncate;
                 d.paragraph_spacing = t.paragraph_spacing.max(0.0);
                 d.paragraph_indent = t.paragraph_indent.max(0.0);
+                d.vertical_trim = t.vertical_trim;
                 d.max_lines = t.max_lines;
             }
         }

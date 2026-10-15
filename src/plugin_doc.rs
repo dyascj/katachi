@@ -638,6 +638,7 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
         v["textDecoration"] = json!(deco_json(n.decoration));
         v["paragraphSpacing"] = json!(n.paragraph_spacing);
         v["paragraphIndent"] = json!(n.paragraph_indent);
+        v["leadingTrim"] = json!(if n.vertical_trim { "CAP_HEIGHT" } else { "NONE" });
         v["textTruncation"] = json!(if n.truncate { "ENDING" } else { "DISABLED" });
         v["maxLines"] = if n.max_lines > 0 { json!(n.max_lines) } else { Value::Null };
         v["textStyleId"] = json!(n.text_style.map(|s| format!("S:{s}")).unwrap_or_default());
@@ -1193,6 +1194,9 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
         }
         if changed("paragraphIndent") {
             n.paragraph_indent = num("paragraphIndent").unwrap_or(0.0).max(0.0);
+        }
+        if changed("leadingTrim") {
+            n.vertical_trim = s("leadingTrim") == "CAP_HEIGHT";
         }
         if changed("textTruncation") {
             n.truncate = s("textTruncation") == "ENDING";
