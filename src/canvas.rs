@@ -2233,7 +2233,7 @@ fn text_key(ctx: &egui::Context, n: &Node) -> u64 {
     let mut h = std::hash::DefaultHasher::new();
     n.text.hash(&mut h);
     format!("{:?}", crate::text::font_family(ctx, &n.font_family, n.font_weight, n.italic)).hash(&mut h);
-    (n.font_size.to_bits(), n.letter_spacing.to_bits(), n.text_sizing as u8, n.text_case as u8).hash(&mut h);
+    (n.font_size.to_bits(), n.letter_spacing.to_bits(), n.text_sizing as u8, n.text_case as u8, n.italic).hash(&mut h);
     format!("{:?}", n.line_height).hash(&mut h);
     (n.truncate, n.max_lines, n.paragraph_spacing.to_bits(), n.paragraph_indent.to_bits(), n.vertical_trim).hash(&mut h);
     format!("{:?}", n.lists).hash(&mut h);
