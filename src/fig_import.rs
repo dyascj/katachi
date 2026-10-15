@@ -952,7 +952,16 @@ fn effects(v: &Value) -> Vec<Shadow> {
                 _ => return None,
             };
             let off = e.get("offset").map_or(Vec2::ZERO, |o| vec2(o.f("x").unwrap_or(0.0), o.f("y").unwrap_or(0.0)));
-            Some(Shadow { kind, color: rgba(e.get("color"), 1.0), offset: off, blur: e.f("radius").unwrap_or(0.0), spread: e.f("spread").unwrap_or(0.0), visible: e.b("visible").unwrap_or(true) })
+            Some(Shadow {
+                kind,
+                color: rgba(e.get("color"), 1.0),
+                offset: off,
+                blur: e.f("radius").unwrap_or(0.0),
+                spread: e.f("spread").unwrap_or(0.0),
+                visible: e.b("visible").unwrap_or(true),
+                show_behind: e.b("showShadowBehindNode").unwrap_or(false),
+                ..Default::default()
+            })
         })
         .collect()
 }

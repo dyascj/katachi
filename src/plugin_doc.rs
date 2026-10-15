@@ -193,30 +193,114 @@ pub fn paint_from(v: &Value, doc: &Document, layer: Option<egui::Vec2>) -> Optio
     Some(p)
 }
 
-fn effect_json(s: &Shadow) -> Value {
-    json!({
-        "type": match s.kind { EffectKind::DropShadow => "DROP_SHADOW", EffectKind::InnerShadow => "INNER_SHADOW", EffectKind::LayerBlur => "LAYER_BLUR", EffectKind::BackgroundBlur => "BACKGROUND_BLUR" },
-        "color": rgba(s.color), "offset": { "x": s.offset.x, "y": s.offset.y }, "radius": s.blur, "spread": s.spread,
-        "visible": s.visible, "blendMode": "NORMAL", "showShadowBehindNode": false,
-    })
+pub fn effect_json(s: &Shadow) -> Value {
+    let kind = match s.kind {
+        EffectKind::DropShadow => "DROP_SHADOW",
+        EffectKind::InnerShadow => "INNER_SHADOW",
+        EffectKind::LayerBlur => "LAYER_BLUR",
+        EffectKind::BackgroundBlur => "BACKGROUND_BLUR",
+        EffectKind::Noise => "NOISE",
+        EffectKind::Texture => "TEXTURE",
+        EffectKind::Glass => "GLASS",
+    };
+    let vector = |p: Pos2| json!({ "x": p.x, "y": p.y });
+    match s.kind {
+        EffectKind::LayerBlur | EffectKind::BackgroundBlur => match s.progressive {
+            Some(p) => json!({
+                "type": kind, "radius": s.blur, "visible": s.visible, "blurType": "PROGRESSIVE",
+                "startRadius": p.start_blur, "startOffset": vector(p.start), "endOffset": vector(p.end),
+            }),
+            None => json!({ "type": kind, "radius": s.blur, "visible": s.visible, "blurType": "NORMAL" }),
+        },
+        EffectKind::Noise => {
+            let mut v = json!({
+                "type": kind, "color": rgba(s.color), "visible": s.visible, "blendMode": "NORMAL", "noiseSize": s.size, "density": s.density,
+                "noiseType": match s.noise { NoiseType::Mono => "MONOTONE", NoiseType::Duo => "DUOTONE", NoiseType::Multi => "MULTITONE" },
+            });
+            match s.noise {
+                NoiseType::Duo => v["secondaryColor"] = rgba(s.color2),
+                NoiseType::Multi => v["opacity"] = json!(s.color.a() as f64 / 255.0),
+                NoiseType::Mono => {}
+            }
+            v
+        }
+        EffectKind::Texture => json!({ "type": kind, "visible": s.visible, "noiseSize": s.size, "radius": s.blur, "clipToShape": s.clip }),
+        EffectKind::Glass => json!({
+            "type": kind, "visible": s.visible, "radius": s.blur, "lightIntensity": s.glass.light, "lightAngle": s.glass.angle,
+            "refraction": s.glass.refraction, "depth": s.glass.depth, "dispersion": s.glass.dispersion,
+        }),
+        _ => json!({
+            "type": kind, "color": rgba(s.color), "offset": { "x": s.offset.x, "y": s.offset.y }, "radius": s.blur, "spread": s.spread,
+            "visible": s.visible, "blendMode": "NORMAL", "showShadowBehindNode": s.show_behind,
+        }),
+    }
 }
 
-fn effect_from(v: &Value) -> Option<Shadow> {
+pub fn effect_from(v: &Value) -> Option<Shadow> {
     let kind = match v["type"].as_str()? {
         "DROP_SHADOW" => EffectKind::DropShadow,
         "INNER_SHADOW" => EffectKind::InnerShadow,
         "LAYER_BLUR" => EffectKind::LayerBlur,
         "BACKGROUND_BLUR" => EffectKind::BackgroundBlur,
+        "NOISE" => EffectKind::Noise,
+        "TEXTURE" => EffectKind::Texture,
+        "GLASS" => EffectKind::Glass,
         _ => return None,
     };
-    Some(Shadow {
+    let d = Shadow::of(kind);
+    let num = |k: &str, or: f32| f(v, k).map_or(or, |x| x as f32);
+    let point = |k: &str, or: Pos2| pos2(f(&v[k], "x").map_or(or.x, |x| x as f32), f(&v[k], "y").map_or(or.y, |y| y as f32));
+    let mut s = Shadow {
         kind,
-        color: v.get("color").map_or(Rgba([0, 0, 0, 64]), |c| color_from(c, 1.0)),
-        offset: vec2(f(&v["offset"], "x").unwrap_or(0.0) as f32, f(&v["offset"], "y").unwrap_or(0.0) as f32),
-        blur: f(v, "radius").unwrap_or(0.0) as f32,
-        spread: f(v, "spread").unwrap_or(0.0) as f32,
         visible: v["visible"].as_bool().unwrap_or(true),
-    })
+        blur: num("radius", if kind.is_shadow() || kind.is_blur() { 0.0 } else { d.blur }),
+        ..d
+    };
+    match kind {
+        EffectKind::DropShadow | EffectKind::InnerShadow => {
+            s.color = v.get("color").map_or(d.color, |c| color_from(c, 1.0));
+            s.offset = vec2(f(&v["offset"], "x").unwrap_or(0.0) as f32, f(&v["offset"], "y").unwrap_or(0.0) as f32);
+            s.spread = num("spread", 0.0);
+            s.show_behind = v["showShadowBehindNode"].as_bool().unwrap_or(false);
+        }
+        EffectKind::LayerBlur | EffectKind::BackgroundBlur => {
+            if v["blurType"].as_str() == Some("PROGRESSIVE") {
+                let p = Progressive::default();
+                s.progressive = Some(Progressive { start: point("startOffset", p.start), end: point("endOffset", p.end), start_blur: num("startRadius", 0.0) });
+            }
+        }
+        EffectKind::Noise => {
+            s.size = num("noiseSize", d.size);
+            s.density = num("density", d.density);
+            s.color = v.get("color").map_or(d.color, |c| color_from(c, 1.0));
+            s.noise = match v["noiseType"].as_str() {
+                Some("DUOTONE") => NoiseType::Duo,
+                Some("MULTITONE") => NoiseType::Multi,
+                _ => NoiseType::Mono,
+            };
+            if let Some(c) = v.get("secondaryColor") {
+                s.color2 = color_from(c, 1.0);
+            }
+            if s.noise == NoiseType::Multi {
+                s.color = s.color.with_alpha((num("opacity", 0.25).clamp(0.0, 1.0) * 255.0).round() as u8);
+            }
+        }
+        EffectKind::Texture => {
+            s.size = num("noiseSize", d.size);
+            s.clip = v["clipToShape"].as_bool().unwrap_or(true);
+        }
+        EffectKind::Glass => {
+            let g = d.glass;
+            s.glass = Glass {
+                refraction: num("refraction", g.refraction),
+                depth: num("depth", g.depth),
+                dispersion: num("dispersion", g.dispersion),
+                angle: num("lightAngle", g.angle),
+                light: num("lightIntensity", g.light),
+            };
+        }
+    }
+    Some(s)
 }
 
 pub fn weight_of(style: &str) -> (u16, bool) {

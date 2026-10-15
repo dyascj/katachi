@@ -3229,6 +3229,87 @@ fn paint_rows_reorder_by_dragging_their_grip() {
     assert_eq!(order(&h), vec![r, g, b], "one undo step");
 }
 
+/// The new effects on the canvas, with an effect's settings open, for a look by eye.
+#[test]
+#[ignore]
+fn effects_ui_look() {
+    use crate::doc::{EffectKind, Paint, Progressive, Rgba, Shadow};
+    isolate_data();
+    let mut h = Harness::builder().with_size(vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).wgpu().build_eframe(|cc| {
+        crate::setup_style(&cc.egui_ctx);
+        let mut app = App::new(None);
+        app.recoverable.clear();
+        app
+    });
+    h.run_steps(2);
+    let st = h.state_mut();
+    let mut bg = Node::new(Kind::Frame, r(-500., -260., 1000., 520.));
+    bg.fills = vec![Paint::solid(Rgba::rgb(24, 24, 28))];
+    let bg = st.doc.insert(0, None, None, bg);
+    for i in 0..9 {
+        let mut c = Node::new(Kind::Ellipse, r(-480. + i as f32 * 110., -200. + (i % 3) as f32 * 120., 100., 100.));
+        c.fills = vec![Paint::solid([Rgba::rgb(13, 153, 255), Rgba::rgb(255, 199, 0), Rgba::rgb(242, 72, 34), Rgba::rgb(20, 174, 92)][i % 4])];
+        st.doc.insert(0, Some(bg), None, c);
+    }
+    let fx = [
+        Shadow { blur: 8., ..Shadow::of(EffectKind::Glass) },
+        Shadow { progressive: Some(Progressive::default()), blur: 24., ..Shadow::of(EffectKind::BackgroundBlur) },
+        Shadow { color: Rgba([0, 0, 0, 160]), ..Shadow::of(EffectKind::Noise) },
+        Shadow::of(EffectKind::Texture),
+    ];
+    let mut ids = vec![];
+    for (i, s) in fx.into_iter().enumerate() {
+        let mut n = Node::new(Kind::Rectangle, r(-460. + i as f32 * 240., -120., 200., 240.));
+        n.radius = 32.;
+        n.fills = if s.kind.is_backdrop() { vec![Paint::solid(Rgba([255, 255, 255, 20]))] } else { vec![Paint::solid(Rgba::rgb(142, 114, 255))] };
+        n.shadows = vec![s];
+        ids.push(st.doc.insert(0, Some(bg), None, n));
+    }
+    st.sel = vec![ids[0]];
+    st.zoom_to(&egui::Context::default(), None, false);
+    h.run_steps(3);
+    h.get_by_label("Glass").click();
+    h.run_steps(4);
+    assert!(egui::Popup::is_any_open(&h.ctx));
+    h.render().unwrap().save("target/look-effects-glass.png").unwrap();
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    h.state_mut().sel = vec![ids[1]];
+    h.run_steps(3);
+    h.get_by_label("Background blur").click();
+    h.run_steps(4);
+    h.render().unwrap().save("target/look-effects-progressive.png").unwrap();
+}
+
+#[test]
+fn effects_reorder_by_dragging_and_switch_to_new_types() {
+    use crate::doc::{EffectKind, Shadow};
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (80.0, 80.0));
+    h.state_mut().doc.node_mut(id).shadows = vec![Shadow::default(), Shadow::of(EffectKind::LayerBlur), Shadow::of(EffectKind::Noise)];
+    h.run_steps(2);
+    // The fill's grip comes first, then effects, topmost (noise) first: drag it to the bottom.
+    let grips: Vec<Rect> = h.get_all_by_label("Drag to reorder").map(|n| n.rect()).collect();
+    assert_eq!(grips.len(), 4);
+    drag(&mut h, grips[1].center(), grips[3].center() + vec2(0.0, 14.0), Modifiers::NONE);
+    let kinds = |h: &Harness<App>| h.state().doc.node(id).shadows.iter().map(|s| s.kind).collect::<Vec<_>>();
+    assert_eq!(kinds(&h), vec![EffectKind::Noise, EffectKind::DropShadow, EffectKind::LayerBlur]);
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(kinds(&h), vec![EffectKind::DropShadow, EffectKind::LayerBlur, EffectKind::Noise], "one undo step");
+    // Open the drop shadow, pick Glass from its type menu: Figma's glass settings come with it.
+    h.state_mut().doc.node_mut(id).shadows = vec![Shadow::default()];
+    h.run_steps(2);
+    h.get_by_label("Drop shadow").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Show behind transparent areas").is_some(), "drop shadows have the option");
+    h.get_by_label("Drop shadow ⏵").hover();
+    h.run_steps(2);
+    h.get_by_label("Glass").click();
+    h.run_steps(3);
+    let s = h.state().doc.node(id).shadows[0];
+    assert_eq!((s.kind, s.glass), (EffectKind::Glass, Shadow::of(EffectKind::Glass).glass));
+    assert!(h.query_by_label("Refraction").is_some() && h.query_by_label("Show behind transparent areas").is_none());
+}
+
 #[test]
 fn number_keys_set_opacity_and_shift_x_swaps_fill_and_stroke() {
     let mut h = harness();

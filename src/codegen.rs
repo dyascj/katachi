@@ -284,9 +284,39 @@ pub fn css(doc: &Document, id: NodeId) -> String {
         decl!("box-shadow", shadows.join(", "));
     }
     for s in n.shadows.iter().filter(|s| s.visible) {
+        // CSS has no progressive blur, grain, or refraction: those are described in comments.
+        if let Some(p) = s.progressive.filter(|_| s.kind.is_blur()) {
+            let pt = |q: egui::Pos2| format!("{}% {}%", num(q.x * 100.0), num(q.y * 100.0));
+            let _ = writeln!(out, "/* Progressive {}: {}px at {} to {}px at {} */", s.kind.label().to_lowercase(), num(p.start_blur), pt(p.start), num(s.blur), pt(p.end));
+            continue;
+        }
         match s.kind {
             EffectKind::LayerBlur => decl!("filter", format!("blur({}px)", num(s.blur / 2.0))),
             EffectKind::BackgroundBlur => decl!("backdrop-filter", format!("blur({}px)", num(s.blur / 2.0))),
+            EffectKind::Noise => {
+                let colors = match s.noise {
+                    crate::doc::NoiseType::Mono => css_color(s.color),
+                    crate::doc::NoiseType::Duo => format!("{}, {}", css_color(s.color), css_color(s.color2)),
+                    crate::doc::NoiseType::Multi => format!("{}% opacity", num(s.color.a() as f32 / 2.55)),
+                };
+                let _ = writeln!(out, "/* Noise ({}): {}px grain, {}% density, {colors} */", s.noise.label().to_lowercase(), num(s.size), num(s.density * 100.0));
+            }
+            EffectKind::Texture => {
+                let _ = writeln!(out, "/* Texture: {}px grain, {}px radius{} */", num(s.size), num(s.blur), if s.clip { ", clipped to shape" } else { "" });
+            }
+            EffectKind::Glass => {
+                let g = s.glass;
+                let _ = writeln!(
+                    out,
+                    "/* Glass: refraction {}%, depth {}px, dispersion {}%, light {}deg at {}% */",
+                    num(g.refraction * 100.0),
+                    num(g.depth),
+                    num(g.dispersion * 100.0),
+                    num(g.angle),
+                    num(g.light * 100.0)
+                );
+                decl!("backdrop-filter", format!("blur({}px)", num(s.blur / 2.0)));
+            }
             _ => {}
         }
     }
@@ -462,10 +492,10 @@ pub fn tailwind(doc: &Document, id: NodeId) -> String {
     if !shadows.is_empty() {
         c.push(format!("shadow-[{}]", shadows.join(",")));
     }
-    for s in n.shadows.iter().filter(|s| s.visible) {
+    for s in n.shadows.iter().filter(|s| s.visible && s.progressive.is_none()) {
         match s.kind {
             EffectKind::LayerBlur => c.push(format!("blur-[{}px]", num(s.blur / 2.0))),
-            EffectKind::BackgroundBlur => c.push(format!("backdrop-blur-[{}px]", num(s.blur / 2.0))),
+            EffectKind::BackgroundBlur | EffectKind::Glass => c.push(format!("backdrop-blur-[{}px]", num(s.blur / 2.0))),
             _ => {}
         }
     }
@@ -631,6 +661,25 @@ mod tests {
         assert!(tc.contains("font-weight: 600;") && tc.contains("text-transform: uppercase;") && !tc.contains("position"), "{tc}");
         assert!(swiftui(&d, t).contains("Text(\"Hi\")") && swiftui(&d, t).contains(".semibold"));
         assert!(compose(&d, f).starts_with("Row("));
+    }
+
+    #[test]
+    fn new_effects_become_css_or_comments() {
+        use crate::doc::{EffectKind, Progressive};
+        let mut d = Document::default();
+        let mut n = Node::new(Kind::Rectangle, Rect::from_min_size(pos2(0., 0.), vec2(100., 100.)));
+        n.shadows = vec![
+            Shadow { blur: 8., progressive: Some(Progressive::default()), ..Shadow::of(EffectKind::LayerBlur) },
+            Shadow::of(EffectKind::Noise),
+            Shadow::of(EffectKind::Texture),
+            Shadow { blur: 12., ..Shadow::of(EffectKind::Glass) },
+        ];
+        let n = d.insert(0, None, None, n);
+        let css = css(&d, n);
+        for want in ["/* Progressive layer blur: 0px at 50% 0% to 8px at 50% 100% */", "/* Noise (mono): 1px grain, 50% density", "/* Texture: 4px grain, 4px radius, clipped to shape */", "/* Glass: refraction 80%", "backdrop-filter: blur(6px);"] {
+            assert!(css.contains(want), "missing {want}:\n{css}");
+        }
+        assert!(!css.contains("\nfilter:"), "no uniform blur for a progressive one:\n{css}");
     }
 
     #[test]

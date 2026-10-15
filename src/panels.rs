@@ -4764,11 +4764,42 @@ impl App {
             egui::Popup::open_id(ui.ctx(), ui.id().with(("shadow", shadows.len() - 1, first)).with("popup"));
         }
         let mut remove = None;
+        // Topmost first; each row drags by its grip to reorder, like paints.
+        let (mut rows, mut dragging, mut dropped) = (vec![], None, None);
         for i in (0..shadows.len()).rev() {
-            let (c, r) = shadow_row(ui, ui.id().with(("shadow", i, first)), &mut shadows[i]);
+            let row = ui.horizontal(|ui| {
+                let grip = crate::paint_ui::grip(ui);
+                if grip.dragged() {
+                    dragging = Some(i);
+                }
+                if grip.drag_stopped() {
+                    dropped = Some(i);
+                }
+                shadow_row(ui, ui.id().with(("shadow", i, first)), &mut shadows[i])
+            });
+            rows.push((i, row.response.rect));
+            let (c, r) = row.inner;
             changed |= c;
             if r {
                 remove = Some(i);
+            }
+        }
+        if let (Some(src), Some(y)) = (dragging.or(dropped), ui.ctx().pointer_interact_pos().map(|p| p.y)) {
+            let others: Vec<Rect> = rows.iter().filter(|(j, _)| *j != src).map(|r| r.1).collect();
+            let above = others.iter().filter(|r| r.center().y < y).count();
+            if dropped.is_some() {
+                let dst = shadows.len() - 1 - above;
+                if dst != src {
+                    // A reorder is one step of its own.
+                    self.checkpoint();
+                    let s = shadows.remove(src);
+                    shadows.insert(dst, s);
+                    for &id in &self.sel.clone() {
+                        self.doc.node_mut(id).shadows = shadows.clone();
+                    }
+                }
+            } else if let Some(line) = if above == 0 { others.first().map(|r| r.min.y) } else { others.get(above - 1).map(|r| r.max.y) } {
+                ui.painter().hline(ui.max_rect().x_range(), line, Stroke::new(2.0, BLUE));
             }
         }
         if let Some(i) = remove {
