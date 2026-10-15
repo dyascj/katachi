@@ -301,6 +301,12 @@ pub struct App {
     /// Where the canvas was right-clicked (world), for the menu's "Select layer".
     pub menu_at: Option<Pos2>,
     pub batch_rename: Option<crate::panels::BatchRename>,
+    /// Cmd K's link field while editing text: the characters it links and the URL typed so far.
+    pub link_edit: Option<(usize, usize, String)>,
+    /// Focus the link field on its next frame.
+    pub focus_link: bool,
+    /// The Replace fonts dialog: each missing family and its chosen replacement.
+    pub replace_fonts: Option<Vec<(String, String)>>,
     /// This session's crash-recovery autosave.
     recovery: PathBuf,
     last_autosave: f64,
@@ -417,6 +423,9 @@ impl App {
             layer_search: None,
             menu_at: None,
             batch_rename: None,
+            replace_fonts: None,
+            link_edit: None,
+            focus_link: false,
             recovery: {
                 // Unique per window, even for two opened in the same millisecond.
                 static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -901,6 +910,7 @@ impl App {
             if n.kind == Kind::Text && src.kind == Kind::Text {
                 n.font_family = src.font_family.clone();
                 n.font_weight = src.font_weight;
+                n.italic = src.italic;
                 n.font_size = src.font_size;
                 n.line_height = src.line_height;
                 n.letter_spacing = src.letter_spacing;
@@ -1525,6 +1535,7 @@ impl App {
     // ---------- text & pen ----------
 
     pub fn end_text_edit(&mut self) {
+        self.link_edit = None;
         if let Some(id) = self.editing_text.take()
             && self.doc.nodes.get(&id).is_some_and(|n| n.text.trim().is_empty()) {
                 self.doc.remove(id);
@@ -2464,9 +2475,26 @@ impl App {
             return;
         }
         let typing = ctx.egui_wants_keyboard_input();
-        let (events, shift) = ctx.input(|i| (i.events.clone(), i.modifiers.shift));
+        let (events, m) = ctx.input(|i| (i.events.clone(), i.modifiers));
+        // A text shortcut eats its key's side effects this frame: Shift Cmd X's cut, Alt >'s "≥".
+        let mut swallow = false;
         for e in events {
             match e {
+                // egui turns every Cmd C, X and V into a clipboard event, Alt and Shift chords
+                // included, so those shortcuts (copy and paste properties, copy as PNG,
+                // strikethrough) arrive here instead of as keys.
+                Event::Copy | Event::Cut if m.alt || m.shift => {
+                    let key = if e == Event::Copy { Key::C } else { Key::X };
+                    if self.text_shortcut(ctx, key, m, typing) {
+                        swallow = true;
+                    } else {
+                        self.key(ctx, key, m, typing);
+                    }
+                }
+                Event::Paste(_) if m.alt => {
+                    self.pasted = true;
+                    self.key(ctx, Key::V, m, typing);
+                }
                 Event::Copy if !typing => self.copy(ctx),
                 Event::Cut if !typing => {
                     self.copy(ctx);
@@ -2474,19 +2502,23 @@ impl App {
                 }
                 Event::Paste(t) if !typing => {
                     self.pasted = true;
-                    self.paste_text(&t, shift);
+                    self.paste_text(&t, m.shift);
                 }
                 // Cmd V with no text on the clipboard (an image, say) reaches egui only as the V
                 // key's release: the press was taken as a paste that found nothing to deliver.
-                Event::Key { key: Key::V, pressed: false, .. } => {
+                Event::Key { key: Key::V, pressed: false, modifiers: km, .. } => {
                     let (seen, pasted) = (std::mem::take(&mut self.v_pressed), std::mem::take(&mut self.pasted));
                     if !typing && !seen && !pasted {
-                        self.paste_clipboard_image();
+                        if km.alt { self.key(ctx, Key::V, km, typing) } else { void(self.paste_clipboard_image()) }
                     }
                 }
                 Event::Key { key, pressed: true, modifiers: m, .. } => {
                     self.v_pressed |= key == Key::V;
-                    self.key(ctx, key, m, typing)
+                    if self.text_shortcut(ctx, key, m, typing) {
+                        swallow = true;
+                    } else {
+                        self.key(ctx, key, m, typing)
+                    }
                 }
                 // Holding Z zooms for a moment, then hands back the previous tool (Figma).
                 Event::Key { key: Key::Z, pressed: false, .. } => {
@@ -2500,12 +2532,17 @@ impl App {
                 _ => {}
             }
         }
+        if swallow {
+            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, Event::Text(_) | Event::Cut)));
+        }
     }
 
     fn key(&mut self, ctx: &egui::Context, key: Key, m: Modifiers, typing: bool) {
         let cmd = m.command;
         // Global shortcuts that work even while a field has focus.
         match (cmd, m.shift, key) {
+            // Figma: Cmd K links the characters selected in the text editor.
+            (true, false, Key::K) if !m.alt && self.text_selection(ctx).is_some() => return self.create_link(ctx),
             (true, false, Key::Slash | Key::K) if !m.alt => return self.toggle_quick_actions(),
             (true, false, Key::Comma) => return self.open_settings(crate::settings::Tab::Account),
             (true, false, Key::S) => return void(self.save(false)),
@@ -2521,6 +2558,11 @@ impl App {
             (true, true, Key::Num7) => return self.toggle_list(ctx, crate::doc::ListKind::Number),
             (true, true, Key::Num8) => return self.toggle_list(ctx, crate::doc::ListKind::Bullet),
             _ => {}
+        }
+        if key == Key::Escape && self.link_edit.is_some() {
+            self.link_edit = None;
+            self.focus_text = true;
+            return;
         }
         if key == Key::Escape && self.editing_text.is_some() {
             return self.end_text_edit();
@@ -2849,6 +2891,7 @@ impl eframe::App for App {
         self.console_window(&ctx);
         self.batch_rename_window(&ctx);
         self.export_window(&ctx);
+        self.replace_fonts_window(&ctx);
         self.quick_actions(&ctx);
         self.plugin_frame(&ctx, frame);
         self.appearance_frame(&ctx, frame);

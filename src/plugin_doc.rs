@@ -673,7 +673,7 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
     if n.kind == Kind::Text {
         v["characters"] = json!(n.text);
         v["fontSize"] = json!(n.font_size);
-        v["fontName"] = json!({ "family": n.font_family, "style": crate::text::weight_name(n.font_weight) });
+        v["fontName"] = json!({ "family": n.font_family, "style": crate::text::style_name(n.font_weight, n.italic) });
         v["textAlignHorizontal"] = json!(match n.text_align {
             TextAlign::Left => "LEFT",
             TextAlign::Center => "CENTER",
@@ -696,6 +696,8 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
         v["textCase"] = json!(case_json(n.text_case));
         v["textDecoration"] = json!(deco_json(n.decoration));
         v["paragraphSpacing"] = json!(n.paragraph_spacing);
+        v["paragraphIndent"] = json!(n.paragraph_indent);
+        v["leadingTrim"] = json!(if n.vertical_trim { "CAP_HEIGHT" } else { "NONE" });
         v["textTruncation"] = json!(if n.truncate { "ENDING" } else { "DISABLED" });
         v["maxLines"] = if n.max_lines > 0 { json!(n.max_lines) } else { Value::Null };
         v["textStyleId"] = json!(n.text_style.map(|s| format!("S:{s}")).unwrap_or_default());
@@ -755,7 +757,7 @@ fn style_json(s: &Style) -> Value {
         }
         StyleValue::Text(t) => {
             v["type"] = json!("TEXT");
-            v["fontName"] = json!({ "family": t.font_family, "style": crate::text::weight_name(t.font_weight) });
+            v["fontName"] = json!({ "family": t.font_family, "style": crate::text::style_name(t.font_weight, t.italic) });
             v["fontSize"] = json!(t.font_size);
             v["lineHeight"] = line_height_json(t.line_height);
             v["letterSpacing"] = json!({ "unit": "PERCENT", "value": t.letter_spacing });
@@ -879,9 +881,11 @@ fn apply_styles_and_variables(doc: &mut Document, out: &Value, refs: &mut Refs) 
             Some("EFFECT") => StyleValue::Effect(s["effects"].as_array().into_iter().flatten().filter_map(effect_from).collect()),
             Some("TEXT") => {
                 let size = f(s, "fontSize").unwrap_or(12.0) as f32;
+                let (font_weight, italic) = weight_of(s["fontName"]["style"].as_str().unwrap_or("Regular"));
                 StyleValue::Text(TextStyle {
                     font_family: s["fontName"]["family"].as_str().unwrap_or("Inter").to_string(),
-                    font_weight: weight_of(s["fontName"]["style"].as_str().unwrap_or("Regular")).0,
+                    font_weight,
+                    italic,
                     font_size: size,
                     line_height: line_height_from(&s["lineHeight"]),
                     letter_spacing: letter_spacing_from(&s["letterSpacing"], size),
@@ -1229,11 +1233,11 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
             n.font_family = v["fontName"]["family"].as_str().unwrap_or("Inter").to_string();
             let (w, italic) = weight_of(v["fontName"]["style"].as_str().unwrap_or("Regular"));
             n.font_weight = w;
-            n.spans.retain(|sp| sp.style.italic.is_none());
-            if italic {
-                let len = n.text.chars().count();
-                n.spans = style_range(&n.spans, len, 0, len, &SpanStyle { italic: Some(true), ..Default::default() });
+            n.italic = italic;
+            for sp in &mut n.spans {
+                sp.style.italic = None;
             }
+            n.spans.retain(|sp| !sp.style.is_empty());
         }
         if changed("textAlignHorizontal") {
             n.text_align = match s("textAlignHorizontal") {
@@ -1272,6 +1276,12 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
         }
         if changed("paragraphSpacing") {
             n.paragraph_spacing = num("paragraphSpacing").unwrap_or(0.0).max(0.0);
+        }
+        if changed("paragraphIndent") {
+            n.paragraph_indent = num("paragraphIndent").unwrap_or(0.0).max(0.0);
+        }
+        if changed("leadingTrim") {
+            n.vertical_trim = s("leadingTrim") == "CAP_HEIGHT";
         }
         if changed("textTruncation") {
             n.truncate = s("textTruncation") == "ENDING";

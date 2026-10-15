@@ -3282,3 +3282,297 @@ fn serve_refuses_a_file_it_cannot_read() {
     assert!(crate::load_or_new(Some(&dir.join("new.katachi"))).is_ok(), "a new file starts empty");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Put characters [a, b) of the text being edited under the editor's selection.
+fn select_chars(h: &mut Harness<App>, a: usize, b: usize) {
+    let edit_id = egui::Id::new("katachi-text-edit");
+    let mut state = egui::TextEdit::load_state(&h.ctx, edit_id).expect("editor state");
+    state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(a), egui::text::CCursor::new(b))));
+    state.store(&h.ctx, edit_id);
+}
+
+/// A clipboard event as egui-winit sends it: the chord's modifiers are only in the input state.
+fn clip_event(h: &mut Harness<App>, m: Modifiers, e: Event) {
+    h.input_mut().modifiers = m;
+    h.event_modifiers(e, m);
+    h.run_steps(2);
+    h.input_mut().modifiers = Modifiers::NONE;
+}
+
+#[test]
+fn text_formatting_shortcuts_style_layers_and_ranges() {
+    use crate::doc::{Decoration, LineHeight, TextAlign, TextSizing};
+    let mut h = harness();
+    let mut t = Node::new(Kind::Text, r(0., 0., 120., 10.));
+    t.text = "Hello world".into();
+    t.font_size = 20.;
+    t.text_sizing = TextSizing::AutoHeight;
+    let id = h.state_mut().doc.insert(0, None, None, t);
+    h.state_mut().sel = vec![id];
+    h.run_steps(2);
+    let node = |h: &Harness<App>| h.state().doc.node(id).clone();
+    // With the layer selected, shortcuts restyle all of it.
+    key(&mut h, Modifiers::COMMAND, Key::B);
+    assert_eq!(node(&h).font_weight, 700);
+    key(&mut h, Modifiers::COMMAND, Key::B);
+    assert_eq!(node(&h).font_weight, 400, "Cmd B toggles back");
+    key(&mut h, Modifiers::COMMAND, Key::I);
+    assert!(node(&h).italic);
+    key(&mut h, Modifiers::COMMAND, Key::U);
+    assert_eq!(node(&h).decoration, Decoration::Underline);
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::J);
+    assert_eq!(node(&h).text_align, TextAlign::Justify);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::Period);
+    assert_eq!(node(&h).font_size, 21.0);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::Comma);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::Comma);
+    assert_eq!(node(&h).font_size, 19.0);
+    key(&mut h, Modifiers::ALT, Key::Period);
+    assert_eq!(node(&h).letter_spacing, 1.0);
+    key(&mut h, Modifiers::ALT | Modifiers::SHIFT, Key::Period);
+    assert_eq!(node(&h).line_height, LineHeight::Px((19.0 * crate::text::NATURAL_LINE).round() + 1.0), "Auto becomes px");
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::Period);
+    assert_eq!(node(&h).font_weight, 500, "next installed weight");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(node(&h).font_weight, 400, "one undo step each");
+    // Shift Cmd X reaches the app as a cut: it strikes through instead of cutting the layer.
+    clip_event(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Event::Cut);
+    assert!(h.state().doc.nodes.contains_key(&id));
+    assert_eq!(node(&h).decoration, Decoration::Strikethrough);
+    // While editing with characters selected, they apply to the range only.
+    h.state_mut().editing_text = Some(id);
+    h.state_mut().focus_text = true;
+    h.run_steps(3);
+    select_chars(&mut h, 6, 11);
+    key(&mut h, Modifiers::COMMAND, Key::B);
+    let n = node(&h);
+    assert_eq!((n.font_weight, n.spans.len()), (400, 1));
+    assert_eq!((n.spans[0].start, n.spans[0].end, n.spans[0].style.font_weight), (6, 11, Some(700)));
+    clip_event(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Event::Cut);
+    let n = node(&h);
+    assert_eq!(n.text, "Hello world", "the editor didn't cut");
+    assert_eq!(n.spans[0].style.decoration, Some(Decoration::None), "strikethrough toggles off on the range");
+    // Justified rows fill the box but a paragraph's last row doesn't.
+    let mut j = n.clone();
+    j.text = "alpha beta gamma delta epsilon a".into();
+    j.spans.clear();
+    j.italic = false;
+    let painter = egui::Painter::new(h.ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+    let (g, _, _) = crate::text::layout(&painter, &j, 1.0, egui::Color32::BLACK);
+    assert!(g.rows.len() >= 2);
+    assert!((g.rows[0].size.x - 120.0).abs() < 0.5, "{}", g.rows[0].size.x);
+    assert!(g.rows.last().unwrap().size.x < 100.0, "{}", g.rows.last().unwrap().size.x);
+    let jid = h.state_mut().doc.insert(0, None, None, j);
+    h.run_steps(2);
+    let svg = crate::export::to_svg(&h.state().doc, &[jid]);
+    assert_eq!(svg.matches(r#"textLength="120""#).count(), h.state().doc.node(jid).lines.len() - 1, "{svg}");
+}
+
+#[test]
+fn italics_use_real_faces_and_slant_only_without_one() {
+    use crate::text::{style_name, styles_for};
+    let mut h = harness();
+    assert_eq!(style_name(400, true), "Italic");
+    assert_eq!(style_name(700, true), "Bold Italic");
+    assert_eq!(style_name(600, false), "Semi Bold");
+    assert!([400, 500, 600, 700].iter().all(|w| styles_for("Inter").contains(&(*w, false))));
+    let slanted = |h: &Harness<App>, family: &str, italic: bool| {
+        let mut n = Node::new(Kind::Text, r(0., 0., 10., 10.));
+        (n.font_family, n.italic) = (family.into(), italic);
+        crate::text::job(&h.ctx, &n, "x", 1.0, egui::Color32::BLACK).sections[0].format.italics
+    };
+    // No such family: Inter stands in, slanted.
+    let mut t = Node::new(Kind::Text, r(0., 0., 10., 10.));
+    (t.text, t.font_family, t.italic) = ("Hi".into(), "No Such Font".into(), true);
+    let missing = h.state_mut().doc.insert(0, None, None, t.clone());
+    // A family with a real italic (when this machine has one) draws it unslanted.
+    let real = crate::text::families().iter().find(|f| styles_for(f).contains(&(400, true)) && styles_for(f).contains(&(400, false))).cloned();
+    if let Some(f) = &real {
+        t.font_family = f.clone();
+        h.state_mut().doc.insert(0, None, None, t);
+    }
+    h.run_steps(4);
+    assert!(slanted(&h, "No Such Font", true));
+    assert!(!slanted(&h, "No Such Font", false));
+    assert!(crate::export::to_svg(&h.state().doc, &[missing]).contains(r#"font-style="italic""#));
+    if let Some(f) = real {
+        assert!(!slanted(&h, &f, true), "{f} has an italic face");
+        assert_eq!(crate::text::font_family(&h.ctx, &f, 400, true).0, egui::FontFamily::Name(format!("{f}#400i").into()));
+    }
+}
+
+#[test]
+fn missing_fonts_show_and_replace_in_one_step() {
+    use crate::doc::{SpanStyle, TextSpan};
+    let mut h = harness();
+    let mut t = Node::new(Kind::Text, r(0., 0., 10., 10.));
+    (t.text, t.font_family, t.font_weight) = ("Imported".into(), "Fig Only Sans".into(), 700);
+    t.spans = vec![TextSpan { start: 0, end: 3, style: SpanStyle { font_family: Some("Fig Only Serif".into()), italic: Some(true), ..Default::default() } }];
+    let id = h.state_mut().doc.insert(0, None, None, t);
+    h.state_mut().sel = vec![id];
+    h.run_steps(2);
+    let missing = crate::text::missing_fonts(&h.state().doc);
+    assert_eq!(missing, vec![("Fig Only Sans".to_string(), vec![(700, false)]), ("Fig Only Serif".to_string(), vec![(700, true)])]);
+    // The Typography section flags it and opens Replace fonts.
+    h.get_by_label("Missing fonts");
+    h.get_by_label("Replace fonts…").click();
+    h.run_steps(2);
+    assert_eq!(h.state().replace_fonts.as_ref().map(|p| p.len()), Some(2));
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Replace fonts").click();
+    h.run_steps(2);
+    let n = h.state().doc.node(id).clone();
+    assert_eq!((n.font_family.as_str(), n.font_weight, n.spans[0].style.font_family.as_deref()), ("Inter", 700, Some("Inter")));
+    assert!(crate::text::missing_fonts(&h.state().doc).is_empty() && h.state().replace_fonts.is_none());
+    assert!(h.query_by_label("Missing fonts").is_none());
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(crate::text::missing_fonts(&h.state().doc).len(), 2, "one undo step");
+}
+
+#[test]
+fn text_links_add_edit_remove_export_and_click_through() {
+    let mut h = harness();
+    let f = draw(&mut h, Key::F, (0.0, 0.0), (300.0, 100.0));
+    let mut t = Node::new(Kind::Text, r(10., 10., 10., 10.));
+    (t.text, t.font_size) = ("Visit site".into(), 20.0);
+    let id = h.state_mut().doc.insert(0, Some(f), None, t);
+    h.state_mut().sel = vec![id];
+    h.state_mut().editing_text = Some(id);
+    h.state_mut().focus_text = true;
+    h.run_steps(3);
+    // Cmd K on selected characters opens the link field instead of quick actions.
+    select_chars(&mut h, 6, 10);
+    key(&mut h, Modifiers::COMMAND, Key::K);
+    assert!(h.state().quick.is_none());
+    assert_eq!(h.state().link_edit, Some((6, 10, String::new())));
+    h.event(Event::Text("example.com".into()));
+    key(&mut h, Modifiers::NONE, Key::Enter);
+    let n = h.state().doc.node(id).clone();
+    assert_eq!(n.text, "Visit site");
+    assert_eq!(crate::doc::link_at(&n.spans, 7), Some((6, 10, "https://example.com".into())));
+    assert!(crate::doc::link_at(&n.spans, 2).is_none());
+    // Exported as an <a> around the same run.
+    let svg = crate::export::to_svg(&h.state().doc, &[id]);
+    assert!(svg.contains(r##"<a href="https://example.com"><tspan fill="#0D99FF" text-decoration="underline">site</tspan></a>"##), "{svg}");
+    assert!(svg.contains(">Visit </tspan>"), "{svg}");
+    // The caret in the link shows it, with Remove.
+    select_chars(&mut h, 8, 8);
+    h.run_steps(2);
+    assert!(h.query_by_label("https://example.com").is_some());
+    // Clicking it in presentation opens it.
+    h.state_mut().editing_text = None;
+    h.state_mut().sel = vec![f];
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::Enter);
+    h.run_steps(2);
+    let painter = egui::Painter::new(h.ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+    let n = h.state().doc.node(id).clone();
+    let (g, _, _) = crate::text::layout(&painter, &n, 1.0, egui::Color32::BLACK);
+    let w = n.rect.min + crate::text::draw_offset(&n, g.rows.len()) + g.pos_from_cursor(egui::text::CCursor::new(8)).center().to_vec2();
+    assert_eq!(crate::text::link_at(&painter, &n, w).as_deref(), Some("https://example.com"));
+    let at = ps(&h, w.x, w.y);
+    move_to(&mut h, at, Modifiers::NONE);
+    press(&mut h, at, true, Modifiers::NONE);
+    // Released in a single frame, so its output is the one to read.
+    h.input_mut().events.push(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+    h.step();
+    let opened = h.output().platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::OpenUrl(u) if u.url == "https://example.com"));
+    assert!(opened, "{:?}", h.output().platform_output.commands);
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    // Remove takes it off again, in one undo step.
+    h.state_mut().editing_text = Some(id);
+    h.state_mut().focus_text = true;
+    h.run_steps(3);
+    select_chars(&mut h, 8, 8);
+    h.run_steps(2);
+    h.get_by_label("Remove link").click();
+    h.run_steps(2);
+    assert!(crate::doc::link_at(&h.state().doc.node(id).spans, 8).is_none());
+    assert!(h.state().doc.node(id).spans.is_empty());
+}
+
+#[test]
+fn paragraph_indent_moves_first_lines_in() {
+    use crate::doc::TextSizing;
+    let mut h = harness();
+    let mut n = Node::new(Kind::Text, r(0., 0., 10., 10.));
+    (n.text, n.font_size) = ("alpha beta gamma\nsecond".into(), 10.0);
+    let plain = h.state_mut().doc.insert(0, None, None, n.clone());
+    n.paragraph_indent = 20.0;
+    let id = h.state_mut().doc.insert(0, None, None, n.clone());
+    // Wrapped: only each paragraph's first row starts in.
+    n.text_sizing = TextSizing::AutoHeight;
+    n.rect = r(0., 100., 70., 10.);
+    let wrapped = h.state_mut().doc.insert(0, None, None, n);
+    h.run_steps(3);
+    let w = |id| h.state().doc.node(id).rect.width();
+    assert!((w(id) - w(plain) - 20.0).abs() < 0.5, "auto width grows by the indent: {} vs {}", w(id), w(plain));
+    let painter = egui::Painter::new(h.ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+    let t = h.state().doc.node(wrapped).clone();
+    let (g, _, _) = crate::text::layout(&painter, &t, 1.0, egui::Color32::BLACK);
+    let starts: Vec<f32> = g.rows.iter().map(|r| r.pos.x + r.glyphs[0].pos.x).collect();
+    assert!(starts.len() >= 3, "{:?}", t.lines);
+    assert!((starts[0] - 20.0).abs() < 0.5 && starts[1] < 1.0 && (starts.last().unwrap() - 20.0).abs() < 0.5, "{starts:?}");
+    let svg = crate::export::to_svg(&h.state().doc, &[id]);
+    assert_eq!(svg.matches(r#"x="20""#).count(), 2, "{svg}");
+}
+
+#[test]
+fn vertical_trim_fits_the_box_from_cap_height_to_baseline() {
+    use crate::doc::LineHeight;
+    use crate::text::CAP;
+    let mut h = harness();
+    let mut n = Node::new(Kind::Text, r(0., 0., 10., 10.));
+    (n.text, n.font_size, n.vertical_trim) = ("Hamburg".into(), 100.0, true);
+    let one = h.state_mut().doc.insert(0, None, None, n.clone());
+    (n.text, n.line_height) = ("Two\nlines".into(), LineHeight::Px(150.0));
+    n.rect = r(0., 300., 10., 10.);
+    let two = h.state_mut().doc.insert(0, None, None, n);
+    h.run_steps(3);
+    let height = |id| h.state().doc.node(id).rect.height();
+    assert!((height(one) - CAP * 100.0).abs() < 0.01, "{}", height(one));
+    assert!((height(two) - (150.0 + CAP * 100.0)).abs() < 0.01, "{}", height(two));
+    // The first baseline sits at the cap height from the top, in export too.
+    let svg = crate::export::to_svg(&h.state().doc, &[one]);
+    let y: f32 = svg.split(" y=\"").nth(1).unwrap().split('"').next().unwrap().parse().unwrap();
+    assert!((y - CAP * 100.0).abs() < 0.01, "{svg}");
+    let css = crate::codegen::css(&h.state().doc, one);
+    assert!(css.contains("text-box: trim-both cap alphabetic"), "{css}");
+    // Set from Typography's Type details popover.
+    h.state_mut().doc.node_mut(two).vertical_trim = false;
+    h.state_mut().sel = vec![two];
+    h.run_steps(2);
+    h.get_by_label("···").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Paragraph indent").is_some(), "popover open");
+    h.get_by_label_contains("Standard").click();
+    h.run_steps(2);
+    h.get_by_label("Cap height to baseline").click();
+    h.run_steps(2);
+    assert!(h.state().doc.node(two).vertical_trim);
+}
+
+#[test]
+fn copy_and_paste_properties_survive_egui_clipboard_events() {
+    use crate::app::TEST_CLIPBOARD;
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (40.0, 40.0));
+    let b = draw(&mut h, Key::R, (100.0, 0.0), (140.0, 40.0));
+    h.state_mut().doc.node_mut(a).opacity = 0.5;
+    h.state_mut().sel = vec![a];
+    // The windowing layer sends Alt Cmd C and Alt Cmd V as Copy and Paste, never as C and V keys.
+    let am = Modifiers::COMMAND | Modifiers::ALT;
+    clip_event(&mut h, am, Event::Copy);
+    assert!(h.state().style_clip.is_some(), "Alt Cmd C copies properties");
+    h.state_mut().sel = vec![b];
+    clip_event(&mut h, am, Event::Paste("some text".into()));
+    assert_eq!(h.state().doc.node(b).opacity, 0.5, "Alt Cmd V pastes properties");
+    assert_eq!(h.state().doc.nodes.len(), 2, "and doesn't paste the clipboard text");
+    let release = Event::Key { key: Key::V, physical_key: None, pressed: false, repeat: false, modifiers: am };
+    clip_event(&mut h, am, release.clone());
+    // With no text on the clipboard only the V key's release arrives.
+    h.state_mut().doc.node_mut(b).opacity = 1.0;
+    TEST_CLIPBOARD.with(|c| c.borrow_mut().1 = Some(image::RgbaImage::new(2, 2)));
+    clip_event(&mut h, am, release);
+    TEST_CLIPBOARD.with(|c| c.borrow_mut().1 = None);
+    assert_eq!(h.state().doc.node(b).opacity, 0.5);
+    assert_eq!(h.state().doc.nodes.len(), 2, "no image pasted");
+}

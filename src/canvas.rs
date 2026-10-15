@@ -260,10 +260,10 @@ impl App {
         let mut changed = false;
         for id in ids {
             let n = self.doc.node(id);
-            crate::text::ensure_font(&ctx, &n.font_family, n.font_weight);
+            crate::text::ensure_font(&ctx, &n.font_family, n.font_weight, n.italic);
             for sp in &n.spans {
                 let fam = sp.style.font_family.as_deref().unwrap_or(&n.font_family);
-                crate::text::ensure_font(&ctx, fam, sp.style.font_weight.unwrap_or(n.font_weight));
+                crate::text::ensure_font(&ctx, fam, sp.style.font_weight.unwrap_or(n.font_weight), sp.style.italic.unwrap_or(n.italic));
             }
             let key = text_key(&ctx, n);
             if self.text_keys.get(&id) == Some(&key) {
@@ -2048,21 +2048,21 @@ impl App {
             .fixed_pos(self.view.to_screen(local))
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut text)
-                        .id(egui::Id::new(TEXT_EDIT_ID))
-                        .layouter(&mut layouter)
-                        .frame(egui::Frame::NONE)
-                        .margin(egui::Margin::ZERO)
-                        .desired_width(width)
-                        .desired_rows(1),
-                )
+                egui::TextEdit::multiline(&mut text)
+                    .id(egui::Id::new(TEXT_EDIT_ID))
+                    .layouter(&mut layouter)
+                    .frame(egui::Frame::NONE)
+                    .margin(egui::Margin::ZERO)
+                    .desired_width(width)
+                    .desired_rows(1)
+                    .show(ui)
             })
             .inner;
         if self.focus_text {
-            out.request_focus();
+            out.response.request_focus();
             self.focus_text = false;
         }
+        self.link_popover(ui.ctx(), id, &out.galley, out.galley_pos);
         if text != n.text {
             let node = self.doc.node_mut(id);
             node.spans = crate::doc::shift_spans(&node.spans, &n.text, &text);
@@ -2073,6 +2073,58 @@ impl App {
             }
             node.text = text;
             self.dirty = true;
+        }
+    }
+
+    /// Cmd K while editing: a link field for the selected characters (showing their link, if any).
+    pub fn create_link(&mut self, ctx: &egui::Context) {
+        let (Some(id), Some((a, b))) = (self.editing_text, self.text_selection(ctx)) else { return };
+        let url = crate::doc::link_at(&self.doc.node(id).spans, a).map(|l| l.2).unwrap_or_default();
+        self.link_edit = Some((a, b, url));
+        self.focus_link = true;
+    }
+
+    /// Figma's link popover under the caret: the link there (open, edit, remove), or the field
+    /// for the link Cmd K is adding.
+    fn link_popover(&mut self, ctx: &egui::Context, id: NodeId, galley: &egui::Galley, origin: Pos2) {
+        let Some(caret) = egui::TextEdit::load_state(ctx, egui::Id::new(TEXT_EDIT_ID)).and_then(|s| s.cursor.char_range()).map(|r| r.primary.index) else { return };
+        let found = crate::doc::link_at(&self.doc.node(id).spans, caret.0);
+        let anchor = self.link_edit.as_ref().map(|e| e.0).or(found.as_ref().map(|l| l.0));
+        let Some(anchor) = anchor else { return };
+        let at = origin + galley.pos_from_cursor(egui::text::CCursor::new(anchor)).left_bottom().to_vec2() + vec2(0.0, 6.0);
+        let (mut apply, mut remove) = (None, None);
+        egui::Area::new(egui::Id::new("text-link")).fixed_pos(at).order(egui::Order::Foreground).show(ctx, |ui| {
+            crate::chrome::popover_frame(ui).inner_margin(8).show(ui, |ui| {
+                if let Some((a, b, url)) = &mut self.link_edit {
+                    let r = ui.add(egui::TextEdit::singleline(url).hint_text("Paste or type a link").desired_width(240.0));
+                    if std::mem::take(&mut self.focus_link) {
+                        r.request_focus();
+                    }
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        apply = Some((*a, *b, url.trim().to_string()));
+                    }
+                } else if let Some((a, b, url)) = &found {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Hyperlink::from_label_and_url(url.as_str(), url.as_str()).open_in_new_tab(true));
+                        if ui.small_button("Edit").clicked() {
+                            self.link_edit = Some((*a, *b, url.clone()));
+                            self.focus_link = true;
+                        }
+                        if ui.small_button("Remove link").clicked() {
+                            remove = Some((*a, *b));
+                        }
+                    });
+                }
+            });
+        });
+        // An empty field removes the link; a bare domain gets https, as in Figma.
+        let change = apply.map(|(a, b, url)| (a, b, if url.is_empty() || url.contains(':') { url } else { format!("https://{url}") })).or(remove.map(|(a, b)| (a, b, String::new())));
+        if let Some((a, b, url)) = change {
+            self.checkpoint();
+            let n = self.doc.node_mut(id);
+            n.spans = crate::doc::style_range(&n.spans, n.text.chars().count(), a, b, &crate::doc::SpanStyle { link: Some(url), ..Default::default() });
+            self.link_edit = None;
+            self.focus_text = true;
         }
     }
 
@@ -2123,6 +2175,98 @@ impl App {
         let n = self.doc.node_mut(id);
         let len = n.text.chars().count();
         n.spans = crate::doc::style_range(&n.spans, len, a, b, &patch);
+        true
+    }
+
+    /// Figma's text formatting shortcuts, while editing text or with text layers selected.
+    /// Returns whether one applied (the caller then drops the key's text and clipboard events).
+    pub fn text_shortcut(&mut self, ctx: &egui::Context, key: Key, m: egui::Modifiers, typing: bool) -> bool {
+        let Some(f) = text_fmt_key(key, m) else { return false };
+        // A panel field with focus keeps its keys; the canvas editor doesn't.
+        let editing = self.editing_text.is_some() && (!typing || ctx.memory(|mem| mem.has_focus(egui::Id::new(TEXT_EDIT_ID))));
+        let layers = !typing && self.sel.iter().any(|&i| self.doc.node(i).kind == Kind::Text);
+        (editing || layers) && self.format_text(ctx, f)
+    }
+
+    /// Apply a formatting command to the characters selected in the editor, else to the whole
+    /// edited or selected text layers. Toggles follow the first character or layer, as in Figma.
+    pub fn format_text(&mut self, ctx: &egui::Context, f: TextFmt) -> bool {
+        use crate::doc::{Decoration, LineHeight, SpanStyle};
+        let ids: Vec<NodeId> = match self.editing_text {
+            Some(id) => vec![id],
+            None => self.sel.iter().copied().filter(|&i| self.doc.node(i).kind == Kind::Text).collect(),
+        };
+        let Some(&first) = ids.first() else { return false };
+        let deco = |cur: Decoration, d: Decoration| if cur == d { Decoration::None } else { d };
+        if let (Some((a, b)), Some(id)) = (self.text_selection(ctx), self.editing_text) {
+            let n = self.doc.node(id);
+            let st = n.spans.iter().find(|sp| sp.start <= a && sp.end > a).map(|sp| sp.style.clone()).unwrap_or_default();
+            let family = st.font_family.clone().unwrap_or_else(|| n.font_family.clone());
+            let weight = st.font_weight.unwrap_or(n.font_weight);
+            let patch = match f {
+                TextFmt::Bold => Some(SpanStyle { font_weight: Some(bold_toggle(&family, weight)), ..Default::default() }),
+                TextFmt::Weight(d) => Some(SpanStyle { font_weight: Some(weight_step(&family, weight, d)), ..Default::default() }),
+                TextFmt::Italic => Some(SpanStyle { italic: Some(!st.italic.unwrap_or(n.italic)), ..Default::default() }),
+                TextFmt::Underline => Some(SpanStyle { decoration: Some(deco(st.decoration.unwrap_or(n.decoration), Decoration::Underline)), ..Default::default() }),
+                TextFmt::Strikethrough => Some(SpanStyle { decoration: Some(deco(st.decoration.unwrap_or(n.decoration), Decoration::Strikethrough)), ..Default::default() }),
+                TextFmt::Size(d) => Some(SpanStyle { font_size: Some((st.font_size.unwrap_or(n.font_size) + d).max(1.0)), ..Default::default() }),
+                // Alignment, letter spacing and line height belong to the whole layer here.
+                _ => None,
+            };
+            if let Some(p) = patch {
+                self.checkpoint();
+                let n = self.doc.node_mut(id);
+                n.spans = crate::doc::style_range(&n.spans, n.text.chars().count(), a, b, &p);
+                return true;
+            }
+        }
+        let n0 = self.doc.node(first).clone();
+        self.checkpoint();
+        for id in ids {
+            let n = self.doc.node_mut(id);
+            // Restyling a whole layer replaces that property's per-character overrides.
+            let clear = |n: &mut Node, f: fn(&mut SpanStyle)| {
+                n.spans.iter_mut().for_each(|sp| f(&mut sp.style));
+                n.spans.retain(|sp| !sp.style.is_empty());
+            };
+            match f {
+                TextFmt::Bold => {
+                    n.font_weight = bold_toggle(&n.font_family, if n0.font_weight >= 600 { 700 } else { 400 });
+                    clear(n, |s| s.font_weight = None);
+                }
+                TextFmt::Weight(d) => {
+                    n.font_weight = weight_step(&n.font_family, n.font_weight, d);
+                    clear(n, |s| s.font_weight = None);
+                }
+                TextFmt::Italic => {
+                    n.italic = !n0.italic;
+                    clear(n, |s| s.italic = None);
+                }
+                TextFmt::Underline | TextFmt::Strikethrough => {
+                    n.decoration = deco(n0.decoration, if f == TextFmt::Underline { Decoration::Underline } else { Decoration::Strikethrough });
+                    clear(n, |s| s.decoration = None);
+                }
+                TextFmt::Size(d) => {
+                    n.font_size = (n.font_size + d).max(1.0);
+                    for sp in &mut n.spans {
+                        sp.style.font_size = sp.style.font_size.map(|s| (s + d).max(1.0));
+                    }
+                }
+                TextFmt::Align(a) => n.text_align = a,
+                TextFmt::Letter(d) => n.letter_spacing += d,
+                TextFmt::Line(d) => {
+                    n.line_height = match n.line_height {
+                        LineHeight::Auto => LineHeight::Px((crate::text::line_pitch(n).round() + d).max(1.0)),
+                        LineHeight::Px(v) => LineHeight::Px((v + d).max(1.0)),
+                        LineHeight::Percent(p) => LineHeight::Percent((p + d).max(1.0)),
+                    }
+                }
+            }
+            // Changing a styled value by hand detaches the text style, like the panel.
+            if !matches!(f, TextFmt::Align(_)) {
+                n.text_style = None;
+            }
+        }
         true
     }
 
@@ -2371,15 +2515,102 @@ fn pill(painter: &Painter, at: Pos2, text: String, fill: Color32) {
     painter.galley(r.min + vec2(4.0, 2.0), g, Color32::WHITE);
 }
 
+/// A text formatting command (Figma's Text menu and its shortcuts).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TextFmt {
+    Bold,
+    Italic,
+    Underline,
+    Strikethrough,
+    Align(crate::doc::TextAlign),
+    /// Font size, in px.
+    Size(f32),
+    /// Steps through the family's installed weights.
+    Weight(i32),
+    /// Letter spacing, in percent.
+    Letter(f32),
+    /// Line height, in px (or percent when set as one).
+    Line(f32),
+}
+
+/// Figma's Text menu, in groups: command, label, shortcut. Also searchable in quick actions.
+pub const TEXT_MENU: &[&[(TextFmt, &str, &str)]] = {
+    use crate::doc::TextAlign;
+    &[
+        &[(TextFmt::Bold, "Bold", "⌘B"), (TextFmt::Italic, "Italic", "⌘I"), (TextFmt::Underline, "Underline", "⌘U"), (TextFmt::Strikethrough, "Strikethrough", "⇧⌘X")],
+        &[
+            (TextFmt::Align(TextAlign::Left), "Text align left", "⌥⌘L"),
+            (TextFmt::Align(TextAlign::Center), "Text align center", "⌥⌘T"),
+            (TextFmt::Align(TextAlign::Right), "Text align right", "⌥⌘R"),
+            (TextFmt::Align(TextAlign::Justify), "Text align justified", "⌥⌘J"),
+        ],
+        &[
+            (TextFmt::Size(1.0), "Increase font size", "⇧⌘>"),
+            (TextFmt::Size(-1.0), "Decrease font size", "⇧⌘<"),
+            (TextFmt::Weight(1), "Increase font weight", "⌥⌘>"),
+            (TextFmt::Weight(-1), "Decrease font weight", "⌥⌘<"),
+            (TextFmt::Letter(1.0), "Increase letter spacing", "⌥>"),
+            (TextFmt::Letter(-1.0), "Decrease letter spacing", "⌥<"),
+            (TextFmt::Line(1.0), "Increase line height", "⌥⇧>"),
+            (TextFmt::Line(-1.0), "Decrease line height", "⌥⇧<"),
+        ],
+    ]
+};
+
+/// Figma's text shortcuts. "<" and ">" are the comma and period keys.
+pub fn text_fmt_key(key: Key, m: egui::Modifiers) -> Option<TextFmt> {
+    use crate::doc::TextAlign;
+    if m.ctrl && !m.command {
+        return None;
+    }
+    Some(match (m.command, m.shift, m.alt, key) {
+        (true, false, false, Key::B) => TextFmt::Bold,
+        (true, false, false, Key::I) => TextFmt::Italic,
+        (true, false, false, Key::U) => TextFmt::Underline,
+        (true, true, false, Key::X) => TextFmt::Strikethrough,
+        (true, false, true, Key::L) => TextFmt::Align(TextAlign::Left),
+        (true, false, true, Key::T) => TextFmt::Align(TextAlign::Center),
+        (true, false, true, Key::R) => TextFmt::Align(TextAlign::Right),
+        (true, false, true, Key::J) => TextFmt::Align(TextAlign::Justify),
+        (true, true, false, Key::Period) => TextFmt::Size(1.0),
+        (true, true, false, Key::Comma) => TextFmt::Size(-1.0),
+        (true, false, true, Key::Period) => TextFmt::Weight(1),
+        (true, false, true, Key::Comma) => TextFmt::Weight(-1),
+        (false, false, true, Key::Period) => TextFmt::Letter(1.0),
+        (false, false, true, Key::Comma) => TextFmt::Letter(-1.0),
+        (false, true, true, Key::Period) => TextFmt::Line(1.0),
+        (false, true, true, Key::Comma) => TextFmt::Line(-1.0),
+        _ => return None,
+    })
+}
+
+/// The installed weight nearest `w`.
+fn nearest_weight(family: &str, w: u16) -> u16 {
+    crate::text::weights_for(family).into_iter().min_by_key(|x| (*x as i32 - w as i32).abs()).unwrap_or(w)
+}
+
+/// Cmd B: bold text goes back to regular, anything lighter to bold.
+fn bold_toggle(family: &str, w: u16) -> u16 {
+    nearest_weight(family, if w >= 600 { 400 } else { 700 })
+}
+
+/// The next installed weight up or down.
+fn weight_step(family: &str, w: u16, d: i32) -> u16 {
+    let ws = crate::text::weights_for(family);
+    let cur = nearest_weight(family, w);
+    let i = ws.iter().position(|x| *x == cur).unwrap_or(0) as i32;
+    ws.get((i + d).clamp(0, ws.len() as i32 - 1) as usize).copied().unwrap_or(w)
+}
+
 /// Everything that affects a text layer's measured size, hashed.
 fn text_key(ctx: &egui::Context, n: &Node) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::hash::DefaultHasher::new();
     n.text.hash(&mut h);
-    format!("{:?}", crate::text::font_family(ctx, &n.font_family, n.font_weight)).hash(&mut h);
-    (n.font_size.to_bits(), n.letter_spacing.to_bits(), n.text_sizing as u8, n.text_case as u8).hash(&mut h);
+    format!("{:?}", crate::text::font_family(ctx, &n.font_family, n.font_weight, n.italic)).hash(&mut h);
+    (n.font_size.to_bits(), n.letter_spacing.to_bits(), n.text_sizing as u8, n.text_case as u8, n.italic).hash(&mut h);
     format!("{:?}", n.line_height).hash(&mut h);
-    (n.truncate, n.max_lines, n.paragraph_spacing.to_bits()).hash(&mut h);
+    (n.truncate, n.max_lines, n.paragraph_spacing.to_bits(), n.paragraph_indent.to_bits(), n.vertical_trim).hash(&mut h);
     format!("{:?}", n.lists).hash(&mut h);
     if n.truncate && n.text_sizing == crate::doc::TextSizing::Fixed {
         n.rect.height().to_bits().hash(&mut h);

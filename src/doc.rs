@@ -532,6 +532,9 @@ pub struct SpanStyle {
     pub decoration: Option<Decoration>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub italic: Option<bool>,
+    /// A hyperlink (URL) on these characters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 impl SpanStyle {
@@ -544,6 +547,12 @@ impl SpanStyle {
             color: patch.color.or(self.color),
             decoration: patch.decoration.or(self.decoration),
             italic: patch.italic.or(self.italic),
+            // An empty link in a patch removes the link.
+            link: match &patch.link {
+                Some(l) if l.is_empty() => None,
+                Some(l) => Some(l.clone()),
+                None => self.link.clone(),
+            },
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -557,6 +566,23 @@ pub struct TextSpan {
     pub start: usize,
     pub end: usize,
     pub style: SpanStyle,
+}
+
+/// The link run around char `c`, joining neighboring spans with the same link: start, end, URL.
+/// A caret just after a link still counts as in it.
+pub fn link_at(spans: &[TextSpan], c: usize) -> Option<(usize, usize, String)> {
+    let linked = |sp: &&TextSpan| sp.style.link.is_some();
+    let sp = spans.iter().filter(linked).find(|sp| sp.start <= c && c < sp.end).or_else(|| spans.iter().filter(linked).find(|sp| sp.start < c && c == sp.end))?;
+    let url = sp.style.link.clone()?;
+    let same = |s: &TextSpan| s.style.link.as_ref() == Some(&url);
+    let (mut a, mut b) = (sp.start, sp.end);
+    while let Some(s) = spans.iter().find(|s| s.end == a && same(s)) {
+        a = s.start;
+    }
+    while let Some(s) = spans.iter().find(|s| s.start == b && same(s)) {
+        b = s.end;
+    }
+    Some((a, b, url))
 }
 
 /// Apply a style patch to chars [start, end), splitting and merging spans as needed.
@@ -646,6 +672,27 @@ pub fn replace_text(n: &mut Node, find: &str, with: &str) -> usize {
         n.text = next;
     }
     starts.len()
+}
+
+/// Use `to` wherever the document uses the font family `from`: text layers, their styled runs, and
+/// text styles. Weights and italics stay; they resolve to `to`'s nearest installed face.
+pub fn replace_font(doc: &mut Document, from: &str, to: &str) {
+    let ids: Vec<NodeId> = doc.nodes.values().filter(|n| n.kind == Kind::Text && (n.font_family == from || n.spans.iter().any(|sp| sp.style.font_family.as_deref() == Some(from)))).map(|n| n.id).collect();
+    for id in ids {
+        let n = doc.node_mut(id);
+        if n.font_family == from {
+            n.font_family = to.to_string();
+        }
+        for sp in n.spans.iter_mut().filter(|sp| sp.style.font_family.as_deref() == Some(from)) {
+            sp.style.font_family = Some(to.to_string());
+        }
+    }
+    for st in &mut doc.styles {
+        if let StyleValue::Text(t) = &mut st.value
+            && t.font_family == from {
+                t.font_family = to.to_string();
+            }
+    }
 }
 
 /// Paragraphs after an edit: list formatting follows its paragraph, and new
@@ -741,6 +788,8 @@ pub struct TextStyle {
     pub letter_spacing: f32,
     pub decoration: Decoration,
     pub text_case: TextCase,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub italic: bool,
 }
 
 impl TextStyle {
@@ -753,6 +802,7 @@ impl TextStyle {
             letter_spacing: n.letter_spacing,
             decoration: n.decoration,
             text_case: n.text_case,
+            italic: n.italic,
         }
     }
     pub fn apply(&self, n: &mut Node) {
@@ -763,6 +813,7 @@ impl TextStyle {
         n.letter_spacing = self.letter_spacing;
         n.decoration = self.decoration;
         n.text_case = self.text_case;
+        n.italic = self.italic;
     }
 }
 
@@ -1542,6 +1593,9 @@ pub struct Node {
     pub font_weight: u16,
     #[serde(skip_serializing_if = "dflt::font_family")]
     pub font_family: String,
+    /// The family's italic face (Figma's "Italic" font styles).
+    #[serde(skip_serializing_if = "dflt::italic")]
+    pub italic: bool,
     #[serde(skip_serializing_if = "dflt::text_sizing")]
     pub text_sizing: TextSizing,
     #[serde(skip_serializing_if = "dflt::text_align")]
@@ -1560,6 +1614,13 @@ pub struct Node {
     /// Extra space after each paragraph.
     #[serde(skip_serializing_if = "dflt::paragraph_spacing")]
     pub paragraph_spacing: f32,
+    /// How far each paragraph's first line starts in (Figma's paragraph indent).
+    #[serde(skip_serializing_if = "dflt::paragraph_indent")]
+    pub paragraph_indent: f32,
+    /// Figma's vertical trim "Cap height to baseline": the box starts at the first line's cap
+    /// height and ends at the last line's baseline (off is "Standard").
+    #[serde(skip_serializing_if = "dflt::vertical_trim")]
+    pub vertical_trim: bool,
     /// End overflowing text with an ellipsis.
     #[serde(skip_serializing_if = "dflt::truncate")]
     pub truncate: bool,
@@ -1648,6 +1709,7 @@ mod dflt {
         font_size: f32,
         font_weight: u16,
         font_family: String,
+        italic: bool,
         text_sizing: TextSizing,
         text_align: TextAlign,
         text_valign: VAlign,
@@ -1656,6 +1718,8 @@ mod dflt {
         decoration: Decoration,
         text_case: TextCase,
         paragraph_spacing: f32,
+        paragraph_indent: f32,
+        vertical_trim: bool,
         truncate: bool,
         max_lines: u32,
         spans: Vec<TextSpan>,
@@ -1734,6 +1798,7 @@ impl Default for Node {
             font_size: 12.0,
             font_weight: 400,
             font_family: "Inter".into(),
+            italic: false,
             text_sizing: TextSizing::AutoWidth,
             text_align: TextAlign::Left,
             text_valign: VAlign::Top,
@@ -1742,6 +1807,8 @@ impl Default for Node {
             decoration: Decoration::None,
             text_case: TextCase::Original,
             paragraph_spacing: 0.0,
+            paragraph_indent: 0.0,
+            vertical_trim: false,
             truncate: false,
             max_lines: 0,
             spans: vec![],
@@ -3681,8 +3748,8 @@ fn merge_from(e: &mut Node, src: &Node) {
     }
     take!(
         name, visible, opacity, fills, strokes, stroke_width, stroke_sides, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, min_size, max_size, constraints, absolute,
-        paths, even_odd, text, font_size, font_weight, font_family, text_sizing, text_align, text_valign, line_height, letter_spacing,
-        decoration, text_case, paragraph_spacing, truncate, max_lines, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, overflow, scroll_pos, fill_style,
+        paths, even_odd, text, font_size, font_weight, font_family, italic, text_sizing, text_align, text_valign, line_height, letter_spacing,
+        decoration, text_case, paragraph_spacing, paragraph_indent, vertical_trim, truncate, max_lines, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, overflow, scroll_pos, fill_style,
         stroke_style, text_style, effect_style, prop_bind, is_mask, blend, bindings, modes, spans, lists
     );
     e.synced = Some(Box::new(Node { children: vec![], synced: None, ..src.clone() }));

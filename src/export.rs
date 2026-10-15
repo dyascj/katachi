@@ -419,6 +419,9 @@ impl Svg<'_> {
                         n.font_size,
                         n.font_weight
                     );
+                    if n.italic {
+                        attrs.push_str(r#" font-style="italic""#);
+                    }
                     if n.letter_spacing != 0.0 {
                         let _ = write!(attrs, r#" letter-spacing="{}""#, n.letter_spacing / 100.0 * n.font_size);
                     }
@@ -441,7 +444,9 @@ impl Svg<'_> {
                     for (i, line) in lines.iter().enumerate() {
                         let y = top + n.font_size * crate::text::ASCENT + pitch * i as f32 + n.paragraph_spacing * para as f32;
                         let indent = crate::text::list_indent(n, para);
-                        let lx = if anchor == "start" { x + indent } else { x };
+                        // Paragraph indent: the first line starts further in (its row is that much wider when centered).
+                        let pin = if first { n.paragraph_indent * if anchor == "start" { 1.0 } else if anchor == "middle" { 0.5 } else { 0.0 } } else { 0.0 };
+                        let lx = if anchor == "start" { x + indent + pin } else { x + pin };
                         if first && let Some(m) = markers.get(para).filter(|m| !m.is_empty()) {
                             let _ = write!(self.out, r#"<tspan x="{}" y="{y}">{}</tspan>"#, r.min.x + indent - n.font_size * 1.2, esc(m));
                         }
@@ -461,10 +466,18 @@ impl Svg<'_> {
                         }
                         cuts.sort();
                         cuts.dedup();
+                        // Justified lines (all but a paragraph's last) stretch their spaces to the box.
+                        // ponytail: only lines in one style run; mixed runs stay ragged in export.
+                        let justify = n.text_align == TextAlign::Justify && n.text_sizing != crate::doc::TextSizing::AutoWidth && !first && i + 1 < lines.len() && cuts.len() == 2;
                         for (k, w) in cuts.windows(2).enumerate() {
-                            let text: String = body[w[0]..w[1]].iter().collect();
+                            let mut text: String = body[w[0]..w[1]].iter().collect();
                             let (a, b) = (offset + w[0], offset + w[1]);
                             let mut style = String::new();
+                            let mut href = None;
+                            if justify {
+                                text.truncate(text.trim_end().len());
+                                let _ = write!(style, r#" textLength="{}" lengthAdjust="spacing""#, r.width() - indent - pin);
+                            }
                             if let Some(sp) = n.spans.iter().find(|sp| sp.start <= a && sp.end >= b) {
                                 let st = &sp.style;
                                 if let Some(w) = st.font_weight {
@@ -479,18 +492,33 @@ impl Svg<'_> {
                                 if let Some(c) = st.color {
                                     let (c, a) = color_parts(c);
                                     let _ = write!(style, r#" fill="{c}" fill-opacity="{a:.3}""#);
+                                } else if st.link.is_some() {
+                                    let l = crate::text::LINK;
+                                    let (c, _) = color_parts(Rgba::rgb(l.r(), l.g(), l.b()));
+                                    let _ = write!(style, r#" fill="{c}""#);
                                 }
-                                if st.italic == Some(true) {
-                                    style.push_str(r#" font-style="italic""#);
+                                href = st.link.clone();
+                                match st.italic {
+                                    Some(true) => style.push_str(r#" font-style="italic""#),
+                                    Some(false) if n.italic => style.push_str(r#" font-style="normal""#),
+                                    _ => {}
                                 }
-                                match st.decoration {
-                                    Some(Decoration::Underline) => style.push_str(r#" text-decoration="underline""#),
-                                    Some(Decoration::Strikethrough) => style.push_str(r#" text-decoration="line-through""#),
+                                // Links are underlined, as on the canvas.
+                                match (st.decoration, href.is_some()) {
+                                    (Some(Decoration::Strikethrough), true) => style.push_str(r#" text-decoration="underline line-through""#),
+                                    (Some(Decoration::Underline), _) | (_, true) => style.push_str(r#" text-decoration="underline""#),
+                                    (Some(Decoration::Strikethrough), false) => style.push_str(r#" text-decoration="line-through""#),
                                     _ => {}
                                 }
                             }
                             let pos = if k == 0 { format!(r#" x="{lx}" y="{y}""#) } else { String::new() };
-                            let _ = write!(self.out, r#"<tspan{pos}{style}>{}</tspan>"#, esc(&text));
+                            let run = format!(r#"<tspan{pos}{style}>{}</tspan>"#, esc(&text));
+                            match href {
+                                Some(url) => {
+                                    let _ = write!(self.out, r#"<a href="{}">{run}</a>"#, esc(&url));
+                                }
+                                None => self.out.push_str(&run),
+                            }
                         }
                         offset += line.chars().count();
                     }
@@ -758,7 +786,7 @@ fn encode_with(doc: &Document, svg: &str, format: crate::doc::ExportFormat, scal
         }
         ExportFormat::Pdf => {
             let mut opt = svg2pdf::usvg::Options::default();
-            if doc.nodes.values().any(|n| n.kind == Kind::Text && n.font_family != "Inter") {
+            if needs_system_fonts(doc) {
                 opt.fontdb_mut().load_system_fonts();
             }
             for f in FONTS {
@@ -770,11 +798,19 @@ fn encode_with(doc: &Document, svg: &str, format: crate::doc::ExportFormat, scal
     }
 }
 
+/// System fonts only when text uses one (or an italic, which Inter isn't bundled in); Inter is
+/// always bundled. usvg then picks the same faces the canvas does: both query fontdb by family,
+/// weight and style.
+/// ponytail: a family without an italic face exports upright, where the canvas slants it.
+fn needs_system_fonts(doc: &Document) -> bool {
+    doc.nodes.values().any(|n| {
+        n.kind == Kind::Text && (n.font_family != "Inter" || n.italic || n.spans.iter().any(|s| s.style.font_family.is_some() || s.style.italic == Some(true)))
+    })
+}
+
 pub fn svg_to_png(doc: &Document, svg: &str, scale: f32) -> Result<Vec<u8>, String> {
     let mut opt = resvg::usvg::Options::default();
-    // System fonts only when a layer uses one; Inter is always bundled.
-    let needs_system = doc.nodes.values().any(|n| n.kind == Kind::Text && n.font_family != "Inter");
-    if needs_system {
+    if needs_system_fonts(doc) {
         opt.fontdb = std::sync::Arc::new(crate::text::system_fonts().clone());
     }
     for f in FONTS {

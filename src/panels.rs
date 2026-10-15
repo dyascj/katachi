@@ -1145,6 +1145,33 @@ impl App {
                 ui.close();
             }
         });
+        ui.menu_button("Text", |ui| {
+            let text = self.editing_text.is_some() || self.sel.iter().any(|&i| self.doc.node(i).kind == Kind::Text);
+            for group in crate::canvas::TEXT_MENU {
+                for &(f, label, short) in *group {
+                    if enabled(ui, text, label, short) {
+                        self.format_text(&ctx, f);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+            }
+            for (kind, label, short) in [(crate::doc::ListKind::Bullet, "Bulleted list", "⇧⌘8"), (crate::doc::ListKind::Number, "Numbered list", "⇧⌘7")] {
+                if enabled(ui, text, label, short) {
+                    self.toggle_list(&ctx, kind);
+                    ui.close();
+                }
+            }
+            if enabled(ui, self.text_selection(&ctx).is_some(), "Create link", "⌘K") {
+                self.create_link(&ctx);
+                ui.close();
+            }
+            ui.separator();
+            if item(ui, "Replace fonts…", "") {
+                self.open_replace_fonts();
+                ui.close();
+            }
+        });
         ui.menu_button("Arrange", |ui| {
             for (order, label, short) in [(crate::doc::Order::Front, "Bring to front", "⌥⌘]"), (crate::doc::Order::Forward, "Bring forward", "⌘]"), (crate::doc::Order::Backward, "Send backward", "⌘["), (crate::doc::Order::Back, "Send to back", "⌥⌘[")] {
                 if enabled(ui, has, label, short) {
@@ -1715,6 +1742,56 @@ impl App {
             }
         } else if open && !cancel {
             self.batch_rename = Some(b);
+        }
+    }
+
+    pub fn open_replace_fonts(&mut self) {
+        self.replace_fonts = Some(crate::text::missing_fonts(&self.doc).into_iter().map(|(f, _)| (f, "Inter".to_string())).collect());
+    }
+
+    /// Figma's Replace fonts: each missing family gets an installed one, across the document.
+    pub fn replace_fonts_window(&mut self, ctx: &egui::Context) {
+        let Some(mut picks) = self.replace_fonts.take() else { return };
+        let missing = crate::text::missing_fonts(&self.doc);
+        let (mut open, mut apply) = (true, false);
+        crate::chrome::window(ctx, "Replace fonts", &mut open, 340.0, |ui| {
+            let muted = theme::muted(ui.ctx());
+            if picks.is_empty() {
+                ui.label(RichText::new("Every font in this file is installed.").color(muted));
+                return;
+            }
+            ui.label(RichText::new("These fonts aren't installed. Pick a replacement for each.").color(muted));
+            ui.add_space(6.0);
+            for (i, (from, to)) in picks.iter_mut().enumerate() {
+                let styles = missing.iter().find(|m| m.0 == *from).map_or(String::new(), |m| m.1.iter().map(|&(w, it)| crate::text::style_name(w, it)).collect::<Vec<_>>().join(", "));
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(150.0);
+                        ui.label(RichText::new(from.as_str()).italics().strikethrough());
+                        ui.label(RichText::new(styles).small().color(muted));
+                    });
+                    egui::ComboBox::from_id_salt(("replace-font", i)).width(150.0).selected_text(to.as_str()).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+                        for f in crate::text::families() {
+                            ui.selectable_value(to, f.clone(), f);
+                        }
+                    });
+                });
+            }
+            ui.add_space(6.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), 26.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                apply = ui.add(egui::Button::new(RichText::new("Replace fonts").color(Color32::WHITE)).fill(BLUE).corner_radius(6)).clicked();
+            });
+        });
+        if apply {
+            // One undo step for the whole replacement.
+            self.checkpoint();
+            for (from, to) in &picks {
+                crate::doc::replace_font(&mut self.doc, from, to);
+            }
+            self.doc.reflow();
+            self.toast(format!("Replaced {} font{}", picks.len(), if picks.len() == 1 { "" } else { "s" }));
+        } else if open {
+            self.replace_fonts = Some(picks);
         }
     }
 
@@ -2437,7 +2514,7 @@ impl App {
                 }
             }
             if dn.kind == Kind::Text {
-                let t = format!("{} {} · {}px", dn.font_family, crate::text::weight_name(dn.font_weight), num(dn.font_size));
+                let t = format!("{} {} · {}px", dn.font_family, crate::text::style_name(dn.font_weight, dn.italic), num(dn.font_size));
                 if !type_styles.contains(&t) {
                     type_styles.push(t);
                 }
@@ -2464,6 +2541,22 @@ impl App {
             heading(ui, "Typography");
             for t in type_styles {
                 ui.label(t);
+            }
+        }
+        // Text links, clickable.
+        let links: Vec<(String, String)> = ids
+            .iter()
+            .flat_map(|&d| {
+                let dn = self.doc.node(d);
+                let chars: Vec<char> = dn.text.chars().collect();
+                dn.spans.iter().filter_map(move |sp| Some((chars[sp.start.min(chars.len())..sp.end.min(chars.len())].iter().collect(), sp.style.link.clone()?))).collect::<Vec<_>>()
+            })
+            .collect();
+        if !links.is_empty() {
+            ui.separator();
+            heading(ui, "Links");
+            for (text, url) in links {
+                ui.add(egui::Hyperlink::from_label_and_url(text, &url).open_in_new_tab(true)).on_hover_text(url);
             }
         }
         ui.separator();
@@ -3459,7 +3552,7 @@ impl App {
 
     fn typography_section(&mut self, ui: &mut Ui, n: &crate::doc::Node) {
         use crate::doc::{Decoration, LineHeight, TextAlign, TextCase, TextSizing, VAlign};
-        use crate::text::{families, weight_name, weights_for};
+        use crate::text::{families, style_name, styles_for};
         let mut pick = None;
         ui.horizontal(|ui| {
             ui.label(RichText::new("Typography").strong());
@@ -3504,7 +3597,20 @@ impl App {
         let mut t = n.clone();
         // Font family picker with search.
         let fam_id = ui.id().with("font-search");
-        let resp = ui.add_sized([ui.available_width(), 24.0], egui::Button::new(&t.font_family));
+        // A missing font reads struck through in italics, with a way to replace it (Figma).
+        let missing = std::iter::once(&n.font_family).chain(n.spans.iter().filter_map(|sp| sp.style.font_family.as_ref())).any(|f| !crate::text::installed(f));
+        let label = if crate::text::installed(&t.font_family) { RichText::new(&t.font_family) } else { RichText::new(&t.font_family).italics().strikethrough() };
+        let resp = ui.add_sized([ui.available_width(), 24.0], egui::Button::new(label));
+        if missing {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Missing fonts").small().color(Color32::from_rgb(0xF2, 0x48, 0x22)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Replace fonts…").clicked() {
+                        self.open_replace_fonts();
+                    }
+                });
+            });
+        }
         // Each opening starts with an empty, focused search, as in Figma.
         if resp.clicked() {
             ui.data_mut(|d| d.insert_temp(fam_id, String::new()));
@@ -3523,9 +3629,12 @@ impl App {
                     let current = *f == t.font_family;
                     if ui.add(egui::Button::new(format!("{}{f}", if current { "✓  " } else { "     " })).frame(false)).clicked() {
                         t.font_family = f.clone();
-                        let ws = weights_for(f);
-                        if !ws.contains(&t.font_weight) {
-                            t.font_weight = *ws.iter().min_by_key(|w| (**w as i32 - 400).abs()).unwrap_or(&400);
+                        // Keep the style if the new family has it, else its nearest, upright if need be.
+                        let ss = styles_for(f);
+                        if !ss.contains(&(t.font_weight, t.italic)) {
+                            let italic = t.italic && ss.iter().any(|s| s.1);
+                            let near = ss.iter().filter(|s| s.1 == italic).min_by_key(|s| (s.0 as i32 - t.font_weight as i32).abs());
+                            (t.font_weight, t.italic) = near.copied().unwrap_or((400, false));
                         }
                         ui.close();
                     }
@@ -3533,9 +3642,12 @@ impl App {
             });
         });
         ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("weight").width(half(ui) - 12.0).selected_text(weight_name(t.font_weight)).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
-                for w in weights_for(&t.font_family) {
-                    ui.selectable_value(&mut t.font_weight, w, weight_name(w));
+            // Font styles as Figma lists them: each weight, then its italic.
+            egui::ComboBox::from_id_salt("weight").width(half(ui) - 12.0).selected_text(style_name(t.font_weight, t.italic)).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+                for (w, i) in styles_for(&t.font_family) {
+                    if ui.selectable_label((t.font_weight, t.italic) == (w, i), style_name(w, i)).clicked() {
+                        (t.font_weight, t.italic) = (w, i);
+                    }
                 }
             });
             num_field(ui, &mut t.font_size, "", 1.0, half(ui));
@@ -3577,8 +3689,13 @@ impl App {
         });
         // Alignment and resizing.
         ui.horizontal(|ui| {
-            for (a, icon) in [(TextAlign::Left, Icon::Align(Align::Left)), (TextAlign::Center, Icon::Align(Align::HCenter)), (TextAlign::Right, Icon::Align(Align::Right))] {
-                if icon_button(ui, icon, t.text_align == a, 24.0, &format!("Align {a:?}")).clicked() {
+            for (a, icon, tip) in [
+                (TextAlign::Left, Icon::Align(Align::Left), "Align left  ⌥⌘L"),
+                (TextAlign::Center, Icon::Align(Align::HCenter), "Align center  ⌥⌘T"),
+                (TextAlign::Right, Icon::Align(Align::Right), "Align right  ⌥⌘R"),
+                (TextAlign::Justify, Icon::Menu, "Justify  ⌥⌘J"),
+            ] {
+                if icon_button(ui, icon, t.text_align == a, 24.0, tip).clicked() {
                     t.text_align = a;
                 }
             }
@@ -3617,21 +3734,37 @@ impl App {
             });
         });
         ui.horizontal(|ui| {
-            if ui.selectable_label(false, RichText::new(" I ").italics()).on_hover_text("Italic (selected characters)").clicked() {
-                let on = self
-                    .text_selection(ui.ctx())
-                    .and_then(|(a, _)| n.spans.iter().find(|sp| sp.start <= a && sp.end > a))
-                    .and_then(|sp| sp.style.italic)
-                    .unwrap_or(false);
-                self.style_selection(ui.ctx(), crate::doc::SpanStyle { italic: Some(!on), ..Default::default() });
+            if ui.selectable_label(n.italic, RichText::new(" I ").italics()).on_hover_text(crate::chrome::keys("Italic  ⌘I")).clicked() {
+                self.format_text(ui.ctx(), crate::canvas::TextFmt::Italic);
+                return;
             }
-            for (d, label) in [(Decoration::Underline, RichText::new(" U ").underline()), (Decoration::Strikethrough, RichText::new(" S ").strikethrough())] {
+            for (d, label, tip) in [(Decoration::Underline, RichText::new(" U ").underline(), "Underline  ⌘U"), (Decoration::Strikethrough, RichText::new(" S ").strikethrough(), "Strikethrough  ⇧⌘X")] {
                 let on = t.decoration == d;
-                if ui.selectable_label(on, label).on_hover_text(format!("{d:?}")).clicked() {
+                if ui.selectable_label(on, label).on_hover_text(crate::chrome::keys(tip)).clicked() {
                     t.decoration = if on { Decoration::None } else { d };
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Figma's type details: the paragraph settings that don't fit the main rows.
+                let more = ui.button("···").on_hover_text("Type details");
+                crate::chrome::popover(&more, ui.id().with("type-details"), "Type details", 220.0, |ui| {
+                    let row = |ui: &mut Ui, label: &str, add: &mut dyn FnMut(&mut Ui)| {
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| add(ui));
+                        });
+                    };
+                    row(ui, "Paragraph indent", &mut |ui| {
+                        num_field(ui, &mut t.paragraph_indent, "", 0.0, 64.0);
+                    });
+                    row(ui, "Vertical trim", &mut |ui| {
+                        let shown = if t.vertical_trim { "Cap height to baseline" } else { "Standard" };
+                        dropdown(ui, shown, |ui| {
+                            ui.selectable_value(&mut t.vertical_trim, false, "Standard");
+                            ui.selectable_value(&mut t.vertical_trim, true, "Cap height to baseline");
+                        });
+                    });
+                });
                 num_field(ui, &mut t.paragraph_spacing, "¶", 0.0, 64.0);
             });
         });
@@ -3652,6 +3785,7 @@ impl App {
         });
         let changed = t.font_family != n.font_family
             || t.font_weight != n.font_weight
+            || t.italic != n.italic
             || t.font_size != n.font_size
             || t.line_height != n.line_height
             || t.letter_spacing != n.letter_spacing
@@ -3662,12 +3796,15 @@ impl App {
             || t.text_case != n.text_case
             || t.truncate != n.truncate
             || t.paragraph_spacing != n.paragraph_spacing
+            || t.paragraph_indent != n.paragraph_indent
+            || t.vertical_trim != n.vertical_trim
             || t.max_lines != n.max_lines;
         // With characters selected in the editor, changes style just that range (rich text).
         if changed && self.text_selection(ui.ctx()).is_some() {
             let patch = crate::doc::SpanStyle {
                 font_family: (t.font_family != n.font_family).then(|| t.font_family.clone()),
                 font_weight: (t.font_weight != n.font_weight).then_some(t.font_weight),
+                italic: (t.italic != n.italic).then_some(t.italic),
                 font_size: (t.font_size != n.font_size).then_some(t.font_size),
                 decoration: (t.decoration != n.decoration).then_some(t.decoration),
                 ..Default::default()
@@ -3685,6 +3822,7 @@ impl App {
                 d.text_style = None;
                 d.font_family = t.font_family.clone();
                 d.font_weight = t.font_weight;
+                d.italic = t.italic;
                 d.font_size = t.font_size;
                 d.line_height = t.line_height;
                 d.letter_spacing = t.letter_spacing;
@@ -3695,6 +3833,8 @@ impl App {
                 d.text_case = t.text_case;
                 d.truncate = t.truncate;
                 d.paragraph_spacing = t.paragraph_spacing.max(0.0);
+                d.paragraph_indent = t.paragraph_indent.max(0.0);
+                d.vertical_trim = t.vertical_trim;
                 d.max_lines = t.max_lines;
             }
         }
