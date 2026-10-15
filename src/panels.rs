@@ -710,6 +710,9 @@ impl App {
                 self.assets(ui);
                 return;
             }
+            if self.dev_mode {
+                self.ready_list(ui);
+            }
             self.pages_list(ui);
             ui.separator();
             ui.horizontal(|ui| {
@@ -741,6 +744,29 @@ impl App {
             let out = area.show_rows(ui, row_h, rows.len(), |ui, range| self.layers(ui, &rows, range));
             ui.data_mut(|d| d.insert_temp(view_key, (out.state.offset.y, out.inner_rect.height())));
         });
+    }
+
+    /// Dev Mode's "Ready for dev" list: frames and sections marked ready, on every page. A click
+    /// goes to one.
+    fn ready_list(&mut self, ui: &mut Ui) {
+        let mut ready: Vec<(usize, NodeId, String)> = self.doc.nodes.values().filter(|n| n.ready).map(|n| (self.doc.page_of(n.id), n.id, n.name.clone())).collect();
+        ready.sort_by(|a, b| (a.0, &a.2).cmp(&(b.0, &b.2)));
+        ui.label(RichText::new(format!("Ready for dev ({})", ready.len())).strong());
+        if ready.is_empty() {
+            ui.label(RichText::new("Mark frames ready from the canvas menu.").small().color(theme::muted(ui.ctx())));
+        }
+        for (page, id, name) in ready {
+            let green = Color32::from_rgb(0x14, 0xAE, 0x5C);
+            let text = format!("{name}  ·  {}", self.doc.pages[page].name);
+            if ui.add(egui::Button::selectable(self.sel.contains(&id), RichText::new(text).color(green))).clicked() {
+                if page != self.page {
+                    self.select_page(page);
+                }
+                self.sel = vec![id];
+                self.zoom_target = Some(id);
+            }
+        }
+        ui.separator();
     }
 
     /// Assets tab: every main component in the file. Drag one onto the canvas to place an instance.
@@ -2488,13 +2514,34 @@ impl App {
         let n = self.doc.node(id).clone();
         ui.label(RichText::new(&n.name).strong().size(14.0));
         ui.label(RichText::new(format!("{}  ·  {} × {}", n.kind.label(), num(n.rect.width()), num(n.rect.height()))).color(theme::muted(ui.ctx())));
+        // A component's (or an instance's main's) description, as Dev Mode shows it.
+        let main = match n.kind {
+            Kind::Component | Kind::ComponentSet => Some(id),
+            Kind::Instance => n.component.filter(|c| self.doc.nodes.contains_key(c)),
+            _ => None,
+        };
+        if let Some(desc) = main.map(|c| self.doc.description_of(c).to_string()).filter(|d| !d.is_empty()) {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.label(RichText::new(desc).color(theme::muted(ui.ctx())));
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+        }
+        if n.kind.is_frame() && n.kind != Kind::Instance {
+            let green = Color32::from_rgb(0x14, 0xAE, 0x5C);
+            let (label, fill) = if n.ready { ("Ready for dev", green) } else { ("Mark as ready for dev", theme::subtle(ui.ctx())) };
+            let text = if n.ready { RichText::new(label).color(Color32::WHITE) } else { RichText::new(label) };
+            if ui.add_sized([ui.available_width(), 24.0], egui::Button::new(text).fill(fill)).on_hover_text(if n.ready { "Click to mark as changed" } else { "" }).clicked() {
+                self.toggle_ready_for_dev();
+            }
+        }
         ui.separator();
         ui.horizontal(|ui| {
             ui.label(RichText::new("Code").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                for (lang, label) in [(Lang::Compose, "Compose"), (Lang::SwiftUi, "SwiftUI"), (Lang::Css, "CSS")] {
-                    ui.selectable_value(&mut self.code_lang, lang, label);
-                }
+                egui::ComboBox::from_id_salt("code-lang").selected_text(self.code_lang.label()).width(90.0).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+                    for lang in Lang::ALL {
+                        ui.selectable_value(&mut self.code_lang, lang, lang.label());
+                    }
+                });
             });
         });
         let code = generate(&self.doc, id, self.code_lang);
@@ -2548,8 +2595,39 @@ impl App {
                 ui.label(t);
             }
         }
+        self.annotations_section(ui, id);
         ui.separator();
         self.export_props(ui);
+    }
+
+    /// Dev Mode annotations on a layer: notes that label it on the canvas.
+    fn annotations_section(&mut self, ui: &mut Ui, id: NodeId) {
+        ui.separator();
+        let mut notes = self.doc.node(id).annotations.clone();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Annotations").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icon_button(ui, Icon::Plus, false, 22.0, "Add annotation").clicked() {
+                    notes.push("Note".into());
+                }
+            });
+        });
+        let mut remove = None;
+        for (i, note) in notes.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::multiline(note).desired_rows(1).desired_width(ui.available_width() - 28.0));
+                if icon_button(ui, Icon::Minus, false, 22.0, "Remove annotation").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            notes.remove(i);
+        }
+        if notes != self.doc.node(id).annotations {
+            self.begin_edit();
+            self.doc.node_mut(id).annotations = notes;
+        }
     }
 
     fn page_props(&mut self, ui: &mut Ui) {

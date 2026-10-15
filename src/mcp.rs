@@ -197,7 +197,7 @@ fn tools() -> Vec<Value> {
         tool("get_metadata", "Outline of the current page (or one layer): ids, types, names, positions, sizes, and text, as XML.", json!({ "node_id": node }), &[]),
         tool("get_selection", "The selected layers' ids, types, and names.", json!({}), &[]),
         tool("get_screenshot", "A PNG of a layer, the selection, or the page.", json!({ "node_id": node, "scale": { "type": "number", "description": "Pixel density, default 1" } }), &[]),
-        tool("get_code", "Code for a layer and its children: CSS (default), SwiftUI, or Jetpack Compose.", json!({ "node_id": node, "language": { "type": "string", "enum": ["css", "swiftui", "compose"] } }), &[]),
+        tool("get_code", "Code for a layer and its children: CSS (default), Tailwind, SwiftUI, or Jetpack Compose.", json!({ "node_id": node, "language": { "type": "string", "enum": ["css", "tailwind", "swiftui", "compose"] } }), &[]),
         tool("get_variable_defs", "Variable collections, modes, and values, plus color, text, and effect styles.", json!({}), &[]),
         tool("get_components", "Main components and component sets with their properties and variants.", json!({}), &[]),
         tool(

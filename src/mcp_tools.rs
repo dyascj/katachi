@@ -147,6 +147,7 @@ impl App {
                 let lang = match args["language"].as_str() {
                     Some("swiftui") => crate::codegen::Lang::SwiftUi,
                     Some("compose") => crate::codegen::Lang::Compose,
+                    Some("tailwind") => crate::codegen::Lang::Tailwind,
                     _ => crate::codegen::Lang::Css,
                 };
                 let mut out = String::new();

@@ -2904,3 +2904,36 @@ fn plugin_preferred_swap_values_round_trip() {
     let c = out["pages"][0]["children"].as_array().unwrap().iter().find(|n| n["name"] == "Card").unwrap().clone();
     assert_eq!(c["componentPropertyDefinitions"]["Icon"]["preferredValues"][0]["key"], id("Heart").to_string());
 }
+
+#[test]
+fn dev_mode_ready_for_dev_annotations_and_spacing() {
+    let mut h = harness();
+    let f = draw(&mut h, Key::F, (0.0, 0.0), (300.0, 120.0));
+    for x in [20.0, 120.0] {
+        h.state_mut().doc.insert(0, Some(f), None, Node::new(Kind::Rectangle, r(x, 20., 60., 60.)));
+    }
+    h.state_mut().sel = vec![f];
+    h.state_mut().add_auto_layout();
+    h.state_mut().dev_mode = true;
+    h.run_steps(2);
+    h.get_by_label("Mark as ready for dev").click();
+    h.run_steps(2);
+    assert!(h.state().doc.node(f).ready);
+    assert!(h.query_by_label("Ready for dev (1)").is_some(), "listed in Dev Mode's left panel");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert!(!h.state().doc.node(f).ready, "undoable");
+    // Annotations: add one from the panel; it's stored on the layer.
+    h.get_by_label("Add annotation").click();
+    h.run_steps(2);
+    assert_eq!(h.state().doc.node(f).annotations, ["Note"]);
+    // Padding and the gap between the two children, as hovering shows them.
+    let n = h.state().doc.node(f).clone();
+    let bands = crate::canvas::spacing_bands(&h.state().doc, f);
+    let pads = n.layout.padding.iter().filter(|p| **p > 0.0).count();
+    assert_eq!(bands.len(), pads + 1, "{bands:?}");
+    assert_eq!(bands.last().unwrap().1, n.layout.gap);
+    // Hovering it in Dev Mode draws them (and the annotation) without trouble.
+    let c = s(&h, n.rect.center().x, n.rect.min.y + 2.0);
+    move_to(&mut h, c, Modifiers::NONE);
+    h.run_steps(2);
+}

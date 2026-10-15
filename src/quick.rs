@@ -80,6 +80,7 @@ const COMMANDS: &[(&str, &str, Run)] = &[
     ("Layout guides", "⌃G", |a, _| a.show_grids = !a.show_grids),
     ("Hide UI", "⌘\\", |a, _| a.ui_hidden = !a.ui_hidden),
     ("Dev Mode", "⇧D", |a, _| a.dev_mode = !a.dev_mode),
+    ("Mark as ready for dev", "", |a, _| a.toggle_ready_for_dev()),
     ("Present", "⌥⌘↵", |a, c| a.present(c.input(|i| i.time))),
     ("Comments", "⇧C", |a, _| a.show_comments = !a.show_comments),
     ("Local variables", "", |a, _| a.show_variables = true),

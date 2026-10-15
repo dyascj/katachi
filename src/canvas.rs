@@ -169,6 +169,12 @@ impl App {
         if (mods.alt || self.dev_mode) && self.drag.is_none() {
             self.draw_measurements(&painter);
         }
+        if self.dev_mode {
+            if let Some(h) = self.hover.filter(|h| self.doc.nodes.contains_key(h)) {
+                self.draw_layout_spacing(&painter, h);
+            }
+            self.draw_annotations(&painter);
+        }
         self.draw_guides(&painter, rect);
         if self.rulers {
             self.draw_rulers(&painter, rect);
@@ -1547,6 +1553,36 @@ impl App {
         }
     }
 
+    /// Dev Mode, hovering an auto layout frame: its padding and the gaps between children, shaded
+    /// pink with their sizes, as Figma shows them.
+    fn draw_layout_spacing(&self, painter: &Painter, id: NodeId) {
+        for (band, size) in spacing_bands(&self.doc, id) {
+            let sr = self.view.rect_to_screen(band);
+            painter.rect_filled(sr, 0.0, GAP.gamma_multiply(0.2));
+            painter.rect_stroke(sr, 0.0, Stroke::new(1.0, GAP.gamma_multiply(0.6)), StrokeKind::Inside);
+            pill(painter, sr.center(), num(size), GAP);
+        }
+    }
+
+    /// Dev Mode annotations: each note as a label to the right of its layer, joined by a leader line.
+    fn draw_annotations(&self, painter: &Painter) {
+        let stroke = Stroke::new(1.0, PURPLE);
+        for n in self.doc.nodes.values().filter(|n| !n.annotations.is_empty() && self.doc.page_of(n.id) == self.page) {
+            let r = self.view.rect_to_screen(n.aabb());
+            let mut y = r.min.y;
+            for note in &n.annotations {
+                let g = painter.layout(note.clone(), FontId::proportional(11.0), Color32::WHITE, 200.0);
+                let label = Rect::from_min_size(pos2(r.max.x + 32.0, y), g.size() + vec2(12.0, 8.0));
+                let from = pos2(r.max.x, r.center().y.clamp(r.min.y, r.max.y));
+                painter.line_segment([from, pos2(label.min.x, label.center().y)], stroke);
+                painter.circle_filled(from, 3.0, PURPLE);
+                painter.rect_filled(label, 4.0, PURPLE);
+                painter.galley(label.min + vec2(6.0, 4.0), g, Color32::WHITE);
+                y = label.max.y + 6.0;
+            }
+        }
+    }
+
     /// The ruler under screen point `s`, as the axis of the guide it pulls out (top ruler: Y).
     fn ruler_at(&self, s: Pos2) -> Option<Axis> {
         let r = self.canvas_rect.filter(|_| self.rulers)?;
@@ -1900,6 +1936,14 @@ impl App {
                 }
             });
         });
+        let frames = has && self.sel.iter().all(|&s| self.doc.node(s).kind.is_frame() && self.doc.node(s).kind != Kind::Instance);
+        if frames {
+            let ready = self.doc.node(self.sel[0]).ready;
+            if item(ui, if ready { "Mark as changed" } else { "Mark as ready for dev" }, "", true) {
+                self.toggle_ready_for_dev();
+                ui.close();
+            }
+        }
         let comps = self.sel.len() > 1 && self.sel.iter().all(|&s| self.doc.node(s).kind == Kind::Component);
         if comps && item(ui, "Combine as variants", "", true) {
             self.combine_as_variants();
@@ -1986,6 +2030,36 @@ impl App {
             }
         }
     }
+}
+
+/// An auto layout frame's padding bands and the gaps between its flowing children, each with its
+/// size (world space; empty for other layers and rotated frames).
+pub fn spacing_bands(doc: &crate::doc::Document, id: NodeId) -> Vec<(Rect, f32)> {
+    let n = doc.node(id);
+    if n.layout.mode == crate::doc::LayoutMode::None || n.rotation != 0.0 {
+        return vec![];
+    }
+    let r = n.rect;
+    let [t, rt, b, l] = n.layout.padding;
+    let mut bands: Vec<(Rect, f32)> = vec![
+        (Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + t)), t),
+        (Rect::from_min_max(pos2(r.max.x - rt, r.min.y), r.max), rt),
+        (Rect::from_min_max(pos2(r.min.x, r.max.y - b), r.max), b),
+        (Rect::from_min_max(r.min, pos2(r.min.x + l, r.max.y)), l),
+    ];
+    let horizontal = n.layout.mode == crate::doc::LayoutMode::Horizontal;
+    let kids: Vec<Rect> = n.children.iter().map(|c| doc.node(*c)).filter(|c| c.visible && !c.absolute).map(|c| c.aabb()).collect();
+    let inner = Rect::from_min_max(r.min + vec2(l, t), r.max - vec2(rt, b));
+    for w in kids.windows(2) {
+        let gap = if horizontal {
+            Rect::from_min_max(pos2(w[0].max.x, inner.min.y), pos2(w[1].min.x, inner.max.y))
+        } else {
+            Rect::from_min_max(pos2(inner.min.x, w[0].max.y), pos2(inner.max.x, w[1].min.y))
+        };
+        bands.push((gap, if horizontal { gap.width() } else { gap.height() }));
+    }
+    bands.retain(|(b, s)| *s > 0.0 && b.is_positive());
+    bands
 }
 
 /// A small measurement label centered at `at`: white text on `fill`.
