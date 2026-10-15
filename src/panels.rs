@@ -1056,6 +1056,15 @@ impl App {
                 self.show_collab = true;
                 ui.close();
             }
+            let spot = self.collab.as_ref().is_some_and(|c| c.me.spotlight);
+            if enabled(ui, self.collab.is_some(), if spot { "Stop spotlight" } else { "Spotlight me" }, "") {
+                self.toggle_spotlight();
+                ui.close();
+            }
+            if item(ui, "Cursor chat", "/") {
+                self.open_chat(&ctx);
+                ui.close();
+            }
         });
         ui.menu_button("Edit", |ui| {
             if item(ui, "Undo", "⌘Z") {
@@ -1994,18 +2003,43 @@ impl App {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let ctx = ui.ctx().clone();
-                    // Collaborators' avatars; clicking opens the session window.
+                    // Avatars, as in Figma: click someone to follow them; yours has Spotlight me.
                     if let Some(c) = &self.collab {
-                        let mut open = false;
-                        for p in c.peers.values().take(4) {
+                        let avatar = |ui: &mut Ui, name: &str, color: usize, ring: bool| {
                             let (r, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
-                            let col = crate::collab::PEER_COLORS[p.color % crate::collab::PEER_COLORS.len()];
+                            let col = crate::collab::peer_color(color);
                             ui.painter().circle_filled(r.center(), 10.0, col);
-                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, p.name.chars().next().unwrap_or('?').to_string(), FontId::proportional(10.0), Color32::WHITE);
-                            open |= resp.on_hover_text(&p.name).clicked();
+                            if ring {
+                                ui.painter().circle_stroke(r.center(), 11.5, Stroke::new(1.5, col));
+                            }
+                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, name.chars().next().unwrap_or('?').to_string(), FontId::proportional(10.0), Color32::WHITE);
+                            resp
+                        };
+                        let mut follow = None;
+                        for (&id, p) in c.peers.iter().rev().take(4) {
+                            let tip = if self.following == Some(id) { format!("Stop following {}", p.name) } else { format!("Follow {}", p.name) };
+                            if avatar(ui, &p.name, p.color, self.following == Some(id)).on_hover_text(tip).clicked() {
+                                follow = Some(id);
+                            }
                         }
-                        if open {
-                            self.show_collab = true;
+                        let me = avatar(ui, &c.me.name, c.me.color, c.me.spotlight).on_hover_text(format!("{} (you)", c.me.name));
+                        let spot = if c.me.spotlight { "Stop spotlight" } else { "Spotlight me" };
+                        let mut act = None;
+                        egui::Popup::menu(&me).style(crate::chrome::menu_style).show(|ui| {
+                            if ui.button(spot).clicked() {
+                                act = Some(true);
+                            }
+                            if ui.button("Session settings…").clicked() {
+                                act = Some(false);
+                            }
+                        });
+                        match act {
+                            Some(true) => self.toggle_spotlight(),
+                            Some(false) => self.show_collab = true,
+                            None => {}
+                        }
+                        if let Some(id) = follow {
+                            self.toggle_follow(id);
                         }
                     }
                     if icon_button(ui, Icon::Play, false, 24.0, "Present (⌥⌘↵)").clicked() {

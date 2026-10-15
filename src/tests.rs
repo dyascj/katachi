@@ -1821,6 +1821,16 @@ fn settle(a: &mut Harness<App>, b: &mut Harness<App>, done: &dyn Fn(&App, &App) 
     }
 }
 
+/// This window's id in the session.
+fn client(h: &Harness<App>) -> u32 {
+    h.state().collab.as_ref().expect("in a session").client
+}
+
+/// What `of` knows of the participant `id`.
+fn peer(of: &App, id: u32) -> Option<&crate::collab::Presence> {
+    of.collab.as_ref()?.peers.get(&id)
+}
+
 #[test]
 fn multiplayer_host_join_edit_and_undo_only_mine() {
     let (mut a, mut b) = pair();
@@ -3852,6 +3862,96 @@ fn dev_mode_ready_for_dev_annotations_and_spacing() {
     let c = s(&h, n.rect.center().x, n.rect.min.y + 2.0);
     move_to(&mut h, c, Modifiers::NONE);
     h.run_steps(2);
+}
+
+#[test]
+fn cursor_chat_shows_by_the_cursor_for_everyone_then_fades() {
+    let (mut a, mut b) = pair();
+    let ada = client(&a);
+    let p = s(&a, 100., 100.);
+    move_to(&mut a, p, Modifiers::NONE);
+    key(&mut a, Modifiers::NONE, Key::Slash);
+    assert!(a.state().chat.is_some(), "/ opens cursor chat");
+    a.event(Event::Text("Hello there".into()));
+    a.run_steps(2);
+    // While typing, letters are text, not tool shortcuts.
+    key(&mut a, Modifiers::NONE, Key::R);
+    assert_eq!(a.state().tool, Tool::Move);
+    assert_eq!(a.state().chat.as_ref().map(|c| c.0.as_str()), Some("Hello there"));
+    settle(&mut a, &mut b, &|_, b| peer(b, ada).is_some_and(|p| p.chat.as_deref() == Some("Hello there")));
+    assert_eq!(peer(b.state(), ada).and_then(|p| p.chat.clone()).as_deref(), Some("Hello there"), "Bo sees the bubble");
+    assert!(!b.state().dirty, "presence isn't a change to the file");
+    // Escape cancels it for everyone.
+    key(&mut a, Modifiers::NONE, Key::Escape);
+    assert!(a.state().chat.is_none());
+    settle(&mut a, &mut b, &|_, b| peer(b, ada).is_some_and(|p| p.chat.is_none()));
+    assert!(peer(b.state(), ada).is_some_and(|p| p.chat.is_none()));
+    // A message left alone fades away after a few seconds.
+    key(&mut a, Modifiers::NONE, Key::Slash);
+    a.event(Event::Text("Brb".into()));
+    a.run_steps(2);
+    assert!(a.state().chat.is_some());
+    a.run_steps(60 * 6);
+    assert!(a.state().chat.is_none(), "faded out");
+}
+
+#[test]
+fn follow_and_spotlight_track_the_leaders_page_and_view() {
+    let (mut a, mut b) = pair();
+    let ada = client(&a);
+    let center = |h: &App| h.view.to_world(h.canvas_rect.unwrap().center());
+    // Bo follows Ada; she zooms in elsewhere and moves to another page.
+    b.state_mut().toggle_follow(ada);
+    a.state_mut().view = crate::render::View { pan: vec2(-300., -200.), zoom: 2.0 };
+    settle(&mut a, &mut b, &|a, b| (center(a) - center(b)).length() < 0.5 && (a.view.zoom - b.view.zoom).abs() < 1e-3);
+    assert!((center(a.state()) - center(b.state())).length() < 0.5, "Bo sees what Ada sees");
+    assert_eq!(b.state().view.zoom, a.state().view.zoom);
+    a.state_mut().doc.pages.push(crate::doc::Page { name: "Two".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, guides: vec![], prototype: Default::default() });
+    a.state_mut().select_page(1);
+    settle(&mut a, &mut b, &|_, b| b.page == 1);
+    assert_eq!(b.state().page, 1, "follows to the other page");
+    assert_eq!(b.state().following, Some(ada));
+    // Bo pans by hand: he takes over and stops following.
+    key(&mut b, Modifiers::NONE, Key::H);
+    let p = b.state().canvas_rect.unwrap().center();
+    drag(&mut b, p, p + vec2(80., 0.), Modifiers::NONE);
+    key(&mut b, Modifiers::NONE, Key::V);
+    assert_eq!(b.state().following, None, "a manual pan stops following");
+    // Spotlight: Ada asks everyone to follow her; Bo does, with a notice, until Escape.
+    a.state_mut().toggle_spotlight();
+    settle(&mut a, &mut b, &|_, b| b.following == Some(ada));
+    assert_eq!(b.state().following, Some(ada));
+    assert!(b.state().toast.as_ref().is_some_and(|t| t.0.contains("spotlighting")));
+    key(&mut b, Modifiers::NONE, Key::Escape);
+    assert_eq!(b.state().following, None, "Escape stops following");
+    // Ending the spotlight ends following for those still on it.
+    b.state_mut().toggle_follow(ada);
+    a.state_mut().toggle_spotlight();
+    settle(&mut a, &mut b, &|_, b| b.following.is_none());
+    assert_eq!(b.state().following, None);
+}
+
+#[test]
+fn others_see_my_selection_and_text_caret() {
+    let (mut a, mut b) = pair();
+    let ada = client(&a);
+    let mut t = Node::new(Kind::Text, r(0., 0., 200., 40.));
+    t.text = "Hello".into();
+    let id = a.state_mut().doc.insert(0, None, None, t);
+    a.state_mut().sel = vec![id];
+    a.state_mut().editing_text = Some(id);
+    a.state_mut().focus_text = true;
+    a.run_steps(3);
+    a.event(Event::Text("!".into()));
+    a.run_steps(2);
+    let caret = a.state().caret;
+    assert!(caret.is_some(), "the editor reports its caret");
+    settle(&mut a, &mut b, &|_, b| peer(b, ada).is_some_and(|p| p.caret == Some((id, caret.unwrap())) && p.selection == [id]));
+    let p = peer(b.state(), ada).unwrap();
+    assert_eq!(p.caret, Some((id, caret.unwrap())), "Bo sees where Ada types");
+    assert_eq!(p.selection, vec![id]);
+    // Bo's canvas draws them (name tag and caret) without trouble.
+    b.run_steps(2);
 }
 
 #[test]
