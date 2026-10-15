@@ -289,7 +289,6 @@ pub struct App {
     pub dev_mode: bool,
     pub code_lang: crate::codegen::Lang,
     pub show_comments: bool,
-    pub show_resolved: bool,
     pub draft_comment: Option<(crate::doc::Comment, String)>,
     pub open_comment: Option<u64>,
     pub comment_reply: String,
@@ -335,6 +334,9 @@ pub struct App {
     follow_view: Option<(usize, View)>,
     /// The text editor's caret (character index), shared so others see where you type.
     pub caret: Option<usize>,
+    pub comment_filter: crate::comments::Filter,
+    /// Messages seen per comment thread, for unread dots: what others added since then.
+    pub comment_read: std::collections::HashMap<u64, usize>,
     /// Text layers' last measured inputs, so unchanged text isn't re-laid out every frame.
     pub text_keys: std::collections::HashMap<NodeId, u64>,
     in_gesture: bool,
@@ -422,7 +424,6 @@ impl App {
             dev_mode: false,
             code_lang: crate::codegen::Lang::Css,
             show_comments: false,
-            show_resolved: false,
             draft_comment: None,
             open_comment: None,
             comment_reply: String::new(),
@@ -462,6 +463,8 @@ impl App {
             following: None,
             follow_view: None,
             caret: None,
+            comment_filter: Default::default(),
+            comment_read: Default::default(),
             text_keys: Default::default(),
             in_gesture: false,
             path: None,
@@ -1702,6 +1705,7 @@ impl App {
             Ok(doc) => {
                 self.reset_to(App::new(None));
                 self.doc = doc;
+                self.read_all_comments();
                 crate::files::add_recent(&p);
                 self.path = Some(p);
             }
@@ -1904,6 +1908,7 @@ impl App {
             if let Some(doc) = doc {
                 self.checkpoint();
                 self.doc = doc;
+                self.read_all_comments();
                 self.sel.clear();
                 self.page = 0;
                 self.view_ready = false;
@@ -2389,6 +2394,7 @@ impl App {
                     self.view_ready = false;
                 }
                 self.doc = doc;
+                self.read_all_comments();
                 self.sel.clear();
                 self.page = 0;
                 self.undo.clear();

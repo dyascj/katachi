@@ -3955,6 +3955,60 @@ fn others_see_my_selection_and_text_caret() {
 }
 
 #[test]
+fn comments_filter_mention_and_track_unread() {
+    use crate::comments::{Filter, complete_mention, mention_query, mentions};
+    use crate::doc::Comment;
+    let mut h = harness();
+    let st = h.state_mut();
+    st.collab_name = "Ada".into();
+    let mk = |id: u64, msgs: &[(&str, &str)], resolved: bool| Comment {
+        id,
+        page: 0,
+        at: pos2(60. * id as f32, 60.),
+        anchor: None,
+        messages: msgs.iter().map(|(w, t)| (w.to_string(), t.to_string(), 0)).collect(),
+        resolved,
+    };
+    st.doc.comments = vec![mk(1, &[("Ada", "Mine")], false), mk(2, &[("Luna", "Hey @Ada look")], false), mk(3, &[("Luna", "Done, @Adam")], true)];
+    st.read_all_comments();
+    // Luna replies later: that thread is unread for Ada.
+    st.doc.comments[0].messages.push(("Luna".into(), "A reply".into(), 0));
+    assert!(st.unread(&st.doc.comments[0].clone()) && !st.unread(&st.doc.comments[1].clone()));
+    let ids = |st: &mut App, f: Filter| {
+        st.comment_filter = f;
+        st.filtered_comments().iter().map(|c| c.id).collect::<Vec<_>>()
+    };
+    assert_eq!(ids(st, Filter::All), vec![1, 2, 3]);
+    assert_eq!(ids(st, Filter::Unresolved), vec![1, 2]);
+    assert_eq!(ids(st, Filter::Resolved), vec![3]);
+    assert_eq!(ids(st, Filter::Mine), vec![1]);
+    assert_eq!(ids(st, Filter::Mentions), vec![2], "@Adam isn't @Ada");
+    // Opening the thread reads it; Mark as unread brings the dot back and closes it.
+    st.comment_filter = Filter::All;
+    st.show_comments = true;
+    st.open_comment = Some(1);
+    h.run_steps(2);
+    assert!(!h.state().unread(&h.state().doc.comments[0]));
+    h.get_by_label("Mark as unread").click();
+    h.run_steps(2);
+    assert!(h.state().unread(&h.state().doc.comments[0]));
+    assert_eq!(h.state().open_comment, None);
+    // Typing @ in a reply suggests people; picking one completes the name.
+    assert_eq!(mention_query("hi @Lu"), Some("Lu"));
+    assert_eq!(mention_query("mail a@b"), None);
+    let mut t = "hi @Lu".to_string();
+    complete_mention(&mut t, "Luna");
+    assert_eq!(t, "hi @Luna ");
+    assert!(mentions("hi @Luna, look", "Luna") && !mentions("hi @Lunatic", "Luna"));
+    h.state_mut().open_comment = Some(2);
+    h.state_mut().comment_reply = "Thanks @Lu".into();
+    h.run_steps(2);
+    h.get_by_label("@Luna").click();
+    h.run_steps(2);
+    assert_eq!(h.state().comment_reply, "Thanks @Luna ");
+}
+
+#[test]
 fn session_window_shows_status_and_the_host_removes_someone() {
     let (mut a, mut b) = pair();
     a.state_mut().show_collab = true;
