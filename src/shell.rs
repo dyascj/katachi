@@ -967,7 +967,7 @@ mod look {
         for (i, name) in ["Lumen", "Weather app", "Smart home HUD", "Onboarding flow with a long file name"].iter().enumerate() {
             let mut app = App::new(None);
             if i % 2 == 0 {
-                crate::plugins::run(&mut app.doc, 0, &[], include_str!("../assets/promo/showcase.js")).unwrap();
+                crate::plugins::run(&mut app.doc, 0, &[], include_str!("../assets/showcase.js")).unwrap();
             }
             let p = dir.join(format!("{name}.katachi"));
             assert!(app.save_to(p.clone()));

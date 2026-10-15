@@ -2044,7 +2044,7 @@ fn perf_bench() {
 #[test]
 fn compact_files_load_back_identical() {
     let mut doc = crate::doc::Document::default();
-    crate::plugins::run(&mut doc, 0, &[], include_str!("../assets/promo/showcase.js")).unwrap();
+    crate::plugins::run(&mut doc, 0, &[], include_str!("../assets/showcase.js")).unwrap();
     // Instances carry a snapshot of their main component, which is compacted too.
     crate::plugins::run(&mut doc, 0, &[], r#"const set = figma.currentPage.findOne(n => n.name === "Button"); const i = set.children[1].createInstance(); i.x = 40; i.y = 2000;"#).unwrap();
     let compact = crate::doc::file_json(&doc);
@@ -2239,7 +2239,7 @@ fn ui_look() {
     // Assets: the showcase's components as a grid.
     {
         let a = h.state_mut();
-        crate::plugins::run(&mut a.doc, 0, &[], include_str!("../assets/promo/showcase.js")).unwrap();
+        crate::plugins::run(&mut a.doc, 0, &[], include_str!("../assets/showcase.js")).unwrap();
         crate::plugins::run(&mut a.doc, 0, &[], "for (const c of ['Chip', 'Avatar', 'Card']) { const k = figma.createComponent(); k.name = c; k.resize(80, 40); k.y = 3000; k.cornerRadius = 12; k.fills = [figma.util.solidPaint('#4DA8FF')]; }").unwrap();
         a.left_tab_assets = true;
     }
@@ -2308,7 +2308,7 @@ fn layer_search_finds_text_and_groups_become_auto_layout_frames() {
 #[test]
 fn assets_show_component_previews_and_search_filters_sets() {
     let mut h = harness();
-    crate::plugins::run(&mut h.state_mut().doc, 0, &[], include_str!("../assets/promo/showcase.js")).unwrap();
+    crate::plugins::run(&mut h.state_mut().doc, 0, &[], include_str!("../assets/showcase.js")).unwrap();
     crate::plugins::run(&mut h.state_mut().doc, 0, &[], "const k = figma.createComponent(); k.name = 'Chip'; k.resize(80, 40);").unwrap();
     h.state_mut().left_tab_assets = true;
     h.run_steps(4);
