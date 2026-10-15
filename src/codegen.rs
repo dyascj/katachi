@@ -186,6 +186,9 @@ pub fn css(doc: &Document, id: NodeId) -> String {
         decl!("font-family", var(Bindable::FontFamily, format!("\"{}\"", n.font_family)));
         decl!("font-size", var(Bindable::FontSize, format!("{}px", num(n.font_size))));
         decl!("font-weight", var(Bindable::FontWeight, n.font_weight.to_string()));
+        if n.italic {
+            decl!("font-style", "italic".into());
+        }
         let lh = match n.line_height {
             LineHeight::Auto => "normal".into(),
             LineHeight::Px(px) => format!("{}px", num(px)),
@@ -399,6 +402,9 @@ pub fn tailwind(doc: &Document, id: NodeId) -> String {
         let size = var(Bindable::FontSize, format!("{}px", num(n.font_size)));
         c.push(if size.starts_with("var(") { tw("text", &format!("length:{size}")) } else { tw("text", &size) });
         c.push(tw("font", &var(Bindable::FontWeight, n.font_weight.to_string())));
+        if n.italic {
+            c.push("italic".into());
+        }
         match n.line_height {
             LineHeight::Auto => {}
             LineHeight::Px(px) => c.push(tw("leading", &var(Bindable::LineHeight, format!("{}px", num(px))))),
@@ -500,6 +506,9 @@ pub fn swiftui(doc: &Document, id: NodeId) -> String {
                 _ => ".bold",
             };
             let mut t = format!("Text({:?})\n    .font(.custom({:?}, size: {}).weight({weight}))", n.text, n.font_family, num(n.font_size));
+            if n.italic {
+                t.push_str("\n    .italic()");
+            }
             if let Some(c) = fill {
                 let _ = write!(t, "\n    .foregroundColor({})", swift_color(c));
             }
@@ -546,6 +555,9 @@ pub fn compose(doc: &Document, id: NodeId) -> String {
             (n.font_weight / 100 * 100).clamp(100, 900),
             n.font_family
         );
+        if n.italic {
+            t.push_str(",\n    fontStyle = FontStyle.Italic");
+        }
         if let Some(c) = fill {
             let _ = write!(t, ",\n    color = {}", fill_color(c));
         }

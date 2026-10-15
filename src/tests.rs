@@ -3843,3 +3843,33 @@ fn dev_mode_ready_for_dev_annotations_and_spacing() {
     move_to(&mut h, c, Modifiers::NONE);
     h.run_steps(2);
 }
+
+/// Windows and Linux send Ctrl as both `ctrl` and `command`; egui's text editor treats Ctrl U and
+/// Ctrl K as "delete to paragraph start / end". Formatting and linking must not do that too.
+#[test]
+fn pc_ctrl_shortcuts_while_editing_text_keep_the_text() {
+    let mut h = harness();
+    let mut t = Node::new(Kind::Text, r(0., 0., 200., 10.));
+    t.text = "Hello world".into();
+    let id = h.state_mut().doc.insert(0, None, None, t);
+    h.state_mut().sel = vec![id];
+    h.run_steps(2);
+    let p = s(&h, 20., 5.);
+    h.run_steps(30);
+    move_to(&mut h, p, Modifiers::NONE);
+    for _ in 0..2 {
+        press(&mut h, p, true, Modifiers::NONE);
+        press(&mut h, p, false, Modifiers::NONE);
+    }
+    h.run_steps(3);
+    assert_eq!(h.state().editing_text, Some(id), "double-click edits the text");
+    select_chars(&mut h, 6, 11);
+    h.run_steps(1);
+    let pc = Modifiers { ctrl: true, command: true, ..Default::default() };
+    key(&mut h, pc, Key::U);
+    assert_eq!(h.state().doc.node(id).text, "Hello world", "Ctrl U underlines without deleting");
+    select_chars(&mut h, 0, 5);
+    h.run_steps(1);
+    key(&mut h, pc, Key::K);
+    assert_eq!(h.state().doc.node(id).text, "Hello world", "Ctrl K links without deleting");
+}

@@ -563,7 +563,9 @@ impl App {
         }
         // Rulers pull out new guides; the move tool grabs existing ones.
         let ruler = self.ruler_at(s);
-        let guide = if ruler.is_none() { self.guide_at(s) } else { None };
+        // Selection and gradient handles win over a guide under them (snapped edges sit on guides).
+        let over_handle = self.handle_at(s).is_some() || self.gradient_hit(s).is_some();
+        let guide = if ruler.is_none() && !over_handle { self.guide_at(s) } else { None };
         self.guide_sel = guide;
         if let Some(axis) = ruler.or(guide.map(|i| self.doc.pages[self.page].guides[i].axis)) {
             if guide.is_some() {
@@ -1450,7 +1452,9 @@ impl App {
     /// 1px). Returns the axis (0 = row) and the layers in order along it.
     pub fn smart_selection(&self) -> Option<(usize, Vec<(NodeId, Rect)>)> {
         let roots = self.sel_roots();
-        if roots.len() < 2 || self.vector_edit.is_some() {
+        // Auto layout places its own children (its gap and order are edited there instead).
+        let in_flow = |i: NodeId| !self.doc.node(i).absolute && self.doc.node(i).parent.is_some_and(|p| self.doc.node(p).layout.mode != LayoutMode::None);
+        if roots.len() < 2 || self.vector_edit.is_some() || roots.iter().any(|&i| in_flow(i)) {
             return None;
         }
         (0..2).find_map(|a| {

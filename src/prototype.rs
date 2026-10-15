@@ -388,7 +388,7 @@ fn hits(doc: &Document, root: NodeId, p: Pos2) -> Vec<NodeId> {
         if !n.visible || (n.clip && !inside) {
             return;
         }
-        for &c in n.children.iter().rev() {
+        for c in n.paint_order().into_iter().rev() {
             walk(doc, c, p, out);
         }
         if inside {

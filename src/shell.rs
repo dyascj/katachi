@@ -143,12 +143,11 @@ impl Shell {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let (close, next, prev) = ctx.input_mut(|i| {
-            (
-                i.consume_key(Modifiers::COMMAND, Key::W),
-                i.consume_key(Modifiers::CTRL, Key::Tab),
-                i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Tab),
-            )
+        // Shift Tab first: consuming Ctrl Tab would also match it (extra Shift is ignored).
+        let (close, prev, next) = ctx.input_mut(|i| {
+            let close = i.consume_key(Modifiers::COMMAND, Key::W);
+            let prev = i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Tab);
+            (close, prev, i.consume_key(Modifiers::CTRL, Key::Tab))
         });
         if close && let Some(i) = self.active {
             self.request_close(i);

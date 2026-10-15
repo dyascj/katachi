@@ -342,7 +342,8 @@ pub struct App {
     pub prev_sel: Vec<NodeId>,
     pub gradient_edit: Option<GradientEdit>,
     /// The last opacity digit typed and when, for two-digit values.
-    last_digit: Option<(u8, f64)>,
+    /// The last opacity digit, when, and the selection it applied to.
+    last_digit: Option<(u8, f64, Vec<NodeId>)>,
     pub eyedrop: Option<crate::paint_ui::Eyedrop>,
     pub allow_close: bool,
     pub toast: Option<(String, f64)>,
@@ -694,6 +695,7 @@ impl App {
         }
         self.sel = sel;
         self.sel.retain(|id| self.doc.nodes.contains_key(id));
+        self.guide_sel = None;
     }
 
     // ---------- selection & structure ----------
@@ -813,6 +815,7 @@ impl App {
                 n.stroke_width = 1.0;
             }
         }
+        self.doc.reflow();
     }
 
     /// Figma's number keys set the selection's opacity: 1 = 10% ... 9 = 90%, 0 = 100%, and two
@@ -822,16 +825,17 @@ impl App {
             return;
         }
         let pct = match self.last_digit.take() {
-            Some((first, t)) if now - t < 0.6 => (first * 10 + digit) as f32,
+            Some((first, t, sel)) if now - t < 0.6 && sel == self.sel => (first * 10 + digit) as f32,
             _ => {
                 self.checkpoint();
-                self.last_digit = Some((digit, now));
+                self.last_digit = Some((digit, now, self.sel.clone()));
                 if digit == 0 { 100.0 } else { digit as f32 * 10.0 }
             }
         };
         for id in self.sel.clone() {
             self.doc.node_mut(id).opacity = pct / 100.0;
         }
+        self.doc.reflow();
     }
 
     pub fn flip_selection(&mut self, horizontal: bool) {
@@ -919,6 +923,7 @@ impl App {
                 n.text_case = src.text_case;
             }
         }
+        self.doc.reflow();
     }
 
     /// Combine the selection into a live boolean, or change the op of a selected boolean.
@@ -945,7 +950,22 @@ impl App {
         }
     }
 
-    /// Shift+A: turn selected frames into auto layout, or wrap other selections in a new one.
+    /// Backspace while a gradient's handles are showing removes its selected stop, keeping at
+    /// least two, and never deletes the layer under the open editor.
+    pub fn delete_gradient_stop(&mut self, ctx: &egui::Context) {
+        let (Some(g), Some(&id)) = (self.gradient_edit, self.sel.first()) else { return };
+        let n = self.doc.node(id);
+        let stops = (if g.stroke { &n.strokes } else { &n.fills }).get(g.index).map_or(0, |p| p.stops.len());
+        if stops <= 2 || g.stop >= stops {
+            return;
+        }
+        self.checkpoint();
+        let n = self.doc.node_mut(id);
+        (if g.stroke { &mut n.strokes } else { &mut n.fills })[g.index].stops.remove(g.stop);
+        ctx.data_mut(|d| d.insert_temp(g.ui.with("stop"), g.stop.saturating_sub(1)));
+        self.doc.reflow();
+    }
+
     /// Right-click > Move to page: the selection goes to another page at the same positions.
     pub fn move_to_page(&mut self, to: usize) {
         let roots = self.sel_roots();
@@ -953,6 +973,8 @@ impl App {
             return;
         }
         self.checkpoint();
+        // Flow starting points belong to their page.
+        self.doc.pages[self.page].flows.retain(|f| !roots.contains(f));
         for id in roots {
             self.doc.reparent(id, to, None, None);
         }
@@ -969,7 +991,7 @@ impl App {
                 if !n.visible || n.locked || (n.kind.is_frame() && n.clip && !n.rect.contains(n.to_local(p))) {
                     continue;
                 }
-                walk(doc, &n.children, p, tol, out);
+                walk(doc, &n.paint_order(), p, tol, out);
                 if doc.hit_self(n, p, tol) || (n.kind.is_container() && n.rect.contains(n.to_local(p))) {
                     out.push(id);
                 }
@@ -980,6 +1002,7 @@ impl App {
         out
     }
 
+    /// Shift+A: turn selected frames into auto layout, or wrap other selections in a new one.
     pub fn add_auto_layout(&mut self) {
         let roots = self.sel_roots();
         if roots.is_empty() {
@@ -1195,6 +1218,7 @@ impl App {
             n.fills.clear();
             n.fill_style = None;
         }
+        self.doc.reflow();
     }
 
     pub fn align(&mut self, a: Align) {
@@ -2521,6 +2545,7 @@ impl App {
         let (events, m) = ctx.input(|i| (i.events.clone(), i.modifiers));
         // A text shortcut eats its key's side effects this frame: Shift Cmd X's cut, Alt >'s "≥".
         let mut swallow = false;
+        let mut eaten: Vec<Key> = vec![];
         for e in events {
             match e {
                 // egui turns every Cmd C, X and V into a clipboard event, Alt and Shift chords
@@ -2559,8 +2584,13 @@ impl App {
                     self.v_pressed |= key == Key::V;
                     if self.text_shortcut(ctx, key, m, typing) {
                         swallow = true;
+                        eaten.push(key);
                     } else {
-                        self.key(ctx, key, m, typing)
+                        let linking = m.command && !m.alt && key == Key::K && self.text_selection(ctx).is_some();
+                        self.key(ctx, key, m, typing);
+                        if linking {
+                            eaten.push(key);
+                        }
                     }
                 }
                 // Holding Z zooms for a moment, then hands back the previous tool (Figma).
@@ -2575,8 +2605,16 @@ impl App {
                 _ => {}
             }
         }
-        if swallow {
-            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, Event::Text(_) | Event::Cut)));
+        // The text editor would also act on these (Ctrl U and Ctrl K delete to the paragraph's
+        // start and end in egui on Windows and Linux), so they stop here.
+        if swallow || !eaten.is_empty() {
+            ctx.input_mut(|i| {
+                i.events.retain(|e| match e {
+                    Event::Text(_) | Event::Cut => !swallow,
+                    Event::Key { key, pressed: true, .. } => !eaten.contains(key),
+                    _ => true,
+                })
+            });
         }
     }
 
@@ -2587,10 +2625,10 @@ impl App {
             // Figma: Cmd K links the characters selected in the text editor.
             (true, false, Key::K) if !m.alt && self.text_selection(ctx).is_some() => return self.create_link(ctx),
             (true, false, Key::Slash | Key::K) if !m.alt => return self.toggle_quick_actions(),
-            (true, false, Key::Comma) => return self.open_settings(crate::settings::Tab::Account),
+            (true, false, Key::Comma) if !m.alt => return self.open_settings(crate::settings::Tab::Account),
             (true, false, Key::S) => return void(self.save(false)),
             (true, true, Key::S) => return void(self.save(true)),
-            (true, false, Key::O) => return self.request_open(),
+            (true, false, Key::O) if !m.alt => return self.request_open(),
             (true, false, Key::N) => return self.request_new(),
             (true, true, Key::E) => return self.export_dialog = Some(Default::default()),
             (true, false, Key::F) => {
@@ -2607,7 +2645,7 @@ impl App {
             self.focus_text = true;
             return;
         }
-        if key == Key::Escape && self.editing_text.is_some() {
+        if key == Key::Escape && self.editing_text.is_some() && self.quick.is_none() {
             return self.end_text_edit();
         }
         if let Some(ve) = self.vector_edit.as_mut().filter(|_| !typing) {
@@ -2728,14 +2766,15 @@ impl App {
             (true, _, _, Key::Equals | Key::Plus) => self.zoom_step(ctx, 2.0),
             (true, _, _, Key::Minus) => self.zoom_step(ctx, 0.5),
             (false, true, _, Key::Num0) => self.zoom_to(ctx, None, true),
-            (false, true, _, Key::Num1) => self.zoom_to(ctx, None, false),
+            (false, true, _, Key::Num1 | Key::Exclamationmark) => self.zoom_to(ctx, None, false),
             (false, true, _, Key::Num2) => {
                 let s = self.sel_roots();
                 if !s.is_empty() {
                     self.zoom_to(ctx, Some(s), false)
                 }
             }
-            (false, _, _, Key::Delete | Key::Backspace) if self.guide_sel.is_some() => self.delete_guide(),
+            (false, _, _, Key::Delete | Key::Backspace) if self.guide_sel.is_some() && self.sel.is_empty() => self.delete_guide(),
+            (false, _, _, Key::Delete | Key::Backspace) if self.gradient_edit.is_some() => self.delete_gradient_stop(ctx),
             (false, _, _, Key::Delete | Key::Backspace) => self.delete_selection(),
             (false, _, _, Key::ArrowLeft) => self.nudge(vec2(-step, 0.0)),
             (false, _, _, Key::ArrowRight) => self.nudge(vec2(step, 0.0)),
@@ -2786,7 +2825,7 @@ impl App {
             (false, false, false, Key::P) => self.set_tool(Tool::Pen),
             (false, false, false, Key::T) => self.set_tool(Tool::Text),
             (false, false, false, Key::C) => self.set_tool(Tool::Comment),
-            (false, false, false, Key::Z) => {
+            (false, false, false, Key::Z) if self.vector_edit.is_none() && self.pen.is_empty() => {
                 if self.tool != Tool::Zoom {
                     self.zoom_hold = Some((self.tool, ctx.input(|i| i.time)));
                     self.set_tool(Tool::Zoom);

@@ -134,6 +134,7 @@ impl App {
             n.fill_style = None;
             n.bindings.retain(|(b, _)| *b != crate::doc::Bindable::Fill);
         }
+        self.doc.reflow();
     }
 }
 

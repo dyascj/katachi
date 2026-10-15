@@ -440,7 +440,7 @@ impl Override {
             Override::CornerRadius => n.radius != snap.radius || n.corner_radii != snap.corner_radii,
             Override::Text => n.text != snap.text || n.spans != snap.spans,
             Override::TextStyle => {
-                n.font_family != snap.font_family || n.font_size != snap.font_size || n.font_weight != snap.font_weight || n.line_height != snap.line_height || n.letter_spacing != snap.letter_spacing || n.text_style != snap.text_style
+                n.font_family != snap.font_family || n.font_size != snap.font_size || n.font_weight != snap.font_weight || n.italic != snap.italic || n.line_height != snap.line_height || n.letter_spacing != snap.letter_spacing || n.decoration != snap.decoration || n.text_case != snap.text_case || n.text_style != snap.text_style
             }
         }
     }
@@ -458,7 +458,8 @@ impl Override {
             Override::Text => (to.text, to.spans) = (from.text.clone(), from.spans.clone()),
             Override::TextStyle => {
                 to.font_family = from.font_family.clone();
-                (to.font_size, to.font_weight, to.line_height, to.letter_spacing, to.text_style) = (from.font_size, from.font_weight, from.line_height, from.letter_spacing, from.text_style);
+                (to.font_size, to.font_weight, to.italic, to.line_height, to.letter_spacing, to.text_style) = (from.font_size, from.font_weight, from.italic, from.line_height, from.letter_spacing, from.text_style);
+                (to.decoration, to.text_case) = (from.decoration, from.text_case);
             }
         }
     }
@@ -2940,7 +2941,7 @@ impl Document {
             Some(s) => (
                 s.fills != n.fills,
                 s.strokes != n.strokes,
-                (s.font_family != n.font_family || s.font_size != n.font_size || s.font_weight != n.font_weight || s.line_height != n.line_height || s.letter_spacing != n.letter_spacing),
+                (s.font_family != n.font_family || s.font_size != n.font_size || s.font_weight != n.font_weight || s.italic != n.italic || s.line_height != n.line_height || s.letter_spacing != n.letter_spacing || s.decoration != n.decoration || s.text_case != n.text_case),
                 s.shadows != n.shadows,
             ),
             None => (false, false, false, false),
@@ -4077,7 +4078,7 @@ fn merge_from(e: &mut Node, src: &Node) {
         name, visible, opacity, fills, strokes, stroke_width, stroke_sides, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, min_size, max_size, constraints, absolute,
         paths, even_odd, text, font_size, font_weight, font_family, italic, text_sizing, text_align, text_valign, line_height, letter_spacing,
         decoration, text_case, paragraph_spacing, paragraph_indent, vertical_trim, truncate, max_lines, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, overflow, scroll_pos, fill_style,
-        stroke_style, text_style, effect_style, grid_style, prop_bind, is_mask, blend, bindings, modes, spans, lists, exposed
+        stroke_style, text_style, effect_style, grid_style, prop_bind, is_mask, blend, bindings, modes, spans, lists, exposed, grid_span, grids, arc, bool_op
     );
     e.synced = Some(Box::new(Node { children: vec![], synced: None, ..src.clone() }));
 }
