@@ -1079,6 +1079,57 @@ fn cmd_drag_bends_a_segment() {
 }
 
 #[test]
+fn export_presets_edit_several_layers_and_the_export_dialog() {
+    use crate::doc::{ExportFormat, ExportSetting, ExportSize};
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (40.0, 20.0));
+    let b = draw(&mut h, Key::R, (60.0, 0.0), (100.0, 40.0));
+    h.state_mut().sel = vec![a, b];
+    h.run_steps(2);
+    h.get_by_label("Add export setting").click();
+    h.run_steps(2);
+    h.get_by_label("Add export setting").click();
+    h.run_steps(2);
+    let both = |h: &Harness<App>| [a, b].map(|id| h.state().doc.node(id).exports.iter().map(|e| e.scale).collect::<Vec<_>>());
+    assert_eq!(both(&h), [vec![1., 2.], vec![1., 2.]], "presets go on every selected layer");
+    // Different presets read as mixed; + replaces them on all.
+    h.state_mut().doc.node_mut(a).exports.push(ExportSetting { format: ExportFormat::Svg, ..Default::default() });
+    h.run_steps(2);
+    assert!(h.query_by_label("Mixed export settings. Click + to replace them.").is_some());
+    h.get_by_label("Add export setting").click();
+    h.run_steps(2);
+    assert_eq!(both(&h), [vec![1.], vec![1.]]);
+    // Shift Cmd E lists the page's layers with presets.
+    let c = draw(&mut h, Key::R, (0.0, 100.0), (10.0, 110.0));
+    h.state_mut().doc.node_mut(b).exports = vec![ExportSetting { size: ExportSize::Width(80.), ..Default::default() }, ExportSetting { format: ExportFormat::Webp, suffix: "-w".into(), ..Default::default() }];
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::E);
+    assert!(h.state().export_dialog.is_some());
+    assert!(h.query_by_label("Export 3 files").is_some());
+    assert!(h.query_by_label("80w PNG, 1x WEBP").is_some());
+    // Export them to a folder: sizes and suffixes kept; a layer without presets uses the panel default.
+    let dir = std::env::temp_dir().join(format!("katachi-export-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ctx = h.ctx.clone();
+    h.state_mut().export_layers_to(&ctx, &[a, b, c], &dir);
+    let dims = |f: &str| image::open(dir.join(f)).unwrap_or_else(|e| panic!("{f}: {e}")).to_rgba8().dimensions();
+    assert_eq!(dims("Rectangle 1.png"), (40, 20));
+    assert_eq!(dims("Rectangle 2.png"), (80, 80));
+    assert_eq!(dims("Rectangle 2-w.webp"), (40, 40));
+    assert_eq!(dims("Rectangle 3.png"), (10, 10));
+    std::fs::remove_dir_all(&dir).ok();
+    // Copy as code follows Dev Mode's language.
+    h.state_mut().sel = vec![c];
+    h.state_mut().code_lang = crate::codegen::Lang::SwiftUi;
+    h.state_mut().copy_as(&ctx, "code");
+    h.step();
+    let copied = h.output().platform_output.commands.iter().find_map(|c| match c {
+        egui::OutputCommand::CopyText(t) => Some(t.clone()),
+        _ => None,
+    });
+    assert!(copied.is_some_and(|t| t.contains(".frame(width: 10, height: 10)")), "SwiftUI code copied");
+}
+
+#[test]
 fn paste_svg_and_flatten() {
     let mut h = harness();
     h.event(Event::Paste(r##"<svg width="24" height="24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="10" fill="#f00"/></svg>"##.into()));

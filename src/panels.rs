@@ -455,6 +455,56 @@ fn sizing_menu(ui: &mut Ui, id: egui::Id, mode: &mut Sizing, can_hug: bool, can_
     changed
 }
 
+/// One export preset row: Figma's size field (type "2x", "1.5", "512w" or "512h", or pick
+/// one), suffix, format, and JPG quality. Returns true when its remove button was clicked.
+fn export_row(ui: &mut Ui, id: egui::Id, p: &mut crate::doc::ExportSetting, removable: bool) -> bool {
+    use crate::doc::ExportFormat;
+    let mut remove = false;
+    ui.horizontal(|ui| {
+        if p.format.raster() {
+            let tid = id.with("size");
+            let mut text = ui.data(|d| d.get_temp::<String>(tid)).unwrap_or_else(|| p.size_label());
+            let r = ui.add(egui::TextEdit::singleline(&mut text).id(tid).desired_width(40.0)).on_hover_text("Scale (2x), width (512w) or height (512h)");
+            if r.has_focus() {
+                ui.data_mut(|d| d.insert_temp(tid, text));
+            } else {
+                if r.lost_focus() {
+                    p.set_size(&text);
+                }
+                ui.data_mut(|d| d.remove::<String>(tid));
+            }
+            let m = icon_button(ui, Icon::Chevron(true), false, 16.0, "Export size");
+            egui::Popup::menu(&m).id(id.with("sizes")).style(crate::chrome::menu_style).show(|ui| {
+                for v in ["0.5x", "0.75x", "1x", "1.5x", "2x", "3x", "4x", "512w", "512h"] {
+                    if ui.selectable_label(p.size_label() == v, v).clicked() {
+                        p.set_size(v);
+                    }
+                }
+            });
+        }
+        if removable {
+            ui.add(egui::TextEdit::singleline(&mut p.suffix).hint_text("Suffix").desired_width(52.0));
+        }
+        egui::ComboBox::from_id_salt(id.with("fmt")).width(56.0).selected_text(p.format.ext().to_uppercase()).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+            for k in ExportFormat::ALL {
+                ui.selectable_value(&mut p.format, k, k.ext().to_uppercase());
+            }
+        });
+        if removable {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                remove = icon_button(ui, Icon::Minus, false, 20.0, "Remove").clicked();
+            });
+        }
+    });
+    if p.format == ExportFormat::Jpg {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Quality").small());
+            ui.add(egui::Slider::new(&mut p.quality, 1..=100).suffix("%"));
+        });
+    }
+    remove
+}
+
 /// 3x3 alignment picker for auto layout (rows = vertical, columns = horizontal position).
 fn align_grid(ui: &mut Ui, l: &mut AutoLayout) {
     let (rect, resp) = ui.allocate_exact_size(vec2(64.0, 64.0), Sense::click());
@@ -824,6 +874,10 @@ impl App {
                 ui.close();
             }
             if item(ui, "Export…", "⇧⌘E") {
+                self.export_dialog = Some(Default::default());
+                ui.close();
+            }
+            if enabled(ui, has, "Export selection", "") {
                 self.export(&ctx);
                 ui.close();
             }
@@ -845,6 +899,10 @@ impl App {
             ui.separator();
             if enabled(ui, has, "Copy", "⌘C") {
                 self.copy(&ctx);
+                ui.close();
+            }
+            if enabled(ui, has, "Copy as code", "") {
+                self.copy_as(&ctx, "code");
                 ui.close();
             }
             if item(ui, "Paste", "⌘V") {
@@ -4014,76 +4072,57 @@ impl App {
         }
     }
 
+    /// The Export section. With several layers selected it edits all their presets at once
+    /// (mixed presets can be replaced with +), and exports each of them.
     fn export_props(&mut self, ui: &mut Ui) {
-        use crate::doc::{ExportFormat, ExportSetting};
+        use crate::doc::ExportSetting;
         let roots = self.sel_roots();
-        let single = (roots.len() == 1).then(|| roots[0]);
+        let lists: Vec<Vec<ExportSetting>> = roots.iter().map(|&id| self.doc.node(id).exports.clone()).collect();
+        let mixed = lists.windows(2).any(|w| w[0] != w[1]);
+        let presets = if mixed { vec![] } else { lists.first().cloned().unwrap_or_default() };
         ui.horizontal(|ui| {
             ui.label(RichText::new("Export").strong());
-            if let Some(id) = single {
+            if !roots.is_empty() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if icon_button(ui, Icon::Plus, false, 22.0, "Add export setting").clicked() {
                         self.checkpoint();
-                        let n = self.doc.node_mut(id);
-                        // Figma adds the next common scale.
-                        let next = match n.exports.last().map(|e| e.scale) {
+                        // Figma adds the next common scale; mixed presets are replaced.
+                        let next = match presets.last().map(|e| e.scale) {
                             None => 1.0,
                             Some(s) if s < 2.0 => 2.0,
                             Some(s) => s + 1.0,
                         };
-                        n.exports.push(ExportSetting { scale: next, ..Default::default() });
+                        let mut list = presets.clone();
+                        list.push(ExportSetting { scale: next, ..Default::default() });
+                        for &id in &roots {
+                            self.doc.node_mut(id).exports = list.clone();
+                        }
                     }
                 });
             }
         });
-        let fmt_combo = |ui: &mut Ui, id: egui::Id, f: &mut ExportFormat| {
-            let mut changed = false;
-            egui::ComboBox::from_id_salt(id).width(56.0).selected_text(f.ext().to_uppercase()).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
-                for k in [ExportFormat::Png, ExportFormat::Jpg, ExportFormat::Svg, ExportFormat::Pdf] {
-                    changed |= ui.selectable_value(f, k, k.ext().to_uppercase()).changed();
-                }
-            });
-            changed
-        };
-        let scale_combo = |ui: &mut Ui, id: egui::Id, s: &mut f32| {
-            let mut changed = false;
-            egui::ComboBox::from_id_salt(id).width(48.0).selected_text(format!("{}x", num(*s))).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
-                for v in [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0] {
-                    changed |= ui.selectable_value(s, v, format!("{}x", num(v))).changed();
-                }
-            });
-            changed
-        };
-        let presets = single.map(|id| self.doc.node(id).exports.clone()).unwrap_or_default();
-        if presets.is_empty() {
-            ui.horizontal(|ui| {
-                scale_combo(ui, ui.id().with("export-scale"), &mut self.export_scale);
-                let mut f = if self.export_svg { ExportFormat::Svg } else { ExportFormat::Png };
-                if fmt_combo(ui, ui.id().with("export-format"), &mut f) {
-                    self.export_svg = f == ExportFormat::Svg;
-                }
-            });
-        } else if let Some(id) = single {
+        if mixed {
+            ui.label(RichText::new("Mixed export settings. Click + to replace them.").small().color(theme::muted(ui.ctx())));
+        } else if presets.is_empty() {
+            let mut p = self.export_default.clone();
+            export_row(ui, ui.id().with("export-default"), &mut p, false);
+            self.export_default = p;
+        } else {
             let mut list = presets.clone();
             let mut remove = None;
             for (i, p) in list.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    scale_combo(ui, ui.id().with(("ex-scale", id, i)), &mut p.scale);
-                    ui.add(egui::TextEdit::singleline(&mut p.suffix).hint_text("Suffix").desired_width(60.0));
-                    fmt_combo(ui, ui.id().with(("ex-fmt", id, i)), &mut p.format);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if icon_button(ui, Icon::Minus, false, 20.0, "Remove").clicked() {
-                            remove = Some(i);
-                        }
-                    });
-                });
+                if export_row(ui, ui.id().with(("ex", i)), p, true) {
+                    remove = Some(i);
+                }
             }
             if let Some(i) = remove {
                 list.remove(i);
             }
             if list != presets {
                 self.begin_edit();
-                self.doc.node_mut(id).exports = list;
+                for &id in &roots {
+                    self.doc.node_mut(id).exports = list.clone();
+                }
             }
         }
         let label = match roots.as_slice() {
@@ -4093,6 +4132,68 @@ impl App {
         };
         if ui.add_sized([ui.available_width(), 26.0], egui::Button::new(label)).clicked() {
             self.export(&ui.ctx().clone());
+        }
+    }
+
+    /// Shift Cmd E: every layer on the page with export presets, ticked to export, with a
+    /// preview of each, as in Figma's Export dialog.
+    pub fn export_window(&mut self, ctx: &egui::Context) {
+        let Some(mut off) = self.export_dialog.take() else { return };
+        let ids: Vec<NodeId> = self.doc.pages[self.page]
+            .children
+            .iter()
+            .flat_map(|&r| std::iter::once(r).chain(self.doc.descendants(r)))
+            .filter(|&id| !self.doc.node(id).exports.is_empty())
+            .collect();
+        let (mut open, mut go) = (true, false);
+        let mut budget = 4;
+        crate::chrome::window(ctx, "Export", &mut open, 340.0, |ui| {
+            let muted = theme::muted(ui.ctx());
+            if ids.is_empty() {
+                ui.label(RichText::new("No layers on this page have export settings. Add them in the Design panel's Export section.").color(muted));
+                return;
+            }
+            egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+                for &id in &ids {
+                    let tex = self.asset_thumb(ui.ctx(), id, &mut budget);
+                    let n = self.doc.node(id);
+                    ui.horizontal(|ui| {
+                        let mut on = !off.contains(&id);
+                        if ui.checkbox(&mut on, "").on_hover_text(&n.name).changed() {
+                            if on { off.remove(&id) } else { off.insert(id) };
+                        }
+                        let (rect, _) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::hover());
+                        ui.painter().rect_filled(rect, 4.0, theme::subtle(ui.ctx()));
+                        if let Some(tex) = &tex {
+                            let s = tex.size_vec2();
+                            let fit = (32.0 / s.x).min(32.0 / s.y);
+                            ui.painter().image(tex.id(), Rect::from_center_size(rect.center(), s * fit), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+                        }
+                        ui.vertical(|ui| {
+                            ui.add(egui::Label::new(&n.name).truncate());
+                            let what: Vec<String> = n.exports.iter().map(|p| format!("{} {}", if p.format.raster() { p.size_label() } else { String::new() }, p.format.ext().to_uppercase()).trim().to_string()).collect();
+                            ui.label(RichText::new(what.join(", ")).small().color(muted));
+                        });
+                    });
+                }
+            });
+            let files: usize = ids.iter().filter(|id| !off.contains(id)).map(|&id| self.doc.node(id).exports.len()).sum();
+            ui.add_space(6.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), 26.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let label = if files == 1 { "Export 1 file".to_string() } else { format!("Export {files} files") };
+                go = ui.add_enabled(files > 0, egui::Button::new(RichText::new(label).color(Color32::WHITE)).fill(BLUE).corner_radius(6)).clicked();
+            });
+        });
+        if budget == 0 {
+            ctx.request_repaint();
+        }
+        if go {
+            let chosen: Vec<NodeId> = ids.into_iter().filter(|id| !off.contains(id)).collect();
+            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                self.export_layers_to(ctx, &chosen, &dir);
+            }
+        } else if open {
+            self.export_dialog = Some(off);
         }
     }
 

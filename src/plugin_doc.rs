@@ -282,6 +282,44 @@ fn sizing_json(s: Sizing) -> &'static str {
         Sizing::Fill => "FILL",
     }
 }
+fn export_json(e: &crate::doc::ExportSetting) -> Value {
+    use crate::doc::{ExportFormat, ExportSize};
+    let format = match e.format {
+        ExportFormat::Png => "PNG",
+        ExportFormat::Jpg => "JPG",
+        ExportFormat::Svg => "SVG",
+        ExportFormat::Pdf => "PDF",
+        ExportFormat::Webp => "WEBP",
+    };
+    let (kind, value) = match e.size {
+        ExportSize::Scale => ("SCALE", e.scale),
+        ExportSize::Width(w) => ("WIDTH", w),
+        ExportSize::Height(h) => ("HEIGHT", h),
+    };
+    let mut v = json!({ "format": format, "suffix": e.suffix });
+    if e.format.raster() {
+        v["constraint"] = json!({ "type": kind, "value": value });
+    }
+    v
+}
+fn export_from(v: &Value) -> crate::doc::ExportSetting {
+    use crate::doc::{ExportFormat, ExportSetting, ExportSize};
+    let mut e = ExportSetting { suffix: v["suffix"].as_str().unwrap_or("").to_string(), ..Default::default() };
+    e.format = match v["format"].as_str().unwrap_or("") {
+        "JPG" => ExportFormat::Jpg,
+        "SVG" => ExportFormat::Svg,
+        "PDF" => ExportFormat::Pdf,
+        "WEBP" => ExportFormat::Webp,
+        _ => ExportFormat::Png,
+    };
+    let value = v["constraint"]["value"].as_f64().map(|x| x as f32).filter(|x| *x > 0.0).unwrap_or(1.0);
+    match v["constraint"]["type"].as_str().unwrap_or("SCALE") {
+        "WIDTH" => e.size = ExportSize::Width(value),
+        "HEIGHT" => e.size = ExportSize::Height(value),
+        _ => e.scale = value,
+    }
+    e
+}
 fn align_json(a: AxisAlign) -> &'static str {
     match a {
         AxisAlign::Min => "MIN",
@@ -530,6 +568,7 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
         "topLeftRadius": corners[0], "topRightRadius": corners[1], "bottomRightRadius": corners[2], "bottomLeftRadius": corners[3],
         "constraints": { "horizontal": constraint_json(n.constraints[0]), "vertical": constraint_json(n.constraints[1]) },
         "layoutPositioning": if n.absolute { "ABSOLUTE" } else { "AUTO" },
+        "exportSettings": n.exports.iter().map(export_json).collect::<Vec<_>>(),
         "layoutSizingHorizontal": sizing_json(n.sizing[0]), "layoutSizingVertical": sizing_json(n.sizing[1]),
         "minWidth": n.min_size[0], "minHeight": n.min_size[1], "maxWidth": n.max_size[0], "maxHeight": n.max_size[1],
         "fillStyleId": n.fill_style.map(|s| format!("S:{s}")).unwrap_or_default(),
@@ -1051,6 +1090,9 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
     }
     if changed("layoutPositioning") {
         n.absolute = s("layoutPositioning") == "ABSOLUTE";
+    }
+    if changed("exportSettings") {
+        n.exports = v["exportSettings"].as_array().into_iter().flatten().map(export_from).collect();
     }
     for (k, i) in [("gridColumnSpan", 0), ("gridRowSpan", 1)] {
         if changed(k) {

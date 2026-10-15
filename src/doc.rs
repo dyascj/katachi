@@ -844,20 +844,33 @@ pub enum ExportFormat {
     Jpg,
     Svg,
     Pdf,
+    Webp,
 }
 
 impl ExportFormat {
+    pub const ALL: [ExportFormat; 5] = [ExportFormat::Png, ExportFormat::Jpg, ExportFormat::Webp, ExportFormat::Svg, ExportFormat::Pdf];
     pub fn ext(self) -> &'static str {
         match self {
             ExportFormat::Png => "png",
             ExportFormat::Jpg => "jpg",
             ExportFormat::Svg => "svg",
             ExportFormat::Pdf => "pdf",
+            ExportFormat::Webp => "webp",
         }
     }
     pub fn raster(self) -> bool {
-        matches!(self, ExportFormat::Png | ExportFormat::Jpg)
+        matches!(self, ExportFormat::Png | ExportFormat::Jpg | ExportFormat::Webp)
     }
+}
+
+/// How big a raster export is, typed into one field as in Figma: "2x" scales (by `scale`),
+/// "512w" and "512h" fix the width or height in pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize)]
+pub enum ExportSize {
+    #[default]
+    Scale,
+    Width(f32),
+    Height(f32),
 }
 
 /// One export preset on a layer, like Figma's Export rows.
@@ -866,11 +879,61 @@ pub struct ExportSetting {
     pub scale: f32,
     pub format: ExportFormat,
     pub suffix: String,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub size: ExportSize,
+    /// JPG quality, 1 to 100.
+    #[serde(default = "jpg_quality", skip_serializing_if = "is_jpg_quality")]
+    pub quality: u8,
+}
+
+fn jpg_quality() -> u8 {
+    92
+}
+fn is_jpg_quality(q: &u8) -> bool {
+    *q == jpg_quality()
 }
 
 impl Default for ExportSetting {
     fn default() -> Self {
-        Self { scale: 1.0, format: ExportFormat::Png, suffix: String::new() }
+        Self { scale: 1.0, format: ExportFormat::Png, suffix: String::new(), size: ExportSize::Scale, quality: jpg_quality() }
+    }
+}
+
+impl ExportSetting {
+    /// The size field's text: "2x", "512w", "512h".
+    pub fn size_label(&self) -> String {
+        let n = |v: f32| ((v * 100.0).round() / 100.0).to_string();
+        match self.size {
+            ExportSize::Scale => format!("{}x", n(self.scale)),
+            ExportSize::Width(w) => format!("{}w", n(w)),
+            ExportSize::Height(h) => format!("{}h", n(h)),
+        }
+    }
+
+    /// Read what was typed into the size field ("2.5x", "2.5", "512w", "512 h"); false if it
+    /// isn't a size, leaving the preset as it was.
+    pub fn set_size(&mut self, text: &str) -> bool {
+        let t = text.trim().to_lowercase().replace(' ', "");
+        let (num, unit) = match t.chars().last() {
+            Some(c @ ('x' | 'w' | 'h')) => (&t[..t.len() - 1], c),
+            _ => (t.as_str(), 'x'),
+        };
+        let Some(v) = num.parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0) else { return false };
+        match unit {
+            'w' => self.size = ExportSize::Width(v),
+            'h' => self.size = ExportSize::Height(v),
+            _ => (self.size, self.scale) = (ExportSize::Scale, v.min(64.0)),
+        }
+        true
+    }
+
+    /// The raster scale that gives this preset's size for content `size` big.
+    pub fn scale_for(&self, size: Vec2) -> f32 {
+        match self.size {
+            ExportSize::Scale => self.scale,
+            ExportSize::Width(w) => w / size.x.max(0.01),
+            ExportSize::Height(h) => h / size.y.max(0.01),
+        }
     }
 }
 

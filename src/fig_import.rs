@@ -887,6 +887,28 @@ fn finish_common(n: &mut Node, v: &Value) {
     };
     n.dash = v.arr("dashPattern").iter().filter_map(|d| if let Value::Float(f) = d { Some(*f) } else { None }).collect();
     n.shadows = effects(v);
+    n.exports = v
+        .arr("exportSettings")
+        .iter()
+        .map(|e| {
+            use crate::doc::{ExportFormat, ExportSetting, ExportSize};
+            let mut out = ExportSetting { suffix: e.s("suffix").unwrap_or("").to_string(), ..Default::default() };
+            out.format = match e.s("imageType") {
+                Some("JPEG") => ExportFormat::Jpg,
+                Some("SVG") => ExportFormat::Svg,
+                Some("PDF") => ExportFormat::Pdf,
+                _ => ExportFormat::Png,
+            };
+            let c = e.get("constraint");
+            let value = c.and_then(|c| c.f("value")).filter(|v| *v > 0.0).unwrap_or(1.0);
+            match c.and_then(|c| c.s("type")) {
+                Some("CONTENT_WIDTH") => out.size = ExportSize::Width(value),
+                Some("CONTENT_HEIGHT") => out.size = ExportSize::Height(value),
+                _ => out.scale = value,
+            }
+            out
+        })
+        .collect();
 }
 
 fn effects(v: &Value) -> Vec<Shadow> {

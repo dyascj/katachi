@@ -179,7 +179,8 @@ const __NodeProto = {
 function __nodeDefaults(src) {
   const keep = ["width", "height", "fills", "strokes", "strokeWeight", "strokeAlign", "cornerRadius", "effects", "opacity",
     "layoutMode", "itemSpacing", "paddingLeft", "paddingRight", "paddingTop", "paddingBottom", "primaryAxisAlignItems",
-    "counterAxisAlignItems", "primaryAxisSizingMode", "counterAxisSizingMode", "clipsContent", "layoutWrap", "counterAxisSpacing"];
+    "counterAxisAlignItems", "primaryAxisSizingMode", "counterAxisSizingMode", "clipsContent", "layoutWrap", "counterAxisSpacing",
+    "itemReverseZIndex", "gridColumnCount", "gridRowCount", "gridColumnGap", "gridRowGap", "exportSettings"];
   const o = {};
   for (const k of keep) if (src[k] !== undefined) o[k] = __copy(src[k]);
   return o;
@@ -190,14 +191,15 @@ const __base = {
   x: 0, y: 0, width: 100, height: 100, rotation: 0, opacity: 1, visible: true, locked: false, blendMode: "PASS_THROUGH", isMask: false,
   fills: [], strokes: [], strokeWeight: 1, strokeAlign: "INSIDE", dashPattern: [], strokeCap: "NONE", strokeJoin: "MITER",
   effects: [], cornerRadius: 0, constraints: { horizontal: "MIN", vertical: "MIN" },
-  layoutPositioning: "AUTO", layoutGrow: 0, layoutAlign: "INHERIT",
+  layoutPositioning: "AUTO", layoutGrow: 0, layoutAlign: "INHERIT", gridColumnSpan: 1, gridRowSpan: 1, exportSettings: [],
   minWidth: null, maxWidth: null, minHeight: null, maxHeight: null,
 };
 const __frameBase = {
   layoutMode: "NONE", layoutWrap: "NO_WRAP", itemSpacing: 0, counterAxisSpacing: 0,
   paddingLeft: 0, paddingRight: 0, paddingTop: 0, paddingBottom: 0,
   primaryAxisAlignItems: "MIN", counterAxisAlignItems: "MIN", primaryAxisSizingMode: "AUTO", counterAxisSizingMode: "FIXED",
-  clipsContent: true, strokesIncludedInLayout: false,
+  clipsContent: true, strokesIncludedInLayout: false, itemReverseZIndex: false,
+  gridColumnCount: 1, gridRowCount: 0, gridColumnGap: 0, gridRowGap: 0,
 };
 function __create(type, props) {
   const frameish = ["FRAME", "COMPONENT", "COMPONENT_SET", "INSTANCE", "SECTION"].includes(type);

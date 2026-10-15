@@ -1951,7 +1951,7 @@ impl App {
         }
         ui.add_enabled_ui(has, |ui| {
             ui.menu_button("Copy/Paste as", |ui| {
-                for (label, short, what) in [("Copy as PNG", "⇧⌘C", "png"), ("Copy as SVG", "", "svg"), ("Copy as CSS", "", "css")] {
+                for (label, short, what) in [("Copy as PNG", "⇧⌘C", "png"), ("Copy as SVG", "", "svg"), ("Copy as CSS", "", "css"), ("Copy as code", "", "code")] {
                     if ui.add(egui::Button::new(label).shortcut_text(crate::chrome::keys(short))).clicked() {
                         self.copy_as(&ctx, what);
                         ui.close();

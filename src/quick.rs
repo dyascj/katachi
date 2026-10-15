@@ -97,7 +97,12 @@ const COMMANDS: &[(&str, &str, Run)] = &[
     ("Keyboard shortcuts", "", |a, _| a.open_settings(crate::settings::Tab::Shortcuts)),
     ("Manage plugins", "", |a, _| a.open_settings(crate::settings::Tab::Plugins)),
     ("Run script (plugin console)", "", |a, _| a.show_console = true),
-    ("Export selection", "⇧⌘E", |a, c| a.export(c)),
+    ("Export…", "⇧⌘E", |a, _| a.export_dialog = Some(Default::default())),
+    ("Export selection", "", |a, c| a.export(c)),
+    ("Copy as PNG", "⇧⌘C", |a, c| a.copy_as(c, "png")),
+    ("Copy as SVG", "", |a, c| a.copy_as(c, "svg")),
+    ("Copy as CSS", "", |a, c| a.copy_as(c, "css")),
+    ("Copy as code", "", |a, c| a.copy_as(c, "code")),
     ("Place image", "⇧⌘K", |a, _| a.import_dialog()),
     ("Save", "⌘S", |a, _| {
         a.save(false);

@@ -101,7 +101,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Rulers, layout guides, hide UI, outline", "⇧ R, ⌃ G, ⌘ \\, ⌘ Y"),
     ("Pixel grid, snap to pixel grid", "⇧ ', ⇧ ⌘ '"),
     ("Dev Mode, present", "⇧ D, ⌥ ⌘ ↵"),
-    ("Save, open, place image, export", "⌘ S, ⌘ O, ⇧ ⌘ K, ⇧ ⌘ E"),
+    ("Save, open, place image, export dialog", "⌘ S, ⌘ O, ⇧ ⌘ K, ⇧ ⌘ E"),
     ("Find and replace", "⌘ F"),
     ("Next and previous tab, close tab", "⌃ Tab, ⌃ ⇧ Tab, ⌘ W"),
     ("Settings", "⌘ ,"),
