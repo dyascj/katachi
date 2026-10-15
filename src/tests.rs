@@ -720,8 +720,8 @@ fn shots() {
     let find = |st: &App, name: &str| *st.doc.nodes.keys().find(|i| st.doc.node(**i).name == name).unwrap();
     let (hero, star) = (find(st, "Hero"), find(st, "Star 1"));
     if let Some(c) = st.collab.as_mut() {
-        c.peers.insert(91, crate::collab::Presence { name: "Luna".into(), color: 2, page: 0, cursor: Some(pos2(300., 120.)), selection: vec![hero] });
-        c.peers.insert(92, crate::collab::Presence { name: "Sam".into(), color: 1, page: 0, cursor: Some(pos2(260., 700.)), selection: vec![star] });
+        c.peers.insert(91, crate::collab::Presence { name: "Luna".into(), color: 2, page: 0, cursor: Some(pos2(300., 120.)), selection: vec![hero], ..Default::default() });
+        c.peers.insert(92, crate::collab::Presence { name: "Sam".into(), color: 1, page: 0, cursor: Some(pos2(260., 700.)), selection: vec![star], ..Default::default() });
     }
     st.sel.clear();
     h.run_steps(3);
@@ -1790,8 +1790,8 @@ fn rich_text_editing_styles_selection() {
     assert_eq!((n.spans[0].start, n.spans[0].end), (6, 12));
 }
 
-#[test]
-fn multiplayer_host_join_edit_and_undo_only_mine() {
+/// Two windows in one live session: Ada hosts, Bo joins. Waits until each sees the other.
+fn pair() -> (Harness<'static, App>, Harness<'static, App>) {
     let mut a = harness();
     let mut b = harness();
     a.state_mut().collab_port = 0;
@@ -1803,24 +1803,34 @@ fn multiplayer_host_join_edit_and_undo_only_mine() {
     let ctx = b.ctx.clone();
     b.state_mut().join_session(&ctx, &format!("127.0.0.1:{port}"), false);
     assert!(b.state().collab.is_some(), "joined");
+    let sees = |h: &App, name: &str| h.collab.as_ref().is_some_and(|c| c.peers.values().any(|p| p.name == name));
+    settle(&mut a, &mut b, &|a, b| sees(a, "Bo") && sees(b, "Ada"));
+    (a, b)
+}
+
+/// Step both windows until `done`, up to 5 s for the sockets (tests run in parallel and the
+/// machine may be busy).
+fn settle(a: &mut Harness<App>, b: &mut Harness<App>, done: &dyn Fn(&App, &App) -> bool) {
+    for _ in 0..1000 {
+        a.step();
+        b.step();
+        if done(a.state(), b.state()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn multiplayer_host_join_edit_and_undo_only_mine() {
+    let (mut a, mut b) = pair();
     // Ada draws; Bo sees it. Bo draws; Ada sees it.
     let ra = draw(&mut a, Key::R, (0.0, 0.0), (100.0, 100.0));
     let rb = draw(&mut b, Key::O, (200.0, 0.0), (260.0, 60.0));
-    // Up to 5 s for the sockets (tests run in parallel and the machine may be busy).
-    let settle = |a: &mut Harness<App>, b: &mut Harness<App>, done: &dyn Fn(&App, &App) -> bool| {
-        for _ in 0..1000 {
-            a.step();
-            b.step();
-            if done(a.state(), b.state()) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    };
     settle(&mut a, &mut b, &|a, b| b.doc.nodes.contains_key(&ra) && a.doc.nodes.contains_key(&rb) && a.collab.as_ref().is_some_and(|c| c.peers.values().any(|p| p.name == "Bo")));
     let dump = |h: &Harness<App>| {
         let c = h.state().collab.as_ref();
-        format!("nodes {:?} connected {:?} client {:?}", h.state().doc.nodes.keys().collect::<Vec<_>>(), c.map(|c| c.connected), c.map(|c| c.client))
+        format!("nodes {:?} connected {:?} client {:?}", h.state().doc.nodes.keys().collect::<Vec<_>>(), c.map(|c| c.status.clone()), c.map(|c| c.client))
     };
     assert!(b.state().doc.nodes.contains_key(&ra), "Bo sees Ada's rectangle {ra}: Ada {} / Bo {}", dump(&a), dump(&b));
     assert!(a.state().doc.nodes.contains_key(&rb), "Ada sees Bo's ellipse");
@@ -3842,4 +3852,28 @@ fn dev_mode_ready_for_dev_annotations_and_spacing() {
     let c = s(&h, n.rect.center().x, n.rect.min.y + 2.0);
     move_to(&mut h, c, Modifiers::NONE);
     h.run_steps(2);
+}
+
+#[test]
+fn session_window_shows_status_and_the_host_removes_someone() {
+    let (mut a, mut b) = pair();
+    a.state_mut().show_collab = true;
+    a.run_steps(2);
+    a.get_by_label("Connected");
+    a.get_by_label("Copy");
+    a.get_by_label("Bo");
+    a.get_by_label("Remove").click();
+    settle(&mut a, &mut b, &|a, b| {
+        a.collab.as_ref().is_some_and(|c| c.peers.is_empty()) && b.collab.as_ref().is_some_and(|c| matches!(c.status, crate::collab::Status::Disconnected(_)))
+    });
+    assert!(a.state().collab.as_ref().unwrap().peers.is_empty(), "Bo is gone");
+    let status = b.state().collab.as_ref().unwrap().status.clone();
+    assert!(matches!(&status, crate::collab::Status::Disconnected(why) if why.contains("removed")), "{status:?}");
+    // Bo's window says so and offers to leave or try again.
+    b.state_mut().show_collab = true;
+    b.run_steps(2);
+    b.get_by_label("Try again");
+    b.get_by_label("Leave session").click();
+    b.run_steps(2);
+    assert!(b.state().collab.is_none());
 }

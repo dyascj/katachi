@@ -578,7 +578,9 @@ impl App {
         c.me.page = self.page;
         c.me.selection = self.sel.clone();
         c.me.cursor = self.pointer_world;
+        let was = c.status.clone();
         let (touched, remote) = c.tick(&mut self.doc, now);
+        let status = (c.status != was).then(|| c.status.clone());
         // Others' edits are changes to save too.
         if !remote.is_empty() {
             self.dirty = true;
@@ -590,10 +592,11 @@ impl App {
         {
             crate::collab::apply(base, &remote);
         }
-        if !c.connected {
-            self.collab = None;
-            self.toast("Disconnected from the session".into());
-            return;
+        match status {
+            Some(crate::collab::Status::Reconnecting(0)) => self.toast("Connection lost. Reconnecting...".into()),
+            Some(crate::collab::Status::Connected) => self.toast("Reconnected to the session".into()),
+            Some(crate::collab::Status::Disconnected(why)) => self.toast(why),
+            _ => {}
         }
         if let Some(t) = self.undo_touched.last_mut() {
             t.extend(touched);
@@ -2169,9 +2172,22 @@ impl App {
         }
         let mut open = true;
         let mut action: Option<&str> = None;
+        let mut kick = None;
         crate::chrome::window(ctx, "Multiplayer session", &mut open, 320.0, |ui| {
             if let Some(c) = &self.collab {
+                use crate::collab::Status;
+                let (dot, status) = match &c.status {
+                    Status::Connected => (egui::Color32::from_rgb(0x14, 0xAE, 0x5C), "Connected".to_string()),
+                    Status::Reconnecting(0) => (egui::Color32::from_rgb(0xFF, 0xA6, 0x29), "Connection lost. Reconnecting...".to_string()),
+                    Status::Reconnecting(n) => (egui::Color32::from_rgb(0xFF, 0xA6, 0x29), format!("Reconnecting (attempt {})...", n + 1)),
+                    Status::Disconnected(why) => (egui::Color32::from_rgb(0xF2, 0x48, 0x22), format!("Disconnected. {why}.")),
+                };
                 ui.label(egui::RichText::new(if c.hosting { "Hosting a live session" } else { "In a live session" }).strong());
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(r.center(), 4.0, dot);
+                    ui.label(status);
+                });
                 ui.horizontal(|ui| {
                     ui.label("Address");
                     ui.monospace(&c.address);
@@ -2183,18 +2199,35 @@ impl App {
                     ui.label(egui::RichText::new("Others on your network join with this full address, code included.").small());
                 }
                 ui.separator();
-                ui.label(format!("{} (you)", c.me.name));
-                for p in c.peers.values() {
+                let swatch = |ui: &mut egui::Ui, color: usize| {
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    ui.painter().circle_filled(r.center(), 6.0, crate::collab::peer_color(color));
+                };
+                ui.horizontal(|ui| {
+                    swatch(ui, c.me.color);
+                    ui.label(format!("{} (you)", c.me.name));
+                });
+                for (&id, p) in &c.peers {
                     ui.horizontal(|ui| {
-                        let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                        ui.painter().circle_filled(r.center(), 6.0, crate::collab::PEER_COLORS[p.color % crate::collab::PEER_COLORS.len()]);
+                        swatch(ui, p.color);
                         ui.label(&p.name);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Only the host runs the relay, so only the host can remove people.
+                            if c.relay.is_some() && ui.small_button("Remove").on_hover_text(format!("Remove {} from the session", p.name)).clicked() {
+                                kick = Some(id);
+                            }
+                        });
                     });
                 }
                 ui.separator();
-                if ui.button("Leave session").clicked() {
-                    action = Some("leave");
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Leave session").clicked() {
+                        action = Some("leave");
+                    }
+                    if matches!(c.status, Status::Disconnected(_)) && ui.button("Try again").clicked() {
+                        action = Some("retry");
+                    }
+                });
             } else {
                 ui.horizontal(|ui| {
                     ui.label("Your name");
@@ -2220,8 +2253,16 @@ impl App {
                 });
             }
         });
+        if let (Some(id), Some(r)) = (kick, self.collab.as_ref().and_then(|c| c.relay.as_ref())) {
+            r.kick(id);
+        }
         match action {
             Some("leave") => self.collab = None,
+            Some("retry") => {
+                if let Some(c) = self.collab.as_mut() {
+                    c.reconnect();
+                }
+            }
             Some("host") => self.host_session(ctx),
             Some("join") => {
                 if self.dirty {
