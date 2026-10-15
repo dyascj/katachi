@@ -237,8 +237,8 @@ pub struct App {
     /// Zoom to this layer on the next frame (after page switches settle).
     pub zoom_target: Option<NodeId>,
     pub left_tab_assets: bool,
-    /// Assets panel previews: component -> (content key, texture).
-    pub asset_thumbs: std::collections::HashMap<NodeId, (u64, egui::TextureHandle)>,
+    /// Assets panel previews: (library id, "" for this file; component) -> (content key, texture).
+    pub asset_thumbs: std::collections::HashMap<(String, NodeId), (u64, egui::TextureHandle)>,
     /// Last tool used in each toolbar group (move, frame, shape, pen, text).
     pub tool_groups: [Tool; 6],
     pub presenting: Option<crate::prototype::Presentation>,
@@ -347,6 +347,14 @@ pub struct App {
     pub allow_close: bool,
     pub toast: Option<(String, f64)>,
     screenshot: Option<(PathBuf, u32)>,
+    /// Library files this document uses, as last read, by library id.
+    pub libs: std::collections::HashMap<String, crate::library::Loaded>,
+    /// Library changes waiting for review (Figma's "Library updates available").
+    pub lib_updates: Vec<crate::library::Change>,
+    pub show_libraries: bool,
+    pub review_updates: bool,
+    /// Whether the window had focus last frame: regaining it re-checks the libraries.
+    pub focused: bool,
 }
 
 impl App {
@@ -465,6 +473,11 @@ impl App {
             last_digit: None,
             eyedrop: None,
             screenshot: std::env::var_os("KATACHI_SCREENSHOT").map(|p| (PathBuf::from(p), 0)),
+            libs: Default::default(),
+            lib_updates: vec![],
+            show_libraries: false,
+            review_updates: false,
+            focused: false,
         };
         app.recoverable = crate::files::orphaned_recoveries(&app.recovery);
         if let Some(p) = path {
@@ -1552,6 +1565,10 @@ impl App {
             self.toast("Main component is missing".into());
             return;
         };
+        // A library component lives in its library file (Figma offers to open it).
+        if let Some((lib, _)) = crate::library::remote_root(&self.doc, c) {
+            return self.open_library(&lib);
+        }
         let page = self.doc.page_of(c);
         if page != self.page {
             self.select_page(page);
@@ -1637,6 +1654,7 @@ impl App {
                 self.doc = doc;
                 crate::files::add_recent(&p);
                 self.path = Some(p);
+                self.refresh_libraries();
             }
             Err(e) => self.toast(format!("Couldn't open file: {e}")),
         }
@@ -1671,6 +1689,11 @@ impl App {
 
     pub fn save_to(&mut self, path: PathBuf) -> bool {
         self.remember_view();
+        // Files get their library id on first save; library paths follow the file to its folder.
+        if self.doc.id.is_empty() {
+            self.doc.id = crate::library::new_id();
+        }
+        self.rebase_libraries(path.parent());
         let json = self.document_json();
         match crate::files::write_atomic(&path, json.as_bytes()) {
             Ok(()) => {
@@ -1853,7 +1876,8 @@ impl App {
         let before = self.doc.clone();
         let sel = self.sel.clone();
         let mut session = None;
-        let res = crate::plugins::Session::start(&mut self.doc, self.page, &sel, name, id, code, html).map(|(s, out)| {
+        let libs = self.plugin_libs();
+        let res = crate::plugins::Session::start(&mut self.doc, self.page, &sel, name, id, code, html, libs).map(|(s, out)| {
             session = Some(s);
             out
         });
@@ -2940,6 +2964,13 @@ impl eframe::App for App {
         self.appearance_frame(&ctx, frame);
         self.mcp_frame(&ctx);
         self.variables_window(&ctx);
+        let focused = ctx.input(|i| i.focused);
+        if focused && !self.focused {
+            self.refresh_libraries();
+        }
+        self.focused = focused;
+        self.libraries_window(&ctx);
+        self.library_updates(&ctx);
         self.autosave(ctx.input(|i| i.time));
         self.debug_screenshot(&ctx);
 

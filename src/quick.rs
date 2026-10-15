@@ -96,6 +96,9 @@ const COMMANDS: &[(&str, &str, Run)] = &[
     ("Present", "⌥⌘↵", |a, c| a.present(c.input(|i| i.time))),
     ("Comments", "⇧C", |a, _| a.show_comments = !a.show_comments),
     ("Local variables", "", |a, _| a.show_variables = true),
+    ("Libraries", "", |a, _| a.show_libraries = true),
+    ("Publish library", "", |a, _| a.publish_library()),
+    ("Review library updates", "", |a, _| a.review_updates = true),
     ("Replace fonts", "", |a, _| a.open_replace_fonts()),
     ("Create link", "⌘K", |a, c| a.create_link(c)),
     ("Find and replace", "⌘F", |a, _| {

@@ -148,18 +148,25 @@ impl App {
                 self.on_double_click(w);
             }
         if let (Some(drop), Some(p)) = (resp.dnd_release_payload::<crate::panels::AssetDrag>(), hover_pos) {
-            // Instance dropped from the Assets tab, centered under the pointer.
-            if self.doc.nodes.contains_key(&drop.0) {
+            // Instance dropped from the Assets tab, centered under the pointer. A library's
+            // component is copied in first.
+            if drop.1.is_some() || self.doc.nodes.contains_key(&drop.0) {
                 self.checkpoint();
-                let w = self.view.to_world(p);
-                let size = self.doc.node(drop.0).rect.size();
-                let mut parent = self.frame_at(w, &[]);
-                // Never into an instance (its layers come from its main) or the component itself.
-                while let Some(p) = parent.filter(|&p| self.owning_instance(p).is_some() || p == drop.0 || self.doc.is_ancestor(drop.0, p)) {
-                    parent = self.doc.node(p).parent;
+                let comp = match &drop.1 {
+                    Some(lib) => self.import_component(lib, drop.0),
+                    None => Some(drop.0),
+                };
+                if let Some(comp) = comp {
+                    let w = self.view.to_world(p);
+                    let size = self.doc.node(comp).rect.size();
+                    let mut parent = self.frame_at(w, &[]);
+                    // Never into an instance (its layers come from its main) or the component itself.
+                    while let Some(p) = parent.filter(|&p| self.owning_instance(p).is_some() || p == comp || self.doc.is_ancestor(comp, p)) {
+                        parent = self.doc.node(p).parent;
+                    }
+                    let i = self.doc.instantiate(comp, self.page, parent, None, self.px(w - size / 2.0));
+                    self.sel = vec![i];
                 }
-                let i = self.doc.instantiate(drop.0, self.page, parent, None, self.px(w - size / 2.0));
-                self.sel = vec![i];
             }
         }
         crate::chrome::context_menu(&resp, |ui| self.context_menu(ui));
@@ -2476,7 +2483,7 @@ impl App {
             }
         }
         if let Some(inst) = one.and_then(|id| self.owning_instance(id)) {
-            if item(ui, "Go to main component", "", true) {
+            if item(ui, if self.main_is_remote(inst) { "Open library file" } else { "Go to main component" }, "", true) {
                 self.go_to_main(inst);
                 ui.close();
             }

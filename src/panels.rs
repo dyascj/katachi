@@ -79,8 +79,43 @@ pub const TOOL_GROUPS: [&[(Tool, Icon, &str)]; 6] = [
     &[(Tool::Comment, Icon::Comment, "Comment  C")],
 ];
 
-/// Drag payload: a main component dragged from the Assets tab.
-pub struct AssetDrag(pub NodeId);
+/// Drag payload: a main component dragged from the Assets tab, and its library's id if it's
+/// from one (its id is then the library's).
+pub struct AssetDrag(pub NodeId, pub Option<String>);
+
+/// A component's preview, re-rendered when its content changes. Each tile re-checks its
+/// content every 30 frames (staggered), so a big library costs little per frame.
+fn thumb(ctx: &egui::Context, cache: &mut std::collections::HashMap<(String, NodeId), (u64, egui::TextureHandle)>, doc: &crate::doc::Document, lib: &str, id: NodeId, budget: &mut usize) -> Option<egui::TextureHandle> {
+    use std::hash::{Hash, Hasher};
+    let due = (ctx.cumulative_frame_nr() + id) % 30 == 0;
+    let k = (lib.to_string(), id);
+    if let Some((_, tex)) = cache.get(&k)
+        && (!due || *budget == 0)
+    {
+        return Some(tex.clone());
+    }
+    let mut h = std::hash::DefaultHasher::new();
+    for n in std::iter::once(id).chain(doc.descendants(id)) {
+        serde_json::to_vec(&*doc.nodes[&n]).unwrap_or_default().hash(&mut h);
+    }
+    let key = h.finish();
+    if let Some((old, tex)) = cache.get(&k)
+        && *old == key
+    {
+        return Some(tex.clone());
+    }
+    if *budget == 0 {
+        return None;
+    }
+    *budget -= 1;
+    let b = crate::export::export_bounds(doc, &[id]);
+    let scale = (128.0 / b.width().max(b.height()).max(1.0)).min(4.0);
+    let svg = crate::export::to_svg(doc, &[id]);
+    let (px, [w, hgt]) = crate::export::rasterize(&svg, scale)?;
+    let tex = ctx.load_texture(format!("asset-{lib}-{id}"), egui::ColorImage::from_rgba_premultiplied([w, hgt], &px), egui::TextureOptions::LINEAR);
+    cache.insert(k, (key, tex.clone()));
+    Some(tex)
+}
 
 pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
     let s = Stroke::new(1.2, color);
@@ -847,20 +882,44 @@ impl App {
         ui.separator();
     }
 
-    /// Assets tab: every main component in the file. Drag one onto the canvas to place an instance.
+    /// Assets tab: this file's components, then each enabled library's (by library, then page).
+    /// Drag one onto the canvas to place an instance.
     fn assets(&mut self, ui: &mut Ui) {
         let search_id = ui.id().with("asset-search");
         let mut q: String = ui.data(|d| d.get_temp(search_id)).unwrap_or_default();
         ui.add(egui::TextEdit::singleline(&mut q).hint_text("Search assets").desired_width(f32::INFINITY));
         ui.data_mut(|d| d.insert_temp(search_id, q.clone()));
         let q = q.to_lowercase();
+        ui.horizontal(|ui| {
+            if ui.button("Libraries").clicked() {
+                self.show_libraries = true;
+            }
+            // Any file can be a library; publishing hands its changes to the files using it.
+            let tip = match self.doc.published.0 {
+                0 => "Save, and let files using this one as a library take its changes".to_string(),
+                v => format!("Published version {v}"),
+            };
+            if ui.button("Publish library").on_hover_text(tip).clicked() {
+                self.publish_library();
+            }
+        });
+        if !self.lib_updates.is_empty() && ui.button(RichText::new("Library updates available").color(BLUE)).clicked() {
+            self.review_updates = true;
+        }
+        // Enabled libraries whose files are gone; the Libraries dialog relinks them.
+        let missing: Vec<String> = self.doc.libraries.iter().filter(|r| r.enabled && self.libs.get(&r.id).is_some_and(|l| l.doc.is_none())).map(|r| r.name.clone()).collect();
+        for name in missing {
+            if ui.add(egui::Button::new(RichText::new(format!("{name} is missing")).color(Color32::from_rgb(0xF2, 0x48, 0x22))).frame(false)).on_hover_text("Relink it in Libraries").clicked() {
+                self.show_libraries = true;
+            }
+        }
         ui.add_space(4.0);
         // Sets appear once (placing their first variant); components inside sets don't.
         let mut comps: Vec<(usize, NodeId, String)> = self
             .doc
             .nodes
             .values()
-            .filter(|n| matches!(n.kind, Kind::Component | Kind::ComponentSet) && n.name.to_lowercase().contains(&q))
+            .filter(|n| matches!(n.kind, Kind::Component | Kind::ComponentSet) && n.remote.is_none() && n.name.to_lowercase().contains(&q))
             .filter(|n| !n.parent.is_some_and(|p| self.doc.node(p).kind == Kind::ComponentSet))
             .filter_map(|n| match n.kind {
                 Kind::ComponentSet => n.children.first().map(|&v| (self.doc.page_of(n.id), v, n.name.clone())),
@@ -868,35 +927,29 @@ impl App {
             })
             .collect();
         comps.sort_by(|a, b| (a.0, &a.2).cmp(&(b.0, &b.2)));
-        if comps.is_empty() {
+        let libs: Vec<(String, String, std::sync::Arc<crate::doc::Document>, Vec<(usize, NodeId, String)>)> = self
+            .enabled_libs()
+            .into_iter()
+            .map(|(r, d)| {
+                let items: Vec<_> = crate::library::components(&d).into_iter().filter(|c| c.2.to_lowercase().contains(&q)).collect();
+                (r.id, r.name, d, items)
+            })
+            .filter(|l| !l.3.is_empty())
+            .collect();
+        if comps.is_empty() && libs.is_empty() {
             ui.label(RichText::new(crate::chrome::keys(if q.is_empty() { "Create components with ⌥⌘K to reuse them here." } else { "No components match." })).color(theme::muted(ui.ctx())));
             return;
         }
-        ui.label(RichText::new("Local components").strong());
         // Thumbnails are rendered a few per frame, so opening a big library doesn't stall.
         let mut budget = 6;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for page in 0..self.doc.pages.len() {
-                let items: Vec<(NodeId, String)> = comps.iter().filter(|c| c.0 == page).map(|c| (c.1, c.2.clone())).collect();
-                if items.is_empty() {
-                    continue;
-                }
-                egui::CollapsingHeader::new(RichText::new(&self.doc.pages[page].name).color(theme::muted(ui.ctx())))
-                    .id_salt(("asset-page", page))
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        let tile = 70.0;
-                        let gap = 8.0;
-                        let cols = ((ui.available_width() + gap) / (tile + gap)).floor().max(1.0) as usize;
-                        for row in items.chunks(cols) {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = gap;
-                                for (id, name) in row {
-                                    self.asset_tile(ui, *id, name, tile, &mut budget);
-                                }
-                            });
-                        }
-                    });
+            if !comps.is_empty() {
+                ui.label(RichText::new("Local components").strong());
+                self.asset_pages(ui, None, &comps, &mut budget);
+            }
+            for (id, name, d, items) in &libs {
+                ui.label(RichText::new(name).strong());
+                self.asset_pages(ui, Some((id, d)), items, &mut budget);
             }
         });
         if budget == 0 {
@@ -904,11 +957,39 @@ impl App {
         }
     }
 
+    /// Component tiles under collapsible page headers (`lib`: the library they come from).
+    fn asset_pages(&mut self, ui: &mut Ui, lib: Option<(&str, &crate::doc::Document)>, comps: &[(usize, NodeId, String)], budget: &mut usize) {
+        let pages: Vec<String> = lib.map_or(&self.doc, |l| l.1).pages.iter().map(|p| p.name.clone()).collect();
+        for (page, page_name) in pages.iter().enumerate() {
+            let items: Vec<(NodeId, String)> = comps.iter().filter(|c| c.0 == page).map(|c| (c.1, c.2.clone())).collect();
+            if items.is_empty() {
+                continue;
+            }
+            egui::CollapsingHeader::new(RichText::new(page_name).color(theme::muted(ui.ctx())))
+                .id_salt(("asset-page", lib.map(|l| l.0), page))
+                .default_open(true)
+                .show(ui, |ui| {
+                    let tile = 70.0;
+                    let gap = 8.0;
+                    let cols = ((ui.available_width() + gap) / (tile + gap)).floor().max(1.0) as usize;
+                    for row in items.chunks(cols) {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = gap;
+                            for (id, name) in row {
+                                self.asset_tile(ui, lib, *id, name, tile, budget);
+                            }
+                        });
+                    }
+                });
+        }
+    }
+
     /// One component in the Assets grid: a preview over its name, with its description on hover.
     /// Drag onto the canvas, or click to place an instance mid-screen, as in Figma.
-    fn asset_tile(&mut self, ui: &mut Ui, id: NodeId, name: &str, size: f32, budget: &mut usize) {
-        let tex = self.asset_thumb(ui.ctx(), id, budget);
-        let desc = self.doc.description_of(id).to_string();
+    fn asset_tile(&mut self, ui: &mut Ui, lib: Option<(&str, &crate::doc::Document)>, id: NodeId, name: &str, size: f32, budget: &mut usize) {
+        let doc = lib.map_or(&self.doc, |l| l.1);
+        let tex = thumb(ui.ctx(), &mut self.asset_thumbs, doc, lib.map_or("", |l| l.0), id, budget);
+        let desc = doc.description_of(id).to_string();
         // Click and drag on one widget: egui's drag source starts dragging on press, which
         // would swallow the click.
         let clicked = ui
@@ -930,7 +1011,7 @@ impl App {
                     ui.painter().rect_stroke(rect, 6.0, Stroke::new(1.0, BLUE), egui::StrokeKind::Inside);
                 }
                 if resp.drag_started() {
-                    egui::DragAndDrop::set_payload(ui.ctx(), AssetDrag(id));
+                    egui::DragAndDrop::set_payload(ui.ctx(), AssetDrag(id, lib.map(|l| l.0.to_string())));
                 }
                 // The tile follows the pointer while dragging.
                 if resp.dragged()
@@ -947,45 +1028,23 @@ impl App {
         if clicked {
             let at = self.view_center_world();
             self.checkpoint();
-            let size = self.doc.node(id).rect.size();
-            let i = self.doc.instantiate(id, self.page, None, None, (at - size / 2.0).round());
+            // A library's component is copied in first; its instance points at the copy.
+            let Some(comp) = (match lib {
+                Some((l, _)) => self.import_component(l, id),
+                None => Some(id),
+            }) else {
+                return;
+            };
+            let size = self.doc.node(comp).rect.size();
+            let i = self.doc.instantiate(comp, self.page, None, None, (at - size / 2.0).round());
             self.sel = vec![i];
         }
     }
 
-    /// A component's preview, re-rendered when its content changes. Each tile re-checks its
-    /// content every 30 frames (staggered), so a big library costs little per frame.
+    /// A component's preview in this file.
     fn asset_thumb(&mut self, ctx: &egui::Context, id: NodeId, budget: &mut usize) -> Option<egui::TextureHandle> {
-        use std::hash::{Hash, Hasher};
-        let due = (ctx.cumulative_frame_nr() + id) % 30 == 0;
-        if let Some((_, tex)) = self.asset_thumbs.get(&id)
-            && (!due || *budget == 0)
-        {
-            return Some(tex.clone());
-        }
-        let mut h = std::hash::DefaultHasher::new();
-        for n in std::iter::once(id).chain(self.doc.descendants(id)) {
-            serde_json::to_vec(&*self.doc.nodes[&n]).unwrap_or_default().hash(&mut h);
-        }
-        let key = h.finish();
-        if let Some((k, tex)) = self.asset_thumbs.get(&id)
-            && *k == key
-        {
-            return Some(tex.clone());
-        }
-        if *budget == 0 {
-            return None;
-        }
-        *budget -= 1;
-        let b = crate::export::export_bounds(&self.doc, &[id]);
-        let scale = (128.0 / b.width().max(b.height()).max(1.0)).min(4.0);
-        let svg = crate::export::to_svg(&self.doc, &[id]);
-        let (px, [w, hgt]) = crate::export::rasterize(&svg, scale)?;
-        let tex = ctx.load_texture(format!("asset-{id}"), egui::ColorImage::from_rgba_premultiplied([w, hgt], &px), egui::TextureOptions::LINEAR);
-        self.asset_thumbs.insert(id, (key, tex.clone()));
-        Some(tex)
+        thumb(ctx, &mut self.asset_thumbs, &self.doc, "", id, budget)
     }
-
     /// The main menu, laid out like Figma's: Actions, then File / Edit / View / Object / Arrange,
     /// then Plugins and Preferences, then Help.
     fn main_menu(&mut self, ui: &mut Ui) {
@@ -1207,6 +1266,10 @@ impl App {
             }
             if item(ui, "Local variables", "") {
                 self.show_variables = true;
+                ui.close();
+            }
+            if item(ui, "Libraries…", "") {
+                self.show_libraries = true;
                 ui.close();
             }
         });
@@ -2855,7 +2918,7 @@ impl App {
             ("Effect styles", |v: &StyleValue| matches!(v, StyleValue::Effect(_))),
             ("Grid styles", |v: &StyleValue| matches!(v, StyleValue::Grid(_))),
         ] {
-            let list: Vec<crate::doc::Style> = self.doc.styles.iter().filter(|s| is(&s.value)).cloned().collect();
+            let list: Vec<crate::doc::Style> = self.doc.styles.iter().filter(|s| s.remote.is_none() && is(&s.value)).cloned().collect();
             if list.is_empty() {
                 continue;
             }
@@ -2910,6 +2973,30 @@ impl App {
             self.checkpoint();
             self.doc.styles.retain(|s| s.id != id);
             self.doc.reflow();
+        }
+        // Library styles this file uses; "Move to this file" makes one local, as in Figma.
+        let remote: Vec<crate::doc::Style> = self.doc.styles.iter().filter(|s| s.remote.is_some()).cloned().collect();
+        if remote.is_empty() {
+            return;
+        }
+        ui.label(RichText::new("Library styles").color(theme::muted(ui.ctx())).small());
+        let mut localize = None;
+        for st in remote {
+            ui.horizontal(|ui| {
+                crate::paint_ui::style_preview(ui, &st.value);
+                ui.label(&st.name);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Move to this file").clicked() {
+                        localize = Some(st.id);
+                    }
+                });
+            });
+        }
+        if let Some(id) = localize {
+            self.checkpoint();
+            if let Some(s) = self.doc.styles.iter_mut().find(|s| s.id == id) {
+                s.remote = None;
+            }
         }
     }
 
@@ -3198,9 +3285,15 @@ impl App {
     /// main component, reset everything or one kind of override.
     pub fn instance_menu(&mut self, ui: &mut Ui, inst: NodeId) {
         let overrides = self.doc.instance_overrides(inst);
-        if ui.add_enabled(!overrides.is_empty(), egui::Button::new("Push changes to main component")).clicked() {
+        // A library component is read-only here; it can be moved into this file instead.
+        let remote = self.main_is_remote(inst);
+        if ui.add_enabled(!overrides.is_empty() && !remote, egui::Button::new("Push changes to main component")).clicked() {
             self.checkpoint();
             self.doc.push_to_main(inst);
+            ui.close();
+        }
+        if remote && ui.button("Move main component to this file").clicked() {
+            self.localize_main(inst);
             ui.close();
         }
         if ui.button("Reset all changes").clicked() {
@@ -3275,7 +3368,7 @@ impl App {
                 }
             }
             ui.horizontal(|ui| {
-                if ui.button("Go to main").clicked() {
+                if ui.button(if self.main_is_remote(i) { "Open library file" } else { "Go to main" }).clicked() {
                     self.go_to_main(i);
                 }
                 if ui.button("Reset").clicked() {
@@ -3913,10 +4006,10 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Typography").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                pick = crate::paint_ui::style_menu(ui, ui.id().with("text-styles"), &self.doc.styles, |v| matches!(v, crate::doc::StyleValue::Text(_)));
+                pick = self.style_picker(ui, ui.id().with("text-styles"), |v| matches!(v, crate::doc::StyleValue::Text(_)));
             });
         });
-        match pick {
+        match self.local_style_pick(pick) {
             Some(crate::paint_ui::StylePick::Apply(sid)) => {
                 self.checkpoint();
                 for &id in &self.sel.clone() {
@@ -3934,7 +4027,7 @@ impl App {
                 self.doc.reflow();
                 return;
             }
-            None => {}
+            _ => {}
         }
         if let Some(style) = n.text_style.and_then(|sid| self.doc.style(sid)).cloned() {
             ui.horizontal(|ui| {
@@ -4198,7 +4291,7 @@ impl App {
 
     fn paints_section(&mut self, ui: &mut Ui, stroke: bool) {
         use crate::doc::StyleValue;
-        use crate::paint_ui::{StylePick, style_menu, style_preview};
+        use crate::paint_ui::{StylePick, style_preview};
         let first = self.sel[0];
         let n = self.doc.node(first).clone();
         let mut paints = if stroke { n.strokes.clone() } else { n.fills.clone() };
@@ -4212,9 +4305,9 @@ impl App {
             ui.label(RichText::new(if stroke { "Stroke" } else { "Fill" }).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 add = icon_button(ui, Icon::Plus, false, 22.0, "").clicked();
-                pick = style_menu(ui, ui.id().with(("paint-styles", stroke)), &self.doc.styles, |v| matches!(v, StyleValue::Paint(_)));
+                pick = self.style_picker(ui, ui.id().with(("paint-styles", stroke)), |v| matches!(v, StyleValue::Paint(_)));
                 // Figma's hexagon: apply a color variable to the paint.
-                if !self.doc.variables.is_empty() {
+                if self.has_variables() {
                     let vb = icon_button(ui, Icon::Variable, false, 22.0, "Apply variable");
                     egui::Popup::menu(&vb).id(ui.id().with(("paint-var", stroke))).style(crate::chrome::menu_style).show(|ui| {
                         var_pick = self.variable_menu(ui, prop);
@@ -4222,7 +4315,7 @@ impl App {
                 }
             });
         });
-        if let Some(v) = var_pick {
+        if let Some(v) = self.local_var(var_pick) {
             self.bind_selection(prop, v);
             return;
         }
@@ -4253,7 +4346,7 @@ impl App {
             }
             app.doc.reflow();
         };
-        match pick {
+        match self.local_style_pick(pick) {
             Some(StylePick::Apply(sid)) => {
                 self.checkpoint();
                 set_link(self, Some(sid));
@@ -4263,7 +4356,7 @@ impl App {
                 let sid = self.doc.add_style(name, StyleValue::Paint(paints.clone()));
                 set_link(self, Some(sid));
             }
-            None => {}
+            _ => {}
         }
         // A linked style shows as one row; editing it edits the style for everyone.
         if let Some(style) = link.and_then(|sid| self.doc.style(sid)).cloned() {
@@ -4271,7 +4364,10 @@ impl App {
                 style_preview(ui, &style.value);
                 let open = ui.add(egui::Button::new(&style.name).frame(false));
                 crate::chrome::popover(&open, ui.id().with(("edit-style", style.id)), &format!("Edit {}", style.name), 240.0, |ui| {
-                    if let StyleValue::Paint(mut ps) = style.value.clone() {
+                    // A library's style is edited in the library.
+                    if style.remote.is_some() {
+                        ui.label(RichText::new("From a library: edit it in its file.").color(theme::muted(ui.ctx())));
+                    } else if let StyleValue::Paint(mut ps) = style.value.clone() {
                         let mut edited = false;
                         for (i, p) in ps.iter_mut().enumerate().rev() {
                             if !matches!(paint_row(ui, ui.id().with(("style-paint", style.id, i)), p, "Fill"), PaintEvent::None) {
@@ -4501,7 +4597,7 @@ impl App {
     fn layout_guides(&mut self, ui: &mut Ui, id: NodeId) {
         use crate::doc::{GridKind, LayoutGrid};
         use crate::doc::StyleValue;
-        use crate::paint_ui::{StylePick, style_menu, style_preview};
+        use crate::paint_ui::{StylePick, style_preview};
         let mut grids = self.doc.node(id).grids.clone();
         let before = grids.clone();
         let (mut add, mut pick) = (false, None);
@@ -4509,7 +4605,7 @@ impl App {
             ui.label(RichText::new("Layout guide").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 add = icon_button(ui, Icon::Plus, false, 22.0, "").clicked();
-                pick = style_menu(ui, ui.id().with("grid-styles"), &self.doc.styles, |v| matches!(v, StyleValue::Grid(_)));
+                pick = self.style_picker(ui, ui.id().with("grid-styles"), |v| matches!(v, StyleValue::Grid(_)));
             });
         });
         let set_link = |app: &mut App, v: Option<crate::doc::StyleId>| {
@@ -4520,7 +4616,7 @@ impl App {
             }
             app.doc.reflow();
         };
-        match pick {
+        match self.local_style_pick(pick) {
             Some(StylePick::Apply(sid)) => {
                 self.checkpoint();
                 set_link(self, Some(sid));
@@ -4532,7 +4628,7 @@ impl App {
                 set_link(self, Some(sid));
                 return;
             }
-            None => {}
+            _ => {}
         }
         // A linked grid style shows as one row, with detach, as in Figma.
         if let Some(style) = self.doc.node(id).grid_style.and_then(|sid| self.doc.style(sid)).cloned() {
@@ -4582,7 +4678,7 @@ impl App {
 
     fn effects_section(&mut self, ui: &mut Ui) {
         use crate::doc::StyleValue;
-        use crate::paint_ui::{StylePick, style_menu, style_preview};
+        use crate::paint_ui::{StylePick, style_preview};
         let first = self.sel[0];
         let mut shadows = self.doc.node(first).shadows.clone();
         let mut changed = false;
@@ -4593,7 +4689,7 @@ impl App {
             ui.label(RichText::new("Effects").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 add = icon_button(ui, Icon::Plus, false, 22.0, "").clicked();
-                pick = style_menu(ui, ui.id().with("effect-styles"), &self.doc.styles, |v| matches!(v, StyleValue::Effect(_)));
+                pick = self.style_picker(ui, ui.id().with("effect-styles"), |v| matches!(v, StyleValue::Effect(_)));
             });
         });
         let set_link = |app: &mut App, v: Option<crate::doc::StyleId>| {
@@ -4602,7 +4698,7 @@ impl App {
             }
             app.doc.reflow();
         };
-        match pick {
+        match self.local_style_pick(pick) {
             Some(StylePick::Apply(sid)) => {
                 self.checkpoint();
                 set_link(self, Some(sid));
@@ -4612,7 +4708,7 @@ impl App {
                 let sid = self.doc.add_style(name, StyleValue::Effect(shadows.clone()));
                 set_link(self, Some(sid));
             }
-            None => {}
+            _ => {}
         }
         if let Some(style) = link.and_then(|sid| self.doc.style(sid)).cloned() {
             ui.horizontal(|ui| {

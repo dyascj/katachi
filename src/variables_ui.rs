@@ -113,22 +113,23 @@ impl App {
         let mut open = true;
         let before = (self.doc.collections.clone(), self.doc.variables.clone());
         crate::chrome::window(ctx, "Local variables", &mut open, 760.0, |ui| {
-            if self.doc.collections.is_empty() {
+            // Library collections are edited in their libraries.
+            let Some(first) = self.doc.collections.iter().find(|c| c.remote.is_none()).map(|c| c.id) else {
                 ui.label("Variables store reusable values like colors and spacing, with modes such as Light and Dark.");
                 if ui.button("Create collection").clicked() {
                     let id = self.doc.add_collection("Collection".into());
                     self.var_collection = Some(id);
                 }
                 return;
-            }
-            let current = self.var_collection.filter(|c| self.doc.collections.iter().any(|x| x.id == *c)).unwrap_or(self.doc.collections[0].id);
+            };
+            let current = self.var_collection.filter(|c| self.doc.collections.iter().any(|x| x.id == *c && x.remote.is_none())).unwrap_or(first);
             self.var_collection = Some(current);
             // Collections in a left column, the selected one's table on the right, as in Figma.
             ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 ui.set_width(160.0);
                 ui.label(egui::RichText::new("Collections").small().color(crate::appearance::muted(ui.ctx())));
-                for c in &self.doc.collections {
+                for c in self.doc.collections.iter().filter(|c| c.remote.is_none()) {
                     if ui.add_sized([160.0, 26.0], egui::Button::selectable(c.id == current, &c.name)).clicked() {
                         self.var_collection = Some(c.id);
                     }
@@ -346,28 +347,42 @@ impl App {
         }
     }
 
-    /// The variables `prop` can use, by collection, as menu buttons. Returns the one clicked.
-    pub fn variable_menu(&self, ui: &mut Ui, prop: Bindable) -> Option<VarId> {
+    /// Whether this file or an enabled library has variables to apply.
+    pub fn has_variables(&self) -> bool {
+        self.doc.variables.iter().any(|v| v.remote.is_none()) || self.enabled_libs().iter().any(|(_, d)| !d.variables.is_empty())
+    }
+
+    /// The variables `prop` can use, by collection (this file's, then each enabled library's),
+    /// as menu buttons. Returns the one clicked: (library id for a library's, its id there).
+    pub fn variable_menu(&self, ui: &mut Ui, prop: Bindable) -> Option<(Option<String>, VarId)> {
         let mut pick = None;
         let mut any = false;
-        for c in &self.doc.collections {
-            let list: Vec<_> = self.doc.variables.iter().filter(|v| v.collection == c.id && v.shows_in(prop) && self.doc.resolve_first(v.id).is_some_and(|x| prop.accepts(&x))).collect();
-            if list.is_empty() {
-                continue;
-            }
-            any = true;
-            ui.label(RichText::new(&c.name).small().color(crate::chrome::MENU_MUTED));
-            for v in list {
-                let swatch = match self.doc.resolve_first(v.id) {
-                    Some(VarValue::Color(c)) => RichText::new("■ ").color(c.to32()),
-                    _ => RichText::new(""),
+        let libs = self.enabled_libs();
+        let sources = std::iter::once((None, &self.doc)).chain(libs.iter().map(|(r, d)| (Some(r), &**d)));
+        for (lib, doc) in sources {
+            for c in doc.collections.iter().filter(|c| c.remote.is_none()) {
+                let list: Vec<_> = doc.variables.iter().filter(|v| v.collection == c.id && v.shows_in(prop) && doc.resolve_first(v.id).is_some_and(|x| prop.accepts(&x))).collect();
+                if list.is_empty() {
+                    continue;
+                }
+                any = true;
+                let title = match lib {
+                    Some(r) => format!("{} · {}", r.name, c.name),
+                    None => c.name.clone(),
                 };
-                let mut job = egui::text::LayoutJob::default();
-                swatch.append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
-                RichText::new(&v.name).append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
-                if ui.button(job).clicked() {
-                    pick = Some(v.id);
-                    ui.close();
+                ui.label(RichText::new(title).small().color(crate::chrome::MENU_MUTED));
+                for v in list {
+                    let swatch = match doc.resolve_first(v.id) {
+                        Some(VarValue::Color(c)) => RichText::new("■ ").color(c.to32()),
+                        _ => RichText::new(""),
+                    };
+                    let mut job = egui::text::LayoutJob::default();
+                    swatch.append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
+                    RichText::new(&v.name).append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
+                    if ui.button(job).clicked() {
+                        pick = Some((lib.map(|r| r.id.clone()), v.id));
+                        ui.close();
+                    }
                 }
             }
         }
@@ -390,13 +405,13 @@ impl App {
 
     /// Design panel: bind selected layers' properties to variables, and pick variable modes.
     pub fn variables_section(&mut self, ui: &mut Ui, id: NodeId) {
-        if self.doc.variables.is_empty() && self.doc.collections.is_empty() {
+        if self.doc.variables.is_empty() && self.doc.collections.is_empty() && !self.has_variables() {
             return;
         }
         let n = self.doc.node(id).clone();
         let in_layout = n.parent.is_some_and(|p| self.doc.node(p).layout.mode != crate::doc::LayoutMode::None);
         ui.separator();
-        let mut add: Option<(Bindable, u64)> = None;
+        let mut add: Option<(Bindable, (Option<String>, VarId))> = None;
         ui.horizontal(|ui| {
             ui.label(RichText::new("Variables").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -424,7 +439,9 @@ impl App {
                 });
             });
         });
-        if let Some((prop, var)) = add {
+        if let Some((prop, pick)) = add
+            && let Some(var) = self.local_var(Some(pick))
+        {
             self.bind_selection(prop, var);
         }
         let mut unbind = None;

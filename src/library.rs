@@ -438,6 +438,333 @@ pub fn load(dir: Option<&Path>, r: &LibraryRef, cached: Option<&Loaded>) -> Load
     Loaded { path, doc: None, modified: now }
 }
 
+// ---------- the app ----------
+
+use crate::app::{App, Want};
+use crate::paint_ui::StylePick;
+use egui::RichText;
+
+impl App {
+    fn doc_dir(&self) -> Option<PathBuf> {
+        self.path.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf)
+    }
+
+    /// How a library path is stored: relative to this file once it has a folder.
+    fn stored_path(&self, p: &Path) -> String {
+        match self.doc_dir() {
+            Some(d) => relative(&d, p),
+            None => p.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// Store library paths relative to `dir`, where the file is being saved.
+    pub fn rebase_libraries(&mut self, dir: Option<&Path>) {
+        let (old, Some(dir)) = (self.doc_dir(), dir) else { return };
+        for r in &mut self.doc.libraries {
+            let abs = self.libs.get(&r.id).map_or_else(|| resolve(old.as_deref(), &r.path), |l| l.path.clone());
+            r.path = relative(dir, &abs);
+        }
+    }
+
+    /// Re-read libraries that changed on disk and list what they changed. Runs when the file
+    /// opens and when the window regains focus.
+    pub fn refresh_libraries(&mut self) {
+        let dir = self.doc_dir();
+        let mut updates = vec![];
+        for i in 0..self.doc.libraries.len() {
+            let r = self.doc.libraries[i].clone();
+            let l = load(dir.as_deref(), &r, self.libs.get(&r.id));
+            if l.doc.is_some() && l.path != resolve(dir.as_deref(), &r.path) {
+                // Found again after a move or rename: remember where.
+                self.doc.libraries[i].path = self.stored_path(&l.path);
+                self.dirty = true;
+            }
+            if let Some(d) = &l.doc {
+                updates.extend(changes(&self.doc, &r.id, d));
+            }
+            self.libs.insert(r.id, l);
+        }
+        self.lib_updates = updates;
+    }
+
+    fn lib_doc(&self, id: &str) -> Option<Arc<Document>> {
+        self.libs.get(id)?.doc.clone()
+    }
+
+    /// Enabled libraries that could be read.
+    pub fn enabled_libs(&self) -> Vec<(LibraryRef, Arc<Document>)> {
+        self.doc.libraries.iter().filter(|r| r.enabled).filter_map(|r| Some((r.clone(), self.lib_doc(&r.id)?))).collect()
+    }
+
+    /// Libraries for plugins: (id, document).
+    pub fn plugin_libs(&self) -> Vec<(String, Arc<Document>)> {
+        self.enabled_libs().into_iter().map(|(r, d)| (r.id, d)).collect()
+    }
+
+    /// "Add library file": use another .katachi file's assets here.
+    pub fn add_library(&mut self, path: PathBuf) {
+        let Some(lib) = read(&path) else { return self.toast("Couldn't open that file as a library".into()) };
+        let id = id_of(&lib, &path);
+        if self.path.as_ref() == Some(&path) || id == self.doc.id {
+            return self.toast("A file can't be its own library".into());
+        }
+        self.checkpoint();
+        match self.doc.libraries.iter_mut().find(|l| l.id == id) {
+            Some(l) => l.enabled = true,
+            None => {
+                let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                let stored = self.stored_path(&path);
+                self.doc.libraries.push(LibraryRef { id, name, path: stored, enabled: true });
+            }
+        }
+        self.refresh_libraries();
+    }
+
+    /// Point library `i` at another file. If that's a different library, the assets this file
+    /// copied move over to it, matched by their ids there (a copy of the original, say).
+    pub fn relink_library(&mut self, i: usize, path: PathBuf) {
+        let Some(lib) = read(&path) else { return self.toast("Couldn't open that file as a library".into()) };
+        let (old, new) = (self.doc.libraries[i].id.clone(), id_of(&lib, &path));
+        self.checkpoint();
+        if new != old {
+            let retarget = |r: &mut Option<Remote>| {
+                if let Some(r) = r.as_mut().filter(|r| r.lib == old) {
+                    r.lib = new.clone();
+                }
+            };
+            for n in self.doc.nodes.values_mut() {
+                if n.remote.as_ref().is_some_and(|r| r.lib == old) {
+                    retarget(&mut Arc::make_mut(n).remote);
+                }
+            }
+            self.doc.styles.iter_mut().for_each(|s| retarget(&mut s.remote));
+            self.doc.variables.iter_mut().for_each(|v| retarget(&mut v.remote));
+            self.doc.collections.iter_mut().for_each(|c| retarget(&mut c.remote));
+        }
+        let stored = self.stored_path(&path);
+        let r = &mut self.doc.libraries[i];
+        (r.id, r.path) = (new, stored);
+        r.name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        self.libs.remove(&old);
+        self.refresh_libraries();
+    }
+
+    /// Copy a library component in (callers make the undo step first).
+    pub fn import_component(&mut self, lib: &str, key: NodeId) -> Option<NodeId> {
+        let d = self.lib_doc(lib)?;
+        Import::new(&self.doc, lib, &d).component(&mut self.doc, key)
+    }
+
+    /// A style picked from a menu, with a library one copied in: Apply or Create as before.
+    pub fn local_style_pick(&mut self, pick: Option<StylePick>) -> Option<StylePick> {
+        match pick {
+            Some(StylePick::Library(lib, key)) => {
+                let d = self.lib_doc(&lib)?;
+                Import::new(&self.doc, &lib, &d).style(&mut self.doc, key).map(StylePick::Apply)
+            }
+            p => p,
+        }
+    }
+
+    /// A variable picked from a menu (library, id there), copied in if it's a library's.
+    pub fn local_var(&mut self, pick: Option<(Option<String>, VarId)>) -> Option<VarId> {
+        match pick? {
+            (None, v) => Some(v),
+            (Some(lib), v) => {
+                let d = self.lib_doc(&lib)?;
+                Import::new(&self.doc, &lib, &d).variable(&mut self.doc, v)
+            }
+        }
+    }
+
+    /// The Styles menu: this file's styles, then each enabled library's.
+    pub fn style_picker(&self, ui: &mut egui::Ui, id: egui::Id, kind: impl Fn(&StyleValue) -> bool) -> Option<StylePick> {
+        let local: Vec<Style> = self.doc.styles.iter().filter(|s| s.remote.is_none()).cloned().collect();
+        let libs: Vec<(String, String, Vec<Style>)> =
+            self.enabled_libs().into_iter().map(|(r, d)| (r.name, r.id, d.styles.iter().filter(|s| s.remote.is_none() && !hidden(&s.name)).cloned().collect())).collect();
+        crate::paint_ui::style_menu(ui, id, &local, &libs, kind)
+    }
+
+    /// Figma's "Publish library": save with a new publish version, which files using this one
+    /// compare against.
+    pub fn publish_library(&mut self) {
+        let before = self.doc.published;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        self.doc.published = (before.0 + 1, now);
+        if self.save(false) {
+            self.toast(format!("Published version {}", self.doc.published.0));
+        } else {
+            self.doc.published = before;
+        }
+    }
+
+    /// Take library updates (all, or the `only`th), as one undo step.
+    pub fn apply_library_updates(&mut self, only: Option<usize>) {
+        let picked: Vec<Change> = match only {
+            Some(i) => self.lib_updates.get(i).cloned().into_iter().collect(),
+            None => self.lib_updates.clone(),
+        };
+        if picked.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for r in self.doc.libraries.clone() {
+            if let Some(d) = self.lib_doc(&r.id) {
+                update(&mut self.doc, &r.id, &d, &picked);
+            }
+        }
+        self.refresh_libraries();
+    }
+
+    /// Open a library's file in a new tab ("Go to main component" on a library instance).
+    pub fn open_library(&mut self, lib: &str) {
+        match self.libs.get(lib).filter(|l| l.doc.is_some()) {
+            Some(l) => self.want = Some(Want::Open(l.path.clone())),
+            None => self.toast("The library file is missing".into()),
+        }
+    }
+
+    /// Whether an instance's main component comes from a library.
+    pub fn main_is_remote(&self, inst: NodeId) -> bool {
+        self.doc.node(inst).component.is_some_and(|c| self.doc.nodes.contains_key(&c) && remote_root(&self.doc, c).is_some())
+    }
+
+    /// "Move to this file": the instance's library component becomes a local one, mid-screen.
+    pub fn localize_main(&mut self, inst: NodeId) {
+        let Some(c) = self.doc.node(inst).component else { return };
+        self.checkpoint();
+        let at = self.view_center_world();
+        if let Some(root) = localize_component(&mut self.doc, c, self.page, at) {
+            self.sel = vec![root];
+        }
+    }
+
+    /// The Libraries dialog: libraries added to this file, on or off, with missing ones to
+    /// relink; add one from disk or from recent files.
+    pub fn libraries_window(&mut self, ctx: &egui::Context) {
+        if !self.show_libraries {
+            return;
+        }
+        let mut open = true;
+        let (mut toggle, mut relink, mut add) = (None, None, None);
+        crate::chrome::window(ctx, "Libraries", &mut open, 420.0, |ui| {
+            let muted = crate::appearance::muted(ui.ctx());
+            if self.doc.libraries.is_empty() {
+                ui.label(RichText::new("Add a .katachi file to use its components, styles and variables here.").color(muted));
+            }
+            for (i, r) in self.doc.libraries.iter().enumerate() {
+                let lib = self.libs.get(&r.id).and_then(|l| l.doc.clone());
+                ui.horizontal(|ui| {
+                    let mut on = r.enabled;
+                    if ui.checkbox(&mut on, RichText::new(&r.name).strong()).changed() {
+                        toggle = Some(i);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| match &lib {
+                        None => {
+                            if ui.button("Relink…").clicked() {
+                                relink = Some(i);
+                            }
+                            ui.label(RichText::new("Missing").color(egui::Color32::from_rgb(0xF2, 0x48, 0x22)));
+                        }
+                        Some(d) => {
+                            let styles = d.styles.iter().filter(|s| s.remote.is_none() && !hidden(&s.name)).count();
+                            ui.label(RichText::new(format!("{} components, {styles} styles", components(d).len())).small().color(muted));
+                        }
+                    });
+                });
+            }
+            ui.separator();
+            if ui.button("Add library file…").clicked()
+                && let Some(p) = rfd::FileDialog::new().add_filter("Katachi", &["katachi"]).pick_file()
+            {
+                add = Some(p);
+            }
+            // Recent files are the likely libraries, as Figma lists a team's files.
+            let dir = self.doc_dir();
+            let used: Vec<PathBuf> = self.doc.libraries.iter().map(|r| self.libs.get(&r.id).map_or_else(|| resolve(dir.as_deref(), &r.path), |l| l.path.clone())).collect();
+            let recent: Vec<PathBuf> = crate::files::recent().into_iter().filter(|p| Some(p) != self.path.as_ref() && !used.contains(p)).take(8).collect();
+            if !recent.is_empty() {
+                ui.label(RichText::new("Recent files").small().color(muted));
+            }
+            for p in recent {
+                ui.horizontal(|ui| {
+                    ui.label(p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()).on_hover_text(p.to_string_lossy());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Add").clicked() {
+                            add = Some(p.clone());
+                        }
+                    });
+                });
+            }
+        });
+        self.show_libraries = open;
+        if let Some(i) = toggle {
+            self.checkpoint();
+            self.doc.libraries[i].enabled = !self.doc.libraries[i].enabled;
+        }
+        if let Some(i) = relink
+            && let Some(p) = rfd::FileDialog::new().add_filter("Katachi", &["katachi"]).pick_file()
+        {
+            self.relink_library(i, p);
+        }
+        if let Some(p) = add {
+            self.add_library(p);
+        }
+    }
+
+    /// Figma's "Library updates available" notice over the canvas, and its review dialog.
+    pub fn library_updates(&mut self, ctx: &egui::Context) {
+        if self.lib_updates.is_empty() {
+            self.review_updates = false;
+            return;
+        }
+        if !self.review_updates {
+            let at = self.canvas_rect.unwrap_or(ctx.content_rect()).right_bottom() - egui::vec2(16.0, 16.0);
+            egui::Area::new(egui::Id::new("lib-updates")).pivot(egui::Align2::RIGHT_BOTTOM).fixed_pos(at).order(egui::Order::Foreground).show(ctx, |ui| {
+                crate::chrome::popover_frame(ui).inner_margin(10).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Library updates available").strong());
+                        if ui.button("Review").clicked() {
+                            self.review_updates = true;
+                        }
+                    });
+                });
+            });
+            return;
+        }
+        let mut one = None;
+        let names: HashMap<String, String> = self.doc.libraries.iter().map(|r| (r.id.clone(), r.name.clone())).collect();
+        let body = |ui: &mut egui::Ui| {
+            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                for (i, c) in self.lib_updates.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let kind = match c.asset {
+                            Asset::Component => "Component",
+                            Asset::Style => "Style",
+                            Asset::Variable => "Variable",
+                        };
+                        ui.label(&c.name);
+                        ui.label(RichText::new(format!("{kind} · {}", names.get(&c.lib).map_or("", |n| n.as_str()))).small().color(crate::appearance::muted(ui.ctx())));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Update").clicked() {
+                                one = Some(i);
+                            }
+                        });
+                    });
+                }
+            });
+        };
+        match crate::chrome::dialog(ctx, "lib-updates-review", "Library updates", 380.0, body, &[("Close", false), ("Update all", true)]) {
+            Some(1) => self.apply_library_updates(None),
+            Some(_) => self.review_updates = false,
+            None => {}
+        }
+        if one.is_some() {
+            self.apply_library_updates(one);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
