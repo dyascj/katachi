@@ -11,6 +11,7 @@ mod export;
 mod fig_import;
 mod files;
 mod kiwi;
+mod library;
 mod macos_open;
 mod mcp;
 mod mcp_tools;

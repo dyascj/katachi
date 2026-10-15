@@ -519,6 +519,9 @@ pub struct Variable {
     /// Code syntax for Dev Mode: Web, iOS, Android (empty = derived from the name).
     #[serde(default, skip_serializing_if = "is_default")]
     pub code_syntax: [String; 3],
+    /// A library variable this file uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<Remote>,
 }
 
 impl Variable {
@@ -533,6 +536,9 @@ pub struct Collection {
     pub id: u64,
     pub name: String,
     pub modes: Vec<String>,
+    /// The collection of library variables this file uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<Remote>,
 }
 
 /// Layer properties a variable can drive.
@@ -1002,6 +1008,36 @@ pub struct Style {
     pub id: StyleId,
     pub name: String,
     pub value: StyleValue,
+    /// A library style this file uses (read-only here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<Remote>,
+}
+
+/// Where a library asset copied into this file came from: the library file's id and the
+/// asset's id there. Components, styles and variables from libraries live in the file as
+/// hidden, read-only copies, so it renders even when the library goes missing.
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Remote {
+    pub lib: String,
+    pub key: u64,
+    /// The asset's content hash and the library's publish version when it was copied (on the
+    /// asset's root layer only); compared to tell when the library has an update.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub hash: u64,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub version: u32,
+}
+
+/// A library this file has added (Figma's team libraries, for local files): another .katachi file.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LibraryRef {
+    /// The library file's `Document::id`; finds it again after a move or rename.
+    pub id: String,
+    pub name: String,
+    /// Relative to this file when possible.
+    pub path: String,
+    /// Offered in Assets and the pickers.
+    pub enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1825,6 +1861,10 @@ pub struct Node {
     /// Dev Mode annotations: notes pinned to the layer, labeled on the canvas.
     #[serde(skip_serializing_if = "dflt::annotations")]
     pub annotations: Vec<String>,
+    /// A layer copied from a library (part of a library component): read-only, and kept off
+    /// the pages (only instances of it show).
+    #[serde(skip_serializing_if = "dflt::remote")]
+    pub remote: Option<Remote>,
 }
 
 /// Serialization leaves out fields at `Node::default()`'s values; `#[serde(default)]` fills
@@ -1917,6 +1957,7 @@ mod dflt {
         exposed: bool,
         ready: bool,
         annotations: Vec<String>,
+        remote: Option<Remote>,
     );
 }
 
@@ -2012,6 +2053,7 @@ impl Default for Node {
             exposed: false,
             ready: false,
             annotations: vec![],
+            remote: None,
         }
     }
 }
@@ -2239,6 +2281,16 @@ pub struct Document {
     pub collections: Vec<Collection>,
     #[serde(default)]
     pub variables: Vec<Variable>,
+    /// A random id given on first save; files using this one as a library find it by it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    /// Libraries added to this file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub libraries: Vec<LibraryRef>,
+    /// As a library: the last publish's version (counting from 1) and unix time. Files using
+    /// it only see updates once it's published again, as in Figma.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub published: (u32, u64),
     #[serde(skip)]
     pub cache: SyncCache,
 }
@@ -2485,6 +2537,9 @@ impl Default for Document {
             comments: vec![],
             collections: vec![],
             variables: vec![],
+            id: String::new(),
+            libraries: vec![],
+            published: (0, 0),
             cache: SyncCache::default(),
         }
     }
@@ -2733,7 +2788,7 @@ impl Document {
     pub fn add_collection(&mut self, name: String) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.collections.push(Collection { id, name, modes: vec!["Mode 1".into()] });
+        self.collections.push(Collection { id, name, modes: vec!["Mode 1".into()], remote: None });
         id
     }
 
@@ -2741,7 +2796,7 @@ impl Document {
         let id = self.next_id;
         self.next_id += 1;
         let modes = self.collections.iter().find(|c| c.id == collection).map_or(1, |c| c.modes.len());
-        self.variables.push(Variable { id, name, collection, values: vec![value; modes], scopes: vec![], code_syntax: Default::default() });
+        self.variables.push(Variable { id, name, collection, values: vec![value; modes], scopes: vec![], code_syntax: Default::default(), remote: None });
         id
     }
 
@@ -2909,7 +2964,7 @@ impl Document {
     pub fn add_style(&mut self, name: String, value: StyleValue) -> StyleId {
         let id = self.next_id;
         self.next_id += 1;
-        self.styles.push(Style { id, name, value });
+        self.styles.push(Style { id, name, value, remote: None });
         id
     }
 
@@ -2989,11 +3044,11 @@ impl Document {
         if let Some(set) = c.parent.map(|p| &self.nodes[&p]).filter(|p| p.kind == Kind::ComponentSet) {
             c.name = set.name.clone();
         }
-        let mut n = Node { children: vec![], name: c.name.clone(), ..c.clone() };
+        let mut n = Node { children: vec![], name: c.name.clone(), remote: None, ..c.clone() };
         n.kind = Kind::Instance;
         n.component = Some(comp);
         n.source = Some(comp);
-        n.synced = Some(Box::new(Node { children: vec![], ..c }));
+        n.synced = Some(Box::new(Node { children: vec![], remote: None, ..c }));
         n.rect = Rect::from_min_size(at, n.rect.size());
         let id = self.insert(page, parent, index, n);
         self.sync_instance(id);
@@ -3024,7 +3079,7 @@ impl Document {
             if let Some(src) = self.nodes[&id].source.and_then(|s| self.nodes.get(&s)).cloned() {
                 let n = self.node_mut(id);
                 let keep = n.rect;
-                *n = Node { id: n.id, parent: n.parent, children: n.children.clone(), kind: n.kind, component: n.component, source: n.source, synced: None, ..(*src).clone() };
+                *n = Node { id: n.id, parent: n.parent, children: n.children.clone(), kind: n.kind, component: n.component, source: n.source, synced: None, remote: n.remote.clone(), ..(*src).clone() };
                 n.rect = keep;
                 n.synced = Some(Box::new(Node { children: vec![], ..n.clone() }));
             }
@@ -3067,7 +3122,8 @@ impl Document {
     /// Figma's "Push changes to main component": the instance's overrides become the main
     /// component's values, so every other instance picks them up too.
     pub fn push_to_main(&mut self, inst: NodeId) {
-        if self.nodes[&inst].component.is_none_or(|c| !self.nodes.contains_key(&c)) {
+        // A library component is read-only here: it changes in its library.
+        if self.nodes[&inst].component.is_none_or(|c| self.nodes.get(&c).is_none_or(|c| c.remote.is_some())) {
             return;
         }
         for d in self.own_layers(inst) {
@@ -3163,9 +3219,9 @@ impl Document {
                     e
                 }
                 None => {
-                    let mut n = Node { children: vec![], ..(*src).clone() };
+                    let mut n = Node { children: vec![], remote: None, ..(*src).clone() };
                     n.source = Some(cid);
-                    n.synced = Some(Box::new(Node { children: vec![], ..(*src).clone() }));
+                    n.synced = Some(Box::new(Node { children: vec![], remote: None, ..(*src).clone() }));
                     // Nested instances keep pointing at their own component.
                     let id = self.insert(page, Some(parent), None, n);
                     by_source.insert(cid, id);
@@ -4079,7 +4135,7 @@ fn merge_from(e: &mut Node, src: &Node) {
         decoration, text_case, paragraph_spacing, paragraph_indent, vertical_trim, truncate, max_lines, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, overflow, scroll_pos, fill_style,
         stroke_style, text_style, effect_style, grid_style, prop_bind, is_mask, blend, bindings, modes, spans, lists, exposed
     );
-    e.synced = Some(Box::new(Node { children: vec![], synced: None, ..src.clone() }));
+    e.synced = Some(Box::new(Node { children: vec![], synced: None, remote: None, ..src.clone() }));
 }
 
 /// Tight bounds of a cubic Bezier: endpoints plus the curve's extrema on each axis.
