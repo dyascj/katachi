@@ -2713,6 +2713,11 @@ fn scale_props(n: &mut Node, k: f32) {
         s.blur *= k;
         s.spread *= k;
         s.offset *= k;
+        s.size *= k;
+        s.glass.depth *= k;
+        if let Some(p) = &mut s.progressive {
+            p.start_blur *= k;
+        }
     }
     n.layout.gap *= k;
     n.layout.padding.iter_mut().for_each(|p| *p *= k);

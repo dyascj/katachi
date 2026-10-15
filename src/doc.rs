@@ -1580,23 +1580,85 @@ pub enum EffectKind {
     InnerShadow,
     LayerBlur,
     BackgroundBlur,
+    Noise,
+    Texture,
+    Glass,
 }
 
 impl EffectKind {
+    /// Every type, in the order of Figma's effect type menu.
+    pub const ALL: [EffectKind; 7] =
+        [EffectKind::DropShadow, EffectKind::InnerShadow, EffectKind::LayerBlur, EffectKind::BackgroundBlur, EffectKind::Noise, EffectKind::Texture, EffectKind::Glass];
     pub fn label(self) -> &'static str {
         match self {
             EffectKind::DropShadow => "Drop shadow",
             EffectKind::InnerShadow => "Inner shadow",
             EffectKind::LayerBlur => "Layer blur",
             EffectKind::BackgroundBlur => "Background blur",
+            EffectKind::Noise => "Noise",
+            EffectKind::Texture => "Texture",
+            EffectKind::Glass => "Glass",
         }
     }
     pub fn is_shadow(self) -> bool {
         matches!(self, EffectKind::DropShadow | EffectKind::InnerShadow)
     }
+    pub fn is_blur(self) -> bool {
+        matches!(self, EffectKind::LayerBlur | EffectKind::BackgroundBlur)
+    }
+    /// Effects drawn from what's behind the layer.
+    pub fn is_backdrop(self) -> bool {
+        matches!(self, EffectKind::BackgroundBlur | EffectKind::Glass)
+    }
 }
 
-/// A layer effect. Blurs use only `blur`; shadows use everything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum NoiseType {
+    #[default]
+    Mono,
+    Duo,
+    Multi,
+}
+
+impl NoiseType {
+    pub fn label(self) -> &'static str {
+        match self {
+            NoiseType::Mono => "Mono",
+            NoiseType::Duo => "Duo",
+            NoiseType::Multi => "Multitone",
+        }
+    }
+}
+
+/// A progressive blur ramps linearly from `start_blur` at `start` to the effect's `blur` at
+/// `end`; both points are in the layer's unit square, as in Figma.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Progressive {
+    pub start: Pos2,
+    pub end: Pos2,
+    pub start_blur: f32,
+}
+
+impl Default for Progressive {
+    fn default() -> Self {
+        Self { start: pos2(0.5, 0.0), end: pos2(0.5, 1.0), start_blur: 0.0 }
+    }
+}
+
+/// Glass settings; its frost is the effect's `blur`. Ratios are 0..1, `depth` is in px and
+/// `angle` in degrees: the direction light travels, counter-clockwise from +x.
+#[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Glass {
+    pub refraction: f32,
+    pub depth: f32,
+    pub dispersion: f32,
+    pub angle: f32,
+    pub light: f32,
+}
+
+/// A layer effect. Blurs use only `blur`; shadows use color, offset, blur and spread. `blur` is
+/// Figma's `radius` for every type: texture strength and glass frost too.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Shadow {
     #[serde(default)]
@@ -1606,12 +1668,92 @@ pub struct Shadow {
     pub blur: f32,
     pub spread: f32,
     pub visible: bool,
+    /// Drop shadows: Figma's "Show behind transparent areas". Off, the shadow is knocked out
+    /// behind the layer.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub show_behind: bool,
+    /// Layer and background blurs: set for a progressive blur.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progressive: Option<Progressive>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub noise: NoiseType,
+    /// Noise and texture grain size, in px.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub size: f32,
+    /// Noise: the share of grains shown, 0..1.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub density: f32,
+    /// Duotone noise's second color. Multitone noise uses only `color`'s alpha, as its opacity.
+    #[serde(default = "transparent", skip_serializing_if = "is_transparent")]
+    pub color2: Rgba,
+    /// Texture: keep the distorted layer inside its original shape.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub clip: bool,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub glass: Glass,
+}
+
+fn transparent() -> Rgba {
+    Rgba([0, 0, 0, 0])
+}
+fn is_transparent(c: &Rgba) -> bool {
+    *c == transparent()
 }
 
 impl Default for Shadow {
     /// Figma's default drop shadow.
     fn default() -> Self {
-        Self { kind: EffectKind::DropShadow, color: Rgba([0, 0, 0, 64]), offset: vec2(0.0, 4.0), blur: 4.0, spread: 0.0, visible: true }
+        Self {
+            kind: EffectKind::DropShadow,
+            color: Rgba([0, 0, 0, 64]),
+            offset: vec2(0.0, 4.0),
+            blur: 4.0,
+            spread: 0.0,
+            visible: true,
+            show_behind: false,
+            progressive: None,
+            noise: NoiseType::Mono,
+            size: 0.0,
+            density: 0.0,
+            color2: transparent(),
+            clip: false,
+            glass: Glass::default(),
+        }
+    }
+}
+
+impl Shadow {
+    /// A new effect of `kind` with Figma's starting settings.
+    pub fn of(kind: EffectKind) -> Self {
+        let d = Self { kind, ..Self::default() };
+        match kind {
+            EffectKind::DropShadow | EffectKind::InnerShadow => d,
+            EffectKind::LayerBlur | EffectKind::BackgroundBlur => Self { offset: Vec2::ZERO, ..d },
+            EffectKind::Noise => Self { offset: Vec2::ZERO, color: Rgba([0, 0, 0, 64]), color2: Rgba([255, 255, 255, 64]), size: 1.0, density: 0.5, ..d },
+            EffectKind::Texture => Self { offset: Vec2::ZERO, size: 4.0, blur: 4.0, clip: true, ..d },
+            EffectKind::Glass => Self { offset: Vec2::ZERO, blur: 4.0, glass: Glass { refraction: 0.8, depth: 20.0, dispersion: 0.5, angle: -45.0, light: 0.8 }, ..d },
+        }
+    }
+
+    /// Switch type, keeping settings between kinds that share them (shadow to shadow, blur to blur).
+    pub fn set_kind(&mut self, kind: EffectKind) {
+        if (self.kind.is_shadow() && kind.is_shadow()) || (self.kind.is_blur() && kind.is_blur()) {
+            self.kind = kind;
+        } else {
+            *self = Self { visible: self.visible, ..Self::of(kind) };
+        }
+    }
+
+    /// The blur at unit-square point `t` along a progressive blur (0 at its start, 1 at its end).
+    pub fn blur_at(&self, t: f32) -> f32 {
+        match self.progressive {
+            Some(p) => p.start_blur + (self.blur - p.start_blur) * t.clamp(0.0, 1.0),
+            None => self.blur,
+        }
+    }
+
+    pub fn max_blur(&self) -> f32 {
+        self.progressive.map_or(self.blur, |p| self.blur.max(p.start_blur))
     }
 }
 
@@ -2066,6 +2208,15 @@ impl Node {
     /// Whether the shape encloses area that fills can paint.
     pub fn has_area(&self) -> bool {
         self.kind != Kind::Vector || self.paths.iter().any(|p| p.closed)
+    }
+
+    /// Whether a drop shadow must be knocked out behind this layer: Figma hides it there unless
+    /// "Show behind transparent areas" is on, which only shows where no opaque fill covers it.
+    /// Groups cast their children's shadow and are left alone.
+    pub fn knocks_out_shadow(&self) -> bool {
+        self.kind != Kind::Group
+            && self.shadows.iter().any(|s| s.visible && s.kind == EffectKind::DropShadow && !s.show_behind)
+            && !(self.has_area() && self.fills.iter().any(|f| f.visible && f.kind == PaintKind::Solid && f.color.a() == 255))
     }
 
     /// Re-derive `rect` so it tightly wraps every contour (anchors relative to it).
