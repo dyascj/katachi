@@ -777,48 +777,15 @@ pub fn shadow_row(ui: &mut Ui, id: egui::Id, s: &mut Shadow) -> (bool, bool) {
         crate::chrome::popover(&open, id.with("popup"), s.kind.label(), 240.0, |ui| {
             // Effect type as a dropdown, as in Figma's header.
             crate::chrome::menu_button(ui, s.kind.label(), |ui| {
-                for k in [EffectKind::DropShadow, EffectKind::InnerShadow, EffectKind::LayerBlur, EffectKind::BackgroundBlur] {
+                for k in EffectKind::ALL {
                     if ui.selectable_label(s.kind == k, k.label()).clicked() && s.kind != k {
-                        s.kind = k;
+                        s.set_kind(k);
                         changed = true;
                     }
                 }
             });
             ui.separator();
-            egui::Grid::new(id.with("grid")).num_columns(4).show(ui, |ui| {
-                let mut field = |ui: &mut Ui, label: &str, v: &mut f32, min: f32| {
-                    ui.label(label);
-                    changed |= ui.add(DragValue::new(v).speed(0.5).range(min..=1000.0).custom_formatter(|v, _| num(v as f32))).changed();
-                };
-                if s.kind.is_shadow() {
-                    field(ui, "X", &mut s.offset.x, -1000.0);
-                    field(ui, "Y", &mut s.offset.y, -1000.0);
-                    ui.end_row();
-                    field(ui, "Blur", &mut s.blur, 0.0);
-                    field(ui, "Spread", &mut s.spread, -1000.0);
-                } else {
-                    field(ui, "Blur", &mut s.blur, 0.0);
-                }
-                ui.end_row();
-            });
-            if s.kind.is_shadow() {
-                // Swatch, hex and opacity; the swatch expands the full picker in place.
-                ui.add_space(4.0);
-                let open_id = id.with("color-open");
-                let mut open: bool = ui.data(|d| d.get_temp(open_id)).unwrap_or(false);
-                ui.horizontal(|ui| {
-                    if swatch(ui, &Paint::solid(s.color)).on_hover_text("Color").clicked() {
-                        open = !open;
-                    }
-                    changed |= hex_field(ui, id.with("hex"), &mut s.color, 64.0);
-                    changed |= alpha_field(ui, &mut s.color);
-                });
-                ui.data_mut(|d| d.insert_temp(open_id, open));
-                if open {
-                    ui.add_space(6.0);
-                    changed |= rgb_picker(ui, &mut s.color);
-                }
-            }
+            changed |= effect_settings(ui, id, s);
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             remove = icon_button(ui, Icon::Minus, false, 22.0, "Remove").clicked();
@@ -829,6 +796,138 @@ pub fn shadow_row(ui: &mut Ui, id: egui::Id, s: &mut Shadow) -> (bool, bool) {
         });
     });
     (changed, remove)
+}
+
+/// An effect's settings, by type, as in Figma's effect popover. Returns whether any changed.
+fn effect_settings(ui: &mut Ui, id: egui::Id, s: &mut Shadow) -> bool {
+    use crate::doc::{EffectKind, NoiseType, Progressive};
+    let mut changed = false;
+    // A labelled number; ratios (0..1) show as percentages.
+    fn field(ui: &mut Ui, label: &str, v: &mut f32, min: f32, max: f32, pct: bool) -> bool {
+        ui.label(label);
+        let k = if pct { 100.0 } else { 1.0 };
+        let mut shown = *v * k;
+        let r = ui.add(DragValue::new(&mut shown).speed(0.5).range(min * k..=max * k).custom_formatter(|v, _| num(v as f32)).suffix(if pct { "%" } else { "" }));
+        if r.changed() {
+            *v = shown / k;
+        }
+        r.changed()
+    }
+    let grid = egui::Grid::new(id.with("grid")).num_columns(4);
+    match s.kind {
+        EffectKind::DropShadow | EffectKind::InnerShadow => {
+            grid.show(ui, |ui| {
+                changed |= field(ui, "X", &mut s.offset.x, -1000.0, 1000.0, false);
+                changed |= field(ui, "Y", &mut s.offset.y, -1000.0, 1000.0, false);
+                ui.end_row();
+                changed |= field(ui, "Blur", &mut s.blur, 0.0, 1000.0, false);
+                changed |= field(ui, "Spread", &mut s.spread, -1000.0, 1000.0, false);
+                ui.end_row();
+            });
+        }
+        EffectKind::LayerBlur | EffectKind::BackgroundBlur => {
+            ui.horizontal(|ui| {
+                if ui.selectable_label(s.progressive.is_none(), "Uniform").clicked() && s.progressive.is_some() {
+                    s.progressive = None;
+                    changed = true;
+                }
+                if ui.selectable_label(s.progressive.is_some(), "Progressive").clicked() && s.progressive.is_none() {
+                    s.progressive = Some(Progressive::default());
+                    changed = true;
+                }
+            });
+            grid.show(ui, |ui| match &mut s.progressive {
+                None => {
+                    changed |= field(ui, "Blur", &mut s.blur, 0.0, 1000.0, false);
+                    ui.end_row();
+                }
+                Some(p) => {
+                    changed |= field(ui, "Start", &mut p.start_blur, 0.0, 1000.0, false);
+                    changed |= field(ui, "End", &mut s.blur, 0.0, 1000.0, false);
+                    ui.end_row();
+                    changed |= field(ui, "Start X", &mut p.start.x, -1.0, 2.0, true);
+                    changed |= field(ui, "Y", &mut p.start.y, -1.0, 2.0, true);
+                    ui.end_row();
+                    changed |= field(ui, "End X", &mut p.end.x, -1.0, 2.0, true);
+                    changed |= field(ui, "Y", &mut p.end.y, -1.0, 2.0, true);
+                    ui.end_row();
+                }
+            });
+        }
+        EffectKind::Noise => {
+            ui.horizontal(|ui| {
+                for t in [NoiseType::Mono, NoiseType::Duo, NoiseType::Multi] {
+                    if ui.selectable_label(s.noise == t, t.label()).clicked() && s.noise != t {
+                        s.noise = t;
+                        changed = true;
+                    }
+                }
+            });
+            grid.show(ui, |ui| {
+                changed |= field(ui, "Size", &mut s.size, 0.1, 100.0, false);
+                changed |= field(ui, "Density", &mut s.density, 0.0, 1.0, true);
+                ui.end_row();
+                if s.noise == NoiseType::Multi {
+                    let mut a = s.color.a() as f32 / 255.0;
+                    let before = a;
+                    changed |= field(ui, "Opacity", &mut a, 0.0, 1.0, true);
+                    if a != before {
+                        s.color = s.color.with_alpha((a * 255.0).round() as u8);
+                    }
+                    ui.end_row();
+                }
+            });
+        }
+        EffectKind::Texture => {
+            grid.show(ui, |ui| {
+                changed |= field(ui, "Size", &mut s.size, 0.1, 100.0, false);
+                changed |= field(ui, "Radius", &mut s.blur, 0.0, 100.0, false);
+                ui.end_row();
+            });
+            changed |= ui.checkbox(&mut s.clip, "Clip to shape").changed();
+        }
+        EffectKind::Glass => {
+            let g = &mut s.glass;
+            grid.show(ui, |ui| {
+                changed |= field(ui, "Light", &mut g.angle, -180.0, 180.0, false);
+                changed |= field(ui, "Intensity", &mut g.light, 0.0, 1.0, true);
+                ui.end_row();
+                changed |= field(ui, "Refraction", &mut g.refraction, 0.0, 1.0, true);
+                changed |= field(ui, "Depth", &mut g.depth, 1.0, 1000.0, false);
+                ui.end_row();
+                changed |= field(ui, "Dispersion", &mut g.dispersion, 0.0, 1.0, true);
+                changed |= field(ui, "Frost", &mut s.blur, 0.0, 1000.0, false);
+                ui.end_row();
+            });
+        }
+    }
+    // Colors: swatch, hex and opacity; the swatch expands the full picker in place.
+    let colors: Vec<&mut Rgba> = match (s.kind, s.noise) {
+        (EffectKind::DropShadow | EffectKind::InnerShadow, _) | (EffectKind::Noise, NoiseType::Mono) => vec![&mut s.color],
+        (EffectKind::Noise, NoiseType::Duo) => vec![&mut s.color, &mut s.color2],
+        _ => vec![],
+    };
+    for (i, c) in colors.into_iter().enumerate() {
+        ui.add_space(4.0);
+        let open_id = id.with(("color-open", i));
+        let mut open: bool = ui.data(|d| d.get_temp(open_id)).unwrap_or(false);
+        ui.horizontal(|ui| {
+            if swatch(ui, &Paint::solid(*c)).on_hover_text("Color").clicked() {
+                open = !open;
+            }
+            changed |= hex_field(ui, id.with(("hex", i)), c, 64.0);
+            changed |= alpha_field(ui, c);
+        });
+        ui.data_mut(|d| d.insert_temp(open_id, open));
+        if open {
+            ui.add_space(6.0);
+            changed |= rgb_picker(ui, c);
+        }
+    }
+    if s.kind == EffectKind::DropShadow {
+        changed |= ui.checkbox(&mut s.show_behind, "Show behind transparent areas").changed();
+    }
+    changed
 }
 
 pub enum StylePick {
