@@ -720,8 +720,8 @@ fn shots() {
     let find = |st: &App, name: &str| *st.doc.nodes.keys().find(|i| st.doc.node(**i).name == name).unwrap();
     let (hero, star) = (find(st, "Hero"), find(st, "Star 1"));
     if let Some(c) = st.collab.as_mut() {
-        c.peers.insert(91, crate::collab::Presence { name: "Luna".into(), color: 2, page: 0, cursor: Some(pos2(300., 120.)), selection: vec![hero] });
-        c.peers.insert(92, crate::collab::Presence { name: "Sam".into(), color: 1, page: 0, cursor: Some(pos2(260., 700.)), selection: vec![star] });
+        c.peers.insert(91, crate::collab::Presence { name: "Luna".into(), color: 2, page: 0, cursor: Some(pos2(300., 120.)), selection: vec![hero], ..Default::default() });
+        c.peers.insert(92, crate::collab::Presence { name: "Sam".into(), color: 1, page: 0, cursor: Some(pos2(260., 700.)), selection: vec![star], ..Default::default() });
     }
     st.sel.clear();
     h.run_steps(3);
@@ -1790,8 +1790,8 @@ fn rich_text_editing_styles_selection() {
     assert_eq!((n.spans[0].start, n.spans[0].end), (6, 12));
 }
 
-#[test]
-fn multiplayer_host_join_edit_and_undo_only_mine() {
+/// Two windows in one live session: Ada hosts, Bo joins. Waits until each sees the other.
+fn pair() -> (Harness<'static, App>, Harness<'static, App>) {
     let mut a = harness();
     let mut b = harness();
     a.state_mut().collab_port = 0;
@@ -1803,24 +1803,44 @@ fn multiplayer_host_join_edit_and_undo_only_mine() {
     let ctx = b.ctx.clone();
     b.state_mut().join_session(&ctx, &format!("127.0.0.1:{port}"), false);
     assert!(b.state().collab.is_some(), "joined");
+    let sees = |h: &App, name: &str| h.collab.as_ref().is_some_and(|c| c.peers.values().any(|p| p.name == name));
+    settle(&mut a, &mut b, &|a, b| sees(a, "Bo") && sees(b, "Ada"));
+    (a, b)
+}
+
+/// Step both windows until `done`, up to 5 s for the sockets (tests run in parallel and the
+/// machine may be busy).
+fn settle(a: &mut Harness<App>, b: &mut Harness<App>, done: &dyn Fn(&App, &App) -> bool) {
+    for _ in 0..1000 {
+        a.step();
+        b.step();
+        if done(a.state(), b.state()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// This window's id in the session.
+fn client(h: &Harness<App>) -> u32 {
+    h.state().collab.as_ref().expect("in a session").client
+}
+
+/// What `of` knows of the participant `id`.
+fn peer(of: &App, id: u32) -> Option<&crate::collab::Presence> {
+    of.collab.as_ref()?.peers.get(&id)
+}
+
+#[test]
+fn multiplayer_host_join_edit_and_undo_only_mine() {
+    let (mut a, mut b) = pair();
     // Ada draws; Bo sees it. Bo draws; Ada sees it.
     let ra = draw(&mut a, Key::R, (0.0, 0.0), (100.0, 100.0));
     let rb = draw(&mut b, Key::O, (200.0, 0.0), (260.0, 60.0));
-    // Up to 5 s for the sockets (tests run in parallel and the machine may be busy).
-    let settle = |a: &mut Harness<App>, b: &mut Harness<App>, done: &dyn Fn(&App, &App) -> bool| {
-        for _ in 0..1000 {
-            a.step();
-            b.step();
-            if done(a.state(), b.state()) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    };
     settle(&mut a, &mut b, &|a, b| b.doc.nodes.contains_key(&ra) && a.doc.nodes.contains_key(&rb) && a.collab.as_ref().is_some_and(|c| c.peers.values().any(|p| p.name == "Bo")));
     let dump = |h: &Harness<App>| {
         let c = h.state().collab.as_ref();
-        format!("nodes {:?} connected {:?} client {:?}", h.state().doc.nodes.keys().collect::<Vec<_>>(), c.map(|c| c.connected), c.map(|c| c.client))
+        format!("nodes {:?} connected {:?} client {:?}", h.state().doc.nodes.keys().collect::<Vec<_>>(), c.map(|c| c.status.clone()), c.map(|c| c.client))
     };
     assert!(b.state().doc.nodes.contains_key(&ra), "Bo sees Ada's rectangle {ra}: Ada {} / Bo {}", dump(&a), dump(&b));
     assert!(a.state().doc.nodes.contains_key(&rb), "Ada sees Bo's ellipse");
@@ -3872,4 +3892,172 @@ fn pc_ctrl_shortcuts_while_editing_text_keep_the_text() {
     h.run_steps(1);
     key(&mut h, pc, Key::K);
     assert_eq!(h.state().doc.node(id).text, "Hello world", "Ctrl K links without deleting");
+}
+
+#[test]
+fn cursor_chat_shows_by_the_cursor_for_everyone_then_fades() {
+    let (mut a, mut b) = pair();
+    let ada = client(&a);
+    let p = s(&a, 100., 100.);
+    move_to(&mut a, p, Modifiers::NONE);
+    key(&mut a, Modifiers::NONE, Key::Slash);
+    assert!(a.state().chat.is_some(), "/ opens cursor chat");
+    a.event(Event::Text("Hello there".into()));
+    a.run_steps(2);
+    // While typing, letters are text, not tool shortcuts.
+    key(&mut a, Modifiers::NONE, Key::R);
+    assert_eq!(a.state().tool, Tool::Move);
+    assert_eq!(a.state().chat.as_ref().map(|c| c.0.as_str()), Some("Hello there"));
+    settle(&mut a, &mut b, &|_, b| peer(b, ada).is_some_and(|p| p.chat.as_deref() == Some("Hello there")));
+    assert_eq!(peer(b.state(), ada).and_then(|p| p.chat.clone()).as_deref(), Some("Hello there"), "Bo sees the bubble");
+    assert!(!b.state().dirty, "presence isn't a change to the file");
+    // Escape cancels it for everyone.
+    key(&mut a, Modifiers::NONE, Key::Escape);
+    assert!(a.state().chat.is_none());
+    settle(&mut a, &mut b, &|_, b| peer(b, ada).is_some_and(|p| p.chat.is_none()));
+    assert!(peer(b.state(), ada).is_some_and(|p| p.chat.is_none()));
+    // A message left alone fades away after a few seconds.
+    key(&mut a, Modifiers::NONE, Key::Slash);
+    a.event(Event::Text("Brb".into()));
+    a.run_steps(2);
+    assert!(a.state().chat.is_some());
+    a.run_steps(60 * 6);
+    assert!(a.state().chat.is_none(), "faded out");
+}
+
+#[test]
+fn follow_and_spotlight_track_the_leaders_page_and_view() {
+    let (mut a, mut b) = pair();
+    let ada = client(&a);
+    let center = |h: &App| h.view.to_world(h.canvas_rect.unwrap().center());
+    // Bo follows Ada; she zooms in elsewhere and moves to another page.
+    b.state_mut().toggle_follow(ada);
+    a.state_mut().view = crate::render::View { pan: vec2(-300., -200.), zoom: 2.0 };
+    settle(&mut a, &mut b, &|a, b| (center(a) - center(b)).length() < 0.5 && (a.view.zoom - b.view.zoom).abs() < 1e-3);
+    assert!((center(a.state()) - center(b.state())).length() < 0.5, "Bo sees what Ada sees");
+    assert_eq!(b.state().view.zoom, a.state().view.zoom);
+    a.state_mut().doc.pages.push(crate::doc::Page { name: "Two".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, guides: vec![], prototype: Default::default() });
+    a.state_mut().select_page(1);
+    settle(&mut a, &mut b, &|_, b| b.page == 1);
+    assert_eq!(b.state().page, 1, "follows to the other page");
+    assert_eq!(b.state().following, Some(ada));
+    // Bo pans by hand: he takes over and stops following.
+    key(&mut b, Modifiers::NONE, Key::H);
+    let p = b.state().canvas_rect.unwrap().center();
+    drag(&mut b, p, p + vec2(80., 0.), Modifiers::NONE);
+    key(&mut b, Modifiers::NONE, Key::V);
+    assert_eq!(b.state().following, None, "a manual pan stops following");
+    // Spotlight: Ada asks everyone to follow her; Bo does, with a notice, until Escape.
+    a.state_mut().toggle_spotlight();
+    settle(&mut a, &mut b, &|_, b| b.following == Some(ada));
+    assert_eq!(b.state().following, Some(ada));
+    assert!(b.state().toast.as_ref().is_some_and(|t| t.0.contains("spotlighting")));
+    key(&mut b, Modifiers::NONE, Key::Escape);
+    assert_eq!(b.state().following, None, "Escape stops following");
+    // Ending the spotlight ends following for those still on it.
+    b.state_mut().toggle_follow(ada);
+    a.state_mut().toggle_spotlight();
+    settle(&mut a, &mut b, &|_, b| b.following.is_none());
+    assert_eq!(b.state().following, None);
+}
+
+#[test]
+fn others_see_my_selection_and_text_caret() {
+    let (mut a, mut b) = pair();
+    let ada = client(&a);
+    let mut t = Node::new(Kind::Text, r(0., 0., 200., 40.));
+    t.text = "Hello".into();
+    let id = a.state_mut().doc.insert(0, None, None, t);
+    a.state_mut().sel = vec![id];
+    a.state_mut().editing_text = Some(id);
+    a.state_mut().focus_text = true;
+    a.run_steps(3);
+    a.event(Event::Text("!".into()));
+    a.run_steps(2);
+    let caret = a.state().caret;
+    assert!(caret.is_some(), "the editor reports its caret");
+    settle(&mut a, &mut b, &|_, b| peer(b, ada).is_some_and(|p| p.caret == Some((id, caret.unwrap())) && p.selection == [id]));
+    let p = peer(b.state(), ada).unwrap();
+    assert_eq!(p.caret, Some((id, caret.unwrap())), "Bo sees where Ada types");
+    assert_eq!(p.selection, vec![id]);
+    // Bo's canvas draws them (name tag and caret) without trouble.
+    b.run_steps(2);
+}
+
+#[test]
+fn comments_filter_mention_and_track_unread() {
+    use crate::comments::{Filter, complete_mention, mention_query, mentions};
+    use crate::doc::Comment;
+    let mut h = harness();
+    let st = h.state_mut();
+    st.collab_name = "Ada".into();
+    let mk = |id: u64, msgs: &[(&str, &str)], resolved: bool| Comment {
+        id,
+        page: 0,
+        at: pos2(60. * id as f32, 60.),
+        anchor: None,
+        messages: msgs.iter().map(|(w, t)| (w.to_string(), t.to_string(), 0)).collect(),
+        resolved,
+    };
+    st.doc.comments = vec![mk(1, &[("Ada", "Mine")], false), mk(2, &[("Luna", "Hey @Ada look")], false), mk(3, &[("Luna", "Done, @Adam")], true)];
+    st.read_all_comments();
+    // Luna replies later: that thread is unread for Ada.
+    st.doc.comments[0].messages.push(("Luna".into(), "A reply".into(), 0));
+    assert!(st.unread(&st.doc.comments[0].clone()) && !st.unread(&st.doc.comments[1].clone()));
+    let ids = |st: &mut App, f: Filter| {
+        st.comment_filter = f;
+        st.filtered_comments().iter().map(|c| c.id).collect::<Vec<_>>()
+    };
+    assert_eq!(ids(st, Filter::All), vec![1, 2, 3]);
+    assert_eq!(ids(st, Filter::Unresolved), vec![1, 2]);
+    assert_eq!(ids(st, Filter::Resolved), vec![3]);
+    assert_eq!(ids(st, Filter::Mine), vec![1]);
+    assert_eq!(ids(st, Filter::Mentions), vec![2], "@Adam isn't @Ada");
+    // Opening the thread reads it; Mark as unread brings the dot back and closes it.
+    st.comment_filter = Filter::All;
+    st.show_comments = true;
+    st.open_comment = Some(1);
+    h.run_steps(2);
+    assert!(!h.state().unread(&h.state().doc.comments[0]));
+    h.get_by_label("Mark as unread").click();
+    h.run_steps(2);
+    assert!(h.state().unread(&h.state().doc.comments[0]));
+    assert_eq!(h.state().open_comment, None);
+    // Typing @ in a reply suggests people; picking one completes the name.
+    assert_eq!(mention_query("hi @Lu"), Some("Lu"));
+    assert_eq!(mention_query("mail a@b"), None);
+    let mut t = "hi @Lu".to_string();
+    complete_mention(&mut t, "Luna");
+    assert_eq!(t, "hi @Luna ");
+    assert!(mentions("hi @Luna, look", "Luna") && !mentions("hi @Lunatic", "Luna"));
+    h.state_mut().open_comment = Some(2);
+    h.state_mut().comment_reply = "Thanks @Lu".into();
+    h.run_steps(2);
+    h.get_by_label("@Luna").click();
+    h.run_steps(2);
+    assert_eq!(h.state().comment_reply, "Thanks @Luna ");
+}
+
+#[test]
+fn session_window_shows_status_and_the_host_removes_someone() {
+    let (mut a, mut b) = pair();
+    a.state_mut().show_collab = true;
+    a.run_steps(2);
+    a.get_by_label("Connected");
+    a.get_by_label("Copy");
+    a.get_by_label("Bo");
+    a.get_by_label("Remove").click();
+    settle(&mut a, &mut b, &|a, b| {
+        a.collab.as_ref().is_some_and(|c| c.peers.is_empty()) && b.collab.as_ref().is_some_and(|c| matches!(c.status, crate::collab::Status::Disconnected(_)))
+    });
+    assert!(a.state().collab.as_ref().unwrap().peers.is_empty(), "Bo is gone");
+    let status = b.state().collab.as_ref().unwrap().status.clone();
+    assert!(matches!(&status, crate::collab::Status::Disconnected(why) if why.contains("removed")), "{status:?}");
+    // Bo's window says so and offers to leave or try again.
+    b.state_mut().show_collab = true;
+    b.run_steps(2);
+    b.get_by_label("Try again");
+    b.get_by_label("Leave session").click();
+    b.run_steps(2);
+    assert!(b.state().collab.is_none());
 }

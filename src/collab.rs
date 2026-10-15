@@ -6,12 +6,12 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use egui::Pos2;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tungstenite::{Message, WebSocket};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -24,13 +24,50 @@ pub enum Op {
     Image(String, String),
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// What a user is doing right now. Not part of the document: never saved, never undone.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Presence {
     pub name: String,
     pub color: usize,
     pub page: usize,
     pub cursor: Option<Pos2>,
     pub selection: Vec<NodeId>,
+    /// Cursor chat (Figma's "/"): the message in the bubble by this user's pointer.
+    #[serde(default)]
+    pub chat: Option<String>,
+    /// The part of the page on this user's screen (world space), for followers.
+    #[serde(default)]
+    pub view: Option<egui::Rect>,
+    /// The text layer this user is editing and the caret's character index.
+    #[serde(default)]
+    pub caret: Option<(NodeId, usize)>,
+    /// Spotlight: asks everyone else to follow this user.
+    #[serde(default)]
+    pub spotlight: bool,
+}
+
+/// The longest cursor chat message, in characters.
+pub const CHAT_MAX: usize = 100;
+
+impl Presence {
+    /// Presence comes from peers, so bound its sizes and drop values that can't be drawn.
+    pub fn sanitize(&mut self) {
+        clip(&mut self.name, 40);
+        if let Some(c) = &mut self.chat {
+            clip(c, CHAT_MAX);
+        }
+        self.color %= PEER_COLORS.len();
+        self.selection.truncate(2000);
+        self.cursor = self.cursor.filter(|p| p.x.is_finite() && p.y.is_finite());
+        self.view = self.view.filter(|r| r.is_finite() && r.is_positive());
+    }
+}
+
+/// Cut `s` to at most `n` characters.
+fn clip(s: &mut String, n: usize) {
+    if let Some((i, _)) = s.char_indices().nth(n) {
+        s.truncate(i);
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45,6 +82,8 @@ pub enum ToClient {
     Ops { from: u32, ops: Vec<Op> },
     Presence { from: u32, presence: Presence },
     Left { from: u32 },
+    /// The host removed this client; it shouldn't reconnect.
+    Kicked,
 }
 
 pub const PEER_COLORS: [egui::Color32; 6] = [
@@ -55,6 +94,11 @@ pub const PEER_COLORS: [egui::Color32; 6] = [
     egui::Color32::from_rgb(0x0D, 0x99, 0xFF),
     egui::Color32::from_rgb(0xE8, 0x3E, 0x8C),
 ];
+
+/// A participant's color (presence carries an index into `PEER_COLORS`).
+pub fn peer_color(i: usize) -> egui::Color32 {
+    PEER_COLORS[i % PEER_COLORS.len()]
+}
 
 /// Everything that changed from `base` to `doc`, as ops.
 pub fn diff(base: &Document, doc: &Document) -> Vec<Op> {
@@ -222,6 +266,8 @@ fn pump(mut ws: WebSocket<TcpStream>, outgoing: Receiver<String>, mut incoming: 
 struct ServerState {
     doc: Document,
     clients: HashMap<u32, Sender<String>>,
+    /// Everyone's latest presence, so a joiner sees people who aren't moving.
+    presence: HashMap<u32, Presence>,
     next: u32,
 }
 
@@ -248,6 +294,23 @@ impl Drop for Relay {
     }
 }
 
+impl Relay {
+    /// Remove a participant (the host's "Remove from session"): they're told, then disconnected.
+    pub fn kick(&self, client: u32) {
+        self.drop_client(client, true);
+    }
+
+    /// Close a client's connection; dropping its sender ends its pump after what's queued.
+    fn drop_client(&self, client: u32, kicked: bool) {
+        let mut s = self.state.lock().unwrap();
+        if let Some(tx) = s.clients.remove(&client)
+            && kicked
+        {
+            let _ = tx.send(crate::doc::to_json(&ToClient::Kicked));
+        }
+    }
+}
+
 /// A hard-to-guess session code (64 bits from the std hasher's OS-seeded random keys).
 pub fn session_token() -> String {
     use std::hash::{BuildHasher, Hasher};
@@ -259,7 +322,7 @@ pub fn session_token() -> String {
 
 /// Run the relay on `listener` in background threads, admitting only clients that know `token`.
 pub fn serve(listener: TcpListener, doc: Document, token: String) -> Relay {
-    let state = Arc::new(Mutex::new(ServerState { doc, clients: HashMap::new(), next: 1 }));
+    let state = Arc::new(Mutex::new(ServerState { doc, clients: HashMap::new(), presence: HashMap::new(), next: 1 }));
     let snap = Arc::new(Mutex::new(state.lock().unwrap().doc.clone()));
     let stop = Arc::new(AtomicBool::new(false));
     let port = listener.local_addr().map_or(0, |a| a.port());
@@ -289,6 +352,9 @@ pub fn serve(listener: TcpListener, doc: Document, token: String) -> Relay {
                     s.next += 1;
                     let welcome = ToClient::Welcome { client: me, doc: Box::new(s.doc.clone()) };
                     let _ = tx.send(crate::doc::to_json(&welcome));
+                    for (&from, p) in &s.presence {
+                        let _ = tx.send(crate::doc::to_json(&ToClient::Presence { from, presence: p.clone() }));
+                    }
                     // Only the relay holds the sender, so dropping the relay ends this connection.
                     s.clients.insert(me, tx);
                     me
@@ -302,7 +368,11 @@ pub fn serve(listener: TcpListener, doc: Document, token: String) -> Relay {
                             *snap.lock().unwrap() = s.doc.clone();
                             ToClient::Ops { from: me, ops }
                         }
-                        ToServer::Presence(presence) => ToClient::Presence { from: me, presence },
+                        ToServer::Presence(mut presence) => {
+                            presence.sanitize();
+                            s.presence.insert(me, presence.clone());
+                            ToClient::Presence { from: me, presence }
+                        }
                     };
                     let json = crate::doc::to_json(&out);
                     for (id, c) in &s.clients {
@@ -314,6 +384,7 @@ pub fn serve(listener: TcpListener, doc: Document, token: String) -> Relay {
                 });
                 let mut s = state.lock().unwrap();
                 s.clients.remove(&me);
+                s.presence.remove(&me);
                 let left = crate::doc::to_json(&ToClient::Left { from: me });
                 for c in s.clients.values() {
                     let _ = c.send(left.clone());
@@ -328,6 +399,8 @@ pub fn serve(listener: TcpListener, doc: Document, token: String) -> Relay {
 pub struct Link {
     pub tx: Sender<String>,
     pub rx: Receiver<ToClient>,
+    /// Woken when a message arrives (and kept for reconnecting).
+    ctx: Option<egui::Context>,
 }
 
 /// Connect to `host:port/code`, the address the host shares.
@@ -347,21 +420,51 @@ pub fn connect(addr: &str, ctx: Option<egui::Context>) -> Result<Link, String> {
     })?;
     let (tx_out, rx_out) = channel::<String>();
     let (tx_in, rx_in) = channel::<ToClient>();
+    let wake = ctx.clone();
     std::thread::spawn(move || {
         pump(ws, rx_out, |text| {
             if let Ok(msg) = crate::doc::from_json::<ToClient>(&text) {
                 if tx_in.send(msg).is_err() {
                     return false;
                 }
-                if let Some(ctx) = &ctx {
+                if let Some(ctx) = &wake {
                     ctx.request_repaint();
                 }
             }
             true
         });
+        // Wake the app so it notices the drop and starts reconnecting.
+        if let Some(ctx) = &wake {
+            ctx.request_repaint();
+        }
     });
-    Ok(Link { tx: tx_out, rx: rx_in })
+    Ok(Link { tx: tx_out, rx: rx_in, ctx })
 }
+
+/// The relay's first message: this client's id and the shared document.
+fn welcome(link: &Link) -> Result<(u32, Document), String> {
+    match link.rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(ToClient::Welcome { client, doc }) => Ok((client, *doc)),
+        Ok(_) => Err("Unexpected reply".into()),
+        Err(_) => Err("No response from the session".into()),
+    }
+}
+
+/// How the link to the session is doing.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Status {
+    Connected,
+    /// Lost the connection; retrying (the number of failed attempts so far).
+    Reconnecting(u32),
+    /// Gave up, or the host removed this user: why.
+    Disconnected(String),
+}
+
+/// How long a dropped client keeps trying to get back in.
+const RETRY_FOR: Duration = Duration::from_secs(30);
+
+/// A reconnect thread's reports: a failed attempt's number, or the new link and its welcome.
+type Retry = Receiver<Result<(Link, u32, Document), u32>>;
 
 /// The app's side of a session.
 pub struct Collab {
@@ -370,15 +473,22 @@ pub struct Collab {
     pub client: u32,
     /// Document as last agreed with the server; local edits are diffs against it.
     pub base: Document,
-    pub peers: HashMap<u32, Presence>,
+    /// Others in the session by client id (ordered, so avatars keep their places).
+    pub peers: BTreeMap<u32, Presence>,
     pub me: Presence,
+    /// The address shown to share (the host's LAN address).
     pub address: String,
+    /// The address this client connects to, kept for reconnecting.
+    dial: String,
     pub hosting: bool,
     /// The relay this app runs when hosting; leaving the session stops it.
     pub relay: Option<Relay>,
     last_send: f64,
     last_presence: Option<Presence>,
-    pub connected: bool,
+    pub status: Status,
+    retry: Option<Retry>,
+    /// Peers whose spotlight turned on (true) or off (false) since the app last looked.
+    pub spotlights: Vec<(u32, bool)>,
 }
 
 /// Move `next_id` past any of `ids` in this client's range, so it never reuses one (a relay that
@@ -392,75 +502,147 @@ fn claim_ids(doc: &mut Document, client: u32, ids: impl IntoIterator<Item = Node
     }
 }
 
+/// Each client allocates ids from its own range so concurrent inserts never collide.
+fn own_ids(doc: &mut Document, client: u32) {
+    doc.next_id = (client as u64) << 32;
+    let ids: Vec<NodeId> = doc.nodes.keys().copied().collect();
+    claim_ids(doc, client, ids);
+}
+
 impl Collab {
     /// Wait for the welcome (up to a few seconds) and set up the session.
     pub fn join(link: Link, address: String, name: String, hosting: bool) -> Result<(Collab, Document), String> {
-        let welcome = link.rx.recv_timeout(Duration::from_secs(5)).map_err(|_| "No response from the session".to_string())?;
-        let ToClient::Welcome { client, doc } = welcome else { return Err("Unexpected reply".into()) };
-        let mut doc = *doc;
-        // Each client allocates ids from its own range so concurrent inserts never collide.
-        doc.next_id = (client as u64) << 32;
-        let ids: Vec<NodeId> = doc.nodes.keys().copied().collect();
-        claim_ids(&mut doc, client, ids);
-        let me = Presence { name, color: client as usize % PEER_COLORS.len(), page: 0, cursor: None, selection: vec![] };
-        let c = Collab { link, client, base: doc.clone(), peers: HashMap::new(), me, address, hosting, relay: None, last_send: 0.0, last_presence: None, connected: true };
+        let (client, mut doc) = welcome(&link)?;
+        own_ids(&mut doc, client);
+        let me = Presence { name, color: client as usize % PEER_COLORS.len(), ..Default::default() };
+        let c = Collab {
+            link,
+            client,
+            base: doc.clone(),
+            peers: BTreeMap::new(),
+            me,
+            dial: address.clone(),
+            address,
+            hosting,
+            relay: None,
+            last_send: 0.0,
+            last_presence: None,
+            status: Status::Connected,
+            retry: None,
+            spotlights: vec![],
+        };
         Ok((c, doc))
+    }
+
+    /// Keep trying to get back into the session in the background, backing off, for up to
+    /// `RETRY_FOR`. Local edits wait in the document meanwhile.
+    pub fn reconnect(&mut self) {
+        let (tx, rx) = channel();
+        let (addr, ctx) = (self.dial.clone(), self.link.ctx.clone());
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            let mut wait = Duration::from_millis(250);
+            for attempt in 1.. {
+                std::thread::sleep(wait);
+                let got = connect(&addr, ctx.clone()).and_then(|link| welcome(&link).map(|(client, doc)| (link, client, doc)));
+                let give_up = got.is_err() && start.elapsed() + wait > RETRY_FOR;
+                // Giving up drops the sender; leaving the session drops the receiver: stop then too.
+                if give_up || tx.send(got.map_err(|_| attempt)).is_err() {
+                    break;
+                }
+                if let Some(ctx) = &ctx {
+                    ctx.request_repaint();
+                }
+                wait = (wait * 2).min(Duration::from_secs(5));
+            }
+            if let Some(ctx) = &ctx {
+                ctx.request_repaint();
+            }
+        });
+        self.retry = Some(rx);
+        self.status = Status::Reconnecting(0);
+        self.peers.clear();
+    }
+
+    /// Ops from the session: local edits not yet sent must survive, so apply them to both the
+    /// agreed base and the document, then put the local diffs back on top.
+    fn receive(&mut self, doc: &mut Document, ops: Vec<Op>, received: &mut Vec<Op>) {
+        let pending = diff(&self.base, doc);
+        apply(&mut self.base, &ops);
+        apply(doc, &ops);
+        apply(doc, &pending);
+        claim_ids(doc, self.client, ops.iter().filter_map(|op| if let Op::Upsert(n) = op { Some(n.id) } else { None }));
+        received.extend(ops);
     }
 
     /// Exchange changes: apply what arrived, send what changed locally (throttled).
     /// Returns ids of nodes this client changed in what it sent (for per-user undo).
     pub fn tick(&mut self, doc: &mut Document, now: f64) -> (Vec<NodeId>, Vec<Op>) {
-        let mut remote = false;
         let mut received: Vec<Op> = vec![];
-        loop {
-            match self.link.rx.try_recv() {
-                Ok(ToClient::Ops { ops, .. }) => {
-                    // Local edits not yet sent must survive: apply to both, keep local diffs on top.
-                    let pending = diff(&self.base, doc);
-                    apply(&mut self.base, &ops);
-                    apply(doc, &ops);
-                    apply(doc, &pending);
-                    claim_ids(doc, self.client, ops.iter().filter_map(|op| if let Op::Upsert(n) = op { Some(n.id) } else { None }));
-                    remote = true;
-                    received.extend(ops);
+        while let Some(r) = self.retry.as_ref().map(|rx| rx.try_recv()) {
+            match r {
+                Ok(Err(attempt)) => self.status = Status::Reconnecting(attempt),
+                Ok(Ok((link, client, fresh))) => {
+                    // Back in: catch up on what others did meanwhile; unsent edits go out next.
+                    self.retry = None;
+                    (self.link, self.client, self.status, self.last_presence) = (link, client, Status::Connected, None);
+                    let ops = diff(&self.base, &fresh);
+                    self.receive(doc, ops, &mut received);
+                    own_ids(doc, client);
                 }
-                Ok(ToClient::Presence { from, presence }) => {
-                    self.peers.insert(from, presence);
-                }
-                Ok(ToClient::Left { from }) => {
-                    self.peers.remove(&from);
-                }
-                Ok(ToClient::Welcome { .. }) => {}
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.connected = false;
-                    break;
+                    self.retry = None;
+                    self.status = Status::Disconnected("Couldn't reach the session".into());
                 }
             }
         }
-        if remote {
+        while self.status == Status::Connected {
+            match self.link.rx.try_recv() {
+                Ok(ToClient::Ops { ops, .. }) => self.receive(doc, ops, &mut received),
+                Ok(ToClient::Presence { from, mut presence }) => {
+                    presence.sanitize();
+                    let was = self.peers.get(&from).is_some_and(|p| p.spotlight);
+                    if presence.spotlight != was {
+                        self.spotlights.push((from, presence.spotlight));
+                    }
+                    self.peers.insert(from, presence);
+                }
+                Ok(ToClient::Left { from }) => {
+                    if self.peers.remove(&from).is_some_and(|p| p.spotlight) {
+                        self.spotlights.push((from, false));
+                    }
+                }
+                Ok(ToClient::Kicked) => {
+                    self.status = Status::Disconnected("The host removed you from the session".into());
+                    self.peers.clear();
+                }
+                Ok(ToClient::Welcome { .. }) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.reconnect(),
+            }
+        }
+        if !received.is_empty() {
             doc.reflow();
         }
         let mut touched = vec![];
-        if now - self.last_send >= 1.0 / 30.0 {
+        if self.status == Status::Connected && now - self.last_send >= 1.0 / 30.0 {
             let ops = diff(&self.base, doc);
-            if !ops.is_empty() {
-                for op in &ops {
-                    match op {
-                        Op::Upsert(n) => touched.push(n.id),
-                        Op::Remove(id) => touched.push(*id),
-                        _ => {}
-                    }
-                }
-                let _ = self.link.tx.send(crate::doc::to_json(&ToServer::Ops(ops)));
+            // ponytail: ops queued just as the link drops are lost (no acks); add acks if that bites.
+            let ids: Vec<NodeId> = ops.iter().filter_map(|op| match op {
+                Op::Upsert(n) => Some(n.id),
+                Op::Remove(id) => Some(*id),
+                _ => None,
+            }).collect();
+            if !ops.is_empty() && self.link.tx.send(crate::doc::to_json(&ToServer::Ops(ops))).is_ok() {
+                touched = ids;
                 self.base = doc.clone();
                 // A forced send (undo checkpoints pass f64::MAX) mustn't stall the throttle forever.
                 if now < f64::MAX {
                     self.last_send = now;
                 }
             }
-            if self.last_presence.as_ref() != Some(&self.me) {
-                let _ = self.link.tx.send(crate::doc::to_json(&ToServer::Presence(self.me.clone())));
+            if self.last_presence.as_ref() != Some(&self.me) && self.link.tx.send(crate::doc::to_json(&ToServer::Presence(self.me.clone()))).is_ok() {
                 self.last_presence = Some(self.me.clone());
             }
         }
@@ -557,12 +739,12 @@ mod tests {
         drop(relay);
         for _ in 0..200 {
             ca.tick(&mut da, t);
-            if !ca.connected {
+            if ca.status != Status::Connected {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(!ca.connected, "clients are dropped when the host leaves");
+        assert_ne!(ca.status, Status::Connected, "clients are dropped when the host leaves");
         std::thread::sleep(Duration::from_millis(50));
         assert!(connect(&addr, None).is_err(), "the port no longer accepts");
     }
@@ -584,5 +766,97 @@ mod tests {
         assert_eq!(c.client, 1);
         let id = d.insert(0, None, None, Node::new(Kind::Ellipse, r(5., 5.)));
         assert_eq!(id, (1 << 32) + 8, "new ids go past the existing ones in this client's range");
+    }
+
+    /// A relay with clients named `names`, all joined.
+    fn session(names: &[&str]) -> (Relay, Vec<(Collab, Document)>) {
+        let relay = serve(TcpListener::bind("127.0.0.1:0").unwrap(), Document::default(), session_token());
+        let addr = format!("127.0.0.1:{}/{}", relay.port, relay.token);
+        let cs = names.iter().map(|n| Collab::join(connect(&addr, None).unwrap(), addr.clone(), n.to_string(), false).unwrap()).collect();
+        (relay, cs)
+    }
+
+    /// Tick every client until `done` (up to about 10 s; tests share the machine).
+    fn settle(cs: &mut [(Collab, Document)], done: impl Fn(&[(Collab, Document)]) -> bool) {
+        let mut t = 1.0;
+        for _ in 0..2000 {
+            for (c, d) in cs.iter_mut() {
+                c.tick(d, t);
+            }
+            t += 0.05;
+            if done(cs) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn presence_extras_are_relayed_bounded_and_replayed_to_joiners() {
+        let (relay, mut cs) = session(&["A", "B"]);
+        let a = cs[0].0.client;
+        let me = &mut cs[0].0.me;
+        me.chat = Some("x".repeat(500));
+        me.name = "N".repeat(500);
+        me.view = Some(Rect::from_min_max(pos2(0., 0.), pos2(-5., 10.)));
+        me.caret = Some((7, 3));
+        me.spotlight = true;
+        me.color = 1_000_003;
+        settle(&mut cs, |cs| cs[1].0.peers.contains_key(&a));
+        let p = &cs[1].0.peers[&a];
+        assert_eq!(p.chat.as_ref().map(|c| c.chars().count()), Some(CHAT_MAX), "chat clipped");
+        assert_eq!(p.name.chars().count(), 40, "name clipped");
+        assert_eq!(p.view, None, "a view that can't be followed is dropped");
+        assert_eq!(p.caret, Some((7, 3)));
+        assert!(p.color < PEER_COLORS.len());
+        assert_eq!(cs[1].0.spotlights, vec![(a, true)], "spotlight start reported");
+        // Someone joining later sees A at once, though A hasn't moved since.
+        let addr = format!("127.0.0.1:{}/{}", relay.port, relay.token);
+        cs.push(Collab::join(connect(&addr, None).unwrap(), addr, "C".into(), false).unwrap());
+        settle(&mut cs, |cs| cs[2].0.peers.contains_key(&a));
+        assert!(cs[2].0.peers[&a].spotlight, "presence replayed to a joiner");
+        // Turning spotlight off is reported too.
+        cs[0].0.me.spotlight = false;
+        settle(&mut cs, |cs| cs[1].0.spotlights.len() == 2);
+        assert_eq!(cs[1].0.spotlights[1], (a, false));
+    }
+
+    #[test]
+    fn a_kicked_client_is_told_and_stays_out() {
+        let (relay, mut cs) = session(&["Host", "Guest"]);
+        let (host, guest) = (cs[0].0.client, cs[1].0.client);
+        settle(&mut cs, |cs| cs[0].0.peers.contains_key(&guest) && cs[1].0.peers.contains_key(&host));
+        relay.kick(guest);
+        settle(&mut cs, |cs| matches!(cs[1].0.status, Status::Disconnected(_)) && cs[0].0.peers.is_empty());
+        assert!(matches!(&cs[1].0.status, Status::Disconnected(why) if why.contains("removed")), "{:?}", cs[1].0.status);
+        assert!(cs[0].0.peers.is_empty(), "the host sees them leave");
+        // No reconnecting after a kick.
+        std::thread::sleep(Duration::from_millis(400));
+        let (c, d) = &mut cs[1];
+        c.tick(d, 100.0);
+        assert!(matches!(cs[1].0.status, Status::Disconnected(_)));
+        assert_eq!(relay.state.lock().unwrap().clients.len(), 1);
+    }
+
+    #[test]
+    fn a_dropped_client_reconnects_and_keeps_its_unsent_edits() {
+        let (relay, mut cs) = session(&["A", "B"]);
+        let b = cs[1].0.client;
+        settle(&mut cs, |cs| cs[0].0.peers.contains_key(&b));
+        relay.drop_client(b, false);
+        settle(&mut cs, |cs| cs[1].0.status != Status::Connected);
+        assert!(matches!(cs[1].0.status, Status::Reconnecting(_)));
+        // Both edit while B is away: B's edit waits locally, A's reaches B once back.
+        let nb = cs[1].1.insert(0, None, None, Node::new(Kind::Ellipse, r(50., 50.)));
+        let na = cs[0].1.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 0.)));
+        settle(&mut cs, |cs| cs[1].0.status == Status::Connected && cs[0].1.nodes.contains_key(&nb) && cs[1].1.nodes.contains_key(&na));
+        assert_eq!(cs[1].0.status, Status::Connected);
+        assert_ne!(cs[1].0.client, b, "a new connection");
+        assert!(cs[0].1.nodes.contains_key(&nb), "B's offline edit reached A");
+        assert!(cs[1].1.nodes.contains_key(&na), "A's edit reached B");
+        // New layers from B use its new id range, never clashing with the old ones.
+        let again = cs[1].1.insert(0, None, None, Node::new(Kind::Ellipse, r(90., 90.)));
+        assert_eq!(again >> 32, cs[1].0.client as u64);
+        assert_eq!(relay.doc.lock().unwrap().nodes.len(), 2);
     }
 }

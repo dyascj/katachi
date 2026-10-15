@@ -289,7 +289,6 @@ pub struct App {
     pub dev_mode: bool,
     pub code_lang: crate::codegen::Lang,
     pub show_comments: bool,
-    pub show_resolved: bool,
     pub draft_comment: Option<(crate::doc::Comment, String)>,
     pub open_comment: Option<u64>,
     pub comment_reply: String,
@@ -326,6 +325,18 @@ pub struct App {
     pub collab_port: u16,
     /// Pointer in world space this frame (shared as presence).
     pub pointer_world: Option<Pos2>,
+    /// Cursor chat ("/") while open: the message, when it was last typed in (0 = just opened),
+    /// and where the bubble sits on screen.
+    pub chat: Option<(String, f64, Pos2)>,
+    /// The collaborator whose view this user follows, and the page and view last taken from
+    /// them (anything else changing it means the user took over).
+    pub following: Option<u32>,
+    follow_view: Option<(usize, View)>,
+    /// The text editor's caret (character index), shared so others see where you type.
+    pub caret: Option<usize>,
+    pub comment_filter: crate::comments::Filter,
+    /// Messages seen per comment thread, for unread dots: what others added since then.
+    pub comment_read: std::collections::HashMap<u64, usize>,
     /// Text layers' last measured inputs, so unchanged text isn't re-laid out every frame.
     pub text_keys: std::collections::HashMap<NodeId, u64>,
     in_gesture: bool,
@@ -414,7 +425,6 @@ impl App {
             dev_mode: false,
             code_lang: crate::codegen::Lang::Css,
             show_comments: false,
-            show_resolved: false,
             draft_comment: None,
             open_comment: None,
             comment_reply: String::new(),
@@ -450,6 +460,12 @@ impl App {
             collab_address: String::new(),
             collab_port: 7878,
             pointer_world: None,
+            chat: None,
+            following: None,
+            follow_view: None,
+            caret: None,
+            comment_filter: Default::default(),
+            comment_read: Default::default(),
             text_keys: Default::default(),
             in_gesture: false,
             path: None,
@@ -579,7 +595,25 @@ impl App {
         c.me.page = self.page;
         c.me.selection = self.sel.clone();
         c.me.cursor = self.pointer_world;
+        c.me.chat = self.chat.as_ref().map(|ch| ch.0.clone()).filter(|t| !t.is_empty());
+        c.me.view = self.canvas_rect.map(|r| Rect::from_min_max(self.view.to_world(r.min), self.view.to_world(r.max)));
+        c.me.caret = self.editing_text.zip(self.caret);
+        let was = c.status.clone();
         let (touched, remote) = c.tick(&mut self.doc, now);
+        let status = (c.status != was).then(|| c.status.clone());
+        // Spotlight: follow whoever turns it on (Escape stops), and stop when they turn it off.
+        for (id, on) in std::mem::take(&mut c.spotlights) {
+            if on {
+                let name = c.peers.get(&id).map_or(String::new(), |p| p.name.clone());
+                self.following = Some(id);
+                self.toast = Some((format!("{name} is spotlighting. Press Esc to stop following."), 0.0));
+            } else if self.following == Some(id) {
+                self.following = None;
+            }
+        }
+        if self.following.is_some_and(|id| !c.peers.contains_key(&id)) {
+            self.following = None;
+        }
         // Others' edits are changes to save too.
         if !remote.is_empty() {
             self.dirty = true;
@@ -591,15 +625,51 @@ impl App {
         {
             crate::collab::apply(base, &remote);
         }
-        if !c.connected {
-            self.collab = None;
-            self.toast("Disconnected from the session".into());
-            return;
+        match status {
+            Some(crate::collab::Status::Reconnecting(0)) => self.toast("Connection lost. Reconnecting...".into()),
+            Some(crate::collab::Status::Connected) => self.toast("Reconnected to the session".into()),
+            Some(crate::collab::Status::Disconnected(why)) => self.toast(why),
+            _ => {}
         }
         if let Some(t) = self.undo_touched.last_mut() {
             t.extend(touched);
         }
         self.sel.retain(|id| self.doc.nodes.contains_key(id));
+    }
+
+    /// Click on a collaborator's avatar (Figma): follow them, or stop if already following.
+    pub fn toggle_follow(&mut self, id: u32) {
+        self.following = if self.following == Some(id) { None } else { Some(id) };
+        self.follow_view = None;
+    }
+
+    /// Spotlight me: ask everyone else in the session to follow this user.
+    pub fn toggle_spotlight(&mut self) {
+        if let Some(c) = self.collab.as_mut() {
+            c.me.spotlight = !c.me.spotlight;
+            self.following = None;
+        }
+    }
+
+    /// While following: show the leader's page and the part of it on their screen. A view or
+    /// page changed by anything else since the last frame means the user took over: stop.
+    pub fn follow(&mut self, screen: Rect) {
+        let Some(id) = self.following else { return self.follow_view = None };
+        if self.follow_view.is_some_and(|(page, view)| page != self.page || view != self.view) {
+            self.following = None;
+            self.follow_view = None;
+            return;
+        }
+        let Some(p) = self.collab.as_ref().and_then(|c| c.peers.get(&id)).cloned() else { return };
+        if p.page != self.page && p.page < self.doc.pages.len() {
+            self.select_page(p.page);
+            self.view_ready = true;
+        }
+        if let Some(v) = p.view {
+            let zoom = (screen.width() / v.width()).min(screen.height() / v.height()).clamp(0.02, 256.0);
+            self.view = View { zoom, pan: screen.center().to_vec2() - v.center().to_vec2() * zoom };
+        }
+        self.follow_view = Some((self.page, self.view));
     }
 
     /// Bring back only the given nodes from a snapshot (multiplayer undo leaves others' work alone).
@@ -1659,6 +1729,7 @@ impl App {
             Ok(doc) => {
                 self.reset_to(App::new(None));
                 self.doc = doc;
+                self.read_all_comments();
                 crate::files::add_recent(&p);
                 self.path = Some(p);
             }
@@ -1861,6 +1932,7 @@ impl App {
             if let Some(doc) = doc {
                 self.checkpoint();
                 self.doc = doc;
+                self.read_all_comments();
                 self.sel.clear();
                 self.page = 0;
                 self.view_ready = false;
@@ -2193,9 +2265,22 @@ impl App {
         }
         let mut open = true;
         let mut action: Option<&str> = None;
+        let (mut kick, mut follow) = (None, None);
         crate::chrome::window(ctx, "Multiplayer session", &mut open, 320.0, |ui| {
             if let Some(c) = &self.collab {
+                use crate::collab::Status;
+                let (dot, status) = match &c.status {
+                    Status::Connected => (egui::Color32::from_rgb(0x14, 0xAE, 0x5C), "Connected".to_string()),
+                    Status::Reconnecting(0) => (egui::Color32::from_rgb(0xFF, 0xA6, 0x29), "Connection lost. Reconnecting...".to_string()),
+                    Status::Reconnecting(n) => (egui::Color32::from_rgb(0xFF, 0xA6, 0x29), format!("Reconnecting (attempt {})...", n + 1)),
+                    Status::Disconnected(why) => (egui::Color32::from_rgb(0xF2, 0x48, 0x22), format!("Disconnected. {why}.")),
+                };
                 ui.label(egui::RichText::new(if c.hosting { "Hosting a live session" } else { "In a live session" }).strong());
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(r.center(), 4.0, dot);
+                    ui.label(status);
+                });
                 ui.horizontal(|ui| {
                     ui.label("Address");
                     ui.monospace(&c.address);
@@ -2207,18 +2292,47 @@ impl App {
                     ui.label(egui::RichText::new("Others on your network join with this full address, code included.").small());
                 }
                 ui.separator();
-                ui.label(format!("{} (you)", c.me.name));
-                for p in c.peers.values() {
+                let swatch = |ui: &mut egui::Ui, color: usize| {
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    ui.painter().circle_filled(r.center(), 6.0, crate::collab::peer_color(color));
+                };
+                ui.horizontal(|ui| {
+                    swatch(ui, c.me.color);
+                    ui.label(format!("{} (you)", c.me.name));
+                    if c.me.spotlight {
+                        ui.label(egui::RichText::new("Spotlighting").small());
+                    }
+                });
+                for (&id, p) in &c.peers {
                     ui.horizontal(|ui| {
-                        let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                        ui.painter().circle_filled(r.center(), 6.0, crate::collab::PEER_COLORS[p.color % crate::collab::PEER_COLORS.len()]);
+                        swatch(ui, p.color);
                         ui.label(&p.name);
+                        if p.spotlight {
+                            ui.label(egui::RichText::new("Spotlighting").small());
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Only the host runs the relay, so only the host can remove people.
+                            if c.relay.is_some() && ui.small_button("Remove").on_hover_text(format!("Remove {} from the session", p.name)).clicked() {
+                                kick = Some(id);
+                            }
+                            if ui.small_button(if self.following == Some(id) { "Stop following" } else { "Follow" }).clicked() {
+                                follow = Some(id);
+                            }
+                        });
                     });
                 }
                 ui.separator();
-                if ui.button("Leave session").clicked() {
-                    action = Some("leave");
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Leave session").clicked() {
+                        action = Some("leave");
+                    }
+                    if matches!(c.status, Status::Disconnected(_)) && ui.button("Try again").clicked() {
+                        action = Some("retry");
+                    }
+                    if ui.button(if c.me.spotlight { "Stop spotlight" } else { "Spotlight me" }).clicked() {
+                        action = Some("spotlight");
+                    }
+                });
             } else {
                 ui.horizontal(|ui| {
                     ui.label("Your name");
@@ -2244,8 +2358,23 @@ impl App {
                 });
             }
         });
+        if let (Some(id), Some(r)) = (kick, self.collab.as_ref().and_then(|c| c.relay.as_ref())) {
+            r.kick(id);
+        }
+        if let Some(id) = follow {
+            self.toggle_follow(id);
+        }
         match action {
-            Some("leave") => self.collab = None,
+            Some("leave") => {
+                self.collab = None;
+                self.following = None;
+            }
+            Some("retry") => {
+                if let Some(c) = self.collab.as_mut() {
+                    c.reconnect();
+                }
+            }
+            Some("spotlight") => self.toggle_spotlight(),
             Some("host") => self.host_session(ctx),
             Some("join") => {
                 if self.dirty {
@@ -2289,6 +2418,7 @@ impl App {
                     self.view_ready = false;
                 }
                 self.doc = doc;
+                self.read_all_comments();
                 self.sel.clear();
                 self.page = 0;
                 self.undo.clear();
@@ -2782,6 +2912,8 @@ impl App {
             (false, _, _, Key::ArrowDown) => self.nudge(vec2(0.0, step)),
             // Escape that closes a popover or menu does only that (Figma keeps the selection).
             (false, false, false, Key::Escape) if egui::Popup::is_any_open(ctx) => {}
+            // Escape stops following (a spotlight too) before it touches the selection.
+            (false, false, false, Key::Escape) if self.following.is_some() => self.following = None,
             // Escape with Find open closes Find and keeps the selection.
             (false, false, false, Key::Escape) if self.find.0 => self.find.0 = false,
             (false, false, false, Key::Escape) => {
@@ -2835,6 +2967,7 @@ impl App {
             (false, true, false, Key::N) => self.zoom_frame(ctx, -1),
             (false, false, false, Key::I) if !self.sel.is_empty() => self.start_eyedrop(crate::paint_ui::EyeTarget::Fill),
             (false, true, false, Key::C) => self.show_comments = !self.show_comments,
+            (false, false, false, Key::Slash) => self.open_chat(ctx),
             _ => {}
         }
     }

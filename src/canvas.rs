@@ -47,6 +47,7 @@ impl App {
         if let Some(t) = self.zoom_target.take().filter(|t| self.doc.nodes.contains_key(t)) {
             self.view = View::fit(self.doc.node(t).aabb(), rect, 1.0);
         }
+        self.follow(rect);
         if let Some(ve) = &self.vector_edit
             && (self.sel != [ve.id] || !self.doc.nodes.contains_key(&ve.id) || self.tool != Tool::Move) {
                 self.vector_edit = None;
@@ -187,6 +188,8 @@ impl App {
             self.draw_rulers(&painter, rect);
         }
         self.draw_peers(&painter);
+        self.draw_follow(&painter, rect);
+        self.cursor_chat(ui, rect);
         self.comment_hits = self.draw_comment_pins(&painter);
         self.comment_popups(ui.ctx());
         self.set_cursor(ui, ptr, panning);
@@ -1622,28 +1625,133 @@ impl App {
         }
     }
 
-    /// Collaborators' selections and cursors, in their colors.
+    /// Collaborators in their colors: selections with a name tag, text carets, and cursors
+    /// with their name or their cursor chat message.
     fn draw_peers(&self, painter: &Painter) {
         let Some(c) = &self.collab else { return };
+        let bubble = CornerRadius { nw: 2, ne: 14, sw: 14, se: 14 };
         for p in c.peers.values().filter(|p| p.page == self.page) {
-            let col = crate::collab::PEER_COLORS[p.color % crate::collab::PEER_COLORS.len()];
+            let col = crate::collab::peer_color(p.color);
+            let mut bounds: Option<Rect> = None;
             for id in &p.selection {
                 if let Some(n) = self.doc.nodes.get(id) {
                     let pts = n.corners().map(|q| self.view.to_screen(q)).to_vec();
                     painter.add(egui::Shape::closed_line(pts, Stroke::new(2.0, col)));
+                    let b = self.view.rect_to_screen(n.aabb());
+                    bounds = Some(bounds.map_or(b, |a| a.union(b)));
                 }
+            }
+            // Figma tags someone's selection with their name at its top-left corner.
+            if let Some(b) = bounds {
+                let g = painter.layout_no_wrap(p.name.clone(), FontId::proportional(10.0), Color32::WHITE);
+                let tag = Rect::from_min_size(b.left_top() - vec2(1.0, g.size().y + 5.0), g.size() + vec2(8.0, 4.0));
+                painter.rect_filled(tag, CornerRadius { nw: 3, ne: 3, sw: 0, se: 3 }, col);
+                painter.galley(tag.min + vec2(4.0, 2.0), g, Color32::WHITE);
+            }
+            if let Some((id, i)) = p.caret
+                && let Some(n) = self.doc.nodes.get(&id).filter(|n| n.kind == Kind::Text)
+            {
+                let zoom = self.view.zoom;
+                let galley = crate::text::align_rows(crate::text::layout(painter, n, zoom, Color32::BLACK).0, n, zoom);
+                let at = self.view.to_screen(n.rect.min + crate::text::draw_offset(n, galley.rows.len()));
+                let r = galley.pos_from_cursor(egui::text::CCursor::new(i.min(n.text.chars().count()))).translate(at.to_vec2());
+                painter.line_segment([r.left_top(), r.left_bottom()], Stroke::new(2.0, col));
             }
             if let Some(w) = p.cursor {
                 let s = self.view.to_screen(w);
                 let arrow = vec![s, s + vec2(0.0, 16.0), s + vec2(4.5, 12.0), s + vec2(8.0, 18.5), s + vec2(10.5, 17.3), s + vec2(7.2, 11.0), s + vec2(12.0, 11.0)];
                 painter.add(egui::Shape::convex_polygon(arrow[..3].to_vec(), col, Stroke::NONE));
                 painter.add(egui::Shape::closed_line(arrow, Stroke::new(1.5, col)));
-                let g = painter.layout_no_wrap(p.name.clone(), FontId::proportional(11.0), Color32::WHITE);
-                let pill = Rect::from_min_size(s + vec2(12.0, 18.0), g.size() + vec2(10.0, 4.0));
-                painter.rect_filled(pill, 4.0, col);
-                painter.galley(pill.min + vec2(5.0, 2.0), g, Color32::WHITE);
+                if let Some(msg) = p.chat.as_ref().filter(|m| !m.is_empty()) {
+                    let name = painter.layout_no_wrap(p.name.clone(), FontId::proportional(10.0), Color32::from_white_alpha(210));
+                    let g = painter.layout(msg.clone(), FontId::proportional(13.0), Color32::WHITE, 240.0);
+                    let (nh, size) = (name.size().y, vec2(g.size().x.max(name.size().x), name.size().y + g.size().y));
+                    let r = Rect::from_min_size(s + vec2(12.0, 18.0), size + vec2(20.0, 14.0));
+                    painter.rect_filled(r, bubble, col);
+                    painter.galley(r.min + vec2(10.0, 6.0), name, Color32::WHITE);
+                    painter.galley(r.min + vec2(10.0, 8.0 + nh), g, Color32::WHITE);
+                } else {
+                    let g = painter.layout_no_wrap(p.name.clone(), FontId::proportional(11.0), Color32::WHITE);
+                    let pill = Rect::from_min_size(s + vec2(12.0, 18.0), g.size() + vec2(10.0, 4.0));
+                    painter.rect_filled(pill, 4.0, col);
+                    painter.galley(pill.min + vec2(5.0, 2.0), g, Color32::WHITE);
+                }
             }
         }
+    }
+
+    /// A border in the leader's color and a pill while following someone (or spotlighting).
+    fn draw_follow(&self, painter: &Painter, rect: Rect) {
+        let Some(c) = &self.collab else { return };
+        let (text, col) = match self.following.and_then(|id| c.peers.get(&id)) {
+            Some(p) => (format!("Following {}", p.name), crate::collab::peer_color(p.color)),
+            None if c.me.spotlight => ("Spotlighting: others follow your view".to_string(), crate::collab::peer_color(c.me.color)),
+            None => return,
+        };
+        painter.rect_stroke(rect, 0.0, Stroke::new(3.0, col), StrokeKind::Inside);
+        let g = painter.layout_no_wrap(text, FontId::proportional(12.0), Color32::WHITE);
+        let pill = Rect::from_center_size(rect.center_top() + vec2(0.0, 24.0), g.size() + vec2(20.0, 8.0));
+        painter.rect_filled(pill, CornerRadius::same(10), col);
+        painter.galley(pill.center() - g.size() / 2.0, g, Color32::WHITE);
+    }
+
+    /// Figma's cursor chat ("/"): a message by your pointer that everyone in the session sees.
+    pub fn open_chat(&mut self, ctx: &egui::Context) {
+        let screen = self.canvas_rect.unwrap_or(Rect::ZERO);
+        let at = ctx.input(|i| i.pointer.hover_pos()).filter(|p| screen.contains(*p)).unwrap_or(screen.center());
+        self.chat = Some((String::new(), 0.0, at));
+        // The "/" that opened it isn't part of the message.
+        ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(t) if t == "/")));
+    }
+
+    /// The cursor chat bubble being typed in. It follows the pointer and fades out a few seconds
+    /// after the last keystroke; Escape or a click closes it, Enter starts a new message.
+    fn cursor_chat(&mut self, ui: &Ui, rect: Rect) {
+        const IDLE: f64 = 5.0;
+        let Some((mut text, mut t, mut at)) = self.chat.take() else { return };
+        let (now, hover, pressed, esc, enter) =
+            ui.input(|i| (i.time, i.pointer.hover_pos(), i.pointer.any_pressed(), i.key_pressed(Key::Escape), i.key_pressed(Key::Enter)));
+        if t == 0.0 {
+            t = now;
+        }
+        if esc || pressed || now - t > IDLE {
+            return;
+        }
+        if let Some(h) = hover.filter(|h| rect.contains(*h)) {
+            at = h;
+        }
+        let col = self.collab.as_ref().map_or(BLUE, |c| crate::collab::peer_color(c.me.color));
+        let fade = ((IDLE - (now - t)) as f32).min(1.0);
+        let font = FontId::proportional(13.0);
+        let shown = if text.is_empty() { "Say something".to_string() } else { text.clone() };
+        let width = ui.painter().layout_no_wrap(shown, font.clone(), Color32::WHITE).size().x.clamp(60.0, 240.0) + 4.0;
+        let edit = egui::Area::new(egui::Id::new("cursor-chat")).fixed_pos(at + vec2(14.0, 18.0)).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
+            egui::Frame::NONE.fill(col.gamma_multiply(fade)).corner_radius(CornerRadius { nw: 2, ne: 14, sw: 14, se: 14 }).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
+                egui::TextEdit::singleline(&mut text)
+                    .id(egui::Id::new("cursor-chat-text"))
+                    .frame(egui::Frame::NONE)
+                    .margin(egui::Margin::ZERO)
+                    .font(font)
+                    .text_color(Color32::WHITE.gamma_multiply(fade))
+                    .hint_text(egui::RichText::new("Say something").color(Color32::from_white_alpha(170)))
+                    .char_limit(crate::collab::CHAT_MAX)
+                    .desired_width(width)
+                    .show(ui)
+                    .response
+            })
+            .inner
+        });
+        let edit = edit.inner;
+        edit.request_focus();
+        if edit.changed() {
+            t = now;
+        }
+        if enter {
+            text.clear();
+            t = now;
+        }
+        self.chat = Some((text, t, at));
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
     }
 
     /// Prototype tab: the "+" circle on the right edge of a single selection.
@@ -2102,6 +2210,7 @@ impl App {
                     .show(ui)
             })
             .inner;
+        self.caret = out.cursor_range.map(|r| r.primary.index.0);
         if self.focus_text {
             out.response.request_focus();
             self.focus_text = false;

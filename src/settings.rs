@@ -112,6 +112,8 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Bulleted and numbered list", "⇧ ⌘ 8, ⇧ ⌘ 7"),
     ("Link the selected text (while editing)", "⌘ K"),
     ("Find and replace", "⌘ F"),
+    ("Cursor chat (Esc closes it)", "/"),
+    ("Stop following a collaborator", "Esc"),
     ("Next and previous tab, close tab", "⌃ Tab, ⌃ ⇧ Tab, ⌘ W"),
     ("Settings", "⌘ ,"),
 ];
