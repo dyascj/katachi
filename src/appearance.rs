@@ -113,7 +113,7 @@ pub fn apply(ctx: &Context, a: &Appearance) {
         ThemePref::System => egui::SystemTheme::SystemDefault,
     }));
     // winit can't read the desktop's light or dark preference on Linux; ask the desktop portal.
-    if cfg!(target_os = "linux")
+    if cfg!(target_os = "linux") && !cfg!(test)
         && let Some(t) = linux_theme()
     {
         ctx.options_mut(|o| o.fallback_theme = t);
