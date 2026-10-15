@@ -38,6 +38,33 @@ pub fn families() -> &'static [String] {
     })
 }
 
+/// Whether `family` is installed (Inter always is: it's bundled).
+pub fn installed(family: &str) -> bool {
+    static SET: OnceLock<HashSet<String>> = OnceLock::new();
+    SET.get_or_init(|| families().iter().cloned().collect()).contains(family)
+}
+
+/// Fonts the document uses that aren't installed, by family, with the styles used (Figma's
+/// missing fonts; mostly from .fig imports).
+pub fn missing_fonts(doc: &crate::doc::Document) -> Vec<(String, Vec<(u16, bool)>)> {
+    let mut out: std::collections::BTreeMap<String, Vec<(u16, bool)>> = Default::default();
+    for n in doc.nodes.values().filter(|n| n.kind == crate::doc::Kind::Text) {
+        let runs = n.spans.iter().map(|sp| (sp.style.font_family.as_deref().unwrap_or(&n.font_family), sp.style.font_weight.unwrap_or(n.font_weight), sp.style.italic.unwrap_or(n.italic)));
+        for (family, w, i) in std::iter::once((n.font_family.as_str(), n.font_weight, n.italic)).chain(runs) {
+            if !installed(family) {
+                out.entry(family.to_string()).or_default().push((w, i));
+            }
+        }
+    }
+    out.into_iter()
+        .map(|(f, mut s)| {
+            s.sort();
+            s.dedup();
+            (f, s)
+        })
+        .collect()
+}
+
 /// Inter's weights bundled with the app (upright only).
 const INTER: [u16; 4] = [400, 500, 600, 700];
 

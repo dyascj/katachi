@@ -81,6 +81,7 @@ const COMMANDS: &[(&str, &str, Run)] = &[
     ("Present", "⌥⌘↵", |a, c| a.present(c.input(|i| i.time))),
     ("Comments", "⇧C", |a, _| a.show_comments = !a.show_comments),
     ("Local variables", "", |a, _| a.show_variables = true),
+    ("Replace fonts", "", |a, _| a.open_replace_fonts()),
     ("Find and replace", "⌘F", |a, _| {
         a.find.0 = true;
         a.find.3 = true;

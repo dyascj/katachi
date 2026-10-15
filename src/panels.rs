@@ -1080,6 +1080,11 @@ impl App {
                     ui.close();
                 }
             }
+            ui.separator();
+            if item(ui, "Replace fonts…", "") {
+                self.open_replace_fonts();
+                ui.close();
+            }
         });
         ui.menu_button("Arrange", |ui| {
             for (order, label, short) in [(crate::doc::Order::Front, "Bring to front", "⌥⌘]"), (crate::doc::Order::Forward, "Bring forward", "⌘]"), (crate::doc::Order::Backward, "Send backward", "⌘["), (crate::doc::Order::Back, "Send to back", "⌥⌘[")] {
@@ -1647,6 +1652,56 @@ impl App {
             }
         } else if open && !cancel {
             self.batch_rename = Some(b);
+        }
+    }
+
+    pub fn open_replace_fonts(&mut self) {
+        self.replace_fonts = Some(crate::text::missing_fonts(&self.doc).into_iter().map(|(f, _)| (f, "Inter".to_string())).collect());
+    }
+
+    /// Figma's Replace fonts: each missing family gets an installed one, across the document.
+    pub fn replace_fonts_window(&mut self, ctx: &egui::Context) {
+        let Some(mut picks) = self.replace_fonts.take() else { return };
+        let missing = crate::text::missing_fonts(&self.doc);
+        let (mut open, mut apply) = (true, false);
+        crate::chrome::window(ctx, "Replace fonts", &mut open, 340.0, |ui| {
+            let muted = theme::muted(ui.ctx());
+            if picks.is_empty() {
+                ui.label(RichText::new("Every font in this file is installed.").color(muted));
+                return;
+            }
+            ui.label(RichText::new("These fonts aren't installed. Pick a replacement for each.").color(muted));
+            ui.add_space(6.0);
+            for (i, (from, to)) in picks.iter_mut().enumerate() {
+                let styles = missing.iter().find(|m| m.0 == *from).map_or(String::new(), |m| m.1.iter().map(|&(w, it)| crate::text::style_name(w, it)).collect::<Vec<_>>().join(", "));
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(150.0);
+                        ui.label(RichText::new(from.as_str()).italics().strikethrough());
+                        ui.label(RichText::new(styles).small().color(muted));
+                    });
+                    egui::ComboBox::from_id_salt(("replace-font", i)).width(150.0).selected_text(to.as_str()).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+                        for f in crate::text::families() {
+                            ui.selectable_value(to, f.clone(), f);
+                        }
+                    });
+                });
+            }
+            ui.add_space(6.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), 26.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                apply = ui.add(egui::Button::new(RichText::new("Replace fonts").color(Color32::WHITE)).fill(BLUE).corner_radius(6)).clicked();
+            });
+        });
+        if apply {
+            // One undo step for the whole replacement.
+            self.checkpoint();
+            for (from, to) in &picks {
+                crate::doc::replace_font(&mut self.doc, from, to);
+            }
+            self.doc.reflow();
+            self.toast(format!("Replaced {} font{}", picks.len(), if picks.len() == 1 { "" } else { "s" }));
+        } else if open {
+            self.replace_fonts = Some(picks);
         }
     }
 
@@ -3364,7 +3419,20 @@ impl App {
         let mut t = n.clone();
         // Font family picker with search.
         let fam_id = ui.id().with("font-search");
-        let resp = ui.add_sized([ui.available_width(), 24.0], egui::Button::new(&t.font_family));
+        // A missing font reads struck through in italics, with a way to replace it (Figma).
+        let missing = std::iter::once(&n.font_family).chain(n.spans.iter().filter_map(|sp| sp.style.font_family.as_ref())).any(|f| !crate::text::installed(f));
+        let label = if crate::text::installed(&t.font_family) { RichText::new(&t.font_family) } else { RichText::new(&t.font_family).italics().strikethrough() };
+        let resp = ui.add_sized([ui.available_width(), 24.0], egui::Button::new(label));
+        if missing {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Missing fonts").small().color(Color32::from_rgb(0xF2, 0x48, 0x22)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Replace fonts…").clicked() {
+                        self.open_replace_fonts();
+                    }
+                });
+            });
+        }
         // Each opening starts with an empty, focused search, as in Figma.
         if resp.clicked() {
             ui.data_mut(|d| d.insert_temp(fam_id, String::new()));

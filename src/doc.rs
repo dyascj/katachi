@@ -630,6 +630,27 @@ pub fn replace_text(n: &mut Node, find: &str, with: &str) -> usize {
     starts.len()
 }
 
+/// Use `to` wherever the document uses the font family `from`: text layers, their styled runs, and
+/// text styles. Weights and italics stay; they resolve to `to`'s nearest installed face.
+pub fn replace_font(doc: &mut Document, from: &str, to: &str) {
+    let ids: Vec<NodeId> = doc.nodes.values().filter(|n| n.kind == Kind::Text && (n.font_family == from || n.spans.iter().any(|sp| sp.style.font_family.as_deref() == Some(from)))).map(|n| n.id).collect();
+    for id in ids {
+        let n = doc.node_mut(id);
+        if n.font_family == from {
+            n.font_family = to.to_string();
+        }
+        for sp in n.spans.iter_mut().filter(|sp| sp.style.font_family.as_deref() == Some(from)) {
+            sp.style.font_family = Some(to.to_string());
+        }
+    }
+    for st in &mut doc.styles {
+        if let StyleValue::Text(t) = &mut st.value
+            && t.font_family == from {
+                t.font_family = to.to_string();
+            }
+    }
+}
+
 /// Paragraphs after an edit: list formatting follows its paragraph, and new
 /// paragraphs typed inside a list item continue the list.
 pub fn shift_lists(lists: &[ListLine], old: &str, new: &str) -> Vec<ListLine> {

@@ -250,6 +250,8 @@ pub struct App {
     pub style_clip: Option<Node>,
     pub layer_search: Option<String>,
     pub batch_rename: Option<crate::panels::BatchRename>,
+    /// The Replace fonts dialog: each missing family and its chosen replacement.
+    pub replace_fonts: Option<Vec<(String, String)>>,
     /// This session's crash-recovery autosave.
     recovery: PathBuf,
     last_autosave: f64,
@@ -358,6 +360,7 @@ impl App {
             style_clip: None,
             layer_search: None,
             batch_rename: None,
+            replace_fonts: None,
             recovery: {
                 // Unique per window, even for two opened in the same millisecond.
                 static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2661,6 +2664,7 @@ impl eframe::App for App {
         self.recovery_prompt(&ctx);
         self.console_window(&ctx);
         self.batch_rename_window(&ctx);
+        self.replace_fonts_window(&ctx);
         self.quick_actions(&ctx);
         self.plugin_frame(&ctx, frame);
         self.appearance_frame(&ctx, frame);

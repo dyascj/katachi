@@ -2790,6 +2790,33 @@ fn italics_use_real_faces_and_slant_only_without_one() {
 }
 
 #[test]
+fn missing_fonts_show_and_replace_in_one_step() {
+    use crate::doc::{SpanStyle, TextSpan};
+    let mut h = harness();
+    let mut t = Node::new(Kind::Text, r(0., 0., 10., 10.));
+    (t.text, t.font_family, t.font_weight) = ("Imported".into(), "Fig Only Sans".into(), 700);
+    t.spans = vec![TextSpan { start: 0, end: 3, style: SpanStyle { font_family: Some("Fig Only Serif".into()), italic: Some(true), ..Default::default() } }];
+    let id = h.state_mut().doc.insert(0, None, None, t);
+    h.state_mut().sel = vec![id];
+    h.run_steps(2);
+    let missing = crate::text::missing_fonts(&h.state().doc);
+    assert_eq!(missing, vec![("Fig Only Sans".to_string(), vec![(700, false)]), ("Fig Only Serif".to_string(), vec![(700, true)])]);
+    // The Typography section flags it and opens Replace fonts.
+    h.get_by_label("Missing fonts");
+    h.get_by_label("Replace fonts…").click();
+    h.run_steps(2);
+    assert_eq!(h.state().replace_fonts.as_ref().map(|p| p.len()), Some(2));
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Replace fonts").click();
+    h.run_steps(2);
+    let n = h.state().doc.node(id).clone();
+    assert_eq!((n.font_family.as_str(), n.font_weight, n.spans[0].style.font_family.as_deref()), ("Inter", 700, Some("Inter")));
+    assert!(crate::text::missing_fonts(&h.state().doc).is_empty() && h.state().replace_fonts.is_none());
+    assert!(h.query_by_label("Missing fonts").is_none());
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(crate::text::missing_fonts(&h.state().doc).len(), 2, "one undo step");
+}
+
+#[test]
 fn copy_and_paste_properties_survive_egui_clipboard_events() {
     use crate::app::TEST_CLIPBOARD;
     let mut h = harness();
