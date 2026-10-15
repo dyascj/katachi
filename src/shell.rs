@@ -12,6 +12,20 @@ use std::time::SystemTime;
 
 /// Matches where macOS centers the traffic lights (16 points down), so they sit mid-strip.
 pub const STRIP_H: f32 = 32.0;
+
+/// Katachi draws the window frame itself (Linux, unless the system title bar is chosen): window
+/// buttons at the end of the tab strip, drag to move, edges to resize.
+pub static OWN_FRAME: AtomicBool = AtomicBool::new(false);
+const BUTTONS_W: f32 = 3.0 * 40.0;
+
+fn own_frame() -> bool {
+    OWN_FRAME.load(Ordering::Relaxed)
+}
+
+/// Whether this window was opened with the desktop's title bar (Linux setting).
+pub fn uses_system_title_bar() -> bool {
+    !own_frame()
+}
 const BLUE: Color32 = Color32::from_rgb(0x0D, 0x99, 0xFF);
 
 pub struct Shell {
@@ -25,12 +39,14 @@ pub struct Shell {
     held: Option<usize>,
     last_active: Option<usize>,
     home: Home,
+    /// The window title last sent (sent only on change; some desktops redraw it every time).
+    title: String,
     pub update: crate::update::Updater,
 }
 
 impl Shell {
     pub fn new(path: Option<PathBuf>) -> Self {
-        let mut s = Shell { tabs: vec![], active: None, idle: App::new(None), held: None, last_active: None, home: Home::default(), update: crate::update::Updater::start() };
+        let mut s = Shell { tabs: vec![], active: None, idle: App::new(None), held: None, last_active: None, home: Home::default(), title: String::new(), update: crate::update::Updater::start() };
         if let Some(p) = path {
             s.open(p);
         }
@@ -127,15 +143,19 @@ impl Shell {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let (close, next, prev) = ctx.input_mut(|i| {
-            (
-                i.consume_key(Modifiers::COMMAND, Key::W),
-                i.consume_key(Modifiers::CTRL, Key::Tab),
-                i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Tab),
-            )
+        // Shift Tab first: consuming Ctrl Tab would also match it (extra Shift is ignored).
+        let (close, prev, next) = ctx.input_mut(|i| {
+            let close = i.consume_key(Modifiers::COMMAND, Key::W);
+            let prev = i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Tab);
+            (close, prev, i.consume_key(Modifiers::CTRL, Key::Tab))
         });
         if close && let Some(i) = self.active {
             self.request_close(i);
+        }
+        // Ctrl Q quits on Windows and Linux (macOS gets Cmd Q from its app menu). Quitting asks
+        // about unsaved work first, as closing the window does.
+        if !cfg!(target_os = "macos") && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Q)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         // Ctrl+Tab cycles Home and the tabs.
         let n = self.tabs.len() as i64 + 1;
@@ -175,6 +195,7 @@ impl Shell {
             Some(Want::OpenDialog) => self.open_dialog(),
             Some(Want::CloseTab) => self.close(i),
             Some(Want::Home) => self.activate(None),
+            Some(Want::KeepOpen) => self.tabs.iter_mut().for_each(|t| t.allow_close = false),
             None => {}
         }
     }
@@ -196,7 +217,7 @@ impl Shell {
     fn strip(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let dark = ui.visuals().dark_mode;
-        let glass = self.holder().appearance.glass;
+        let glass = self.holder().appearance.glass_on();
         let bar = if dark { Color32::from_gray(0x1A) } else { Color32::from_gray(0xE6) };
         let bar = if glass { bar.gamma_multiply(0.55) } else { bar };
         let face = ui.visuals().panel_fill;
@@ -206,8 +227,8 @@ impl Shell {
         let mut action: Option<StripAction> = None;
         egui::Panel::top("tabstrip").exact_size(STRIP_H).resizable(false).show_separator_line(false).frame(egui::Frame::NONE.fill(bar)).show(ui, |ui| {
             let r = ui.max_rect();
-            // Empty strip: drag to move the window, double-click to zoom (macOS draws no title bar).
-            if cfg!(target_os = "macos") {
+            // Empty strip: drag to move the window, double-click to zoom (no system title bar).
+            if cfg!(target_os = "macos") || own_frame() {
                 let resp = ui.interact(r, egui::Id::new("strip-drag"), Sense::click_and_drag());
                 if resp.drag_started() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
@@ -253,7 +274,8 @@ impl Shell {
             x = home.max.x;
             p.vline(x, r.y_range(), Stroke::new(1.0, line));
             // File tabs share what's left, between 110 and 220 points each.
-            let room = (r.max.x - x - 44.0).max(0.0);
+            let end = if own_frame() { r.max.x - BUTTONS_W } else { r.max.x };
+            let room = (end - x - 44.0).max(0.0);
             let w = if self.tabs.is_empty() { 0.0 } else { (room / self.tabs.len() as f32).clamp(110.0, 220.0) };
             for (i, t) in self.tabs.iter().enumerate() {
                 let tr = Rect::from_min_size(pos2(x, r.min.y), vec2(w, r.height()));
@@ -300,7 +322,7 @@ impl Shell {
             }
             // New tab.
             let plus = Rect::from_min_size(pos2(x + 6.0, r.center().y - 12.0), vec2(24.0, 24.0));
-            if plus.max.x < r.max.x {
+            if plus.max.x < end {
                 let resp = ui.interact(plus, egui::Id::new("tab-new"), Sense::click());
                 resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "New design file"));
                 if resp.hovered() {
@@ -313,6 +335,11 @@ impl Shell {
                     action = Some(StripAction::New);
                 }
                 resp.on_hover_text("New design file");
+            }
+            if own_frame() {
+                if let Some(a) = window_buttons(ui, Rect::from_min_max(pos2(end, r.min.y), r.max)) {
+                    action = Some(a);
+                }
             }
             // The line under everything except the tab on screen, which runs into the content.
             let under = r.max.y - 0.5;
@@ -334,6 +361,7 @@ impl Shell {
             }
         });
         match action {
+            Some(StripAction::Window(cmd)) => ctx.send_viewport_cmd(cmd),
             Some(StripAction::Activate(i)) => self.activate(i),
             Some(StripAction::Close(i)) => self.request_close(i),
             Some(StripAction::New) => self.new_tab(),
@@ -350,15 +378,108 @@ impl Shell {
             self.tabs[i].toast(format!("Save {name} before updating"));
             return;
         }
+        if self.update.ready() {
+            return self.update.restart();
+        }
         self.update.install();
     }
 }
 
 enum StripAction {
+    Window(egui::ViewportCommand),
     Activate(Option<usize>),
     Close(usize),
     New,
     Update,
+}
+
+/// Minimize, maximize and close, drawn at the end of the tab strip.
+fn window_buttons(ui: &mut egui::Ui, area: Rect) -> Option<StripAction> {
+    let ctx = ui.ctx().clone();
+    let max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+    let ink = crate::appearance::ink(&ctx);
+    let dark = ui.visuals().dark_mode;
+    let p = ui.painter().clone();
+    let mut action = None;
+    for (k, label) in ["Minimize", if max { "Restore" } else { "Maximize" }, "Close"].into_iter().enumerate() {
+        let b = Rect::from_min_size(pos2(area.min.x + k as f32 * 40.0, area.min.y), vec2(40.0, area.height()));
+        let resp = ui.interact(b, egui::Id::new(("window-button", k)), Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+        let close = k == 2;
+        let hot = resp.hovered();
+        if hot {
+            p.rect_filled(b, 0.0, if close { Color32::from_rgb(0xE8, 0x11, 0x23) } else if dark { Color32::from_gray(0x33) } else { Color32::from_gray(0xD4) });
+        }
+        let c = b.center();
+        let s = Stroke::new(1.0, if hot && close { Color32::WHITE } else { ink });
+        match k {
+            0 => {
+                p.hline(egui::Rangef::new(c.x - 5.0, c.x + 5.0), c.y, s);
+            }
+            1 if max => {
+                p.rect_stroke(Rect::from_center_size(c + vec2(-1.0, 1.0), vec2(8.0, 8.0)), 1.0, s, egui::StrokeKind::Middle);
+                p.line_segment([c + vec2(-3.0, -4.0), c + vec2(5.0, -4.0)], s);
+                p.line_segment([c + vec2(5.0, -4.0), c + vec2(5.0, 4.0)], s);
+            }
+            1 => {
+                p.rect_stroke(Rect::from_center_size(c, vec2(10.0, 10.0)), 1.0, s, egui::StrokeKind::Middle);
+            }
+            _ => {
+                p.line_segment([c - vec2(5.0, 5.0), c + vec2(5.0, 5.0)], s);
+                p.line_segment([c + vec2(-5.0, 5.0), c + vec2(5.0, -5.0)], s);
+            }
+        }
+        if resp.clicked() {
+            action = Some(StripAction::Window(match k {
+                0 => egui::ViewportCommand::Minimized(true),
+                1 => egui::ViewportCommand::Maximized(!max),
+                _ => egui::ViewportCommand::Close,
+            }));
+        }
+    }
+    action
+}
+
+/// With Katachi drawing the frame: a thin border, and pressing near an edge or corner resizes
+/// the window (the window manager takes over from there).
+fn resize_edges(ctx: &egui::Context) {
+    use egui::viewport::ResizeDirection as D;
+    let (max, full) = ctx.input(|i| (i.viewport().maximized.unwrap_or(false), i.viewport().fullscreen.unwrap_or(false)));
+    if max || full {
+        return;
+    }
+    let r = ctx.content_rect();
+    let line = crate::appearance::border(ctx);
+    ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("window-border"))).rect_stroke(r, 0.0, Stroke::new(1.0, line), egui::StrokeKind::Inside);
+    let (e, c) = (5.0, 14.0);
+    let zones = [
+        (D::NorthWest, Rect::from_min_size(r.min, vec2(c, c))),
+        (D::NorthEast, Rect::from_min_size(pos2(r.max.x - c, r.min.y), vec2(c, c))),
+        (D::SouthWest, Rect::from_min_size(pos2(r.min.x, r.max.y - c), vec2(c, c))),
+        (D::SouthEast, Rect::from_min_size(r.max - vec2(c, c), vec2(c, c))),
+        (D::North, Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + e))),
+        (D::South, Rect::from_min_max(pos2(r.min.x, r.max.y - e), r.max)),
+        (D::West, Rect::from_min_max(r.min, pos2(r.min.x + e, r.max.y))),
+        (D::East, Rect::from_min_max(pos2(r.max.x - e, r.min.y), r.max)),
+    ];
+    for (k, (dir, zone)) in zones.into_iter().enumerate() {
+        let resp = egui::Area::new(egui::Id::new(("resize-edge", k)))
+            .order(egui::Order::Foreground)
+            .fixed_pos(zone.min)
+            .show(ctx, |ui| ui.allocate_exact_size(zone.size(), Sense::drag()).1)
+            .inner;
+        if resp.hovered() || resp.dragged() {
+            ctx.set_cursor_icon(match dir {
+                D::North | D::South => egui::CursorIcon::ResizeVertical,
+                D::East | D::West => egui::CursorIcon::ResizeHorizontal,
+                D::NorthWest | D::SouthEast => egui::CursorIcon::ResizeNwSe,
+                D::NorthEast | D::SouthWest => egui::CursorIcon::ResizeNeSw,
+            });
+        }
+        if resp.drag_started() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+        }
+    }
 }
 
 /// A house outline for the Home tab.
@@ -644,7 +765,7 @@ fn write_thumb(file: &Path) -> Result<(), String> {
 impl eframe::App for Shell {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         let holder = self.held.map_or(&self.idle, |i| &self.tabs[i]);
-        if holder.appearance.glass { [0.0; 4] } else { visuals.panel_fill.to_normalized_gamma_f32() }
+        if holder.appearance.glass_on() { [0.0; 4] } else { visuals.panel_fill.to_normalized_gamma_f32() }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -662,6 +783,9 @@ impl eframe::App for Shell {
         }
         self.shortcuts(&ctx);
         self.hold();
+        if own_frame() {
+            resize_edges(&ctx);
+        }
         let presenting = self.active.is_some_and(|i| self.tabs[i].presenting.is_some());
         if !presenting {
             self.strip(ui);
@@ -671,7 +795,6 @@ impl eframe::App for Shell {
             Some(i) => self.tabs[i].ui(ui, frame),
             None => {
                 let action = self.home.ui(ui);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Title("Katachi".into()));
                 // Home has no app on screen: the session's own windows and the MCP server run here.
                 self.holder().session_frame(&ctx, frame);
                 match action {
@@ -698,10 +821,31 @@ impl eframe::App for Shell {
             self.held = Some(i);
             self.activate(Some(i));
         }
+        let title = self.active.and_then(|i| self.tabs.get(i)).map_or_else(|| "Katachi".to_string(), |t| t.window_title());
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
         self.wants();
         self.close_guard(&ctx);
+        // Tabs in the background have unsaved work too.
+        let now = ctx.input(|i| i.time);
+        for t in &mut self.tabs {
+            t.autosave(now);
+        }
         if self.update.poll(&ctx) {
+            // Restart straight into the new version, unless work was changed while it downloaded.
+            if self.update.ready() && !self.tabs.iter().any(|t| t.dirty) {
+                self.update.restart();
+            }
             ctx.request_repaint();
+        }
+    }
+
+    /// The window closed: every tab's unsaved work was saved or let go, so drop the autosaves.
+    fn on_exit(&mut self) {
+        for t in &self.tabs {
+            t.clear_recovery();
         }
     }
 }
@@ -710,8 +854,17 @@ impl eframe::App for Shell {
 fn reveal(p: &Path) {
     if cfg!(target_os = "macos") {
         let _ = std::process::Command::new("open").arg("-R").arg(p).spawn();
-    } else if let Some(dir) = p.parent() {
-        crate::plugin_view::open_url(&dir.display().to_string());
+    } else {
+        // Linux file managers that implement FileManager1 open the folder with the file selected.
+        let path: String = p.to_string_lossy().bytes().map(|b| if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
+        let uri = format!("array:string:file://{path}");
+        let shown = std::process::Command::new("dbus-send")
+            .args(["--session", "--print-reply", "--dest=org.freedesktop.FileManager1", "/org/freedesktop/FileManager1", "org.freedesktop.FileManager1.ShowItems", &uri, "string:"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !shown && let Some(dir) = p.parent() {
+            crate::plugin_view::open_url(&dir.display().to_string());
+        }
     }
 }
 
@@ -729,6 +882,37 @@ mod tests {
         assert_eq!(ago(back(30 * 3600)), "yesterday");
         assert_eq!(ago(back(4 * 86400)), "4 days ago");
         assert_eq!(ago(back(65 * 86400)), "2 months ago");
+    }
+
+    #[test]
+    fn background_tabs_autosave_and_a_cancelled_quit_asks_again() {
+        crate::tests::isolate_data();
+        let tag = format!("Background {}", std::process::id());
+        let page = tag.clone();
+        // Each frame is 31 s, past the autosave interval.
+        let mut h = egui_kittest::Harness::builder().with_step_dt(31.0).build_eframe(move |cc| {
+            crate::setup_style(&cc.egui_ctx);
+            let mut s = Shell::new(None);
+            s.update = crate::update::Updater::off();
+            s.new_tab();
+            s.tabs[0].doc.pages[0].name = page.clone();
+            s.tabs[0].dirty = true;
+            s.new_tab();
+            s
+        });
+        h.run_steps(3);
+        let saved = (0..200).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::fs::read_dir(crate::files::recovery_dir()).into_iter().flatten().flatten().any(|e| std::fs::read_to_string(e.path()).is_ok_and(|s| s.contains(&tag)))
+        });
+        assert!(saved, "the tab that isn't on screen autosaved");
+        // Quitting: tab 0 said "Don't save", then tab 1 cancelled. Both must ask again next time.
+        let s = h.state_mut();
+        s.tabs[0].allow_close = true;
+        s.tabs[1].want = Some(Want::KeepOpen);
+        s.wants();
+        assert!(s.tabs.iter().all(|t| !t.allow_close));
+        s.tabs[0].clear_recovery();
     }
 
     #[test]

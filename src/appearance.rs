@@ -32,6 +32,17 @@ impl Default for Appearance {
     }
 }
 
+/// Whether the window was created with an alpha channel. Linux creates it opaque unless glass
+/// was on at launch, so glass turned on later waits for a restart there.
+pub static TRANSPARENT_WINDOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+impl Appearance {
+    /// Glass as the window can show it right now.
+    pub fn glass_on(&self) -> bool {
+        self.glass && TRANSPARENT_WINDOW.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 fn path() -> std::path::PathBuf {
     crate::files::data_dir().join("appearance.json")
 }
@@ -63,7 +74,7 @@ fn hsl(h: f32, s: f32, l: f32) -> Color32 {
 
 /// Base panel color for a theme, tinted when glass is on.
 fn panel(a: &Appearance, dark: bool) -> Color32 {
-    if a.glass {
+    if a.glass_on() {
         let c = hsl(a.hue, a.saturation, if dark { 0.11 } else { 0.97 });
         Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (a.panel_opacity.clamp(0.15, 1.0) * 255.0) as u8)
     } else if dark {
@@ -73,6 +84,27 @@ fn panel(a: &Appearance, dark: bool) -> Color32 {
     }
 }
 
+/// The desktop's color scheme from the XDG settings portal (GNOME, KDE, and others), falling back
+/// to GNOME's setting. None when neither says.
+/// ponytail: read once per launch; watch the portal's SettingChanged signal if live switching matters.
+fn linux_theme() -> Option<Theme> {
+    static T: std::sync::OnceLock<Option<Theme>> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        let run = |cmd: &str, args: &[&str]| std::process::Command::new(cmd).args(args).output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+        let portal = run(
+            "dbus-send",
+            &["--session", "--print-reply=literal", "--reply-timeout=500", "--dest=org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop", "org.freedesktop.portal.Settings.Read", "string:org.freedesktop.appearance", "string:color-scheme"],
+        );
+        match portal.as_deref().and_then(|s| s.split_whitespace().last()) {
+            Some("1") => return Some(Theme::Dark),
+            Some("2") => return Some(Theme::Light),
+            _ => {}
+        }
+        let gnome = run("gsettings", &["get", "org.gnome.desktop.interface", "color-scheme"])?;
+        Some(if gnome.contains("dark") { Theme::Dark } else { Theme::Light })
+    })
+}
+
 /// Install fonts-independent style for both themes and pick the active one.
 pub fn apply(ctx: &Context, a: &Appearance) {
     ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(match a.theme {
@@ -80,6 +112,12 @@ pub fn apply(ctx: &Context, a: &Appearance) {
         ThemePref::Dark => egui::SystemTheme::Dark,
         ThemePref::System => egui::SystemTheme::SystemDefault,
     }));
+    // winit can't read the desktop's light or dark preference on Linux; ask the desktop portal.
+    if cfg!(target_os = "linux") && !cfg!(test)
+        && let Some(t) = linux_theme()
+    {
+        ctx.options_mut(|o| o.fallback_theme = t);
+    }
     ctx.set_theme(match a.theme {
         ThemePref::Light => egui::ThemePreference::Light,
         ThemePref::Dark => egui::ThemePreference::Dark,
@@ -110,7 +148,7 @@ pub fn apply(ctx: &Context, a: &Appearance) {
                 (Color32::from_gray(0xF5), Color32::from_gray(0xEB), Color32::from_gray(0xE6), Color32::from_gray(0x1E), Color32::from_rgb(0xBD, 0xE3, 0xFF))
             };
             // With glass, fields are a translucent wash so the tint shows through.
-            let wash = |c: Color32| if a.glass { Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 150) } else { c };
+            let wash = |c: Color32| if a.glass_on() { Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 150) } else { c };
             v.extreme_bg_color = wash(field);
             v.faint_bg_color = wash(field);
             v.override_text_color = Some(text);

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.dyascj.Katachi</id>
+  <name>Katachi</name>
+  <summary>Design interfaces, prototypes, and graphics</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="io.github.dyascj">
+    <name>Charles Dyas</name>
+  </developer>
+  <description>
+    <p>Katachi is a native design tool with Figma's workflow: the same canvas behavior, selection rules, tools, panels, and keyboard shortcuts. It runs offline and keeps your files on your disk.</p>
+    <p>It has auto layout, components and variants, variables with modes, vector editing, prototyping with smart animate, Dev Mode code, real-time multiplayer, Figma plugin support, an MCP server for AI agents, and it opens Figma .fig files.</p>
+  </description>
+  <launchable type="desktop-id">io.github.dyascj.Katachi.desktop</launchable>
+  <url type="homepage">https://github.com/dyascj/katachi</url>
+  <url type="bugtracker">https://github.com/dyascj/katachi/issues</url>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/dyascj/katachi/main/docs/screenshot.png</image>
+    </screenshot>
+  </screenshots>
+  <content_rating type="oars-1.1"/>
+  <provides>
+    <binary>katachi</binary>
+    <mediatype>application/x-katachi</mediatype>
+  </provides>
+  <categories>
+    <category>Graphics</category>
+    <category>Development</category>
+  </categories>
+  <releases>
+    <release version="0.4.0" date="2026-10-15"/>
+    <release version="0.3.0" date="2026-10-11"/>
+  </releases>
+</component>

@@ -113,7 +113,7 @@ pub fn context_menu(resp: &Response, add: impl FnOnce(&mut Ui)) {
 
 /// `ui.menu_button`, styled as a Figma menu (submenus of it inherit the style).
 pub fn menu_button<'a, R>(ui: &mut Ui, atoms: impl egui::IntoAtoms<'a>, add: impl FnOnce(&mut Ui) -> R) -> Response {
-    use egui::containers::menu::{MenuButton, MenuConfig, SubMenu, SubMenuButton, is_in_menu};
+    use egui::containers::menu::{MenuButton, MenuConfig, MenuState, SubMenu, SubMenuButton, is_in_menu};
     let config = MenuConfig::new().style(menu_style);
     if !is_in_menu(ui) {
         return MenuButton::new(atoms).config(config).ui(ui, add).0;
@@ -122,25 +122,41 @@ pub fn menu_button<'a, R>(ui: &mut Ui, atoms: impl egui::IntoAtoms<'a>, add: imp
     // the submenu's own, which gives white text on a white menu. Draw the button normally,
     // then open the submenu from a dark-styled scope.
     let resp = ui.add(egui::Button::new(atoms).right_text(SubMenuButton::RIGHT_ARROW));
-    ui.scope(|ui| {
+    // A pick closes just the submenu, a frame later (closing it during the click would let the
+    // popover take the click as one outside it), so the popover stays open as in Figma.
+    let sub = SubMenu::id_from_widget_id(resp.id);
+    if ui.data_mut(|d| d.remove_temp::<bool>(sub.with("picked"))).unwrap_or(false) {
+        MenuState::from_ui(ui, |s, _| s.open_item = s.open_item.filter(|o| *o != sub));
+    }
+    let shown = ui.scope(|ui| {
         menu_style(ui.style_mut());
-        SubMenu::new().config(config).show(ui, &resp, add);
+        SubMenu::new().config(config.close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)).show(ui, &resp, add)
     });
+    if shown.inner.is_some_and(|r| r.response.contains_pointer()) && ui.input(|i| i.pointer.any_click()) {
+        ui.data_mut(|d| d.insert_temp(sub.with("picked"), true));
+    }
     resp
 }
 
 /// Width of the right panel; popovers from it open just left of it, as in Figma.
 const RIGHT_PANEL: f32 = 248.0;
 
+/// Keep open popovers open through the next click: it edits what they show (a gradient
+/// handle on the canvas, a color picked with the eyedropper).
+pub fn pin_popovers(ctx: &egui::Context, on: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("pin-popovers"), on));
+}
+
 /// A Figma popover toggled by `button`: solid, titled, with a close button, opening to the left
 /// of the right panel (or below the button elsewhere), and closing on a click outside or Escape.
 pub fn popover<R>(button: &Response, id: egui::Id, title: &str, width: f32, add: impl FnOnce(&mut Ui) -> R) -> Option<R> {
     let ctx = button.ctx.clone();
+    let pinned = ctx.data(|d| d.get_temp(egui::Id::new("pin-popovers"))).unwrap_or(false);
     let edge = ctx.content_rect().max.x - RIGHT_PANEL;
     let in_panel = button.rect.min.x >= edge - 1.0;
     let mut p = egui::Popup::from_toggle_button_response(button)
         .id(id)
-        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .close_behavior(if pinned { egui::PopupCloseBehavior::IgnoreClicks } else { egui::PopupCloseBehavior::CloseOnClickOutside })
         // Ordinary widget styling inside (egui's popups default to menu styling).
         .style(|_: &mut egui::Style| {})
         .frame(Frame::NONE)
@@ -229,4 +245,93 @@ pub fn dialog(ctx: &egui::Context, id: &str, title: &str, width: f32, body: impl
         pick = Some(usize::MAX);
     }
     pick
+}
+
+/// Shortcut text for this platform. Labels are written with macOS glyphs ("⌥⌘K"); off macOS
+/// they read "Ctrl+Alt+K", and the few chords Figma binds to the Control key on a Mac use
+/// their Windows and Linux equivalents.
+pub fn keys(s: &str) -> String {
+    if cfg!(target_os = "macos") { s.to_string() } else { keys_pc(s) }
+}
+
+fn keys_pc(s: &str) -> String {
+    const MODS: [char; 4] = ['⌃', '⌥', '⇧', '⌘'];
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if !MODS.contains(&c) {
+            match c {
+                '⌫' => out.push_str("Backspace"),
+                '↵' => out.push_str("Enter"),
+                _ => out.push(c),
+            }
+            i += 1;
+            continue;
+        }
+        // A chord: modifiers (maybe space-separated), then the key up to a space, comma or paren.
+        let mut mods = vec![];
+        while i < chars.len() && (MODS.contains(&chars[i]) || (chars[i] == ' ' && chars.get(i + 1).is_some_and(|n| MODS.contains(n)))) {
+            if chars[i] != ' ' {
+                mods.push(chars[i]);
+            }
+            i += 1;
+        }
+        while chars.get(i) == Some(&' ') {
+            i += 1;
+        }
+        let start = i;
+        while i < chars.len() && (i == start || ![' ', ',', ')'].contains(&chars[i])) {
+            i += 1;
+        }
+        let key: String = chars[start..i].iter().collect();
+        let key = match key.as_str() {
+            "⌫" => "Backspace".to_string(),
+            "↵" => "Enter".to_string(),
+            _ => key,
+        };
+        let has = |m: char| mods.contains(&m);
+        let special = match (has('⌃'), has('⌥'), has('⌘'), key.as_str()) {
+            (true, false, false, "G") => Some("Ctrl+Shift+4".to_string()),
+            (true, false, true, "M") => Some("Ctrl+Alt+M".to_string()),
+            (true, true, false, "H" | "V" | "T") => Some(format!("Alt+Shift+{key}")),
+            _ => None,
+        };
+        out.push_str(&special.unwrap_or_else(|| {
+            let mut parts = vec![];
+            if has('⌃') || has('⌘') {
+                parts.push("Ctrl");
+            }
+            if has('⌥') {
+                parts.push("Alt");
+            }
+            if has('⇧') {
+                parts.push("Shift");
+            }
+            parts.push(&key);
+            parts.join("+")
+        }));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shortcut_labels_off_macos() {
+        let k = super::keys_pc;
+        assert_eq!(k("⌥⇧⌘K"), "Ctrl+Alt+Shift+K");
+        assert_eq!(k("⇧⌘S"), "Ctrl+Shift+S");
+        assert_eq!(k("⌃G"), "Ctrl+Shift+4");
+        assert_eq!(k("⌃⌘M"), "Ctrl+Alt+M");
+        assert_eq!(k("Distribute horizontal spacing (⌃⌥H)"), "Distribute horizontal spacing (Alt+Shift+H)");
+        assert_eq!(k("⌘ /  or  ⌘ K"), "Ctrl+/  or  Ctrl+K");
+        assert_eq!(k("⌘ E, ⌃ ⌘ M"), "Ctrl+E, Ctrl+Alt+M");
+        assert_eq!(k("Tab, ⇧ Tab, ⇧ ↵"), "Tab, Shift+Tab, Shift+Enter");
+        assert_eq!(k("⌃ Tab, ⌃ ⇧ Tab, ⌘ W"), "Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+W");
+        assert_eq!(k("Section  ⇧S"), "Section  Shift+S");
+        assert_eq!(k("⌘+"), "Ctrl++");
+        assert_eq!(k("V, K, H"), "V, K, H");
+    }
 }

@@ -126,6 +126,56 @@ fn shift_draw_is_square_and_alt_draws_from_center() {
 }
 
 #[test]
+fn undo_during_a_drag_is_ignored() {
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    let (a, b) = (s(&h, 50., 50.), s(&h, 80., 90.));
+    move_to(&mut h, a, Modifiers::NONE);
+    press(&mut h, a, true, Modifiers::NONE);
+    move_to(&mut h, a.lerp(b, 0.5), Modifiers::NONE);
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    move_to(&mut h, b, Modifiers::NONE);
+    press(&mut h, b, false, Modifiers::NONE);
+    h.run_steps(2);
+    assert_eq!(rect(&h, id), r(30., 40., 100., 100.));
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(rect(&h, id), r(0., 0., 100., 100.), "one undo takes back the move");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert!(h.state().doc.nodes.is_empty(), "the next one the drawing");
+}
+
+#[test]
+fn deleting_an_earlier_page_stays_on_the_current_one() {
+    let mut h = harness();
+    for name in ["Page 2", "Page 3", "Page 4"] {
+        let mut p = h.state().doc.pages[0].clone();
+        p.name = name.into();
+        h.state_mut().doc.pages.push(p);
+    }
+    h.state_mut().page = 2;
+    h.run_steps(2);
+    h.get_by_label("Page 1").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Delete page").click();
+    h.run_steps(2);
+    let st = h.state();
+    assert_eq!((st.doc.pages.len(), st.doc.pages[st.page].name.as_str()), (3, "Page 3"));
+}
+
+#[test]
+fn cancelling_a_quit_resets_every_tab() {
+    let mut h = harness();
+    h.state_mut().dirty = true;
+    h.state_mut().allow_close = true;
+    h.state_mut().confirm = Some(crate::app::After::Close);
+    h.run_steps(2);
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    assert!(!h.state().allow_close);
+    assert_eq!(h.state().want, Some(crate::app::Want::KeepOpen), "the window resets the other tabs");
+}
+
+#[test]
 fn move_resize_and_delete() {
     let mut h = harness();
     let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
@@ -670,8 +720,8 @@ fn shots() {
     let find = |st: &App, name: &str| *st.doc.nodes.keys().find(|i| st.doc.node(**i).name == name).unwrap();
     let (hero, star) = (find(st, "Hero"), find(st, "Star 1"));
     if let Some(c) = st.collab.as_mut() {
-        c.peers.insert(91, crate::collab::Presence { name: "Luna".into(), color: 2, page: 0, cursor: Some(pos2(300., 120.)), selection: vec![hero] });
-        c.peers.insert(92, crate::collab::Presence { name: "Sam".into(), color: 1, page: 0, cursor: Some(pos2(260., 700.)), selection: vec![star] });
+        c.peers.insert(91, crate::collab::Presence { name: "Luna".into(), color: 2, page: 0, cursor: Some(pos2(300., 120.)), selection: vec![hero], ..Default::default() });
+        c.peers.insert(92, crate::collab::Presence { name: "Sam".into(), color: 1, page: 0, cursor: Some(pos2(260., 700.)), selection: vec![star], ..Default::default() });
     }
     st.sel.clear();
     h.run_steps(3);
@@ -748,6 +798,53 @@ fn shift_a_wraps_in_auto_layout_and_drag_reorders() {
     key(&mut h, Modifiers::SHIFT | Modifiers::ALT, Key::A);
     assert_eq!(h.state().doc.node(f).layout.mode, LayoutMode::None);
     assert_eq!(rect(&h, a).min.x, 100.0);
+}
+
+#[test]
+fn arrow_keys_reorder_auto_layout_children() {
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (40.0, 40.0));
+    let b = draw(&mut h, Key::R, (60.0, 0.0), (100.0, 40.0));
+    let c = draw(&mut h, Key::R, (120.0, 0.0), (160.0, 40.0));
+    h.state_mut().sel = vec![a, b, c];
+    key(&mut h, Modifiers::SHIFT, Key::A);
+    let f = h.state().sel[0];
+    h.state_mut().sel = vec![a];
+    key(&mut h, Modifiers::NONE, Key::ArrowRight);
+    assert_eq!(h.state().doc.node(f).children, vec![b, a, c], "moves one place along the row");
+    assert_eq!(rect(&h, a).min.x, 50.0);
+    key(&mut h, Modifiers::NONE, Key::ArrowDown);
+    assert_eq!(h.state().doc.node(f).children, vec![b, a, c], "across the flow does nothing");
+    key(&mut h, Modifiers::NONE, Key::ArrowLeft);
+    assert_eq!(h.state().doc.node(f).children, vec![a, b, c]);
+    // Outside auto layout, arrows still nudge.
+    h.state_mut().sel = vec![f];
+    key(&mut h, Modifiers::NONE, Key::ArrowDown);
+    assert_eq!(rect(&h, f).min.y, 1.0);
+}
+
+#[test]
+fn drag_auto_layout_gap_and_padding_handles() {
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (40.0, 40.0));
+    let b = draw(&mut h, Key::R, (60.0, 0.0), (100.0, 40.0));
+    h.state_mut().sel = vec![a, b];
+    key(&mut h, Modifiers::SHIFT, Key::A);
+    let f = h.state().sel[0];
+    assert_eq!(rect(&h, f), r(0., 0., 90., 40.));
+    // The gap handle sits mid-gap; dragging it right widens the gap.
+    let (from, to) = (s(&h, 45., 20.), s(&h, 55., 20.));
+    drag(&mut h, from, to, Modifiers::NONE);
+    assert_eq!(h.state().doc.node(f).layout.gap, 20.0);
+    assert_eq!(rect(&h, b).min.x, 60.0);
+    assert_eq!(h.state().sel, vec![f], "the frame stays selected");
+    // Top padding (0) has a sliver handle; Shift sets every side.
+    let (from, to) = (s(&h, 50., 7.), s(&h, 50., 19.));
+    drag(&mut h, from, to, Modifiers::SHIFT);
+    assert_eq!(h.state().doc.node(f).layout.padding, [12.0; 4]);
+    assert_eq!(rect(&h, f), r(0., 0., 124., 64.));
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().doc.node(f).layout.padding, [0.0; 4], "one undo step per drag");
 }
 
 #[test]
@@ -915,6 +1012,191 @@ fn vector_edit_moves_adds_and_deletes_points() {
 }
 
 #[test]
+fn vector_edit_marquee_selects_points_and_polygons_convert() {
+    let mut h = harness();
+    draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    let p = s(&h, 50., 50.);
+    double_click(&mut h, p);
+    let v = h.state().sel[0];
+    // A box around the left edge picks its two anchors; Shift adds the top-right one.
+    let (a, b) = (s(&h, -20., -20.), s(&h, 30., 120.));
+    drag(&mut h, a, b, Modifiers::NONE);
+    assert_eq!(h.state().vector_edit.as_ref().unwrap().selected.len(), 2);
+    let (a, b) = (s(&h, 80., -20.), s(&h, 120., 20.));
+    drag(&mut h, a, b, Modifiers::SHIFT);
+    assert_eq!(h.state().vector_edit.as_ref().unwrap().selected.len(), 3);
+    // Dragging one moves all three.
+    let (a, b) = (s(&h, 0., 0.), s(&h, -10., 0.));
+    drag(&mut h, a, b, Modifiers::NONE);
+    let pts: Vec<Pos2> = h.state().doc.node(v).paths[0].points.iter().map(|q| q.p + h.state().doc.node(v).rect.min.to_vec2()).collect();
+    assert_eq!(pts.iter().filter(|q| q.x == -10.0).count(), 2);
+    assert!(pts.contains(&pos2(90., 0.)));
+    // A click on empty canvas outside the path leaves edit mode.
+    let p = s(&h, 300., 300.);
+    click(&mut h, p, Modifiers::NONE);
+    assert!(h.state().vector_edit.is_none());
+    assert!(h.state().sel.is_empty());
+    // Polygons and stars become paths on their first edit.
+    h.state_mut().set_tool(Tool::Polygon);
+    let (a, b) = (s(&h, 200., 0.), s(&h, 300., 100.));
+    drag(&mut h, a, b, Modifiers::NONE);
+    let p = s(&h, 250., 70.);
+    double_click(&mut h, p);
+    let poly = h.state().sel[0];
+    assert!(h.state().vector_edit.is_some());
+    assert_eq!(h.state().doc.node(poly).kind, Kind::Vector);
+    assert_eq!(h.state().doc.node(poly).paths[0].points.len(), 3);
+}
+
+#[test]
+fn vector_cut_join_and_pen_continue() {
+    use crate::doc::PathPoint;
+    let mut h = harness();
+    let pt = |x: f32, y: f32| PathPoint { p: pos2(x, y), ..Default::default() };
+    let mut n = Node::vector_paths(vec![
+        crate::doc::SubPath { points: vec![pt(0., 0.), pt(100., 0.)], closed: false },
+        crate::doc::SubPath { points: vec![pt(100., 50.), pt(0., 50.)], closed: false },
+    ]);
+    n.name = "Lines".into();
+    let v = h.state_mut().doc.insert(0, None, None, n);
+    h.state_mut().enter_vector_edit(v);
+    // Join the two paths' right ends: one path, (0,0) -> (100,0) -> (100,50) -> (0,50).
+    h.state_mut().vector_edit.as_mut().unwrap().selected = vec![(0, 1), (1, 0)];
+    key(&mut h, Modifiers::COMMAND, Key::J);
+    let paths = h.state().doc.node(v).paths.clone();
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].points.iter().map(|q| q.p).collect::<Vec<_>>(), vec![pos2(0., 0.), pos2(100., 0.), pos2(100., 50.), pos2(0., 50.)]);
+    // Both ends of one path: closes it.
+    h.state_mut().vector_edit.as_mut().unwrap().selected = vec![(0, 0), (0, 3)];
+    key(&mut h, Modifiers::COMMAND, Key::J);
+    assert!(h.state().doc.node(v).paths[0].closed);
+    // Cut tool: clicking the top edge opens the path there.
+    key(&mut h, Modifiers::NONE, Key::Y);
+    let p = s(&h, 50., 0.);
+    click(&mut h, p, Modifiers::NONE);
+    let sp = h.state().doc.node(v).paths[0].clone();
+    assert!(!sp.closed);
+    assert_eq!(sp.points.len(), 6);
+    assert_eq!(sp.points[0].p, sp.points[5].p, "both new ends sit at the cut");
+    // Leave, then continue the open path with the pen from its end.
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    assert!(h.state().vector_edit.is_none());
+    key(&mut h, Modifiers::NONE, Key::P);
+    let end = s(&h, 50., 0.);
+    click(&mut h, end, Modifiers::NONE);
+    assert!(h.state().vector_edit.as_ref().is_some_and(|ve| ve.drawing.is_some()), "continues from the end");
+    let p = s(&h, 50., -40.);
+    click(&mut h, p, Modifiers::NONE);
+    let sp = h.state().doc.node(v).paths[0].clone();
+    assert_eq!(sp.points.len(), 7);
+    assert_eq!(h.state().doc.node(v).rect.min.y, -40.0);
+}
+
+#[test]
+fn pencil_smoothing_preference_simplifies_strokes() {
+    let wobble: Vec<Pos2> = (0..60).map(|i| pos2(i as f32 * 4.0, if i % 2 == 0 { 0.0 } else { 3.0 })).collect();
+    let mut h = harness();
+    let mut count = |smoothing: f32| {
+        h.state_mut().prefs.pencil_smoothing = smoothing;
+        key(&mut h, Modifiers::SHIFT, Key::P);
+        let pts: Vec<Pos2> = wobble.iter().map(|p| s(&h, p.x, p.y)).collect();
+        move_to(&mut h, pts[0], Modifiers::NONE);
+        press(&mut h, pts[0], true, Modifiers::NONE);
+        for p in &pts[1..] {
+            move_to(&mut h, *p, Modifiers::NONE);
+        }
+        press(&mut h, pts[59], false, Modifiers::NONE);
+        h.run_steps(2);
+        let id = h.state().sel[0];
+        h.state().doc.node(id).paths[0].points.len()
+    };
+    let (rough, smooth) = (count(0.5), count(10.0));
+    assert!(smooth < rough, "{smooth} vs {rough}");
+}
+
+#[test]
+fn cmd_drag_bends_a_segment() {
+    let mut h = harness();
+    let v = draw(&mut h, Key::L, (0.0, 0.0), (100.0, 0.0));
+    h.state_mut().enter_vector_edit(v);
+    let (a, b) = (s(&h, 50., 0.), s(&h, 50., 30.));
+    drag(&mut h, a, b, Modifiers::COMMAND);
+    let n = h.state().doc.node(v).clone();
+    let [p0, p1] = [n.paths[0].points[0], n.paths[0].points[1]];
+    assert!(p0.h_out.y > 0.0 && p1.h_in.y > 0.0, "both handles pulled down");
+    assert!((n.rect.max.y - 30.0).abs() < 1.0, "the curve passes through the pointer: {:?}", n.rect);
+}
+
+#[test]
+fn export_presets_edit_several_layers_and_the_export_dialog() {
+    use crate::doc::{ExportFormat, ExportSetting, ExportSize};
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (40.0, 20.0));
+    let b = draw(&mut h, Key::R, (60.0, 0.0), (100.0, 40.0));
+    h.state_mut().sel = vec![a, b];
+    h.run_steps(2);
+    h.get_by_label("Add export setting").click();
+    h.run_steps(2);
+    h.get_by_label("Add export setting").click();
+    h.run_steps(2);
+    let both = |h: &Harness<App>| [a, b].map(|id| h.state().doc.node(id).exports.iter().map(|e| e.scale).collect::<Vec<_>>());
+    assert_eq!(both(&h), [vec![1., 2.], vec![1., 2.]], "presets go on every selected layer");
+    // Different presets read as mixed; + replaces them on all.
+    h.state_mut().doc.node_mut(a).exports.push(ExportSetting { format: ExportFormat::Svg, ..Default::default() });
+    h.run_steps(2);
+    assert!(h.query_by_label("Mixed export settings. Click + to replace them.").is_some());
+    h.get_by_label("Add export setting").click();
+    h.run_steps(2);
+    assert_eq!(both(&h), [vec![1.], vec![1.]]);
+    // Shift Cmd E lists the page's layers with presets.
+    let c = draw(&mut h, Key::R, (0.0, 100.0), (10.0, 110.0));
+    h.state_mut().doc.node_mut(b).exports = vec![ExportSetting { size: ExportSize::Width(80.), ..Default::default() }, ExportSetting { format: ExportFormat::Webp, suffix: "-w".into(), ..Default::default() }];
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::E);
+    assert!(h.state().export_dialog.is_some());
+    assert!(h.query_by_label("Export 3 files").is_some());
+    assert!(h.query_by_label("80w PNG, 1x WEBP").is_some());
+    // Export them to a folder: sizes and suffixes kept; a layer without presets uses the panel default.
+    let dir = std::env::temp_dir().join(format!("katachi-export-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ctx = h.ctx.clone();
+    h.state_mut().export_layers_to(&ctx, &[a, b, c], &dir);
+    let dims = |f: &str| image::open(dir.join(f)).unwrap_or_else(|e| panic!("{f}: {e}")).to_rgba8().dimensions();
+    assert_eq!(dims("Rectangle 1.png"), (40, 20));
+    assert_eq!(dims("Rectangle 2.png"), (80, 80));
+    assert_eq!(dims("Rectangle 2-w.webp"), (40, 40));
+    assert_eq!(dims("Rectangle 3.png"), (10, 10));
+    std::fs::remove_dir_all(&dir).ok();
+    // Copy as code follows Dev Mode's language.
+    h.state_mut().sel = vec![c];
+    h.state_mut().code_lang = crate::codegen::Lang::SwiftUi;
+    h.state_mut().copy_as(&ctx, "code");
+    h.step();
+    let copied = h.output().platform_output.commands.iter().find_map(|c| match c {
+        egui::OutputCommand::CopyText(t) => Some(t.clone()),
+        _ => None,
+    });
+    assert!(copied.is_some_and(|t| t.contains(".frame(width: 10, height: 10)")), "SwiftUI code copied");
+}
+
+#[test]
+fn layers_snap_to_uniform_layout_grid_lines() {
+    let mut h = harness();
+    let f = draw(&mut h, Key::F, (0.0, 0.0), (300.0, 300.0));
+    let k = draw(&mut h, Key::R, (100.0, 100.0), (130.0, 130.0));
+    h.state_mut().doc.node_mut(f).grids = vec![crate::doc::LayoutGrid { size: 40., ..Default::default() }];
+    // 23px right puts the left edge 3px past the 120 line: it snaps there.
+    let (p, q) = (s(&h, 115., 115.), s(&h, 138., 115.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    assert_eq!(rect(&h, k).min.x, 120.0);
+    // Hidden guides (Ctrl G) don't snap.
+    h.state_mut().show_grids = false;
+    let (p, q) = (s(&h, 135., 115.), s(&h, 158., 115.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    assert_eq!(rect(&h, k).min.x, 143.0);
+}
+
+#[test]
 fn paste_svg_and_flatten() {
     let mut h = harness();
     h.event(Event::Paste(r##"<svg width="24" height="24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="10" fill="#f00"/></svg>"##.into()));
@@ -1023,20 +1305,23 @@ fn autosave_and_recovery_roundtrip() {
     a.doc.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 0., 10., 10.)));
     a.dirty = true;
     a.autosave(100.0);
-    // Written in the background.
-    let mut left = vec![];
+    // Written in the background; names start with the writer's process id. (Other tests autosave
+    // into the same folder in parallel, so look for this app's own file.)
+    let own = format!("{}-", std::process::id());
+    let mine = a.recovery_path().to_path_buf();
     for _ in 0..200 {
-        left = crate::files::orphaned_recoveries(std::path::Path::new("none"));
-        if !left.is_empty() {
+        if mine.exists() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(!left.is_empty(), "autosave written");
-    // A new session sees the orphan and can recover it as unsaved work.
+    assert!(mine.exists(), "autosave written");
+    assert!(!crate::files::orphaned_recoveries(std::path::Path::new("none")).contains(&mine), "a running session's autosave isn't offered");
+    // Once the process that wrote it is gone, a new session can recover it as unsaved work.
+    let p = mine.with_file_name(mine.file_name().unwrap().to_string_lossy().replacen(&own, "4000000000-", 1));
+    std::fs::rename(&mine, &p).unwrap();
     let mut b = App::new(None);
-    assert!(!b.recoverable.is_empty());
-    let p = b.recoverable.iter().find(|p| left.contains(p)).unwrap().clone();
+    assert!(b.recoverable.contains(&p));
     b.recover(&p);
     assert_eq!(b.doc.nodes.len(), 1);
     assert!(b.dirty);
@@ -1141,6 +1426,212 @@ fn prototype_connect_present_and_navigate() {
     assert!(h.state().presenting.is_none());
 }
 
+/// Screen point of (x, y) in the frame being presented.
+fn ps(h: &Harness<App>, x: f32, y: f32) -> Pos2 {
+    let st = h.state();
+    let frame = st.presenting.as_ref().expect("presenting").frame;
+    st.presented_view(&st.presented(), frame, Rect::from_min_size(Pos2::ZERO, vec2(1440., 900.))).to_screen(pos2(x, y))
+}
+
+#[test]
+fn prototype_change_to_swaps_variants_while_presenting() {
+    use crate::doc::{Action, Reaction, Trigger};
+    let mut h = harness();
+    let st = h.state_mut();
+    let comp = |st: &mut App, name: &str, x: f32| {
+        let mut c = Node::new(Kind::Component, r(x, 400., 80., 40.));
+        c.name = name.into();
+        st.doc.insert(0, None, None, c)
+    };
+    let (a, b, c) = (comp(st, "State=Default", 0.), comp(st, "State=Hover", 100.), comp(st, "State=Pressed", 200.));
+    st.doc.combine_as_variants(&[a, b, c]);
+    // Hovering shows Hover; clicking Hover switches to Pressed.
+    st.doc.node_mut(a).reactions.push(Reaction { trigger: Trigger::OnHover, action: Action::ChangeTo(b), ..Default::default() });
+    st.doc.node_mut(b).reactions.push(Reaction { trigger: Trigger::OnClick, action: Action::ChangeTo(c), ..Default::default() });
+    let frame = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(0., 0., 300., 200.)));
+    let inst = st.doc.instantiate(a, 0, Some(frame), None, pos2(20., 20.));
+    assert_eq!(crate::prototype::sibling_variants(&st.doc, a), vec![a, b, c], "Change to is offered inside a variant");
+    assert!(crate::prototype::sibling_variants(&st.doc, frame).is_empty());
+    st.sel = vec![frame];
+    st.present(0.0);
+    h.run_steps(2);
+    let variant = |h: &Harness<App>| h.state().presented().node(inst).component;
+    let on = ps(&h, 60., 40.);
+    move_to(&mut h, on, Modifiers::NONE);
+    h.run_steps(1);
+    assert_eq!(variant(&h), Some(b), "while hovering");
+    let away = ps(&h, 250., 150.);
+    move_to(&mut h, away, Modifiers::NONE);
+    h.run_steps(1);
+    assert_eq!(variant(&h), Some(a), "back when the pointer leaves");
+    click(&mut h, on, Modifiers::NONE);
+    assert_eq!(variant(&h), Some(c));
+    assert_eq!(h.state().doc.node(inst).component, Some(a), "the file is untouched");
+}
+
+#[test]
+fn prototype_enter_leave_key_and_drag_triggers() {
+    use crate::doc::{Action, Easing, OverlayPos, OverlaySettings, Reaction, Transition, TransitionKind, Trigger};
+    let mut h = harness();
+    let st = h.state_mut();
+    let a = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(0., 0., 300., 200.)));
+    let b = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(400., 0., 300., 200.)));
+    let tip = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(800., 0., 100., 50.)));
+    let btn = st.doc.insert(0, Some(a), None, Node::new(Kind::Rectangle, r(20., 20., 80., 40.)));
+    let pad = st.doc.insert(0, Some(a), None, Node::new(Kind::Rectangle, r(150., 100., 100., 80.)));
+    // A tooltip in the bottom-right corner while the pointer is on the button.
+    let corner = OverlaySettings { position: OverlayPos::BottomRight, background: None, ..Default::default() };
+    st.doc.node_mut(btn).reactions = vec![
+        Reaction { trigger: Trigger::MouseEnter, action: Action::OpenOverlay(tip), overlay: corner, ..Default::default() },
+        Reaction { trigger: Trigger::MouseLeave, action: Action::CloseOverlay, ..Default::default() },
+    ];
+    st.doc.node_mut(pad).reactions.push(Reaction { trigger: Trigger::OnDrag, action: Action::Navigate(b), ..Default::default() });
+    let spring = Transition { kind: TransitionKind::SmartAnimate, easing: Easing::Bouncy, ..Default::default() };
+    st.doc.node_mut(a).reactions.push(Reaction { trigger: Trigger::Key(Key::K, Modifiers::COMMAND), action: Action::Navigate(b), transition: spring, ..Default::default() });
+    st.sel = vec![a];
+    st.present(0.0);
+    h.run_steps(2);
+    let on = ps(&h, 60., 40.);
+    move_to(&mut h, on, Modifiers::NONE);
+    h.run_steps(1);
+    let overlays = |h: &Harness<App>| h.state().presenting.as_ref().unwrap().overlays.clone();
+    assert_eq!(overlays(&h).len(), 1, "mouse enter");
+    assert_eq!(overlays(&h)[0].at, vec2(200., 150.), "bottom right of the frame");
+    let off = ps(&h, 120., 150.);
+    move_to(&mut h, off, Modifiers::NONE);
+    h.run_steps(1);
+    assert!(overlays(&h).is_empty(), "mouse leave");
+    // Cmd+K navigates with a spring, which settles in its own time.
+    key(&mut h, Modifiers::COMMAND, Key::K);
+    assert_eq!(h.state().presenting.as_ref().map(|p| p.frame), Some(b));
+    assert!(h.state().presenting.as_ref().unwrap().anim.is_some());
+    h.run_steps(70);
+    assert!(h.state().presenting.as_ref().unwrap().anim.is_none());
+    // Restart, then drag the pad.
+    key(&mut h, Modifiers::NONE, Key::R);
+    assert_eq!(h.state().presenting.as_ref().map(|p| p.frame), Some(a));
+    let (p, q) = (ps(&h, 160., 120.), ps(&h, 240., 120.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    assert_eq!(h.state().presenting.as_ref().map(|p| p.frame), Some(b));
+}
+
+#[test]
+fn prototype_scroll_to_fixed_layers_and_wheel() {
+    use crate::doc::{Action, Overflow, Reaction, ScrollPos};
+    let mut h = harness();
+    let st = h.state_mut();
+    let a = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(0., 0., 200., 200.)));
+    st.doc.node_mut(a).overflow = Overflow::Vertical;
+    st.doc.insert(0, Some(a), None, Node::new(Kind::Rectangle, r(0., 0., 200., 600.)));
+    let target = st.doc.insert(0, Some(a), None, Node::new(Kind::Rectangle, r(0., 400., 200., 50.)));
+    let bar = st.doc.insert(0, Some(a), None, Node::new(Kind::Rectangle, r(0., 170., 200., 30.)));
+    st.doc.node_mut(bar).scroll_pos = ScrollPos::Fixed;
+    let go = st.doc.insert(0, Some(a), None, Node::new(Kind::Rectangle, r(10., 10., 50., 30.)));
+    st.doc.node_mut(go).reactions.push(Reaction { action: Action::ScrollTo(target), ..Default::default() });
+    st.sel = vec![a];
+    st.present(0.0);
+    h.run_steps(2);
+    let at = ps(&h, 30., 20.);
+    click(&mut h, at, Modifiers::NONE);
+    let offset = |h: &Harness<App>| h.state().presenting.as_ref().unwrap().scroll.get(&a).copied().unwrap_or_default();
+    assert_eq!(offset(&h), vec2(0., 400.), "scrolled to the target, as far as the content goes");
+    let shown = h.state().presented();
+    assert_eq!(shown.node(target).rect.min.y, 0.);
+    assert_eq!(shown.node(bar).rect.min.y, 170., "fixed layers stay put");
+    // The wheel scrolls back up.
+    for _ in 0..4 {
+        h.event(Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, 50.0), modifiers: Modifiers::NONE, phase: egui::TouchPhase::Move });
+        h.run_steps(3);
+    }
+    h.run_steps(20);
+    let y = offset(&h).y;
+    assert!(y < 400. && y >= 0., "{y}");
+}
+
+#[test]
+fn prototype_overlay_settings_swap_overlay_and_set_variable() {
+    use crate::doc::{Action, Bindable, OverlayPos, OverlaySettings, Reaction, Rgba, VarValue};
+    let mut h = harness();
+    let st = h.state_mut();
+    let m = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(0., 0., 300., 200.)));
+    let menu = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(800., 300., 100., 60.)));
+    let next = st.doc.insert(0, Some(menu), None, Node::new(Kind::Rectangle, r(810., 310., 30., 30.)));
+    let sheet = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(800., 500., 80., 80.)));
+    let swatch = st.doc.insert(0, Some(m), None, Node::new(Kind::Rectangle, r(10., 10., 40., 40.)));
+    let red = st.doc.insert(0, Some(m), None, Node::new(Kind::Rectangle, r(60., 10., 40., 40.)));
+    let open = st.doc.insert(0, Some(m), None, Node::new(Kind::Rectangle, r(110., 10., 40., 40.)));
+    let c = st.doc.add_collection("Theme".into());
+    let var = st.doc.add_variable(c, "accent".into(), VarValue::Color(Rgba::WHITE));
+    st.doc.node_mut(swatch).bindings.push((Bindable::Fill, var));
+    st.doc.reflow();
+    st.doc.node_mut(red).reactions.push(Reaction { action: Action::SetVariable(var, VarValue::Color(Rgba::rgb(255, 0, 0))), ..Default::default() });
+    // A menu just under the button that stays open on outside clicks.
+    let below = OverlaySettings { position: OverlayPos::Manual, offset: vec2(0., 45.), close_outside: false, background: None };
+    st.doc.node_mut(open).reactions.push(Reaction { action: Action::OpenOverlay(menu), overlay: below, ..Default::default() });
+    st.doc.node_mut(next).reactions.push(Reaction { action: Action::SwapOverlay(sheet), ..Default::default() });
+    st.sel = vec![m];
+    st.present(0.0);
+    h.run_steps(2);
+    let at = ps(&h, 80., 30.);
+    click(&mut h, at, Modifiers::NONE);
+    assert_eq!(h.state().presented().node(swatch).fills[0].color, Rgba::rgb(255, 0, 0), "bound fill follows the variable");
+    assert_eq!(h.state().doc.node(swatch).fills[0].color, Rgba::WHITE, "the file is untouched");
+    let at = ps(&h, 130., 30.);
+    click(&mut h, at, Modifiers::NONE);
+    let overlays = |h: &Harness<App>| h.state().presenting.as_ref().unwrap().overlays.clone();
+    assert_eq!(overlays(&h)[0].at, vec2(110., 55.), "offset from the trigger");
+    let outside = ps(&h, 20., 180.);
+    click(&mut h, outside, Modifiers::NONE);
+    assert_eq!(overlays(&h).len(), 1, "stays open on outside clicks");
+    let at = ps(&h, 110. + 25., 55. + 25.);
+    click(&mut h, at, Modifiers::NONE);
+    let shown = overlays(&h);
+    assert_eq!((shown.len(), shown[0].id, shown[0].at), (1, sheet, vec2(110., 60.)), "swapped for a centered sheet");
+}
+
+#[test]
+fn prototype_presents_inside_a_device() {
+    use crate::doc::{Action, Device, Reaction};
+    let mut h = harness();
+    let st = h.state_mut();
+    st.doc.pages[0].prototype.device = Device::IPhone16;
+    let a = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(0., 0., 393., 852.)));
+    let b = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(500., 0., 393., 852.)));
+    let btn = st.doc.insert(0, Some(a), None, Node::new(Kind::Rectangle, r(20., 700., 100., 40.)));
+    st.doc.node_mut(btn).reactions.push(Reaction { action: Action::Navigate(b), ..Default::default() });
+    st.sel = vec![a];
+    st.present(0.0);
+    h.run_steps(2);
+    let window = Rect::from_min_size(Pos2::ZERO, vec2(1440., 900.));
+    let v = h.state().presented_view(&h.state().doc, a, window);
+    assert!(v.zoom < 1.0, "the phone scales down to fit");
+    assert!(window.contains_rect(v.rect_to_screen(rect(&h, a))));
+    let at = ps(&h, 70., 720.);
+    click(&mut h, at, Modifiers::NONE);
+    assert_eq!(h.state().presenting.as_ref().map(|p| p.frame), Some(b));
+}
+
+#[test]
+fn prototype_key_trigger_is_set_by_pressing_it() {
+    use crate::doc::{Action, Reaction, Trigger};
+    let mut h = harness();
+    let a = draw(&mut h, Key::F, (0.0, 0.0), (200.0, 150.0));
+    let r0 = Reaction { trigger: Trigger::Key(Key::Space, Modifiers::NONE), action: Action::Back, ..Default::default() };
+    h.state_mut().doc.node_mut(a).reactions.push(r0.clone());
+    h.state_mut().prototype_tab = true;
+    h.state_mut().sel = vec![a];
+    h.run_steps(2);
+    let row = crate::prototype::describe(&h.state().doc, &r0);
+    h.get_by_label(&row).click();
+    h.run_steps(2);
+    h.get_by_label(&crate::prototype::key_label(Key::Space, Modifiers::NONE)).click();
+    h.run_steps(2);
+    let tool = h.state().tool;
+    key(&mut h, Modifiers::SHIFT, Key::K);
+    assert_eq!(h.state().doc.node(a).reactions[0].trigger, Trigger::Key(Key::K, Modifiers::SHIFT));
+    assert!(h.state().tool == tool, "the key went to the trigger, not a shortcut");
+}
+
 #[test]
 fn saves_keep_versions() {
     isolate_data();
@@ -1148,9 +1639,44 @@ fn saves_keep_versions() {
     crate::files::save_version(&file, b"{\"katachi\":1}");
     std::thread::sleep(std::time::Duration::from_millis(5));
     crate::files::save_version(&file, b"{\"katachi\":2}");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    crate::files::save_version(&file, b"{\"katachi\":2}");
     let v = crate::files::versions(&file);
-    assert_eq!(v.len(), 2);
+    assert_eq!(v.len(), 2, "saving again without changes adds no version");
     assert_eq!(std::fs::read_to_string(&v[0].0).unwrap(), "{\"katachi\":2}", "newest first");
+    // History kept under the old (DefaultHasher) folder name moves to the stable one.
+    let other = file.with_file_name("katachi-versions-old.katachi");
+    let mut h = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(&other, &mut h);
+    let old = crate::files::data_dir().join("history").join(format!("{:016x}", std::hash::Hasher::finish(&h)));
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("1.katachi"), "{}").unwrap();
+    assert_eq!(crate::files::versions(&other).len(), 1);
+}
+
+#[test]
+fn atomic_writes_keep_symlinks_permissions_and_siblings() {
+    let dir = std::env::temp_dir().join(format!("katachi-atomic-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // The temp name can't be a real neighbor's (this was "a.katachi-tmp").
+    std::fs::write(dir.join("a.katachi-tmp"), "neighbor").unwrap();
+    crate::files::write_atomic(&dir.join("a.json"), b"new").unwrap();
+    assert_eq!(std::fs::read_to_string(dir.join("a.katachi-tmp")).unwrap(), "neighbor");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "no temp file left behind");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let real = dir.join("real.katachi");
+        std::fs::write(&real, "old").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("link.katachi");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        crate::files::write_atomic(&link, b"new").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "still a link");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -1264,8 +1790,8 @@ fn rich_text_editing_styles_selection() {
     assert_eq!((n.spans[0].start, n.spans[0].end), (6, 12));
 }
 
-#[test]
-fn multiplayer_host_join_edit_and_undo_only_mine() {
+/// Two windows in one live session: Ada hosts, Bo joins. Waits until each sees the other.
+fn pair() -> (Harness<'static, App>, Harness<'static, App>) {
     let mut a = harness();
     let mut b = harness();
     a.state_mut().collab_port = 0;
@@ -1277,24 +1803,44 @@ fn multiplayer_host_join_edit_and_undo_only_mine() {
     let ctx = b.ctx.clone();
     b.state_mut().join_session(&ctx, &format!("127.0.0.1:{port}"), false);
     assert!(b.state().collab.is_some(), "joined");
+    let sees = |h: &App, name: &str| h.collab.as_ref().is_some_and(|c| c.peers.values().any(|p| p.name == name));
+    settle(&mut a, &mut b, &|a, b| sees(a, "Bo") && sees(b, "Ada"));
+    (a, b)
+}
+
+/// Step both windows until `done`, up to 5 s for the sockets (tests run in parallel and the
+/// machine may be busy).
+fn settle(a: &mut Harness<App>, b: &mut Harness<App>, done: &dyn Fn(&App, &App) -> bool) {
+    for _ in 0..1000 {
+        a.step();
+        b.step();
+        if done(a.state(), b.state()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// This window's id in the session.
+fn client(h: &Harness<App>) -> u32 {
+    h.state().collab.as_ref().expect("in a session").client
+}
+
+/// What `of` knows of the participant `id`.
+fn peer(of: &App, id: u32) -> Option<&crate::collab::Presence> {
+    of.collab.as_ref()?.peers.get(&id)
+}
+
+#[test]
+fn multiplayer_host_join_edit_and_undo_only_mine() {
+    let (mut a, mut b) = pair();
     // Ada draws; Bo sees it. Bo draws; Ada sees it.
     let ra = draw(&mut a, Key::R, (0.0, 0.0), (100.0, 100.0));
     let rb = draw(&mut b, Key::O, (200.0, 0.0), (260.0, 60.0));
-    // Up to 5 s for the sockets (tests run in parallel and the machine may be busy).
-    let settle = |a: &mut Harness<App>, b: &mut Harness<App>, done: &dyn Fn(&App, &App) -> bool| {
-        for _ in 0..1000 {
-            a.step();
-            b.step();
-            if done(a.state(), b.state()) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    };
     settle(&mut a, &mut b, &|a, b| b.doc.nodes.contains_key(&ra) && a.doc.nodes.contains_key(&rb) && a.collab.as_ref().is_some_and(|c| c.peers.values().any(|p| p.name == "Bo")));
     let dump = |h: &Harness<App>| {
         let c = h.state().collab.as_ref();
-        format!("nodes {:?} connected {:?} client {:?}", h.state().doc.nodes.keys().collect::<Vec<_>>(), c.map(|c| c.connected), c.map(|c| c.client))
+        format!("nodes {:?} connected {:?} client {:?}", h.state().doc.nodes.keys().collect::<Vec<_>>(), c.map(|c| c.status.clone()), c.map(|c| c.client))
     };
     assert!(b.state().doc.nodes.contains_key(&ra), "Bo sees Ada's rectangle {ra}: Ada {} / Bo {}", dump(&a), dump(&b));
     assert!(a.state().doc.nodes.contains_key(&rb), "Ada sees Bo's ellipse");
@@ -1769,10 +2315,10 @@ fn assets_show_component_previews_and_search_filters_sets() {
     assert_eq!(h.state().asset_thumbs.len(), 2, "the Button set and Chip");
     // Editing a component re-renders just its preview.
     let chip = h.state().doc.nodes.values().find(|n| n.name == "Chip").unwrap().id;
-    let before = h.state().asset_thumbs[&chip].0;
+    let before = h.state().asset_thumbs[&(String::new(), chip)].0;
     h.state_mut().doc.node_mut(chip).radius = 12.0;
     h.run_steps(31);
-    assert_ne!(h.state().asset_thumbs[&chip].0, before);
+    assert_ne!(h.state().asset_thumbs[&(String::new(), chip)].0, before);
 }
 
 #[test]
@@ -1836,8 +2382,57 @@ fn slash_named_styles_group_into_folders() {
     let mut h = harness();
     crate::plugins::run(&mut h.state_mut().doc, 0, &[], "for (const n of ['HUD / Title', 'HUD / Body', 'Accent']) { const s = figma.createPaintStyle(); s.name = n; s.paints = [figma.util.solidPaint('#8E72FF')]; }").unwrap();
     h.run_steps(2);
-    assert!(h.query_by_label("HUD").is_some(), "a HUD folder");
+    assert!(h.query_all_by_value("HUD").next().is_some(), "a HUD folder");
     assert!(h.query_by_label("HUD / Title").is_none(), "names show without the folder");
+    // The folder's name edits in place and renames everything in it.
+    h.get_all_by_value("HUD").next().unwrap().focus();
+    h.run_steps(1);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.get_all_by_value("HUD").next().unwrap().type_text("Game");
+    h.run_steps(1);
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    let mut names: Vec<String> = h.state().doc.styles.iter().map(|s| s.name.clone()).collect();
+    names.sort();
+    assert_eq!(names, ["Accent", "Game / Body", "Game / Title"]);
+}
+
+#[test]
+fn local_styles_edit_text_and_grid_styles_in_place() {
+    use crate::doc::{LayoutGrid, StyleValue, TextStyle};
+    let mut h = harness();
+    let t = draw(&mut h, Key::F, (0.0, 0.0), (200.0, 200.0));
+    let (ts, gs) = {
+        let d = &mut h.state_mut().doc;
+        let ts = d.add_style("Body".into(), StyleValue::Text(TextStyle::of(&Node::new(Kind::Text, r(0., 0., 1., 1.)))));
+        let gs = d.add_style("Columns".into(), StyleValue::Grid(vec![LayoutGrid::default()]));
+        d.node_mut(t).grid_style = Some(gs);
+        (ts, gs)
+    };
+    h.state_mut().doc.reflow();
+    assert_eq!(h.state().doc.node(t).grids, vec![LayoutGrid::default()], "the frame takes the grid style");
+    h.state_mut().sel.clear();
+    h.run_steps(2);
+    assert!(h.query_by_label("Grid styles").is_some());
+    // Open the text style's editor from the list and turn on a fixed line height.
+    h.get_all_by_label("Edit style").next().unwrap().click();
+    h.run_steps(2);
+    h.get_by_label("Auto").click();
+    h.run_steps(2);
+    let lh = match &h.state().doc.style(ts).unwrap().value {
+        StyleValue::Text(t) => t.line_height,
+        _ => unreachable!(),
+    };
+    assert!(matches!(lh, crate::doc::LineHeight::Px(_)), "{lh:?}");
+    // The grid style's editor: switching it to columns moves the linked frame's guides.
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    h.get_all_by_label("Edit style").nth(1).unwrap().click();
+    h.run_steps(2);
+    h.get_by_label("Columns").click();
+    h.run_steps(2);
+    assert_eq!(h.state().doc.node(t).grids[0].kind, crate::doc::GridKind::Columns);
+    let _ = gs;
 }
 
 #[test]
@@ -1858,7 +2453,7 @@ fn files_and_pages_reopen_where_they_were_viewed() {
     assert_eq!(g.state().view.zoom, 2.5);
     assert!((back - center).length() < 0.5, "{back:?} vs {center:?}");
     // Switching pages and back keeps each page's view.
-    g.state_mut().doc.pages.push(crate::doc::Page { name: "Two".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None });
+    g.state_mut().doc.pages.push(crate::doc::Page { name: "Two".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, guides: vec![], prototype: Default::default() });
     g.state_mut().select_page(1);
     g.run_steps(2);
     g.state_mut().select_page(0);
@@ -2047,4 +2642,1676 @@ fn color_picker_drags_and_escape_from_find_keeps_selection() {
     key(&mut h, Modifiers::NONE, Key::Escape);
     assert!(!h.state().find.0);
     assert_eq!(h.state().sel, vec![id], "selection kept");
+}
+
+#[test]
+fn snaps_to_equal_spacing_and_marks_gaps() {
+    let mut h = harness();
+    draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    draw(&mut h, Key::R, (150.0, 0.0), (250.0, 100.0));
+    let c = draw(&mut h, Key::R, (400.0, 0.0), (500.0, 100.0));
+    // Drop c 3px past the 50px gap that a and b already have: it lands one gap after b.
+    let (a, b) = (s(&h, 450., 50.), s(&h, 353., 50.));
+    move_to(&mut h, a, Modifiers::NONE);
+    press(&mut h, a, true, Modifiers::NONE);
+    for i in 1..=6 {
+        move_to(&mut h, a.lerp(b, i as f32 / 6.0), Modifiers::NONE);
+    }
+    assert_eq!(h.state().gap_marks.len(), 2, "both 50px gaps marked");
+    press(&mut h, b, false, Modifiers::NONE);
+    h.run_steps(2);
+    assert_eq!(rect(&h, c).min.x, 300.0);
+    assert!(h.state().gap_marks.is_empty());
+    // Centered between two neighbors: equal gaps on both sides.
+    let mut h = harness();
+    draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    draw(&mut h, Key::R, (300.0, 0.0), (400.0, 100.0));
+    let c = draw(&mut h, Key::R, (0.0, 300.0), (100.0, 400.0));
+    let (a, b) = (s(&h, 50., 350.), s(&h, 198., 50.));
+    drag(&mut h, a, b, Modifiers::NONE);
+    assert_eq!(rect(&h, c), r(150., 0., 100., 100.));
+}
+
+#[test]
+fn smart_selection_spacing_handle_and_swap() {
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    let b = draw(&mut h, Key::R, (150.0, 0.0), (250.0, 100.0));
+    let c = draw(&mut h, Key::R, (300.0, 0.0), (400.0, 100.0));
+    key(&mut h, Modifiers::COMMAND, Key::A);
+    assert!(h.state().smart_selection().is_some_and(|(axis, _)| axis == 0));
+    // The handle mid-gap widens every gap together.
+    let (p, q) = (s(&h, 125., 50.), s(&h, 145., 50.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    assert_eq!((rect(&h, a).min.x, rect(&h, b).min.x, rect(&h, c).min.x), (0., 170., 340.));
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!((rect(&h, b).min.x, rect(&h, c).min.x), (150., 300.), "one undo step");
+    // Dragging a's center knob onto c's slot swaps them.
+    let (p, q) = (s(&h, 50., 50.), s(&h, 350., 50.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    assert_eq!((rect(&h, a).min.x, rect(&h, b).min.x, rect(&h, c).min.x), (300., 150., 0.));
+    assert_eq!(h.state().sel.len(), 3, "selection kept");
+}
+
+#[test]
+fn ruler_guides_create_snap_move_and_delete() {
+    use crate::doc::{Axis, Guide};
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    key(&mut h, Modifiers::SHIFT, Key::R);
+    let top = h.state().canvas_rect.unwrap().min + vec2(400.0, 10.0);
+    // Pull a horizontal guide out of the top ruler down to y = 200.
+    let to = pos2(top.x, s(&h, 0., 200.).y);
+    drag(&mut h, top, to, Modifiers::NONE);
+    assert_eq!(h.state().doc.pages[0].guides, vec![Guide { axis: Axis::Y, offset: 200.0 }]);
+    // Layers snap to it: the bottom edge dropped 3px short lands on the guide.
+    let (a, b) = (s(&h, 50., 50.), s(&h, 50., 147.));
+    click(&mut h, a, Modifiers::NONE);
+    drag(&mut h, a, b, Modifiers::NONE);
+    assert_eq!(rect(&h, id).min.y, 100.0);
+    // Drag the guide itself, then select it and delete it with Backspace.
+    let (a, b) = (s(&h, 300., 200.), s(&h, 300., 250.));
+    drag(&mut h, a, b, Modifiers::NONE);
+    assert_eq!(h.state().doc.pages[0].guides[0].offset, 250.0);
+    let p = s(&h, 300., 250.);
+    click(&mut h, p, Modifiers::NONE);
+    assert_eq!(h.state().guide_sel, Some(0));
+    assert!(h.state().sel.is_empty(), "selecting a guide drops the layer selection");
+    key(&mut h, Modifiers::NONE, Key::Backspace);
+    assert!(h.state().doc.pages[0].guides.is_empty());
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().doc.pages[0].guides.len(), 1, "undoable");
+    // Dragging it back onto the ruler removes it; guides round-trip through the file.
+    let json = crate::doc::file_json(&h.state().doc);
+    assert_eq!(crate::doc::parse_file(&json).unwrap().pages[0].guides.len(), 1);
+    let a = s(&h, 300., 250.);
+    drag(&mut h, a, top, Modifiers::NONE);
+    assert!(h.state().doc.pages[0].guides.is_empty());
+    assert!(!crate::doc::file_json(&h.state().doc).contains("guides"), "no guides, no field");
+}
+
+#[test]
+fn zoom_tool_and_next_frame() {
+    let mut h = harness();
+    let center = |h: &Harness<App>| h.state().view.to_world(h.state().canvas_rect.unwrap().center());
+    // Z: click zooms in at the point, Alt-click zooms back out.
+    key(&mut h, Modifiers::NONE, Key::Z);
+    assert_eq!(h.state().tool, Tool::Zoom, "a tap keeps the zoom tool");
+    let p = s(&h, 100., 100.);
+    click(&mut h, p, Modifiers::NONE);
+    assert_eq!(h.state().view.zoom, 2.0);
+    assert!((s(&h, 100., 100.) - p).length() < 0.5, "the clicked point stays put");
+    click(&mut h, p, Modifiers::ALT);
+    assert_eq!(h.state().view.zoom, 1.0);
+    // Dragging a box zooms to fit it.
+    let (a, b) = (s(&h, 0., 0.), s(&h, 40., 40.));
+    drag(&mut h, a, b, Modifiers::NONE);
+    assert!(h.state().view.zoom > 10.0);
+    assert!((center(&h) - pos2(20., 20.)).length() < 0.5);
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    // N and Shift N walk the top-level frames in layers-panel order (top first).
+    let st = h.state_mut();
+    let f1 = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(0., 0., 100., 100.)));
+    let f2 = st.doc.insert(0, None, None, Node::new(Kind::Frame, r(1000., 0., 100., 100.)));
+    st.zoom_target = Some(f1);
+    h.run_steps(2);
+    let c = |h: &Harness<App>, f: NodeId| (center(h) - h.state().doc.node(f).rect.center()).length() < 0.5;
+    assert!(c(&h, f1));
+    key(&mut h, Modifiers::NONE, Key::N);
+    assert!(c(&h, f2), "wraps from the bottom frame to the top one");
+    key(&mut h, Modifiers::NONE, Key::N);
+    assert!(c(&h, f1));
+    key(&mut h, Modifiers::SHIFT, Key::N);
+    assert!(c(&h, f2));
+    // Holding Z makes the zoom tool temporary: releasing it brings back the previous tool.
+    let z = |pressed| Event::Key { key: Key::Z, physical_key: None, pressed, repeat: false, modifiers: Modifiers::NONE };
+    h.event(z(true));
+    h.run_steps(40);
+    assert_eq!(h.state().tool, Tool::Zoom);
+    h.event(z(false));
+    h.run_steps(2);
+    assert_eq!(h.state().tool, Tool::Move);
+}
+
+#[test]
+fn pixel_grid_and_snap_to_pixel_toggles() {
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    // Snapping to the pixel grid (on by default) keeps a fractional drag on whole pixels.
+    let (a, b) = (s(&h, 50., 50.), s(&h, 80.25, 50.));
+    drag(&mut h, a, b, Modifiers::NONE);
+    assert_eq!(rect(&h, id).min.x, 30.0);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::Quote);
+    assert!(!h.state().prefs.snap_to_pixels);
+    let (a, b) = (s(&h, 50., 50.), s(&h, 50.5, 80.25));
+    drag(&mut h, a, b, Modifiers::NONE);
+    assert_eq!(rect(&h, id).min, pos2(30.5, 30.25), "free positioning with snap off");
+    key(&mut h, Modifiers::SHIFT, Key::Quote);
+    assert!(!h.state().prefs.pixel_grid);
+    key(&mut h, Modifiers::SHIFT, Key::Quote);
+    assert!(h.state().prefs.pixel_grid);
+}
+
+#[test]
+fn layers_panel_shift_ranges_multi_drag_and_reveal() {
+    let mut h = harness();
+    let ids: Vec<NodeId> = (0..60).map(|i| h.state_mut().doc.insert(0, None, None, Node::new(Kind::Rectangle, r(i as f32 * 30., 0., 20., 20.)))).collect();
+    h.run_steps(2);
+    let row = |h: &Harness<App>, name: &str| h.get_by_label(name).rect();
+    let click_row = |h: &mut Harness<App>, name: &str, m| {
+        let p = row(h, name).center();
+        click(h, p, m);
+    };
+    // The list is top-first: Rectangle 60 is the top row.
+    click_row(&mut h, "Rectangle 60", Modifiers::NONE);
+    click_row(&mut h, "Rectangle 57", Modifiers::SHIFT);
+    let mut sel = h.state().sel.clone();
+    sel.sort();
+    assert_eq!(sel, ids[56..60].to_vec(), "Shift-click selects the range");
+    click_row(&mut h, "Rectangle 58", Modifiers::COMMAND);
+    assert_eq!(h.state().sel.len(), 3, "Cmd-click toggles one row");
+    // Drag two selected rows below Rectangle 55: both move, in their order.
+    h.state_mut().sel = vec![ids[59], ids[58]];
+    h.run_steps(2);
+    let (from, to) = (row(&h, "Rectangle 60").center(), row(&h, "Rectangle 55").center() + vec2(0.0, 8.0));
+    drag(&mut h, from, to, Modifiers::NONE);
+    let kids = &h.state().doc.pages[0].children;
+    assert_eq!(kids[54..57].to_vec(), vec![ids[58], ids[59], ids[54]], "moved together, order kept");
+    // Rows are virtualized: the bottom one isn't built until the selection scrolls it into view.
+    assert!(h.query_by_label("Rectangle 1").is_none());
+    h.state_mut().sel = vec![ids[0]];
+    h.run_steps(3);
+    let r1 = row(&h, "Rectangle 1");
+    assert!(r1.max.y <= 900.0 && r1.min.y > 0.0, "revealed at {r1:?}");
+}
+
+#[test]
+fn undo_brings_back_the_selection_and_page() {
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (50.0, 50.0));
+    key(&mut h, Modifiers::NONE, Key::ArrowRight);
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    assert!(h.state().sel.is_empty());
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().sel, vec![a], "what was selected comes back");
+    assert_eq!(rect(&h, a).min.x, 0.0);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::Z);
+    assert_eq!((h.state().sel.clone(), rect(&h, a).min.x), (vec![], 1.0), "redo returns to the state undo left");
+    // A change on another page: undo goes back there.
+    let mut pg = h.state().doc.pages[0].clone();
+    (pg.name, pg.children) = ("Page 2".into(), vec![]);
+    h.state_mut().doc.pages.push(pg);
+    h.state_mut().select_page(1);
+    h.run_steps(2);
+    let b = draw(&mut h, Key::O, (0.0, 0.0), (40.0, 40.0));
+    key(&mut h, Modifiers::NONE, Key::ArrowDown);
+    h.state_mut().select_page(0);
+    h.run_steps(2);
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!((h.state().page, h.state().sel.clone()), (1, vec![b]));
+    assert_eq!(rect(&h, b).min.y, 0.0);
+}
+
+#[test]
+fn select_all_inverse_and_same_properties() {
+    use crate::app::Same;
+    use crate::doc::{Paint, Rgba};
+    let mut h = harness();
+    let add = |h: &mut Harness<App>, kind, c| {
+        let mut n = Node::new(kind, r(0., 0., 20., 20.));
+        n.fills = vec![Paint::solid(c)];
+        h.state_mut().doc.insert(0, None, None, n)
+    };
+    let (red, blue) = (Rgba::rgb(255, 0, 0), Rgba::rgb(0, 0, 255));
+    let a = add(&mut h, Kind::Rectangle, red);
+    let b = add(&mut h, Kind::Ellipse, red);
+    let c = add(&mut h, Kind::Rectangle, blue);
+    let locked = add(&mut h, Kind::Rectangle, red);
+    h.state_mut().doc.node_mut(locked).locked = true;
+    key(&mut h, Modifiers::COMMAND, Key::A);
+    assert_eq!(h.state().sel, vec![a, b, c], "Cmd A skips locked layers");
+    h.state_mut().sel = vec![a];
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::A);
+    assert_eq!(h.state().sel, vec![b, c], "select inverse");
+    h.state_mut().sel = vec![a];
+    h.state_mut().select_same(Same::Fill);
+    assert_eq!(h.state().sel, vec![a, b], "same fill, any kind");
+    // No stroke on the layer: the selection stays.
+    h.state_mut().select_same(Same::Stroke);
+    assert_eq!(h.state().sel, vec![a, b]);
+    let text = |h: &mut Harness<App>, size| {
+        let mut t = Node::new(Kind::Text, r(0., 50., 80., 20.));
+        (t.text, t.font_size) = ("Hi".into(), size);
+        h.state_mut().doc.insert(0, None, None, t)
+    };
+    let (t1, _, t3) = (text(&mut h, 16.0), text(&mut h, 24.0), text(&mut h, 16.0));
+    h.state_mut().sel = vec![t1];
+    h.state_mut().select_same(Same::Font);
+    assert_eq!(h.state().sel, vec![t1, t3]);
+}
+
+#[test]
+fn batch_rename_numbers_and_replaces_as_one_undo_step() {
+    let mut h = harness();
+    let ids: Vec<NodeId> = (0..3).map(|i| draw(&mut h, Key::R, (i as f32 * 60.0, 0.0), (i as f32 * 60.0 + 40.0, 40.0))).collect();
+    // One layer: inline rename in its row.
+    key(&mut h, Modifiers::COMMAND, Key::R);
+    assert!(h.state().renaming.is_some() && h.state().batch_rename.is_none());
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    h.state_mut().sel = ids.clone();
+    h.run_steps(2);
+    key(&mut h, Modifiers::COMMAND, Key::R);
+    let b = h.state_mut().batch_rename.as_mut().expect("batch rename open");
+    b.to = "Card $n of $N ($&)".into();
+    (b.find, b.with) = ("Rectangle".into(), "Box".into());
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("Card 1 of 3 (Box 1)").is_some(), "live preview");    h.get_by_label("Rename").click();
+    h.run_steps(2);
+    let names: Vec<String> = ids.iter().map(|&id| h.state().doc.node(id).name.clone()).collect();
+    assert_eq!(names, ["Card 1 of 3 (Box 1)", "Card 2 of 2 (Box 2)", "Card 3 of 1 (Box 3)"]);
+    assert!(h.state().batch_rename.is_none());
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().doc.node(ids[2]).name, "Rectangle 3", "one undo step");
+    assert_eq!(h.state().doc.node(ids[0]).name, "Rectangle 1");
+}
+
+fn copied_text(h: &mut Harness<App>) -> String {
+    h.event(Event::Copy);
+    h.step();
+    h.output().platform_output.commands.iter().find_map(|c| match c {
+        egui::OutputCommand::CopyText(t) => Some(t.clone()),
+        _ => None,
+    }).expect("copied to clipboard")
+}
+
+#[test]
+fn resize_to_fit_remove_fill_lock_all_and_paste_over_selection() {
+    let mut h = harness();
+    let f = draw(&mut h, Key::F, (0.0, 0.0), (200.0, 200.0));
+    let a = draw(&mut h, Key::R, (10.0, 20.0), (50.0, 60.0));
+    assert_eq!(h.state().doc.node(a).parent, Some(f));
+    h.state_mut().sel = vec![f];
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT | Modifiers::ALT, Key::R);
+    assert_eq!((rect(&h, f), rect(&h, a)), (r(10., 20., 40., 40.), r(10., 20., 40., 40.)), "frame hugs its child, which stays put");
+    h.state_mut().sel = vec![a];
+    h.state_mut().remove_fills();
+    assert!(h.state().doc.node(a).fills.is_empty());
+    // Lock all locks the page's top level; Unlock all frees nested layers too.
+    h.state_mut().doc.node_mut(a).locked = true;
+    h.state_mut().lock_all(true);
+    assert!(h.state().doc.node(f).locked && h.state().sel.is_empty());
+    h.state_mut().lock_all(false);
+    assert!(!h.state().doc.node(f).locked && !h.state().doc.node(a).locked);
+    // Copy the child; Cmd V with the frame selected pastes into it, Shift Cmd V over it.
+    h.state_mut().sel = vec![a];
+    let copied = copied_text(&mut h);
+    h.state_mut().sel = vec![f];
+    h.event(Event::Paste(copied.clone()));
+    h.run_steps(2);
+    let inside = h.state().sel[0];
+    assert_eq!(h.state().doc.node(inside).parent, Some(f));
+    h.state_mut().sel = vec![f];
+    h.input_mut().modifiers = Modifiers::COMMAND | Modifiers::SHIFT;
+    h.event(Event::Paste(copied));
+    h.run_steps(2);
+    h.input_mut().modifiers = Modifiers::NONE;
+    let over = h.state().sel[0];
+    assert_eq!(h.state().doc.node(over).parent, None, "over the frame, not in it");
+    assert_eq!(h.state().doc.pages[0].children, vec![f, over]);
+    assert_eq!(rect(&h, over), rect(&h, a), "same position as copied");
+}
+
+#[test]
+fn clipboard_images_paste_and_dropped_images_replace_fills() {
+    use crate::app::TEST_CLIPBOARD;
+    let mut h = harness();
+    let img = image::RgbaImage::from_pixel(40, 30, image::Rgba([0, 200, 0, 255]));
+    TEST_CLIPBOARD.with(|c| c.borrow_mut().1 = Some(img.clone()));
+    // Cmd V with only an image on the clipboard reaches egui as just the V key going up.
+    let v_up = Event::Key { key: Key::V, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::COMMAND };
+    h.event(v_up.clone());
+    h.run_steps(2);
+    let id = h.state().sel[0];
+    let center = h.state().view_center_world();
+    let n = h.state().doc.node(id);
+    assert_eq!((n.rect.size(), n.rect.center()), (vec2(40., 30.), center));
+    assert_eq!(n.fills[0].kind, crate::doc::PaintKind::Image);
+    // With a frame selected, the image goes in the middle of it.
+    let f = draw(&mut h, Key::F, (150.0, 150.0), (350.0, 350.0));
+    h.event(v_up.clone());
+    h.run_steps(2);
+    let inner = h.state().sel[0];
+    assert_eq!((h.state().doc.node(inner).parent, rect(&h, inner).center()), (Some(f), pos2(250., 250.)));
+    // A text paste doesn't also paste the image.
+    let count = h.state().doc.nodes.len();
+    h.event(Event::Paste("hello".into()));
+    h.event(v_up);
+    h.run_steps(2);
+    assert_eq!(h.state().doc.nodes.len(), count + 1, "just the text layer");
+    // Dropping an image on a layer with an image fill swaps the image; Alt-drop does it on any layer.
+    let drop = |h: &mut Harness<App>, at: Pos2, m: Modifiers, color: [u8; 4]| {
+        let mut buf = std::io::Cursor::new(vec![]);
+        image::RgbaImage::from_pixel(8, 8, image::Rgba(color)).write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        let p = s(h, at.x, at.y);
+        move_to(h, p, m);
+        h.input_mut().dropped_files.push(egui::DroppedFile { name: "new.png".into(), bytes: Some(buf.into_inner().into()), ..Default::default() });
+        h.input_mut().modifiers = m;
+        h.run_steps(2);
+        h.input_mut().modifiers = Modifiers::NONE;
+    };
+    let count = h.state().doc.nodes.len();
+    let old_key = h.state().doc.node(id).fills[0].image.clone();
+    drop(&mut h, center - vec2(10., 10.), Modifiers::NONE, [255, 0, 0, 255]);
+    assert_eq!(h.state().doc.nodes.len(), count, "no new layer");
+    assert_ne!(h.state().doc.node(id).fills[0].image, old_key, "image replaced");
+    let plain = draw(&mut h, Key::R, (-400.0, 0.0), (-300.0, 100.0));
+    drop(&mut h, pos2(-350., 50.), Modifiers::ALT, [0, 0, 255, 255]);
+    assert_eq!(h.state().doc.node(plain).fills.iter().map(|p| p.kind).collect::<Vec<_>>(), vec![crate::doc::PaintKind::Image]);
+    TEST_CLIPBOARD.with(|c| c.borrow_mut().1 = None);
+}
+
+#[test]
+fn pages_reorder_by_dragging_duplicate_and_dividers() {
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (50.0, 50.0));
+    for name in ["Page 2", "---", "Page 3"] {
+        let mut pg = h.state().doc.pages[0].clone();
+        (pg.name, pg.children) = (name.into(), vec![]);
+        h.state_mut().doc.pages.push(pg);
+    }
+    h.run_steps(2);
+    let names = |h: &Harness<App>| h.state().doc.pages.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+    // A divider is a line in the list: clicking it opens nothing.
+    let divider = h.get_by_label("---").rect();
+    assert!(divider.height() < 20.0);
+    click(&mut h, divider.center(), Modifiers::NONE);
+    assert_eq!(h.state().page, 0);
+    // Drag Page 3 above Page 1; the open page stays open.
+    let (from, to) = (h.get_by_label("Page 3").rect().center(), h.get_by_label("Page 1").rect().min + vec2(20.0, 3.0));
+    drag(&mut h, from, to, Modifiers::NONE);
+    assert_eq!(names(&h), ["Page 3", "Page 1", "Page 2", "---"]);
+    assert_eq!(h.state().page, 1, "still on Page 1");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(names(&h)[0], "Page 1", "undoable");
+    h.state_mut().duplicate_page(0);
+    h.run_steps(2);
+    assert_eq!(names(&h)[..2], ["Page 1", "Page 1 copy"]);
+    assert_eq!(h.state().page, 1, "the copy opens");
+    let copy = h.state().doc.pages[1].children.clone();
+    assert_eq!(copy.len(), 1);
+    assert_ne!(copy[0], a);
+    assert_eq!(rect(&h, copy[0]), rect(&h, a));
+}
+
+#[test]
+fn paste_to_replace_takes_layers_copied_in_another_tab() {
+    use crate::app::TEST_CLIPBOARD;
+    let mut a = harness();
+    let e = draw(&mut a, Key::O, (0.0, 0.0), (30.0, 30.0));
+    a.state_mut().sel = vec![e];
+    let copied = copied_text(&mut a);
+    let mut b = harness();
+    let t = draw(&mut b, Key::R, (100.0, 100.0), (140.0, 140.0));
+    TEST_CLIPBOARD.with(|c| c.borrow_mut().0 = Some(copied));
+    key(&mut b, Modifiers::COMMAND | Modifiers::SHIFT, Key::R);
+    TEST_CLIPBOARD.with(|c| c.borrow_mut().0 = None);
+    let new = b.state().sel[0];
+    assert!(!b.state().doc.nodes.contains_key(&t));
+    assert_eq!((b.state().doc.node(new).kind, rect(&b, new).center()), (Kind::Ellipse, pos2(120., 120.)));
+}
+
+#[test]
+fn gradient_handles_edit_on_canvas_while_the_editor_is_open() {
+    use crate::doc::{Paint, PaintKind, Rgba};
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    let mut g = Paint::solid(Rgba::rgb(255, 0, 0));
+    g.convert(PaintKind::Linear);
+    h.state_mut().doc.node_mut(id).fills = vec![g];
+    h.run_steps(2);
+    assert!(h.state().gradient_edit.is_none(), "handles only while the editor is open");
+    h.get_all_by_label("Color swatch").next().unwrap().click();
+    h.run_steps(3);
+    assert!(h.state().gradient_edit.is_some());
+    // Drag the end handle from the bottom center to the right center.
+    let (a, b) = (s(&h, 50.0, 100.0), s(&h, 100.0, 50.0));
+    drag(&mut h, a, b, Modifiers::NONE);
+    let p = h.state().doc.node(id).fills[0].clone();
+    assert!(p.to.distance(pos2(1.0, 0.5)) < 0.02, "{:?}", p.to);
+    assert_eq!(h.state().sel, vec![id], "the layer stays selected");
+    assert!(h.state().gradient_edit.is_some(), "and the editor open");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().doc.node(id).fills[0].to, pos2(0.5, 1.0), "one undo step for the drag");
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::Z);
+    // Clicking the line adds a stop there, selected.
+    let on_line = s(&h, 50.0, 0.0).lerp(s(&h, 100.0, 50.0), 0.4);
+    click(&mut h, on_line, Modifiers::NONE);
+    let p = h.state().doc.node(id).fills[0].clone();
+    assert_eq!(p.stops.len(), 3);
+    assert!((p.stops[1].0 - 0.4).abs() < 0.02, "{:?}", p.stops);
+    assert_eq!(h.state().gradient_edit.unwrap().stop, 1);
+    // Dragging that stop slides it along the line.
+    let further = s(&h, 50.0, 0.0).lerp(s(&h, 100.0, 50.0), 0.8);
+    drag(&mut h, on_line, further, Modifiers::NONE);
+    let p = h.state().doc.node(id).fills[0].clone();
+    assert!((p.stops[1].0 - 0.8).abs() < 0.02, "{:?}", p.stops);
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert!((h.state().doc.node(id).fills[0].stops[1].0 - 0.4).abs() < 0.02, "undo puts the stop back");
+}
+
+/// What the eyedropper's window screenshot would show: one color everywhere.
+fn fake_screenshot(h: &mut Harness<App>, c: egui::Color32) {
+    let size = h.ctx.content_rect().size() * h.ctx.pixels_per_point();
+    let image = std::sync::Arc::new(egui::ColorImage::filled([size.x as usize, size.y as usize], c));
+    h.event(Event::Screenshot { viewport_id: egui::ViewportId::ROOT, user_data: Default::default(), image });
+    h.run_steps(2);
+}
+
+#[test]
+fn eyedropper_picks_fills_and_picker_colors() {
+    use crate::doc::Rgba;
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (80.0, 80.0));
+    // I with a layer selected picks its fill; Escape cancels and keeps the selection.
+    key(&mut h, Modifiers::NONE, Key::I);
+    assert!(h.state().eyedrop.is_some());
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    assert!(h.state().eyedrop.is_none());
+    assert_eq!(h.state().sel, vec![id]);
+    key(&mut h, Modifiers::NONE, Key::I);
+    fake_screenshot(&mut h, egui::Color32::from_rgb(10, 200, 30));
+    let far = s(&h, 400.0, 300.0);
+    click(&mut h, far, Modifiers::NONE);
+    assert!(h.state().eyedrop.is_none());
+    assert_eq!(h.state().doc.node(id).fills[0].color, Rgba::rgb(10, 200, 30));
+    assert_eq!(h.state().sel, vec![id], "the click picked, it didn't deselect");
+    // From the color picker: the pick lands in the picker, which stays open.
+    h.get_all_by_label("Color swatch").next().unwrap().click();
+    h.run_steps(3);
+    h.get_by_label("Pick color  I").click();
+    h.run_steps(3);
+    assert!(h.state().eyedrop.is_some());
+    fake_screenshot(&mut h, egui::Color32::from_rgb(200, 20, 90));
+    click(&mut h, far, Modifiers::NONE);
+    assert_eq!(h.state().doc.node(id).fills[0].color, Rgba::rgb(200, 20, 90));
+    assert!(egui::Popup::is_any_open(&h.ctx), "picker still open");
+}
+
+#[test]
+fn color_picker_formats_and_page_swatches() {
+    use crate::doc::Rgba;
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (40.0, 40.0));
+    let b = draw(&mut h, Key::R, (60.0, 0.0), (100.0, 40.0));
+    h.state_mut().doc.node_mut(a).fills[0].color = Rgba::rgb(0x12, 0x34, 0x56);
+    h.state_mut().sel = vec![b];
+    h.run_steps(2);
+    h.get_all_by_label("Color swatch").next().unwrap().click();
+    h.run_steps(3);
+    // The other layer's color is offered under "On this page"; a click applies it.
+    assert!(h.query_by_label("On this page").is_some());
+    h.get_by_label("#123456").click();
+    h.run_steps(2);
+    assert_eq!(h.state().doc.node(b).fills[0].color, Rgba::rgb(0x12, 0x34, 0x56));
+    // The format dropdown switches the fields.
+    // (Menus inside a popover open to the side: their buttons end in an arrow.)
+    h.get_by_label("Hex \u{23F5}").click();
+    h.run_steps(2);
+    h.get_by_label("HSL").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("HSL \u{23F5}").is_some() && h.query_by_label("Hex \u{23F5}").is_none(), "HSL fields now");
+    assert!(h.query_by_label("HSB").is_none(), "the format menu closed, the picker stayed open");
+}
+
+/// Visual check of the paint tools: `cargo test paint_look -- --ignored` writes target/look-*.png.
+#[test]
+#[ignore]
+fn paint_look() {
+    use crate::doc::{Paint, PaintKind, Rgba};
+    isolate_data();
+    let mut h = Harness::builder().with_size(vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).wgpu().build_eframe(|cc| {
+        crate::setup_style(&cc.egui_ctx);
+        let mut app = App::new(None);
+        app.recoverable.clear();
+        app
+    });
+    h.run_steps(2);
+    let mut ids = vec![];
+    for (i, kind) in [PaintKind::Angular, PaintKind::Diamond, PaintKind::Radial].into_iter().enumerate() {
+        let mut g = Paint::solid(Rgba::rgb(13, 153, 255));
+        g.convert(kind);
+        g.stops = vec![(0.0, Rgba::rgb(13, 153, 255)), (0.5, Rgba::rgb(255, 199, 0)), (1.0, Rgba::rgb(151, 71, 255))];
+        if kind == PaintKind::Radial {
+            g.width_to = Some(pos2(0.5, 0.75));
+        }
+        let mut n = Node::new(Kind::Rectangle, r(-560. + i as f32 * 220., -100., 200., 200.));
+        n.fills = vec![g];
+        ids.push(h.state_mut().doc.insert(0, None, None, n));
+    }
+    h.state_mut().sel = vec![ids[2]];
+    h.run_steps(2);
+    h.get_all_by_label("Color swatch").next().unwrap().click();
+    h.run_steps(4);
+    assert!(egui::Popup::is_any_open(&h.ctx));
+    h.render().unwrap().save("target/look-gradient.png").unwrap();
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    h.state_mut().doc.node_mut(ids[2]).fills = vec![Paint::solid(Rgba::rgb(0x8E, 0x72, 0xFF))];
+    h.run_steps(2);
+    h.get_all_by_label("Color swatch").next().unwrap().click();
+    h.run_steps(4);
+    h.render().unwrap().save("target/look-picker.png").unwrap();
+    h.get_by_label("Pick color  I").click();
+    h.run_steps(3);
+    let size = h.ctx.content_rect().size() * h.ctx.pixels_per_point();
+    let image = std::sync::Arc::new(egui::ColorImage::new([size.x as usize, size.y as usize], (0..(size.x * size.y) as usize).map(|i| egui::Color32::from_gray((i % 7 * 30) as u8)).collect()));
+    h.event(Event::Screenshot { viewport_id: egui::ViewportId::ROOT, user_data: Default::default(), image });
+    let p = s(&h, 0.0, 0.0);
+    move_to(&mut h, p, Modifiers::NONE);
+    h.run_steps(2);
+    h.render().unwrap().save("target/look-eyedropper.png").unwrap();
+}
+
+#[test]
+fn paint_rows_reorder_by_dragging_their_grip() {
+    use crate::doc::{Paint, Rgba};
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (80.0, 80.0));
+    let (r, g, b) = (Rgba::rgb(255, 0, 0), Rgba::rgb(0, 255, 0), Rgba::rgb(0, 0, 255));
+    h.state_mut().doc.node_mut(id).fills = vec![Paint::solid(r), Paint::solid(g), Paint::solid(b)];
+    h.run_steps(2);
+    // Fill rows list topmost (blue) first: drag it below the last row (red).
+    let grips: Vec<Rect> = h.get_all_by_label("Drag to reorder").map(|n| n.rect()).collect();
+    assert_eq!(grips.len(), 3);
+    drag(&mut h, grips[0].center(), grips[2].center() + vec2(0.0, 14.0), Modifiers::NONE);
+    let order = |h: &Harness<App>| h.state().doc.node(id).fills.iter().map(|p| p.color).collect::<Vec<_>>();
+    assert_eq!(order(&h), vec![b, r, g], "blue is now the bottom paint");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(order(&h), vec![r, g, b], "one undo step");
+}
+
+/// The new effects on the canvas, with an effect's settings open, for a look by eye.
+#[test]
+#[ignore]
+fn effects_ui_look() {
+    use crate::doc::{EffectKind, Paint, Progressive, Rgba, Shadow};
+    isolate_data();
+    let mut h = Harness::builder().with_size(vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).wgpu().build_eframe(|cc| {
+        crate::setup_style(&cc.egui_ctx);
+        let mut app = App::new(None);
+        app.recoverable.clear();
+        app
+    });
+    h.run_steps(2);
+    let st = h.state_mut();
+    let mut bg = Node::new(Kind::Frame, r(-500., -260., 1000., 520.));
+    bg.fills = vec![Paint::solid(Rgba::rgb(24, 24, 28))];
+    let bg = st.doc.insert(0, None, None, bg);
+    for i in 0..9 {
+        let mut c = Node::new(Kind::Ellipse, r(-480. + i as f32 * 110., -200. + (i % 3) as f32 * 120., 100., 100.));
+        c.fills = vec![Paint::solid([Rgba::rgb(13, 153, 255), Rgba::rgb(255, 199, 0), Rgba::rgb(242, 72, 34), Rgba::rgb(20, 174, 92)][i % 4])];
+        st.doc.insert(0, Some(bg), None, c);
+    }
+    let fx = [
+        Shadow { blur: 8., ..Shadow::of(EffectKind::Glass) },
+        Shadow { progressive: Some(Progressive::default()), blur: 24., ..Shadow::of(EffectKind::BackgroundBlur) },
+        Shadow { color: Rgba([0, 0, 0, 160]), ..Shadow::of(EffectKind::Noise) },
+        Shadow::of(EffectKind::Texture),
+    ];
+    let mut ids = vec![];
+    for (i, s) in fx.into_iter().enumerate() {
+        let mut n = Node::new(Kind::Rectangle, r(-460. + i as f32 * 240., -120., 200., 240.));
+        n.radius = 32.;
+        n.fills = if s.kind.is_backdrop() { vec![Paint::solid(Rgba([255, 255, 255, 20]))] } else { vec![Paint::solid(Rgba::rgb(142, 114, 255))] };
+        n.shadows = vec![s];
+        ids.push(st.doc.insert(0, Some(bg), None, n));
+    }
+    st.sel = vec![ids[0]];
+    st.zoom_to(&egui::Context::default(), None, false);
+    h.run_steps(3);
+    h.get_by_label("Glass").click();
+    h.run_steps(4);
+    assert!(egui::Popup::is_any_open(&h.ctx));
+    h.render().unwrap().save("target/look-effects-glass.png").unwrap();
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    h.state_mut().sel = vec![ids[1]];
+    h.run_steps(3);
+    h.get_by_label("Background blur").click();
+    h.run_steps(4);
+    h.render().unwrap().save("target/look-effects-progressive.png").unwrap();
+}
+
+#[test]
+fn effects_reorder_by_dragging_and_switch_to_new_types() {
+    use crate::doc::{EffectKind, Shadow};
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (80.0, 80.0));
+    h.state_mut().doc.node_mut(id).shadows = vec![Shadow::default(), Shadow::of(EffectKind::LayerBlur), Shadow::of(EffectKind::Noise)];
+    h.run_steps(2);
+    // The fill's grip comes first, then effects, topmost (noise) first: drag it to the bottom.
+    let grips: Vec<Rect> = h.get_all_by_label("Drag to reorder").map(|n| n.rect()).collect();
+    assert_eq!(grips.len(), 4);
+    drag(&mut h, grips[1].center(), grips[3].center() + vec2(0.0, 14.0), Modifiers::NONE);
+    let kinds = |h: &Harness<App>| h.state().doc.node(id).shadows.iter().map(|s| s.kind).collect::<Vec<_>>();
+    assert_eq!(kinds(&h), vec![EffectKind::Noise, EffectKind::DropShadow, EffectKind::LayerBlur]);
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(kinds(&h), vec![EffectKind::DropShadow, EffectKind::LayerBlur, EffectKind::Noise], "one undo step");
+    // Open the drop shadow, pick Glass from its type menu: Figma's glass settings come with it.
+    h.state_mut().doc.node_mut(id).shadows = vec![Shadow::default()];
+    h.run_steps(2);
+    h.get_by_label("Drop shadow").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Show behind transparent areas").is_some(), "drop shadows have the option");
+    h.get_by_label("Drop shadow ⏵").hover();
+    h.run_steps(2);
+    h.get_by_label("Glass").click();
+    h.run_steps(3);
+    let s = h.state().doc.node(id).shadows[0];
+    assert_eq!((s.kind, s.glass), (EffectKind::Glass, Shadow::of(EffectKind::Glass).glass));
+    assert!(h.query_by_label("Refraction").is_some() && h.query_by_label("Show behind transparent areas").is_none());
+}
+
+#[test]
+fn number_keys_set_opacity_and_shift_x_swaps_fill_and_stroke() {
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (80.0, 80.0));
+    let op = |h: &Harness<App>| (h.state().doc.node(id).opacity * 100.0).round();
+    key(&mut h, Modifiers::NONE, Key::Num4);
+    key(&mut h, Modifiers::NONE, Key::Num5);
+    assert_eq!(op(&h), 45.0, "two digits typed quickly");
+    h.run_steps(60);
+    key(&mut h, Modifiers::NONE, Key::Num7);
+    assert_eq!(op(&h), 70.0);
+    h.run_steps(60);
+    key(&mut h, Modifiers::NONE, Key::Num0);
+    assert_eq!(op(&h), 100.0, "0 is 100%");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(op(&h), 45.0, "45 was one undo step");
+    // Shift X: the fill becomes the stroke.
+    let fill = h.state().doc.node(id).fills.clone();
+    key(&mut h, Modifiers::SHIFT, Key::X);
+    let n = h.state().doc.node(id);
+    assert!(n.fills.is_empty() && n.strokes == fill && n.stroke_width > 0.0);
+    // Not while typing: digits go to the text being edited.
+    key(&mut h, Modifiers::NONE, Key::T);
+    let p = s(&h, 300.0, 300.0);
+    click(&mut h, p, Modifiers::NONE);
+    let t = h.state().editing_text.expect("editing new text");
+    key(&mut h, Modifiers::NONE, Key::Num5);
+    assert_eq!(h.state().doc.node(t).opacity, 1.0);
+}
+
+/// UI review renders: `cargo test --release ui_tour -- --ignored` writes target/tour/*.png.
+#[test]
+#[ignore]
+fn ui_tour() {
+    isolate_data();
+    let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tour");
+    std::fs::create_dir_all(&out).unwrap();
+    for theme in [egui::Theme::Dark, egui::Theme::Light] {
+        let tag = if theme == egui::Theme::Dark { "dark" } else { "light" };
+        let mut h = Harness::builder().with_size(vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).with_theme(theme).wgpu().build_eframe(|cc| {
+            crate::setup_style(&cc.egui_ctx);
+            let mut app = App::new(Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/demo.katachi")));
+            app.recoverable.clear();
+            app
+        });
+        h.run_steps(4);
+        let save = |h: &mut Harness<App>, name: &str| {
+            h.run_steps(3);
+            h.render().unwrap().save(out.join(format!("{tag}-{name}.png"))).unwrap();
+        };
+        save(&mut h, "1-editor");
+        let first = h.state().doc.pages[0].children[0];
+        h.state_mut().sel = vec![first];
+        save(&mut h, "2-frame-selected");
+        let p = h.state().view.to_screen(h.state().doc.node(first).rect.center());
+        h.input_mut().events.push(Event::PointerMoved(p));
+        h.input_mut().events.push(Event::PointerButton { pos: p, button: PointerButton::Secondary, pressed: true, modifiers: Modifiers::NONE });
+        h.input_mut().events.push(Event::PointerButton { pos: p, button: PointerButton::Secondary, pressed: false, modifiers: Modifiers::NONE });
+        save(&mut h, "3-context-menu");
+        key(&mut h, Modifiers::NONE, Key::Escape);
+        click(&mut h, pos2(22.0, 22.0), Modifiers::NONE);
+        save(&mut h, "4-main-menu");
+        key(&mut h, Modifiers::NONE, Key::Escape);
+        h.state_mut().prototype_tab = true;
+        save(&mut h, "5-prototype");
+        h.state_mut().prototype_tab = false;
+        h.state_mut().dev_mode = true;
+        save(&mut h, "6-dev-mode");
+        h.state_mut().dev_mode = false;
+        h.state_mut().sel.clear();
+        h.state_mut().open_settings(crate::settings::Tab::Appearance);
+        save(&mut h, "7-settings");
+        h.state_mut().settings_tab = None;
+        key(&mut h, Modifiers::COMMAND, Key::K);
+        save(&mut h, "8-quick-actions");
+    }
+}
+
+#[test]
+fn right_click_select_layer_and_move_to_page() {
+    let mut h = harness();
+    let f = draw(&mut h, Key::F, (0.0, 0.0), (200.0, 200.0));
+    let r1 = draw(&mut h, Key::R, (20.0, 20.0), (120.0, 120.0));
+    // Everything under the pointer, top first: the rectangle, then the frame around it.
+    assert_eq!(h.state().layers_at(pos2(50.0, 50.0)), vec![r1, f]);
+    assert_eq!(h.state().layers_at(pos2(150.0, 150.0)), vec![f]);
+    let two = crate::doc::Page { name: "Two".into(), children: vec![], ..h.state().doc.pages[0].clone() };
+    h.state_mut().doc.pages.push(two);
+    h.state_mut().sel = vec![f];
+    h.state_mut().move_to_page(1);
+    assert!(h.state().doc.pages[0].children.is_empty());
+    assert_eq!(h.state().doc.pages[1].children, vec![f]);
+    assert_eq!(h.state().doc.node(r1).parent, Some(f), "children travel with it");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().doc.pages[0].children, vec![f], "one undo step");
+}
+
+#[test]
+fn huge_text_draws_and_edits_without_overflowing_the_font_atlas() {
+    let mut h = harness();
+    let mut n = Node::new(Kind::Text, r(0., 0., 100., 100.));
+    n.text = "W".into();
+    n.font_size = 20000.;
+    let id = h.state_mut().doc.insert(0, None, None, n);
+    h.state_mut().doc.reflow();
+    h.run_steps(2);
+    h.state_mut().editing_text = Some(id);
+    h.run_steps(2);
+    assert!(h.state().doc.node(id).rect.width() > 10000., "laid out at its true size");
+}
+
+#[test]
+fn serve_refuses_a_file_it_cannot_read() {
+    let dir = std::env::temp_dir().join(format!("katachi-serve-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bad = dir.join("bad.katachi");
+    std::fs::write(&bad, "not a katachi file").unwrap();
+    assert!(crate::load_or_new(Some(&bad)).is_err(), "a broken file isn't replaced with an empty one");
+    assert!(crate::load_or_new(Some(&dir.join("new.katachi"))).is_ok(), "a new file starts empty");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Put characters [a, b) of the text being edited under the editor's selection.
+fn select_chars(h: &mut Harness<App>, a: usize, b: usize) {
+    let edit_id = egui::Id::new("katachi-text-edit");
+    let mut state = egui::TextEdit::load_state(&h.ctx, edit_id).expect("editor state");
+    state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(a), egui::text::CCursor::new(b))));
+    state.store(&h.ctx, edit_id);
+}
+
+/// A clipboard event as egui-winit sends it: the chord's modifiers are only in the input state.
+fn clip_event(h: &mut Harness<App>, m: Modifiers, e: Event) {
+    h.input_mut().modifiers = m;
+    h.event_modifiers(e, m);
+    h.run_steps(2);
+    h.input_mut().modifiers = Modifiers::NONE;
+}
+
+#[test]
+fn text_formatting_shortcuts_style_layers_and_ranges() {
+    use crate::doc::{Decoration, LineHeight, TextAlign, TextSizing};
+    let mut h = harness();
+    let mut t = Node::new(Kind::Text, r(0., 0., 120., 10.));
+    t.text = "Hello world".into();
+    t.font_size = 20.;
+    t.text_sizing = TextSizing::AutoHeight;
+    let id = h.state_mut().doc.insert(0, None, None, t);
+    h.state_mut().sel = vec![id];
+    h.run_steps(2);
+    let node = |h: &Harness<App>| h.state().doc.node(id).clone();
+    // With the layer selected, shortcuts restyle all of it.
+    key(&mut h, Modifiers::COMMAND, Key::B);
+    assert_eq!(node(&h).font_weight, 700);
+    key(&mut h, Modifiers::COMMAND, Key::B);
+    assert_eq!(node(&h).font_weight, 400, "Cmd B toggles back");
+    key(&mut h, Modifiers::COMMAND, Key::I);
+    assert!(node(&h).italic);
+    key(&mut h, Modifiers::COMMAND, Key::U);
+    assert_eq!(node(&h).decoration, Decoration::Underline);
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::J);
+    assert_eq!(node(&h).text_align, TextAlign::Justify);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::Period);
+    assert_eq!(node(&h).font_size, 21.0);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::Comma);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::Comma);
+    assert_eq!(node(&h).font_size, 19.0);
+    key(&mut h, Modifiers::ALT, Key::Period);
+    assert_eq!(node(&h).letter_spacing, 1.0);
+    key(&mut h, Modifiers::ALT | Modifiers::SHIFT, Key::Period);
+    assert_eq!(node(&h).line_height, LineHeight::Px((19.0 * crate::text::NATURAL_LINE).round() + 1.0), "Auto becomes px");
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::Period);
+    assert_eq!(node(&h).font_weight, 500, "next installed weight");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(node(&h).font_weight, 400, "one undo step each");
+    // Shift Cmd X reaches the app as a cut: it strikes through instead of cutting the layer.
+    clip_event(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Event::Cut);
+    assert!(h.state().doc.nodes.contains_key(&id));
+    assert_eq!(node(&h).decoration, Decoration::Strikethrough);
+    // While editing with characters selected, they apply to the range only.
+    h.state_mut().editing_text = Some(id);
+    h.state_mut().focus_text = true;
+    h.run_steps(3);
+    select_chars(&mut h, 6, 11);
+    key(&mut h, Modifiers::COMMAND, Key::B);
+    let n = node(&h);
+    assert_eq!((n.font_weight, n.spans.len()), (400, 1));
+    assert_eq!((n.spans[0].start, n.spans[0].end, n.spans[0].style.font_weight), (6, 11, Some(700)));
+    clip_event(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Event::Cut);
+    let n = node(&h);
+    assert_eq!(n.text, "Hello world", "the editor didn't cut");
+    assert_eq!(n.spans[0].style.decoration, Some(Decoration::None), "strikethrough toggles off on the range");
+    // Justified rows fill the box but a paragraph's last row doesn't.
+    let mut j = n.clone();
+    j.text = "alpha beta gamma delta epsilon a".into();
+    j.spans.clear();
+    j.italic = false;
+    let painter = egui::Painter::new(h.ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+    let (g, _, _) = crate::text::layout(&painter, &j, 1.0, egui::Color32::BLACK);
+    assert!(g.rows.len() >= 2);
+    assert!((g.rows[0].size.x - 120.0).abs() < 0.5, "{}", g.rows[0].size.x);
+    assert!(g.rows.last().unwrap().size.x < 100.0, "{}", g.rows.last().unwrap().size.x);
+    let jid = h.state_mut().doc.insert(0, None, None, j);
+    h.run_steps(2);
+    let svg = crate::export::to_svg(&h.state().doc, &[jid]);
+    assert_eq!(svg.matches(r#"textLength="120""#).count(), h.state().doc.node(jid).lines.len() - 1, "{svg}");
+}
+
+#[test]
+fn italics_use_real_faces_and_slant_only_without_one() {
+    use crate::text::{style_name, styles_for};
+    let mut h = harness();
+    assert_eq!(style_name(400, true), "Italic");
+    assert_eq!(style_name(700, true), "Bold Italic");
+    assert_eq!(style_name(600, false), "Semi Bold");
+    assert!([400, 500, 600, 700].iter().all(|w| styles_for("Inter").contains(&(*w, false))));
+    let slanted = |h: &Harness<App>, family: &str, italic: bool| {
+        let mut n = Node::new(Kind::Text, r(0., 0., 10., 10.));
+        (n.font_family, n.italic) = (family.into(), italic);
+        crate::text::job(&h.ctx, &n, "x", 1.0, egui::Color32::BLACK).sections[0].format.italics
+    };
+    // No such family: Inter stands in, slanted.
+    let mut t = Node::new(Kind::Text, r(0., 0., 10., 10.));
+    (t.text, t.font_family, t.italic) = ("Hi".into(), "No Such Font".into(), true);
+    let missing = h.state_mut().doc.insert(0, None, None, t.clone());
+    // A family with a real italic (when this machine has one) draws it unslanted.
+    let real = crate::text::families().iter().find(|f| styles_for(f).contains(&(400, true)) && styles_for(f).contains(&(400, false))).cloned();
+    if let Some(f) = &real {
+        t.font_family = f.clone();
+        h.state_mut().doc.insert(0, None, None, t);
+    }
+    h.run_steps(4);
+    assert!(slanted(&h, "No Such Font", true));
+    assert!(!slanted(&h, "No Such Font", false));
+    assert!(crate::export::to_svg(&h.state().doc, &[missing]).contains(r#"font-style="italic""#));
+    if let Some(f) = real {
+        assert!(!slanted(&h, &f, true), "{f} has an italic face");
+        assert_eq!(crate::text::font_family(&h.ctx, &f, 400, true).0, egui::FontFamily::Name(format!("{f}#400i").into()));
+    }
+}
+
+#[test]
+fn missing_fonts_show_and_replace_in_one_step() {
+    use crate::doc::{SpanStyle, TextSpan};
+    let mut h = harness();
+    let mut t = Node::new(Kind::Text, r(0., 0., 10., 10.));
+    (t.text, t.font_family, t.font_weight) = ("Imported".into(), "Fig Only Sans".into(), 700);
+    t.spans = vec![TextSpan { start: 0, end: 3, style: SpanStyle { font_family: Some("Fig Only Serif".into()), italic: Some(true), ..Default::default() } }];
+    let id = h.state_mut().doc.insert(0, None, None, t);
+    h.state_mut().sel = vec![id];
+    h.run_steps(2);
+    let missing = crate::text::missing_fonts(&h.state().doc);
+    assert_eq!(missing, vec![("Fig Only Sans".to_string(), vec![(700, false)]), ("Fig Only Serif".to_string(), vec![(700, true)])]);
+    // The Typography section flags it and opens Replace fonts.
+    h.get_by_label("Missing fonts");
+    h.get_by_label("Replace fonts…").click();
+    h.run_steps(2);
+    assert_eq!(h.state().replace_fonts.as_ref().map(|p| p.len()), Some(2));
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Replace fonts").click();
+    h.run_steps(2);
+    let n = h.state().doc.node(id).clone();
+    assert_eq!((n.font_family.as_str(), n.font_weight, n.spans[0].style.font_family.as_deref()), ("Inter", 700, Some("Inter")));
+    assert!(crate::text::missing_fonts(&h.state().doc).is_empty() && h.state().replace_fonts.is_none());
+    assert!(h.query_by_label("Missing fonts").is_none());
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(crate::text::missing_fonts(&h.state().doc).len(), 2, "one undo step");
+}
+
+#[test]
+fn text_links_add_edit_remove_export_and_click_through() {
+    let mut h = harness();
+    let f = draw(&mut h, Key::F, (0.0, 0.0), (300.0, 100.0));
+    let mut t = Node::new(Kind::Text, r(10., 10., 10., 10.));
+    (t.text, t.font_size) = ("Visit site".into(), 20.0);
+    let id = h.state_mut().doc.insert(0, Some(f), None, t);
+    h.state_mut().sel = vec![id];
+    h.state_mut().editing_text = Some(id);
+    h.state_mut().focus_text = true;
+    h.run_steps(3);
+    // Cmd K on selected characters opens the link field instead of quick actions.
+    select_chars(&mut h, 6, 10);
+    key(&mut h, Modifiers::COMMAND, Key::K);
+    assert!(h.state().quick.is_none());
+    assert_eq!(h.state().link_edit, Some((6, 10, String::new())));
+    h.event(Event::Text("example.com".into()));
+    key(&mut h, Modifiers::NONE, Key::Enter);
+    let n = h.state().doc.node(id).clone();
+    assert_eq!(n.text, "Visit site");
+    assert_eq!(crate::doc::link_at(&n.spans, 7), Some((6, 10, "https://example.com".into())));
+    assert!(crate::doc::link_at(&n.spans, 2).is_none());
+    // Exported as an <a> around the same run.
+    let svg = crate::export::to_svg(&h.state().doc, &[id]);
+    assert!(svg.contains(r##"<a href="https://example.com"><tspan fill="#0D99FF" text-decoration="underline">site</tspan></a>"##), "{svg}");
+    assert!(svg.contains(">Visit </tspan>"), "{svg}");
+    // The caret in the link shows it, with Remove.
+    select_chars(&mut h, 8, 8);
+    h.run_steps(2);
+    assert!(h.query_by_label("https://example.com").is_some());
+    // Clicking it in presentation opens it.
+    h.state_mut().editing_text = None;
+    h.state_mut().sel = vec![f];
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::Enter);
+    h.run_steps(2);
+    let painter = egui::Painter::new(h.ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+    let n = h.state().doc.node(id).clone();
+    let (g, _, _) = crate::text::layout(&painter, &n, 1.0, egui::Color32::BLACK);
+    let w = n.rect.min + crate::text::draw_offset(&n, g.rows.len()) + g.pos_from_cursor(egui::text::CCursor::new(8)).center().to_vec2();
+    assert_eq!(crate::text::link_at(&painter, &n, w).as_deref(), Some("https://example.com"));
+    let at = ps(&h, w.x, w.y);
+    move_to(&mut h, at, Modifiers::NONE);
+    press(&mut h, at, true, Modifiers::NONE);
+    // Released in a single frame, so its output is the one to read.
+    h.input_mut().events.push(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+    h.step();
+    let opened = h.output().platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::OpenUrl(u) if u.url == "https://example.com"));
+    assert!(opened, "{:?}", h.output().platform_output.commands);
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    // Remove takes it off again, in one undo step.
+    h.state_mut().editing_text = Some(id);
+    h.state_mut().focus_text = true;
+    h.run_steps(3);
+    select_chars(&mut h, 8, 8);
+    h.run_steps(2);
+    h.get_by_label("Remove link").click();
+    h.run_steps(2);
+    assert!(crate::doc::link_at(&h.state().doc.node(id).spans, 8).is_none());
+    assert!(h.state().doc.node(id).spans.is_empty());
+}
+
+#[test]
+fn paragraph_indent_moves_first_lines_in() {
+    use crate::doc::TextSizing;
+    let mut h = harness();
+    let mut n = Node::new(Kind::Text, r(0., 0., 10., 10.));
+    (n.text, n.font_size) = ("alpha beta gamma\nsecond".into(), 10.0);
+    let plain = h.state_mut().doc.insert(0, None, None, n.clone());
+    n.paragraph_indent = 20.0;
+    let id = h.state_mut().doc.insert(0, None, None, n.clone());
+    // Wrapped: only each paragraph's first row starts in.
+    n.text_sizing = TextSizing::AutoHeight;
+    n.rect = r(0., 100., 70., 10.);
+    let wrapped = h.state_mut().doc.insert(0, None, None, n);
+    h.run_steps(3);
+    let w = |id| h.state().doc.node(id).rect.width();
+    assert!((w(id) - w(plain) - 20.0).abs() < 0.5, "auto width grows by the indent: {} vs {}", w(id), w(plain));
+    let painter = egui::Painter::new(h.ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+    let t = h.state().doc.node(wrapped).clone();
+    let (g, _, _) = crate::text::layout(&painter, &t, 1.0, egui::Color32::BLACK);
+    let starts: Vec<f32> = g.rows.iter().map(|r| r.pos.x + r.glyphs[0].pos.x).collect();
+    assert!(starts.len() >= 3, "{:?}", t.lines);
+    assert!((starts[0] - 20.0).abs() < 0.5 && starts[1] < 1.0 && (starts.last().unwrap() - 20.0).abs() < 0.5, "{starts:?}");
+    let svg = crate::export::to_svg(&h.state().doc, &[id]);
+    assert_eq!(svg.matches(r#"x="20""#).count(), 2, "{svg}");
+}
+
+#[test]
+fn vertical_trim_fits_the_box_from_cap_height_to_baseline() {
+    use crate::doc::LineHeight;
+    use crate::text::CAP;
+    let mut h = harness();
+    let mut n = Node::new(Kind::Text, r(0., 0., 10., 10.));
+    (n.text, n.font_size, n.vertical_trim) = ("Hamburg".into(), 100.0, true);
+    let one = h.state_mut().doc.insert(0, None, None, n.clone());
+    (n.text, n.line_height) = ("Two\nlines".into(), LineHeight::Px(150.0));
+    n.rect = r(0., 300., 10., 10.);
+    let two = h.state_mut().doc.insert(0, None, None, n);
+    h.run_steps(3);
+    let height = |id| h.state().doc.node(id).rect.height();
+    assert!((height(one) - CAP * 100.0).abs() < 0.01, "{}", height(one));
+    assert!((height(two) - (150.0 + CAP * 100.0)).abs() < 0.01, "{}", height(two));
+    // The first baseline sits at the cap height from the top, in export too.
+    let svg = crate::export::to_svg(&h.state().doc, &[one]);
+    let y: f32 = svg.split(" y=\"").nth(1).unwrap().split('"').next().unwrap().parse().unwrap();
+    assert!((y - CAP * 100.0).abs() < 0.01, "{svg}");
+    let css = crate::codegen::css(&h.state().doc, one);
+    assert!(css.contains("text-box: trim-both cap alphabetic"), "{css}");
+    // Set from Typography's Type details popover.
+    h.state_mut().doc.node_mut(two).vertical_trim = false;
+    h.state_mut().sel = vec![two];
+    h.run_steps(2);
+    h.get_by_label("···").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Paragraph indent").is_some(), "popover open");
+    h.get_by_label_contains("Standard").click();
+    h.run_steps(2);
+    h.get_by_label("Cap height to baseline").click();
+    h.run_steps(2);
+    assert!(h.state().doc.node(two).vertical_trim);
+}
+
+#[test]
+fn copy_and_paste_properties_survive_egui_clipboard_events() {
+    use crate::app::TEST_CLIPBOARD;
+    let mut h = harness();
+    let a = draw(&mut h, Key::R, (0.0, 0.0), (40.0, 40.0));
+    let b = draw(&mut h, Key::R, (100.0, 0.0), (140.0, 40.0));
+    h.state_mut().doc.node_mut(a).opacity = 0.5;
+    h.state_mut().sel = vec![a];
+    // The windowing layer sends Alt Cmd C and Alt Cmd V as Copy and Paste, never as C and V keys.
+    let am = Modifiers::COMMAND | Modifiers::ALT;
+    clip_event(&mut h, am, Event::Copy);
+    assert!(h.state().style_clip.is_some(), "Alt Cmd C copies properties");
+    h.state_mut().sel = vec![b];
+    clip_event(&mut h, am, Event::Paste("some text".into()));
+    assert_eq!(h.state().doc.node(b).opacity, 0.5, "Alt Cmd V pastes properties");
+    assert_eq!(h.state().doc.nodes.len(), 2, "and doesn't paste the clipboard text");
+    let release = Event::Key { key: Key::V, physical_key: None, pressed: false, repeat: false, modifiers: am };
+    clip_event(&mut h, am, release.clone());
+    // With no text on the clipboard only the V key's release arrives.
+    h.state_mut().doc.node_mut(b).opacity = 1.0;
+    TEST_CLIPBOARD.with(|c| c.borrow_mut().1 = Some(image::RgbaImage::new(2, 2)));
+    clip_event(&mut h, am, release);
+    TEST_CLIPBOARD.with(|c| c.borrow_mut().1 = None);
+    assert_eq!(h.state().doc.node(b).opacity, 0.5);
+    assert_eq!(h.state().doc.nodes.len(), 2, "no image pasted");
+}
+
+#[test]
+fn variables_table_groups_aliases_and_paint_hexagon() {
+    use crate::doc::{Bindable, Rgba, VarValue};
+    let mut h = harness();
+    let rect_id = draw(&mut h, Key::R, (0.0, 0.0), (80.0, 80.0));
+    let (primary, accent) = {
+        let d = &mut h.state_mut().doc;
+        let c = d.add_collection("Theme".into());
+        let p = d.add_variable(c, "color/primary".into(), VarValue::Color(Rgba::rgb(255, 0, 0)));
+        let a = d.add_variable(c, "color/accent".into(), VarValue::Color(Rgba::rgb(0, 0, 255)));
+        (p, a)
+    };
+    h.state_mut().show_variables = true;
+    h.run_steps(3);
+    // Slash names group under a "color" row and show their leaf names.
+    assert!(h.query_all_by_value("color").next().is_some() && h.query_all_by_value("primary").next().is_some());
+    // The first row's hexagon makes it an alias of the other color.
+    h.get_all_by_label("Create alias").next().unwrap().click();
+    h.run_steps(2);
+    h.get_by_label("color/accent").click();
+    h.run_steps(2);
+    assert_eq!(h.state().doc.variable(primary).unwrap().values[0], VarValue::Alias(accent));
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().doc.variable(primary).unwrap().values[0], VarValue::Color(Rgba::rgb(255, 0, 0)), "undoable");
+    // Collapsing the group hides its rows; renaming it moves every variable.
+    h.get_by_label("Collapse group").click();
+    h.run_steps(2);
+    assert!(h.query_all_by_value("primary").next().is_none());
+    h.get_all_by_value("color").next().unwrap().focus();
+    h.run_steps(1);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.get_all_by_value("color").next().unwrap().type_text("brand");
+    h.run_steps(1);
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    assert_eq!(h.state().doc.variable(accent).unwrap().name, "brand/accent", "renaming the group moves its variables");
+    h.state_mut().show_variables = false;
+    // Fill's hexagon binds a color variable, then shows it in place of the paint.
+    h.state_mut().sel = vec![rect_id];
+    h.run_steps(2);
+    h.get_all_by_label("Apply variable").next().unwrap().click();
+    h.run_steps(2);
+    h.get_by_label("■ brand/accent").click();
+    h.run_steps(2);
+    let n = h.state().doc.node(rect_id).clone();
+    assert_eq!((n.bindings.clone(), n.fills[0].color), (vec![(Bindable::Fill, accent)], Rgba::rgb(0, 0, 255)));
+    assert!(h.query_all_by_label("Detach variable").next().is_some());
+}
+
+#[test]
+fn plugin_variables_carry_scopes_and_code_syntax() {
+    let mut doc = crate::doc::Document::default();
+    crate::plugins::run(&mut doc, 0, &[], r##"
+        const col = figma.variables.createVariableCollection("Tokens");
+        const r = figma.variables.createVariable("radius/md", col, "FLOAT");
+        r.scopes = ["CORNER_RADIUS"];
+        r.setVariableCodeSyntax("WEB", "var(--radius-md)");
+    "##).unwrap();
+    let v = &doc.variables[0];
+    assert_eq!((v.scopes.clone(), v.code_syntax[0].as_str()), (vec![crate::doc::Bindable::Radius], "var(--radius-md)"));
+    // And back out again.
+    let out = crate::plugin_doc::snapshot(&doc, 0, &[], false);
+    assert_eq!(out["variables"][0]["scopes"], serde_json::json!(["CORNER_RADIUS"]));
+    assert_eq!(out["variables"][0]["codeSyntax"]["WEB"], "var(--radius-md)");
+}
+
+/// A "Card" component with a "Bg" rectangle and a "Title" text, and two instances of it.
+fn card_doc() -> crate::doc::Document {
+    let mut doc = crate::doc::Document::default();
+    crate::plugins::run(&mut doc, 0, &[], r##"
+        const c = figma.createComponent(); c.name = "Card"; c.resize(100, 60);
+        const bg = figma.createRectangle(); bg.name = "Bg"; bg.resize(100, 60); c.appendChild(bg);
+        bg.fills = [figma.util.solidPaint("#FF0000")];
+        const t = figma.createText(); t.name = "Title"; t.characters = "Hello"; c.appendChild(t);
+        c.createInstance().x = 200;
+        c.createInstance().x = 400;
+    "##).unwrap();
+    doc.reflow();
+    doc
+}
+
+#[test]
+fn instance_overrides_reset_one_at_a_time_and_push_to_main() {
+    use crate::doc::{Override, Rgba};
+    let mut doc = card_doc();
+    let insts: Vec<NodeId> = doc.pages[0].children.iter().copied().filter(|&i| doc.node(i).kind == Kind::Instance).collect();
+    let layer = |doc: &crate::doc::Document, inst: NodeId, name: &str| doc.descendants(inst).into_iter().find(|&d| doc.node(d).name == name).unwrap();
+    let (bg, title) = (layer(&doc, insts[0], "Bg"), layer(&doc, insts[0], "Title"));
+    doc.node_mut(bg).fills[0].color = Rgba::rgb(0, 0, 255);
+    doc.node_mut(title).text = "Changed".into();
+    doc.reflow();
+    assert_eq!(doc.instance_overrides(insts[0]), vec![Override::Fill, Override::Text]);
+    doc.reset_override(insts[0], Override::Fill);
+    let bg = layer(&doc, insts[0], "Bg");
+    assert_eq!(doc.node(bg).fills[0].color, Rgba::rgb(255, 0, 0), "fill back to the main's");
+    assert_eq!(doc.node(layer(&doc, insts[0], "Title")).text, "Changed", "the text override stays");
+    // Push the text to the main component: the other instance follows, and it is no longer an override.
+    doc.push_to_main(insts[0]);
+    assert_eq!(doc.node(layer(&doc, insts[1], "Title")).text, "Changed");
+    assert!(doc.instance_overrides(insts[0]).is_empty());
+}
+
+#[test]
+fn instance_menu_resets_a_property_and_assets_click_places_an_instance() {
+    let mut h = harness();
+    h.state_mut().doc = card_doc();
+    h.run_steps(2);
+    let inst = h.state().doc.pages[0].children.iter().copied().find(|&i| h.state().doc.node(i).kind == Kind::Instance).unwrap();
+    let bg = h.state().doc.descendants(inst).into_iter().find(|&d| h.state().doc.node(d).name == "Bg").unwrap();
+    h.state_mut().doc.node_mut(bg).opacity = 0.5;
+    h.state_mut().sel = vec![inst];
+    h.run_steps(2);
+    h.get_by_label("More instance options").click();
+    h.run_steps(2);
+    h.get_by_label("Reset opacity").click();
+    h.run_steps(2);
+    assert_eq!(h.state().doc.node(bg).opacity, 1.0);
+    // Assets: a click places an instance mid-screen, and the description shows on hover.
+    let comp = h.state().doc.nodes.values().find(|n| n.kind == Kind::Component).unwrap().id;
+    h.state_mut().doc.node_mut(comp).description = "A content card".into();
+    h.state_mut().sel.clear();
+    h.state_mut().left_tab_assets = true;
+    h.run_steps(3);
+    let before = h.state().doc.nodes.values().filter(|n| n.kind == Kind::Instance).count();
+    h.get_all_by_label("Card").max_by(|a, b| a.rect().height().total_cmp(&b.rect().height())).unwrap().click();
+    h.run_steps(2);
+    assert_eq!(h.state().doc.nodes.values().filter(|n| n.kind == Kind::Instance).count(), before + 1);
+    assert_eq!(h.state().doc.node(h.state().sel[0]).component, Some(comp));
+    // Dragging the tile onto the canvas still drops an instance there.
+    let tile = h.get_all_by_label("Card").max_by(|a, b| a.rect().height().total_cmp(&b.rect().height())).unwrap().rect().center();
+    // It lands over the instance placed above, so goes beside it rather than inside.
+    drag(&mut h, tile, pos2(800.0, 450.0), Modifiers::NONE);
+    assert_eq!(h.state().doc.nodes.values().filter(|n| n.kind == Kind::Instance).count(), before + 2);
+}
+
+#[test]
+fn exposed_nested_instance_props_show_on_the_outer_instance() {
+    let mut h = harness();
+    let mut doc = crate::doc::Document::default();
+    crate::plugins::run(&mut doc, 0, &[], r##"
+        const icon = figma.createComponent(); icon.name = "Icon"; icon.resize(20, 20);
+        const g = figma.createText(); g.name = "Glyph"; g.characters = "A"; icon.appendChild(g);
+        icon.addComponentProperty("Glyph", "TEXT", "A");
+        g.componentPropertyReferences = { characters: "Glyph" };
+        const b = figma.createComponent(); b.name = "Button"; b.resize(100, 40); b.y = 100;
+        const nested = icon.createInstance(); b.appendChild(nested);
+        nested.isExposedInstance = true;
+        b.description = "Primary action";
+        b.createInstance().x = 300;
+    "##).unwrap();
+    doc.reflow();
+    let button = doc.nodes.values().find(|n| n.name == "Button" && n.kind == Kind::Component).unwrap().id;
+    assert_eq!(doc.description_of(button), "Primary action");
+    let outer = doc.nodes.values().find(|n| n.kind == Kind::Instance && n.component == Some(button)).unwrap().id;
+    let nested = doc.descendants(outer).into_iter().find(|&d| doc.node(d).kind == Kind::Instance).unwrap();
+    assert!(doc.node(nested).exposed, "the copy carries the main's expose flag");
+    h.state_mut().doc = doc;
+    h.state_mut().sel = vec![outer];
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("↳ Icon").is_some(), "the nested instance's properties are listed");
+    assert!(h.query_by_label("Primary action").is_some(), "the description shows");
+    // Its property drives the nested layers, from the outer instance's panel.
+    h.state_mut().doc.node_mut(nested).prop_values = vec![("Glyph".into(), crate::doc::PropValue::Text("B".into()))];
+    h.state_mut().doc.reflow();
+    let glyph = h.state().doc.descendants(nested).into_iter().find(|&d| h.state().doc.node(d).kind == Kind::Text).unwrap();
+    assert_eq!(h.state().doc.node(glyph).text, "B");
+}
+
+#[test]
+fn plugin_preferred_swap_values_round_trip() {
+    let mut doc = crate::doc::Document::default();
+    crate::plugins::run(&mut doc, 0, &[], r##"
+        const a = figma.createComponent(); a.name = "Star";
+        const b = figma.createComponent(); b.name = "Heart";
+        const card = figma.createComponent(); card.name = "Card";
+        card.addComponentProperty("Icon", "INSTANCE_SWAP", a.id, { preferredValues: [{ type: "COMPONENT", key: b.id }] });
+    "##).unwrap();
+    let id = |n: &str| doc.nodes.values().find(|x| x.name == n).unwrap().id;
+    let card = doc.node(id("Card"));
+    assert_eq!(card.comp_props[0].preferred, vec![id("Heart")]);
+    let out = crate::plugin_doc::snapshot(&doc, 0, &[], false);
+    let c = out["pages"][0]["children"].as_array().unwrap().iter().find(|n| n["name"] == "Card").unwrap().clone();
+    assert_eq!(c["componentPropertyDefinitions"]["Icon"]["preferredValues"][0]["key"], id("Heart").to_string());
+}
+
+#[test]
+fn dev_mode_ready_for_dev_annotations_and_spacing() {
+    let mut h = harness();
+    let f = draw(&mut h, Key::F, (0.0, 0.0), (300.0, 120.0));
+    for x in [20.0, 120.0] {
+        h.state_mut().doc.insert(0, Some(f), None, Node::new(Kind::Rectangle, r(x, 20., 60., 60.)));
+    }
+    h.state_mut().sel = vec![f];
+    h.state_mut().add_auto_layout();
+    h.state_mut().dev_mode = true;
+    h.run_steps(2);
+    h.get_by_label("Mark as ready for dev").click();
+    h.run_steps(2);
+    assert!(h.state().doc.node(f).ready);
+    assert!(h.query_by_label("Ready for dev (1)").is_some(), "listed in Dev Mode's left panel");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert!(!h.state().doc.node(f).ready, "undoable");
+    // Annotations: add one from the panel; it's stored on the layer.
+    h.get_by_label("Add annotation").click();
+    h.run_steps(2);
+    assert_eq!(h.state().doc.node(f).annotations, ["Note"]);
+    // Padding and the gap between the two children, as hovering shows them.
+    let n = h.state().doc.node(f).clone();
+    let bands = crate::canvas::spacing_bands(&h.state().doc, f);
+    let pads = n.layout.padding.iter().filter(|p| **p > 0.0).count();
+    assert_eq!(bands.len(), pads + 1, "{bands:?}");
+    assert_eq!(bands.last().unwrap().1, n.layout.gap);
+    // Hovering it in Dev Mode draws them (and the annotation) without trouble.
+    let c = s(&h, n.rect.center().x, n.rect.min.y + 2.0);
+    move_to(&mut h, c, Modifiers::NONE);
+    h.run_steps(2);
+}
+
+/// Windows and Linux send Ctrl as both `ctrl` and `command`; egui's text editor treats Ctrl U and
+/// Ctrl K as "delete to paragraph start / end". Formatting and linking must not do that too.
+#[test]
+fn pc_ctrl_shortcuts_while_editing_text_keep_the_text() {
+    let mut h = harness();
+    let mut t = Node::new(Kind::Text, r(0., 0., 200., 10.));
+    t.text = "Hello world".into();
+    let id = h.state_mut().doc.insert(0, None, None, t);
+    h.state_mut().sel = vec![id];
+    h.run_steps(2);
+    let p = s(&h, 20., 5.);
+    h.run_steps(30);
+    move_to(&mut h, p, Modifiers::NONE);
+    for _ in 0..2 {
+        press(&mut h, p, true, Modifiers::NONE);
+        press(&mut h, p, false, Modifiers::NONE);
+    }
+    h.run_steps(3);
+    assert_eq!(h.state().editing_text, Some(id), "double-click edits the text");
+    select_chars(&mut h, 6, 11);
+    h.run_steps(1);
+    let pc = Modifiers { ctrl: true, command: true, ..Default::default() };
+    key(&mut h, pc, Key::U);
+    assert_eq!(h.state().doc.node(id).text, "Hello world", "Ctrl U underlines without deleting");
+    select_chars(&mut h, 0, 5);
+    h.run_steps(1);
+    key(&mut h, pc, Key::K);
+    assert_eq!(h.state().doc.node(id).text, "Hello world", "Ctrl K links without deleting");
+}
+
+#[test]
+fn cursor_chat_shows_by_the_cursor_for_everyone_then_fades() {
+    let (mut a, mut b) = pair();
+    let ada = client(&a);
+    let p = s(&a, 100., 100.);
+    move_to(&mut a, p, Modifiers::NONE);
+    key(&mut a, Modifiers::NONE, Key::Slash);
+    assert!(a.state().chat.is_some(), "/ opens cursor chat");
+    a.event(Event::Text("Hello there".into()));
+    a.run_steps(2);
+    // While typing, letters are text, not tool shortcuts.
+    key(&mut a, Modifiers::NONE, Key::R);
+    assert_eq!(a.state().tool, Tool::Move);
+    assert_eq!(a.state().chat.as_ref().map(|c| c.0.as_str()), Some("Hello there"));
+    settle(&mut a, &mut b, &|_, b| peer(b, ada).is_some_and(|p| p.chat.as_deref() == Some("Hello there")));
+    assert_eq!(peer(b.state(), ada).and_then(|p| p.chat.clone()).as_deref(), Some("Hello there"), "Bo sees the bubble");
+    assert!(!b.state().dirty, "presence isn't a change to the file");
+    // Escape cancels it for everyone.
+    key(&mut a, Modifiers::NONE, Key::Escape);
+    assert!(a.state().chat.is_none());
+    settle(&mut a, &mut b, &|_, b| peer(b, ada).is_some_and(|p| p.chat.is_none()));
+    assert!(peer(b.state(), ada).is_some_and(|p| p.chat.is_none()));
+    // A message left alone fades away after a few seconds.
+    key(&mut a, Modifiers::NONE, Key::Slash);
+    a.event(Event::Text("Brb".into()));
+    a.run_steps(2);
+    assert!(a.state().chat.is_some());
+    a.run_steps(60 * 6);
+    assert!(a.state().chat.is_none(), "faded out");
+}
+
+#[test]
+fn follow_and_spotlight_track_the_leaders_page_and_view() {
+    let (mut a, mut b) = pair();
+    let ada = client(&a);
+    let center = |h: &App| h.view.to_world(h.canvas_rect.unwrap().center());
+    // Bo follows Ada; she zooms in elsewhere and moves to another page.
+    b.state_mut().toggle_follow(ada);
+    a.state_mut().view = crate::render::View { pan: vec2(-300., -200.), zoom: 2.0 };
+    settle(&mut a, &mut b, &|a, b| (center(a) - center(b)).length() < 0.5 && (a.view.zoom - b.view.zoom).abs() < 1e-3);
+    assert!((center(a.state()) - center(b.state())).length() < 0.5, "Bo sees what Ada sees");
+    assert_eq!(b.state().view.zoom, a.state().view.zoom);
+    a.state_mut().doc.pages.push(crate::doc::Page { name: "Two".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, guides: vec![], prototype: Default::default() });
+    a.state_mut().select_page(1);
+    settle(&mut a, &mut b, &|_, b| b.page == 1);
+    assert_eq!(b.state().page, 1, "follows to the other page");
+    assert_eq!(b.state().following, Some(ada));
+    // Bo pans by hand: he takes over and stops following.
+    key(&mut b, Modifiers::NONE, Key::H);
+    let p = b.state().canvas_rect.unwrap().center();
+    drag(&mut b, p, p + vec2(80., 0.), Modifiers::NONE);
+    key(&mut b, Modifiers::NONE, Key::V);
+    assert_eq!(b.state().following, None, "a manual pan stops following");
+    // Spotlight: Ada asks everyone to follow her; Bo does, with a notice, until Escape.
+    a.state_mut().toggle_spotlight();
+    settle(&mut a, &mut b, &|_, b| b.following == Some(ada));
+    assert_eq!(b.state().following, Some(ada));
+    assert!(b.state().toast.as_ref().is_some_and(|t| t.0.contains("spotlighting")));
+    key(&mut b, Modifiers::NONE, Key::Escape);
+    assert_eq!(b.state().following, None, "Escape stops following");
+    // Ending the spotlight ends following for those still on it.
+    b.state_mut().toggle_follow(ada);
+    a.state_mut().toggle_spotlight();
+    settle(&mut a, &mut b, &|_, b| b.following.is_none());
+    assert_eq!(b.state().following, None);
+}
+
+#[test]
+fn others_see_my_selection_and_text_caret() {
+    let (mut a, mut b) = pair();
+    let ada = client(&a);
+    let mut t = Node::new(Kind::Text, r(0., 0., 200., 40.));
+    t.text = "Hello".into();
+    let id = a.state_mut().doc.insert(0, None, None, t);
+    a.state_mut().sel = vec![id];
+    a.state_mut().editing_text = Some(id);
+    a.state_mut().focus_text = true;
+    a.run_steps(3);
+    a.event(Event::Text("!".into()));
+    a.run_steps(2);
+    assert!(a.state().caret.is_some(), "the editor reports its caret");
+    // The caret can still move a frame later (the typed text lands), so compare with Ada's latest.
+    settle(&mut a, &mut b, &|a, b| peer(b, ada).is_some_and(|p| a.caret.is_some_and(|c| p.caret == Some((id, c))) && p.selection == [id]));
+    let p = peer(b.state(), ada).unwrap();
+    assert_eq!(p.caret, Some((id, a.state().caret.unwrap())), "Bo sees where Ada types");
+    assert_eq!(p.selection, vec![id]);
+    // Bo's canvas draws them (name tag and caret) without trouble.
+    b.run_steps(2);
+}
+
+#[test]
+fn comments_filter_mention_and_track_unread() {
+    use crate::comments::{Filter, complete_mention, mention_query, mentions};
+    use crate::doc::Comment;
+    let mut h = harness();
+    let st = h.state_mut();
+    st.collab_name = "Ada".into();
+    let mk = |id: u64, msgs: &[(&str, &str)], resolved: bool| Comment {
+        id,
+        page: 0,
+        at: pos2(60. * id as f32, 60.),
+        anchor: None,
+        messages: msgs.iter().map(|(w, t)| (w.to_string(), t.to_string(), 0)).collect(),
+        resolved,
+    };
+    st.doc.comments = vec![mk(1, &[("Ada", "Mine")], false), mk(2, &[("Luna", "Hey @Ada look")], false), mk(3, &[("Luna", "Done, @Adam")], true)];
+    st.read_all_comments();
+    // Luna replies later: that thread is unread for Ada.
+    st.doc.comments[0].messages.push(("Luna".into(), "A reply".into(), 0));
+    assert!(st.unread(&st.doc.comments[0].clone()) && !st.unread(&st.doc.comments[1].clone()));
+    let ids = |st: &mut App, f: Filter| {
+        st.comment_filter = f;
+        st.filtered_comments().iter().map(|c| c.id).collect::<Vec<_>>()
+    };
+    assert_eq!(ids(st, Filter::All), vec![1, 2, 3]);
+    assert_eq!(ids(st, Filter::Unresolved), vec![1, 2]);
+    assert_eq!(ids(st, Filter::Resolved), vec![3]);
+    assert_eq!(ids(st, Filter::Mine), vec![1]);
+    assert_eq!(ids(st, Filter::Mentions), vec![2], "@Adam isn't @Ada");
+    // Opening the thread reads it; Mark as unread brings the dot back and closes it.
+    st.comment_filter = Filter::All;
+    st.show_comments = true;
+    st.open_comment = Some(1);
+    h.run_steps(2);
+    assert!(!h.state().unread(&h.state().doc.comments[0]));
+    h.get_by_label("Mark as unread").click();
+    h.run_steps(2);
+    assert!(h.state().unread(&h.state().doc.comments[0]));
+    assert_eq!(h.state().open_comment, None);
+    // Typing @ in a reply suggests people; picking one completes the name.
+    assert_eq!(mention_query("hi @Lu"), Some("Lu"));
+    assert_eq!(mention_query("mail a@b"), None);
+    let mut t = "hi @Lu".to_string();
+    complete_mention(&mut t, "Luna");
+    assert_eq!(t, "hi @Luna ");
+    assert!(mentions("hi @Luna, look", "Luna") && !mentions("hi @Lunatic", "Luna"));
+    h.state_mut().open_comment = Some(2);
+    h.state_mut().comment_reply = "Thanks @Lu".into();
+    h.run_steps(2);
+    h.get_by_label("@Luna").click();
+    h.run_steps(2);
+    assert_eq!(h.state().comment_reply, "Thanks @Luna ");
+}
+
+#[test]
+fn session_window_shows_status_and_the_host_removes_someone() {
+    let (mut a, mut b) = pair();
+    a.state_mut().show_collab = true;
+    a.run_steps(2);
+    a.get_by_label("Connected");
+    a.get_by_label("Copy");
+    a.get_by_label("Bo");
+    a.get_by_label("Remove").click();
+    settle(&mut a, &mut b, &|a, b| {
+        a.collab.as_ref().is_some_and(|c| c.peers.is_empty()) && b.collab.as_ref().is_some_and(|c| matches!(c.status, crate::collab::Status::Disconnected(_)))
+    });
+    assert!(a.state().collab.as_ref().unwrap().peers.is_empty(), "Bo is gone");
+    let status = b.state().collab.as_ref().unwrap().status.clone();
+    assert!(matches!(&status, crate::collab::Status::Disconnected(why) if why.contains("removed")), "{status:?}");
+    // Bo's window says so and offers to leave or try again.
+    b.state_mut().show_collab = true;
+    b.run_steps(2);
+    b.get_by_label("Try again");
+    b.get_by_label("Leave session").click();
+    b.run_steps(2);
+    assert!(b.state().collab.is_none());
+}
+
+/// A library file `kit.katachi` in `dir`: a Button component filled by a color style, and a
+/// hidden component. Ids come out the same each time, as in a real file saved again.
+fn write_library(dir: &std::path::Path, color: crate::doc::Rgba, published: u32) -> (std::path::PathBuf, NodeId) {
+    use crate::doc::{Document, Paint, StyleValue};
+    let mut lib = Document { id: "kit-id".into(), published: (published, 0), ..Default::default() };
+    let brand = lib.add_style("Brand".into(), StyleValue::Paint(vec![Paint::solid(color)]));
+    let mut b = Node::new(Kind::Component, r(0., 0., 80., 30.));
+    b.name = "Button".into();
+    b.fill_style = Some(brand);
+    let b = lib.insert(0, None, None, b);
+    let mut t = Node::new(Kind::Text, r(10., 5., 40., 20.));
+    (t.name, t.text) = ("Label".into(), "OK".into());
+    lib.insert(0, Some(b), None, t);
+    let mut hidden = Node::new(Kind::Component, r(200., 0., 10., 10.));
+    hidden.name = ".Internal".into();
+    lib.insert(0, None, None, hidden);
+    lib.reflow();
+    let path = dir.join("kit.katachi");
+    crate::files::write_atomic(&path, crate::doc::file_json(&lib).as_bytes()).unwrap();
+    (path, b)
+}
+
+fn temp_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("katachi-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn library_components_place_update_detach_and_relink() {
+    use crate::doc::Rgba;
+    let (blue, red) = (Rgba::rgb(0, 0, 255), Rgba::rgb(255, 0, 0));
+    let dir = temp_dir("libs");
+    let (kit, _) = write_library(&dir, blue, 0);
+    let mut h = harness();
+    assert!(h.state_mut().save_to(dir.join("app.katachi")));
+    assert!(!h.state().doc.id.is_empty(), "the first save gives the file an id");
+    h.state_mut().add_library(kit.clone());
+    assert_eq!(h.state().doc.libraries[0].path, "kit.katachi", "stored relative to the file");
+    // Assets lists the library's components (not hidden ones); a click places an instance.
+    h.state_mut().left_tab_assets = true;
+    h.run_steps(3);
+    assert!(h.query_by_label(".Internal").is_none(), "hidden components aren't offered");
+    h.get_all_by_label("Button").max_by(|a, b| a.rect().height().total_cmp(&b.rect().height())).unwrap().click();
+    h.run_steps(2);
+    let inst = h.state().sel[0];
+    let comp = h.state().doc.node(inst).component.unwrap();
+    let st = h.state();
+    assert!(st.doc.node(comp).remote.is_some() && !st.doc.pages[0].children.contains(&comp), "the main is a hidden library copy");
+    assert_eq!(st.doc.node(inst).fills[0].color, blue);
+    assert!(st.doc.styles.iter().any(|s| s.name == "Brand" && s.remote.is_some()), "its style came along");
+    // Dragging a tile works too.
+    let tile = h.get_all_by_label("Button").max_by(|a, b| a.rect().height().total_cmp(&b.rect().height())).unwrap().rect().center();
+    drag(&mut h, tile, pos2(900.0, 600.0), Modifiers::NONE);
+    assert_eq!(h.state().doc.nodes.values().filter(|n| n.component == Some(comp) && n.kind == Kind::Instance).count(), 2, "both use one copy");
+    // Override the label; then the library changes on disk.
+    let label = h.state().doc.node(inst).children[0];
+    h.state_mut().doc.node_mut(label).text = "Buy".into();
+    write_library(&dir, red, 0);
+    // Regaining focus re-checks libraries and shows the notice.
+    h.state_mut().focused = false;
+    h.run_steps(2);
+    assert!(h.state().lib_updates.iter().any(|c| c.name == "Brand"), "{:?}", h.state().lib_updates);
+    h.get_by_label("Review").click();
+    // A few frames for the dialog to settle where it's centered.
+    h.run_steps(5);
+    h.get_by_label("Update all").click();
+    h.run_steps(2);
+    let st = h.state();
+    assert!(st.lib_updates.is_empty(), "{:?}", st.lib_updates);
+    assert_eq!(st.doc.node(inst).fills[0].color, red, "the instance follows the library");
+    assert_eq!(st.doc.node(label).text, "Buy", "and keeps its override");
+    // Go to main component opens the library file instead.
+    h.state_mut().go_to_main(inst);
+    assert_eq!(h.state().want, Some(crate::app::Want::Open(kit.clone())));
+    // A renamed library is found again by its id.
+    let moved = dir.join("design-system.katachi");
+    std::fs::rename(&kit, &moved).unwrap();
+    h.state_mut().refresh_libraries();
+    assert_eq!(h.state().doc.libraries[0].path, "design-system.katachi");
+    // A deleted one shows as missing in the Libraries dialog; the file still renders.
+    std::fs::remove_file(&moved).unwrap();
+    h.state_mut().refresh_libraries();
+    h.state_mut().show_libraries = true;
+    h.run_steps(2);
+    assert!(h.query_by_label("Missing").is_some() && h.query_by_label("Relink…").is_some());
+    assert_eq!(h.state().doc.node(inst).fills[0].color, red);
+    // Detaching a library instance leaves a plain frame.
+    h.state_mut().show_libraries = false;
+    h.state_mut().sel = vec![inst];
+    h.state_mut().detach_selection();
+    assert_eq!(h.state().doc.node(inst).kind, Kind::Frame);
+}
+
+#[test]
+fn library_styles_apply_and_move_to_this_file() {
+    let dir = temp_dir("lib-styles");
+    let (kit, _) = write_library(&dir, crate::doc::Rgba::rgb(0, 128, 0), 0);
+    let mut h = harness();
+    h.state_mut().add_library(kit);
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (50.0, 50.0));
+    // The fill's Styles menu lists the library's styles under its name.
+    h.get_all_by_label("Styles").next().unwrap().click();
+    h.run_steps(2);
+    assert!(h.query_by_label("kit").is_some(), "the library's section");
+    h.get_by_label("Brand").click();
+    h.run_steps(2);
+    let st = h.state();
+    let sid = st.doc.node(id).fill_style.unwrap();
+    assert!(st.doc.style(sid).unwrap().remote.is_some());
+    assert_eq!(st.doc.node(id).fills[0].color, crate::doc::Rgba::rgb(0, 128, 0));
+    // With nothing selected, Library styles offer "Move to this file".
+    h.state_mut().sel.clear();
+    h.run_steps(2);
+    h.get_by_label("Move to this file").click();
+    h.run_steps(2);
+    assert!(h.state().doc.style(sid).unwrap().remote.is_none(), "now a local style");
+}
+
+#[test]
+fn publishing_a_library_saves_a_version_consumers_wait_for() {
+    let dir = temp_dir("publish");
+    let mut h = harness();
+    crate::plugins::run(&mut h.state_mut().doc, 0, &[], "const k = figma.createComponent(); k.name = 'Chip';").unwrap();
+    let path = dir.join("lib.katachi");
+    assert!(h.state_mut().save_to(path.clone()));
+    h.state_mut().left_tab_assets = true;
+    h.run_steps(2);
+    h.get_by_label("Publish library").click();
+    h.run_steps(2);
+    let saved = crate::library::read(&path).unwrap();
+    assert_eq!(saved.published.0, 1);
+    assert_eq!(saved.id, h.state().doc.id);
+    // A file using it takes Chip; an unpublished edit isn't offered, the next publish is.
+    let mut doc = crate::doc::Document::default();
+    let chip = saved.nodes.values().find(|n| n.name == "Chip").unwrap().id;
+    crate::library::Import::new(&doc, &saved.id, &saved).component(&mut doc, chip).unwrap();
+    h.state_mut().doc.node_mut(chip).radius = 8.0;
+    assert!(h.state_mut().save_to(path.clone()));
+    assert!(crate::library::changes(&doc, &saved.id, &crate::library::read(&path).unwrap()).is_empty());
+    h.state_mut().publish_library();
+    assert_eq!(crate::library::changes(&doc, &saved.id, &crate::library::read(&path).unwrap()).len(), 1);
+}
+
+#[test]
+fn plugins_and_agents_import_library_components_by_key() {
+    isolate_data();
+    let dir = temp_dir("lib-plugin");
+    let (kit, button) = write_library(&dir, crate::doc::Rgba::rgb(0, 0, 255), 0);
+    let mut app = App::new(None);
+    app.add_library(kit);
+    let ctx = egui::Context::default();
+    ctx.begin_pass(Default::default());
+    let _ = ctx.end_pass();
+    let list = app.mcp_tool(&ctx, "get_components", &serde_json::json!({}));
+    let text = list["content"][0]["text"].as_str().unwrap();
+    let key = format!("kit-id:{button}");
+    assert!(text.contains(&key) && text.contains("\"library\":\"kit\"") && !text.contains("Internal"), "{text}");
+    let code = format!("const c = await figma.importComponentByKeyAsync('{key}'); const i = c.createInstance(); i.x = 40; figma.currentPage.appendChild(i); return c.key;");
+    let out = app.mcp_tool(&ctx, "execute_code", &serde_json::json!({ "code": code }));
+    assert_ne!(out["isError"], true, "{out}");
+    let inst = app.doc.pages[0].children[0];
+    let comp = app.doc.node(inst).component.unwrap();
+    assert!(app.doc.node(comp).remote.is_some(), "the instance uses the library copy");
+    assert_eq!(app.doc.node(inst).rect.min.x, 40.0);
+    // Already copied: found straight away (and its instances' mainComponent too).
+    let again = app.mcp_tool(&ctx, "execute_code", &serde_json::json!({ "code": format!("const c = await figma.importComponentByKeyAsync('{key}'); return [c.name, figma.currentPage.children[0].mainComponent.key];") }));
+    assert!(again["content"][0]["text"].as_str().unwrap().contains(&key), "{again}");
+    let bad = app.mcp_tool(&ctx, "execute_code", &serde_json::json!({ "code": "await figma.importComponentByKeyAsync('nope:1')" }));
+    assert_eq!(bad["isError"], true);
 }

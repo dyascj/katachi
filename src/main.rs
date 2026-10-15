@@ -11,6 +11,7 @@ mod export;
 mod fig_import;
 mod files;
 mod kiwi;
+mod library;
 mod macos_open;
 mod mcp;
 mod mcp_tools;
@@ -53,13 +54,23 @@ fn main() -> eframe::Result {
     }
     let path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
     macos_open::install();
+    let transparent = !cfg!(target_os = "linux") || appearance::load().glass;
+    appearance::TRANSPARENT_WINDOW.store(transparent, std::sync::atomic::Ordering::Relaxed);
+    // Linux: tabs sit in the title bar with Katachi's own window buttons, as in Figma's desktop app.
+    let own_frame = cfg!(target_os = "linux") && !settings::load().system_title_bar;
+    shell::OWN_FRAME.store(own_frame, std::sync::atomic::Ordering::Relaxed);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Katachi")
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([800.0, 500.0])
-            // Always transparent so glass can switch on without a restart; opaque otherwise.
-            .with_transparent(true)
+            // macOS and Windows: always transparent, so glass can switch on without a restart.
+            // Linux: only with glass on at launch. Transparent windows draw black or garbled
+            // without a compositor and on some drivers, so the default window stays opaque.
+            .with_transparent(transparent)
+            // Wayland and X11 match the window to katachi.desktop by this id (taskbar icon, pinning).
+            .with_app_id("io.github.dyascj.Katachi")
+            .with_decorations(!own_frame)
             // macOS: Katachi draws its own title bar (so it can be glass too); the traffic lights sit on it.
             .with_fullsize_content_view(true)
             .with_titlebar_shown(false)
@@ -102,27 +113,44 @@ fn setup_style(ctx: &egui::Context) {
             break;
         }
     }
+    // Monospace text (code in Dev Mode) falls back to Inter for glyphs its fonts lack.
+    fonts.families.get_mut(&FontFamily::Monospace).unwrap().push("Inter".into());
     ctx.set_fonts(fonts);
     ctx.options_mut(|o| o.zoom_with_keyboard = false);
     appearance::apply(ctx, &appearance::load());
 }
 
+/// The file to serve: a new document if it doesn't exist yet, an error if it can't be read.
+fn load_or_new(file: Option<&std::path::Path>) -> Result<doc::Document, String> {
+    match file {
+        Some(f) if f.exists() => {
+            let text = std::fs::read_to_string(f).map_err(|e| format!("couldn't read {}: {e}", f.display()))?;
+            doc::parse_file(&text).map_err(|e| format!("couldn't open {}: {e}", f.display()))
+        }
+        _ => Ok(doc::Document::default()),
+    }
+}
+
 fn serve_headless(args: &[String]) {
     let port: u16 = args.iter().position(|a| a == "--port").and_then(|i| args.get(i + 1)).and_then(|p| p.parse().ok()).unwrap_or(7878);
     let file = args.iter().find(|a| !a.starts_with("--") && a.parse::<u16>().is_err()).map(std::path::PathBuf::from);
-    let doc = file
-        .as_ref()
-        .and_then(|f| std::fs::read_to_string(f).ok())
-        .and_then(|s| doc::parse_file(&s).ok())
-        .unwrap_or_default();
+    let doc = match load_or_new(file.as_deref()) {
+        Ok(d) => d,
+        Err(e) => {
+            // Saving over a file that didn't load would wipe it.
+            eprintln!("katachi serve: {e}");
+            std::process::exit(1);
+        }
+    };
     let listener = std::net::TcpListener::bind(("0.0.0.0", port)).expect("port in use");
-    let shared = collab::serve(listener, doc);
-    println!("Katachi session on {}:{port}", collab::local_ip());
+    let relay = collab::serve(listener, doc, collab::session_token());
+    println!("Katachi session on {}:{port}/{}", collab::local_ip(), relay.token);
+    println!("Share the whole address, code included: anyone without it is turned away.");
     let mut last = String::new();
     loop {
         std::thread::sleep(std::time::Duration::from_secs(5));
         if let Some(f) = &file {
-            let json = doc::file_json(&shared.lock().unwrap());
+            let json = doc::file_json(&relay.doc.lock().unwrap());
             if json != last {
                 let _ = files::write_atomic(f, json.as_bytes());
                 last = json;

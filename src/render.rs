@@ -272,6 +272,83 @@ pub fn blur_rgba(px: &mut [u8], w: usize, h: usize, sigma: f32) {
     }
 }
 
+/// A blur that varies across the image: `t(x, y)` (0..1) goes from `sigma0` to `sigma1`. Blends
+/// a few uniformly blurred copies, which is plenty for a smooth ramp.
+pub fn blur_ramp(px: &mut [u8], w: usize, h: usize, sigma0: f32, sigma1: f32, t: impl Fn(usize, usize) -> f32) {
+    const LEVELS: usize = 4;
+    let levels: Vec<Vec<u8>> = (0..=LEVELS)
+        .map(|k| {
+            let mut c = px.to_vec();
+            blur_rgba(&mut c, w, h, sigma0 + (sigma1 - sigma0) * k as f32 / LEVELS as f32);
+            c
+        })
+        .collect();
+    for y in 0..h {
+        for x in 0..w {
+            let f = t(x, y).clamp(0.0, 1.0) * LEVELS as f32;
+            let k = (f as usize).min(LEVELS - 1);
+            let a = f - k as f32;
+            let i = (y * w + x) * 4;
+            for c in i..i + 4 {
+                px[c] = (levels[k][c] as f32 * (1.0 - a) + levels[k + 1][c] as f32 * a).round() as u8;
+            }
+        }
+    }
+}
+
+/// Figma's glass, approximated over a backdrop `px` (premultiplied RGBA) inside the layer's
+/// shape `mask`: frosted by the effect's blur, bent near the edges as by a lens `depth` thick
+/// (pulling in what's just outside), split into slight color fringes there, and lit along the
+/// rim facing the light with a fainter catch and a soft shade on the far side. Lengths are
+/// scaled to pixels by `scale`.
+pub fn glass(px: &mut [u8], mask: &[u8], w: usize, h: usize, s: &crate::doc::Shadow, scale: f32) {
+    let g = s.glass;
+    blur_rgba(px, w, h, s.blur / 2.0 * scale);
+    let depth = (g.depth * scale).max(1.0);
+    // The shape softened over the lens depth: 0.5 on its edge, rising to 1 a depth inside.
+    let mut soft = mask.to_vec();
+    blur_rgba(&mut soft, w, h, depth / 2.0);
+    let at = |x: isize, y: isize| soft[(y.clamp(0, h as isize - 1) as usize * w + x.clamp(0, w as isize - 1) as usize) * 4 + 3] as f32 / 255.0;
+    let src = px.to_vec();
+    // Bilinear sample of one channel.
+    let sample = |x: f32, y: f32, c: usize| {
+        let (x, y) = (x.clamp(0.0, w as f32 - 1.0), y.clamp(0.0, h as f32 - 1.0));
+        let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+        let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+        let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+        let p = |x: usize, y: usize| src[(y * w + x) * 4 + c] as f32;
+        (p(x0, y0) * (1.0 - fx) + p(x1, y0) * fx) * (1.0 - fy) + (p(x0, y1) * (1.0 - fx) + p(x1, y1) * fx) * fy
+    };
+    let ray = Vec2::angled(-g.angle.to_radians());
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            if mask[i + 3] == 0 {
+                continue;
+            }
+            let (xi, yi) = (x as isize, y as isize);
+            let slope = vec2(at(xi + 1, yi) - at(xi - 1, yi), at(xi, yi + 1) - at(xi, yi - 1));
+            let out = if slope.length() > 1e-5 { -slope.normalized() } else { Vec2::ZERO };
+            // 1 on the edge, 0 a depth inside.
+            let edge = ((1.0 - at(xi, yi)) * 2.0).clamp(0.0, 1.0);
+            let bend = out * edge * edge * g.refraction * depth;
+            let (fx, fy) = (x as f32, y as f32);
+            for (c, k) in [(0, 1.0 + g.dispersion * 0.3), (1, 1.0), (2, 1.0 - g.dispersion * 0.3), (3, 1.0)] {
+                px[i + c] = sample(fx + bend.x * k, fy + bend.y * k, c).round() as u8;
+            }
+            let facing = out.dot(-ray);
+            let rim = edge.powi(3);
+            let light = g.light * rim * (facing.max(0.0).powi(2) + 0.35 * (-facing).max(0.0).powi(2));
+            let shade = 1.0 - 0.25 * g.light * rim * (-facing).max(0.0);
+            let a = px[i + 3] as f32;
+            for c in i..i + 3 {
+                let v = px[c] as f32 * shade;
+                px[c] = (v + light * (a - v)).round().clamp(0.0, a) as u8;
+            }
+        }
+    }
+}
+
 /// Cut a path into dashes following `pattern` (on, off, on, off, ...), in screen units.
 pub fn dashed(path: &Path, pattern: &[f32]) -> Path {
     use lyon::path::Event;
@@ -279,9 +356,12 @@ pub fn dashed(path: &Path, pattern: &[f32]) -> Path {
     let pattern: Vec<f32> = if pattern.len() % 2 == 1 { pattern.iter().chain(pattern).copied().collect() } else { pattern.to_vec() };
     let total: f32 = pattern.iter().sum();
     let mut b = Path::builder();
-    if total <= 0.0 {
+    // Dashes under a pixel look solid anyway, and millions of them would freeze the canvas.
+    if !(total >= 1.0) || pattern.iter().any(|d| !d.is_finite() || *d < 0.0) {
         return path.clone();
     }
+    const MAX_DASHES: usize = 20_000;
+    let mut dashes = 0;
     let (mut idx, mut left, mut on, mut open) = (0usize, pattern[0], true, false);
     for ev in path.iter().flattened(0.15) {
         match ev {
@@ -310,6 +390,10 @@ pub fn dashed(path: &Path, pattern: &[f32]) -> Path {
                         if on && open {
                             b.end(false);
                             open = false;
+                            dashes += 1;
+                            if dashes > MAX_DASHES {
+                                return path.clone();
+                            }
                         }
                         idx = (idx + 1) % pattern.len();
                         left = pattern[idx];
@@ -363,7 +447,8 @@ impl Textures {
 
     fn gradient(&mut self, ctx: &egui::Context, p: &Paint) -> TextureId {
         let mut h = DefaultHasher::new();
-        (p.kind as u8, p.from.x.to_bits(), p.from.y.to_bits(), p.to.x.to_bits(), p.to.y.to_bits()).hash(&mut h);
+        let w = p.width_point();
+        (p.kind as u8, p.from.x.to_bits(), p.from.y.to_bits(), p.to.x.to_bits(), p.to.y.to_bits(), w.x.to_bits(), w.y.to_bits()).hash(&mut h);
         for (t, c) in &p.stops {
             (t.to_bits(), c.0).hash(&mut h);
         }
@@ -420,27 +505,18 @@ impl Textures {
         Some(id)
     }
 
-    /// Blurred backdrop masked to a layer's shape (see `export::backdrop_parts`).
-    fn backdrop(&mut self, ctx: &egui::Context, (content, mask, _, blur): (String, String, Rect, f32), scale: f32) -> Option<TextureId> {
+    /// Blurred or glassed backdrop masked to a layer's shape (see `export::backdrop_parts`).
+    fn backdrop(&mut self, ctx: &egui::Context, n: &Node, parts: &(String, String, Rect), scale: f32) -> Option<TextureId> {
         let mut h = DefaultHasher::new();
-        (&content, &mask, blur.to_bits(), scale.to_bits()).hash(&mut h);
+        let fx = n.shadows.iter().find(|s| s.visible && s.kind.is_backdrop());
+        (&parts.0, &parts.1, format!("{fx:?} {:?} {}", n.rect, n.rotation), scale.to_bits()).hash(&mut h);
         let key = h.finish();
         self.used.insert(key);
         self.last_key = key;
         if let Some(t) = self.rasters.get(&key) {
             return Some(t.id());
         }
-        let (mut px, size) = crate::export::rasterize(&content, scale)?;
-        let (m, msize) = crate::export::rasterize(&mask, scale)?;
-        if msize != size {
-            return None;
-        }
-        blur_rgba(&mut px, size[0], size[1], blur / 2.0 * scale);
-        for (p, a) in px.chunks_exact_mut(4).zip(m.chunks_exact(4).map(|c| c[3] as u32)) {
-            for c in p.iter_mut() {
-                *c = (*c as u32 * a / 255) as u8;
-            }
-        }
+        let (px, size) = crate::export::backdrop_pixels(n, parts, scale)?;
         let t = ctx.load_texture(format!("backdrop-{key}"), ColorImage::from_rgba_premultiplied(size, &px), TextureOptions::LINEAR);
         let id = t.id();
         self.rasters.insert(key, t);
@@ -456,8 +532,7 @@ impl Textures {
             self.images.retain(|k, _| !k.starts_with(&prefix));
         }
         let entry = self.images.entry(cache).or_insert_with(|| {
-            let bytes = doc.images.get(key)?;
-            let mut img = image::load_from_memory(bytes).ok()?.to_rgba8();
+            let (mut img, size) = gpu_image(ctx, doc.images.get(key)?, 2)?;
             adj.apply(&mut img);
             let (w, h) = (img.width() as usize, img.height() as usize);
             let mut padded = vec![0u8; (w + 2) * (h + 2) * 4];
@@ -467,7 +542,7 @@ impl Textures {
                 padded[at..at + w * 4].copy_from_slice(src);
             }
             let color = ColorImage::from_rgba_unmultiplied([w + 2, h + 2], &padded);
-            Some((ctx.load_texture(format!("image-{key}-{adj:?}"), color, TextureOptions::LINEAR), vec2(w as f32, h as f32)))
+            Some((ctx.load_texture(format!("image-{key}-{adj:?}"), color, TextureOptions::LINEAR), size))
         });
         entry.as_ref().map(|(t, s)| (t.id(), *s))
     }
@@ -480,7 +555,7 @@ impl Textures {
             self.tiles.retain(|k, _| !k.starts_with(&prefix));
         }
         let entry = self.tiles.entry(cache).or_insert_with(|| {
-            let mut img = image::load_from_memory(doc.images.get(key)?).ok()?.to_rgba8();
+            let (mut img, _) = gpu_image(ctx, doc.images.get(key)?, 0)?;
             adj.apply(&mut img);
             let color = ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
             let opts = TextureOptions { wrap_mode: egui::TextureWrapMode::Repeat, ..TextureOptions::LINEAR };
@@ -488,6 +563,20 @@ impl Textures {
         });
         entry.as_ref().map(|t| t.id())
     }
+}
+
+/// Decode an embedded image for upload, shrunk to the GPU's largest texture (less `pad` pixels
+/// of border); wgpu rejects bigger ones. Also returns the original pixel size, which layout uses.
+fn gpu_image(ctx: &egui::Context, bytes: &[u8], pad: u32) -> Option<(image::RgbaImage, Vec2)> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let size = vec2(img.width() as f32, img.height() as f32);
+    let max = match ctx.input(|i| i.max_texture_side) {
+        0 => 8192,
+        m => m as u32,
+    } - pad;
+    // ponytail: the 1px Fit border is placed for the original size, under a texel off when shrunk.
+    let img = if img.width().max(img.height()) > max { img.resize(max, max, image::imageops::FilterType::Triangle) } else { img };
+    Some((img.to_rgba8(), size))
 }
 
 struct NodeRaster {
@@ -527,7 +616,7 @@ fn paint_geo(painter: &Painter, sc: &mut Scene, n: &Node, geo: VertexBuffers<Pos
     };
     let (tex, uv): (TextureId, Box<dyn Fn(Pos2) -> Pos2>) = match p.kind {
         PaintKind::Solid => return void(painter.add(to_mesh(geo, p.color.to32().gamma_multiply(a)))),
-        PaintKind::Linear | PaintKind::Radial => (sc.tex.gradient(ctx, p), Box::new(unit)),
+        PaintKind::Linear | PaintKind::Radial | PaintKind::Angular | PaintKind::Diamond => (sc.tex.gradient(ctx, p), Box::new(unit)),
         PaintKind::Image if p.scale_mode == crate::doc::ScaleMode::Tile => match (sc.tex.image_tile(ctx, sc.doc, &p.image, &p.adjust), sc.tex.image(ctx, sc.doc, &p.image, &p.adjust)) {
             (Some(id), Some((_, size))) => {
                 let tile = size * p.tile_scale.max(0.01);
@@ -609,7 +698,7 @@ fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
         } else if !matches!(n.kind, Kind::Group | Kind::Boolean) {
             painter.add(stroke_mesh(&node_path(n, &v, 0.0), 1.0, gray));
         }
-        for &c in &n.children {
+        for c in n.paint_order() {
             draw_node(painter, sc, c, alpha);
         }
         return;
@@ -631,7 +720,7 @@ fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
     let reach = n.stroke_width.max(n.shadows.iter().map(|s| s.blur + s.spread + s.offset.length()).fold(0.0, f32::max));
     let ppp = painter.ctx().pixels_per_point();
     let on_screen = painter.clip_rect().intersects(screen.expand(reach * v.zoom + 2.0));
-    if on_screen && n.shadows.iter().any(|s| s.visible && s.kind == EffectKind::BackgroundBlur) {
+    if on_screen && n.shadows.iter().any(|s| s.visible && s.kind.is_backdrop()) {
         // What shows through depends on the layers overlapping this one on its page.
         let area = n.aabb().expand(64.0);
         let page = sc.doc.page_of(id);
@@ -647,9 +736,9 @@ fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
         let scale = bucket(v.zoom * ppp);
         let tex = match sc.tex.cached_raster(id, 1, &deps, scale) {
             Some(t) => Some(t),
-            None => crate::export::backdrop_parts(sc.doc, id).and_then(|parts| {
+            None => crate::export::backdrop_parts(sc.doc, id, false).and_then(|parts| {
                 let region = parts.2;
-                sc.tex.backdrop(painter.ctx(), parts, scale).map(|t| {
+                sc.tex.backdrop(painter.ctx(), n, &parts, scale).map(|t| {
                     sc.tex.store_raster(id, 1, &deps, scale, t, region);
                     (t, region)
                 })
@@ -663,9 +752,15 @@ fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
         // Masks only shape what's above them.
         return;
     }
+    // Blend modes, of layers or of single paints, need real compositing: the top-level layer
+    // holding them is drawn through resvg (paint blends then mix only within that layer).
+    let paint_blend = |d: &Node| d.fills.iter().chain(&d.strokes).any(|p| p.visible && p.blend != crate::doc::BlendMode::Normal);
     let needs_compositing = n.children.iter().any(|c| sc.doc.node(*c).is_mask)
-        || (n.parent.is_none() && sc.doc.descendants(id).iter().any(|d| sc.doc.node(*d).blend != crate::doc::BlendMode::Normal));
-    if Some(id) != sc.hide && (needs_compositing || n.shadows.iter().any(|s| s.visible && matches!(s.kind, EffectKind::InnerShadow | EffectKind::LayerBlur))) {
+        || (n.parent.is_none()
+            && (paint_blend(n) || sc.doc.descendants(id).iter().any(|d| sc.doc.node(*d).blend != crate::doc::BlendMode::Normal || paint_blend(sc.doc.node(*d)))));
+    // So do effects egui can't draw: blurs, inner shadows, grain, and shadows knocked out behind see-through layers.
+    let raster_fx = n.knocks_out_shadow() || n.shadows.iter().any(|s| s.visible && matches!(s.kind, EffectKind::InnerShadow | EffectKind::LayerBlur | EffectKind::Noise | EffectKind::Texture));
+    if Some(id) != sc.hide && (needs_compositing || raster_fx) {
         if !on_screen {
             return;
         }
@@ -676,7 +771,7 @@ fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
         let tex = match sc.tex.cached_raster(id, 0, &deps, scale) {
             Some(t) => Some(t),
             None => {
-                let svg = crate::export::to_svg(sc.doc, &[id]);
+                let svg = crate::export::svg_of(sc.doc, &[id], false);
                 let region = crate::export::export_bounds(sc.doc, &[id]);
                 sc.tex.raster(painter.ctx(), &svg, scale).map(|t| {
                     sc.tex.store_raster(id, 0, &deps, scale, t, region);
@@ -710,7 +805,7 @@ fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
     } else {
         painter.clone()
     };
-    for &c in &n.children.clone() {
+    for c in n.paint_order() {
         draw_node(&child_painter, sc, c, a);
     }
 }
@@ -791,6 +886,47 @@ fn draw_content(painter: &Painter, sc: &mut Scene, n: &Node, a: f32) {
                 draw_marker(painter, v.to_screen(tip), dir, m, w, c);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tiny_or_endless_dashes_draw_solid() {
+        let line = |len: f32| {
+            let mut b = Path::builder();
+            b.begin(point(0.0, 0.0));
+            b.line_to(point(len, 0.0));
+            b.end(false);
+            b.build()
+        };
+        let count = |p: &Path| p.iter().filter(|e| matches!(e, lyon::path::Event::Begin { .. })).count();
+        assert_eq!(count(&dashed(&line(1e7), &[0.1, 0.1])), 1, "a cycle under a pixel");
+        assert_eq!(count(&dashed(&line(1e7), &[2.0, 2.0])), 1, "millions of dashes");
+        assert_eq!(count(&dashed(&line(100.0), &[10.0, 10.0])), 5);
+    }
+
+    #[test]
+    fn blur_ramps_from_sharp_to_soft() {
+        // Black left half, white right half; rows blur more going down, so the edge softens.
+        let (w, h) = (40, 40);
+        let mut px: Vec<u8> = (0..w * h).flat_map(|i| if i % w < 20 { [0, 0, 0, 255] } else { [255; 4] }).collect();
+        blur_ramp(&mut px, w, h, 0.0, 6.0, |_, y| y as f32 / (h - 1) as f32);
+        let step = |y: usize| px[(y * w + 20) * 4] - px[(y * w + 19) * 4];
+        assert!(step(0) == 255 && step(0) > step(10) && step(10) > step(39) && step(39) < 40, "{} {} {}", step(0), step(10), step(39));
+    }
+
+    #[test]
+    fn huge_images_shrink_to_the_texture_limit() {
+        let ctx = egui::Context::default();
+        let max = ctx.input(|i| i.max_texture_side) as u32;
+        let mut png = vec![];
+        image::RgbaImage::new(max + 500, 4).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let (img, size) = gpu_image(&ctx, &png, 2).unwrap();
+        assert_eq!(img.width(), max - 2);
+        assert_eq!(size, vec2((max + 500) as f32, 4.0), "layout keeps the real size");
     }
 }
 

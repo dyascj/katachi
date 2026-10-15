@@ -159,9 +159,9 @@ const __NodeProto = {
     for (const k of Object.keys(props)) cp[k] = Object.assign({}, cp[k] || {}, { value: props[k] });
     this.componentProperties = cp;
   },
-  addComponentProperty(name, type, value) {
+  addComponentProperty(name, type, value, options) {
     this.componentPropertyDefinitions = this.componentPropertyDefinitions || {};
-    this.componentPropertyDefinitions[name] = { type, defaultValue: value };
+    this.componentPropertyDefinitions[name] = Object.assign({ type, defaultValue: value }, options && options.preferredValues ? { preferredValues: options.preferredValues } : {});
     return name;
   },
   editComponentProperty(name, def) {
@@ -171,6 +171,8 @@ const __NodeProto = {
     const next = def.name || name;
     delete d[name];
     d[next] = { type: old.type, defaultValue: def.defaultValue !== undefined ? def.defaultValue : old.defaultValue };
+    const preferred = def.preferredValues || old.preferredValues;
+    if (preferred) d[next].preferredValues = preferred;
     return next;
   },
   deleteComponentProperty(name) { delete (this.componentPropertyDefinitions || {})[name]; },
@@ -179,7 +181,8 @@ const __NodeProto = {
 function __nodeDefaults(src) {
   const keep = ["width", "height", "fills", "strokes", "strokeWeight", "strokeAlign", "cornerRadius", "effects", "opacity",
     "layoutMode", "itemSpacing", "paddingLeft", "paddingRight", "paddingTop", "paddingBottom", "primaryAxisAlignItems",
-    "counterAxisAlignItems", "primaryAxisSizingMode", "counterAxisSizingMode", "clipsContent", "layoutWrap", "counterAxisSpacing"];
+    "counterAxisAlignItems", "primaryAxisSizingMode", "counterAxisSizingMode", "clipsContent", "layoutWrap", "counterAxisSpacing",
+    "itemReverseZIndex", "gridColumnCount", "gridRowCount", "gridColumnGap", "gridRowGap", "exportSettings"];
   const o = {};
   for (const k of keep) if (src[k] !== undefined) o[k] = __copy(src[k]);
   return o;
@@ -190,14 +193,15 @@ const __base = {
   x: 0, y: 0, width: 100, height: 100, rotation: 0, opacity: 1, visible: true, locked: false, blendMode: "PASS_THROUGH", isMask: false,
   fills: [], strokes: [], strokeWeight: 1, strokeAlign: "INSIDE", dashPattern: [], strokeCap: "NONE", strokeJoin: "MITER",
   effects: [], cornerRadius: 0, constraints: { horizontal: "MIN", vertical: "MIN" },
-  layoutPositioning: "AUTO", layoutGrow: 0, layoutAlign: "INHERIT",
+  layoutPositioning: "AUTO", layoutGrow: 0, layoutAlign: "INHERIT", gridColumnSpan: 1, gridRowSpan: 1, exportSettings: [],
   minWidth: null, maxWidth: null, minHeight: null, maxHeight: null,
 };
 const __frameBase = {
   layoutMode: "NONE", layoutWrap: "NO_WRAP", itemSpacing: 0, counterAxisSpacing: 0,
   paddingLeft: 0, paddingRight: 0, paddingTop: 0, paddingBottom: 0,
   primaryAxisAlignItems: "MIN", counterAxisAlignItems: "MIN", primaryAxisSizingMode: "AUTO", counterAxisSizingMode: "FIXED",
-  clipsContent: true, strokesIncludedInLayout: false,
+  clipsContent: true, strokesIncludedInLayout: false, itemReverseZIndex: false,
+  gridColumnCount: 1, gridRowCount: 0, gridColumnGap: 0, gridRowGap: 0,
 };
 function __create(type, props) {
   const frameish = ["FRAME", "COMPONENT", "COMPONENT_SET", "INSTANCE", "SECTION"].includes(type);
@@ -235,6 +239,8 @@ const __CollectionProto = {
 };
 const __VariableProto = {
   setValueForMode(modeId, value) { this.valuesByMode[modeId] = __copy(value); },
+  setVariableCodeSyntax(platform, value) { this.codeSyntax = Object.assign({}, this.codeSyntax, { [platform]: value }); },
+  removeVariableCodeSyntax(platform) { this.codeSyntax = Object.assign({}, this.codeSyntax); delete this.codeSyntax[platform]; },
   remove() { __variables = __variables.filter(v => v !== this); __removedVariables.push(this.id); },
   resolveForConsumer() { const c = __collections.find(c => c.id === this.variableCollectionId); return { value: this.valuesByMode[c.modes[0].modeId], resolvedType: this.resolvedType }; },
 };
@@ -351,7 +357,7 @@ const figma = {
       const c = typeof collection === "string" ? __byId(__collections, collection) : collection;
       if (!c) throw new Error("createVariable needs a collection");
       const zero = { COLOR: { r: 0, g: 0, b: 0, a: 1 }, FLOAT: 0, STRING: "", BOOLEAN: false }[type];
-      const v = Object.setPrototypeOf({ id: "VariableID:" + __newid(), name, variableCollectionId: c.id, resolvedType: type, valuesByMode: {}, description: "", scopes: ["ALL_SCOPES"] }, __VariableProto);
+      const v = Object.setPrototypeOf({ id: "VariableID:" + __newid(), name, variableCollectionId: c.id, resolvedType: type, valuesByMode: {}, description: "", scopes: ["ALL_SCOPES"], codeSyntax: {} }, __VariableProto);
       for (const m of c.modes) v.valuesByMode[m.modeId] = __copy(zero);
       __variables.push(v);
       return v;
@@ -409,6 +415,34 @@ figma.setCurrentPageAsync = (p) => { __currentPage = p; return Promise.resolve()
 figma.loadAllPagesAsync = () => Promise.resolve();
 figma.createPage = () => { const p = __page("Page " + (figma.root.children.length + 1), "page:" + __newid(), true); figma.root.children.push(p); p.parent = figma.root; return p; };
 
+// Library components ("libraryId:nodeId" keys). One this file doesn't have yet is copied in by
+// Katachi once the script is waiting on it (__importKeys, then __resolveImports).
+let __imports = [];
+function __byKey(key) {
+  for (const n of __nodes.values()) if (n.type === "COMPONENT" && n.key === key) return n;
+  return null;
+}
+figma.importComponentByKeyAsync = (key) => {
+  const n = __byKey(key);
+  return n ? Promise.resolve(n) : new Promise((resolve, reject) => __imports.push({ key, resolve, reject }));
+};
+function __importKeys() { return JSON.stringify(__imports.map(i => i.key)); }
+function __resolveImports(trees) {
+  for (const t of trees) __linkTree(t, null);
+  const pending = __imports;
+  __imports = [];
+  for (const i of pending) {
+    const n = __byKey(i.key);
+    if (n) i.resolve(n); else i.reject(new Error("No library component with key " + i.key));
+  }
+}
+function __linkTree(raw, parent) {
+  const n = __link(raw);
+  n.parent = parent;
+  if (raw.children) n.children = raw.children.map(c => __linkTree(c, n));
+  return n;
+}
+
 function __load(snap) {
   __nodes.clear();
   const link = (raw, parent) => {
@@ -426,6 +460,9 @@ function __load(snap) {
     return p;
   });
   figma.root = root;
+  // Library components this file uses: on no page, but instances' mainComponent finds them.
+  for (const r of snap.remote || []) __linkTree(r, null);
+  __imports = [];
   __currentPage = root.children[snap.current];
   __currentPage.selection = snap.selection.map(id => __nodes.get(id)).filter(Boolean);
   __styles = snap.styles.map(s => Object.setPrototypeOf(s, __StyleProto));

@@ -74,6 +74,8 @@ pub enum LayoutMode {
     None,
     Horizontal,
     Vertical,
+    /// Figma's grid auto layout: children flow into rows and columns of cells.
+    Grid,
 }
 
 /// How a layer sizes itself along one axis.
@@ -93,6 +95,8 @@ pub enum AxisAlign {
     Min,
     Center,
     Max,
+    /// Horizontal layouts, cross axis: line up the first text baselines (Figma's "Text baseline").
+    Baseline,
 }
 
 /// Figma constraint for one axis: Left/Top, Right/Bottom, Left & right, Center, Scale.
@@ -123,6 +127,13 @@ pub struct AutoLayout {
     pub cross_gap: f32,
     /// Strokes take up space: the frame's inner stroke pads it, children's outer strokes add to their size.
     pub strokes_included: bool,
+    /// Canvas stacking "First on top": earlier children paint over later ones (Figma's itemReverseZIndex).
+    pub reverse_z: bool,
+    /// Grid: column and row counts (0 = 1 column; rows grow to fit the children).
+    pub grid: [u32; 2],
+    /// Grid: fixed column width and row height; None shares the space out (Fill), or hugs the
+    /// largest cell when the frame hugs that axis. Column gap is `gap`, row gap `cross_gap`.
+    pub tracks: [Option<f32>; 2],
 }
 
 /// How a text box sizes itself.
@@ -180,10 +191,16 @@ pub enum TextCase {
 pub enum Trigger {
     #[default]
     OnClick,
+    /// Figma's "While hovering": the action holds while the pointer stays on the layer.
     OnHover,
     WhilePressed,
     /// Fires this many milliseconds after the frame appears.
     AfterDelay(u32),
+    MouseEnter,
+    MouseLeave,
+    OnDrag,
+    /// Key/Gamepad: a key with modifiers (only Cmd/Ctrl, Shift and Alt are kept).
+    Key(egui::Key, egui::Modifiers),
 }
 
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
@@ -195,6 +212,14 @@ pub enum Action {
     OpenOverlay(NodeId),
     CloseOverlay,
     OpenUrl(String),
+    /// Interactive components: switch the instance the trigger is in to this variant.
+    ChangeTo(NodeId),
+    /// Scroll the layer's scrolling frame until the layer reaches its top-left.
+    ScrollTo(NodeId),
+    /// Replace the topmost overlay with this frame.
+    SwapOverlay(NodeId),
+    /// Give a variable a new value for the rest of the presentation.
+    SetVariable(VarId, VarValue),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -221,13 +246,114 @@ pub enum Direction {
 pub struct Transition {
     pub kind: TransitionKind,
     pub direction: Direction,
-    /// Seconds.
+    /// Seconds (springs settle in their own time).
     pub duration: f32,
+    #[serde(default)]
+    pub easing: Easing,
 }
 
 impl Default for Transition {
     fn default() -> Self {
-        Self { kind: TransitionKind::Instant, direction: Direction::Left, duration: 0.3 }
+        Self { kind: TransitionKind::Instant, direction: Direction::Left, duration: 0.3, easing: Easing::EaseOut }
+    }
+}
+
+/// Figma's animation curves.
+#[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize)]
+pub enum Easing {
+    Linear,
+    EaseIn,
+    #[default]
+    EaseOut,
+    EaseInOut,
+    EaseInBack,
+    EaseOutBack,
+    EaseInOutBack,
+    /// Cubic bezier control points: x1, y1, x2, y2.
+    Custom([f32; 4]),
+    Gentle,
+    Quick,
+    Bouncy,
+    Slow,
+}
+
+/// Where an overlay opens, relative to the frame (or the trigger, for Manual).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum OverlayPos {
+    #[default]
+    Center,
+    TopLeft,
+    TopCenter,
+    TopRight,
+    BottomLeft,
+    BottomCenter,
+    BottomRight,
+    Manual,
+}
+
+/// Open and Swap overlay settings.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OverlaySettings {
+    pub position: OverlayPos,
+    /// Manual position: from the trigger layer's top-left.
+    pub offset: Vec2,
+    pub close_outside: bool,
+    /// Color laid behind the overlay; None leaves the frame as is.
+    pub background: Option<Rgba>,
+}
+
+impl Default for OverlaySettings {
+    /// Centered, closing on an outside click, over a dimmed frame (how overlays always opened before).
+    fn default() -> Self {
+        Self { position: OverlayPos::Center, offset: Vec2::ZERO, close_outside: true, background: Some(Rgba([0, 0, 0, 100])) }
+    }
+}
+
+/// Prototype overflow: which way a frame scrolls when its content runs past its edges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Overflow {
+    #[default]
+    None,
+    Vertical,
+    Horizontal,
+    Both,
+}
+
+/// How a layer moves when its parent frame scrolls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ScrollPos {
+    #[default]
+    Scroll,
+    Fixed,
+    /// Scrolls until its top edge reaches the frame's top, then stays.
+    Sticky,
+}
+
+/// Devices a prototype can be presented in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Device {
+    #[default]
+    None,
+    IPhone16,
+    IPhone16ProMax,
+    Pixel9,
+    IPad,
+    MacBook,
+    Desktop,
+}
+
+/// A page's prototype settings.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProtoSettings {
+    pub device: Device,
+    pub background: Rgba,
+}
+
+impl Default for ProtoSettings {
+    fn default() -> Self {
+        Self { device: Device::None, background: Rgba::rgb(0x1E, 0x1E, 0x1E) }
     }
 }
 
@@ -238,6 +364,9 @@ pub struct Reaction {
     pub action: Action,
     #[serde(default)]
     pub transition: Transition,
+    /// Open and Swap overlay only.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub overlay: OverlaySettings,
 }
 
 /// A component property definition (on a component or component set).
@@ -253,6 +382,87 @@ pub enum PropValue {
 pub struct CompProp {
     pub name: String,
     pub default: PropValue,
+    /// Instance swap: Figma's "Preferred values", the components the swap picker offers first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preferred: Vec<NodeId>,
+}
+
+/// Instance overrides that can be reset one at a time (Figma's "Reset fill", "Reset text"...).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Override {
+    Name,
+    Visibility,
+    Opacity,
+    Fill,
+    Stroke,
+    Effects,
+    CornerRadius,
+    Text,
+    TextStyle,
+}
+
+impl Override {
+    pub const ALL: [Override; 9] = [
+        Override::Name,
+        Override::Visibility,
+        Override::Opacity,
+        Override::Fill,
+        Override::Stroke,
+        Override::Effects,
+        Override::CornerRadius,
+        Override::Text,
+        Override::TextStyle,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Override::Name => "Reset name",
+            Override::Visibility => "Reset visibility",
+            Override::Opacity => "Reset opacity",
+            Override::Fill => "Reset fill",
+            Override::Stroke => "Reset stroke",
+            Override::Effects => "Reset effects",
+            Override::CornerRadius => "Reset corner radius",
+            Override::Text => "Reset text",
+            Override::TextStyle => "Reset text style",
+        }
+    }
+
+    /// Whether layer `n` overrides this against `snap`, what it last copied from the main.
+    pub fn differs(self, n: &Node, snap: &Node) -> bool {
+        match self {
+            Override::Name => n.name != snap.name,
+            Override::Visibility => n.visible != snap.visible,
+            Override::Opacity => n.opacity != snap.opacity,
+            Override::Fill => n.fills != snap.fills || n.fill_style != snap.fill_style,
+            Override::Stroke => n.strokes != snap.strokes || n.stroke_style != snap.stroke_style || n.stroke_width != snap.stroke_width,
+            Override::Effects => n.shadows != snap.shadows || n.effect_style != snap.effect_style,
+            Override::CornerRadius => n.radius != snap.radius || n.corner_radii != snap.corner_radii,
+            Override::Text => n.text != snap.text || n.spans != snap.spans,
+            Override::TextStyle => {
+                n.font_family != snap.font_family || n.font_size != snap.font_size || n.font_weight != snap.font_weight || n.italic != snap.italic || n.line_height != snap.line_height || n.letter_spacing != snap.letter_spacing || n.decoration != snap.decoration || n.text_case != snap.text_case || n.text_style != snap.text_style
+            }
+        }
+    }
+
+    /// Copy this property group from `from` onto `to`.
+    pub fn copy(self, from: &Node, to: &mut Node) {
+        match self {
+            Override::Name => to.name = from.name.clone(),
+            Override::Visibility => to.visible = from.visible,
+            Override::Opacity => to.opacity = from.opacity,
+            Override::Fill => (to.fills, to.fill_style) = (from.fills.clone(), from.fill_style),
+            Override::Stroke => (to.strokes, to.stroke_style, to.stroke_width) = (from.strokes.clone(), from.stroke_style, from.stroke_width),
+            Override::Effects => (to.shadows, to.effect_style) = (from.shadows.clone(), from.effect_style),
+            Override::CornerRadius => (to.radius, to.corner_radii) = (from.radius, from.corner_radii),
+            Override::Text => (to.text, to.spans) = (from.text.clone(), from.spans.clone()),
+            Override::TextStyle => {
+                to.font_family = from.font_family.clone();
+                (to.font_size, to.font_weight, to.italic, to.line_height, to.letter_spacing, to.text_style) = (from.font_size, from.font_weight, from.italic, from.line_height, from.letter_spacing, from.text_style);
+                (to.decoration, to.text_case) = (from.decoration, from.text_case);
+            }
+        }
+    }
 }
 
 /// Which property of a layer a component property drives.
@@ -299,10 +509,27 @@ pub enum VarValue {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Variable {
     pub id: VarId,
+    /// Slashes group variables in the table, as in Figma ("color/brand/primary").
     pub name: String,
     pub collection: u64,
     /// One value per mode of the collection.
     pub values: Vec<VarValue>,
+    /// Figma's "Show in": the properties whose pickers offer this variable (empty = all supported).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<Bindable>,
+    /// Code syntax for Dev Mode: Web, iOS, Android (empty = derived from the name).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub code_syntax: [String; 3],
+    /// A library variable this file uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<Remote>,
+}
+
+impl Variable {
+    /// Whether the bind pickers for `prop` offer this variable.
+    pub fn shows_in(&self, prop: Bindable) -> bool {
+        self.scopes.is_empty() || self.scopes.contains(&prop)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -310,6 +537,9 @@ pub struct Collection {
     pub id: u64,
     pub name: String,
     pub modes: Vec<String>,
+    /// The collection of library variables this file uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<Remote>,
 }
 
 /// Layer properties a variable can drive.
@@ -327,6 +557,21 @@ pub enum Bindable {
     FontSize,
     Text,
     Visible,
+    LineHeight,
+    LetterSpacing,
+    ParagraphSpacing,
+    FontFamily,
+    FontWeight,
+    MinWidth,
+    MaxWidth,
+    MinHeight,
+    MaxHeight,
+    /// The first effect's color, blur, spread and offsets.
+    EffectColor,
+    EffectBlur,
+    EffectSpread,
+    EffectX,
+    EffectY,
 }
 
 impl Bindable {
@@ -345,10 +590,57 @@ impl Bindable {
             Bindable::FontSize => "Font size",
             Bindable::Text => "Text",
             Bindable::Visible => "Visibility",
+            Bindable::LineHeight => "Line height",
+            Bindable::LetterSpacing => "Letter spacing",
+            Bindable::ParagraphSpacing => "Paragraph spacing",
+            Bindable::FontFamily => "Font family",
+            Bindable::FontWeight => "Font weight",
+            Bindable::MinWidth => "Min width",
+            Bindable::MaxWidth => "Max width",
+            Bindable::MinHeight => "Min height",
+            Bindable::MaxHeight => "Max height",
+            Bindable::EffectColor => "Effect color",
+            Bindable::EffectBlur => "Effect blur",
+            Bindable::EffectSpread => "Effect spread",
+            Bindable::EffectX => "Effect X",
+            Bindable::EffectY => "Effect Y",
         }
     }
 
-    pub const ALL: [Bindable; 12] = [
+    /// Figma's variable scope for the property (`VariableScope`).
+    pub fn scope(self) -> &'static str {
+        match self {
+            Bindable::Fill => "ALL_FILLS",
+            Bindable::Stroke => "STROKE_COLOR",
+            Bindable::Opacity => "OPACITY",
+            Bindable::Radius => "CORNER_RADIUS",
+            Bindable::Width | Bindable::Height | Bindable::MinWidth | Bindable::MaxWidth | Bindable::MinHeight | Bindable::MaxHeight => "WIDTH_HEIGHT",
+            Bindable::Gap | Bindable::Padding => "GAP",
+            Bindable::StrokeWidth => "STROKE_FLOAT",
+            Bindable::FontSize => "FONT_SIZE",
+            Bindable::Text => "TEXT_CONTENT",
+            Bindable::Visible => "ALL_SCOPES",
+            Bindable::LineHeight => "LINE_HEIGHT",
+            Bindable::LetterSpacing => "LETTER_SPACING",
+            Bindable::ParagraphSpacing => "PARAGRAPH_SPACING",
+            Bindable::FontFamily => "FONT_FAMILY",
+            Bindable::FontWeight => "FONT_WEIGHT",
+            Bindable::EffectColor => "EFFECT_COLOR",
+            Bindable::EffectBlur | Bindable::EffectSpread | Bindable::EffectX | Bindable::EffectY => "EFFECT_FLOAT",
+        }
+    }
+
+    /// Properties covered by a Figma scope name (the inverse of `scope`).
+    pub fn from_scope(s: &str) -> Vec<Bindable> {
+        match s {
+            "FRAME_FILL" | "SHAPE_FILL" | "TEXT_FILL" => vec![Bindable::Fill],
+            "FONT_STYLE" => vec![Bindable::FontWeight],
+            "ALL_SCOPES" => vec![],
+            _ => Bindable::ALL.into_iter().filter(|b| b.scope() == s).collect(),
+        }
+    }
+
+    pub const ALL: [Bindable; 26] = [
         Bindable::Fill,
         Bindable::Stroke,
         Bindable::Opacity,
@@ -361,12 +653,26 @@ impl Bindable {
         Bindable::FontSize,
         Bindable::Text,
         Bindable::Visible,
+        Bindable::LineHeight,
+        Bindable::LetterSpacing,
+        Bindable::ParagraphSpacing,
+        Bindable::FontFamily,
+        Bindable::FontWeight,
+        Bindable::MinWidth,
+        Bindable::MaxWidth,
+        Bindable::MinHeight,
+        Bindable::MaxHeight,
+        Bindable::EffectColor,
+        Bindable::EffectBlur,
+        Bindable::EffectSpread,
+        Bindable::EffectX,
+        Bindable::EffectY,
     ];
     /// Whether a value of this kind fits the property.
     pub fn accepts(self, v: &VarValue) -> bool {
         match self {
-            Bindable::Fill | Bindable::Stroke => matches!(v, VarValue::Color(_)),
-            Bindable::Text => matches!(v, VarValue::Text(_)),
+            Bindable::Fill | Bindable::Stroke | Bindable::EffectColor => matches!(v, VarValue::Color(_)),
+            Bindable::Text | Bindable::FontFamily => matches!(v, VarValue::Text(_)),
             Bindable::Visible => matches!(v, VarValue::Bool(_)),
             _ => matches!(v, VarValue::Number(_)),
         }
@@ -380,6 +686,7 @@ pub struct Comment {
     pub page: usize,
     /// World position, or offset from the anchor's top-left when anchored.
     pub at: Pos2,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<NodeId>,
     /// (author, text, unix seconds); the first entry opens the thread.
     pub messages: Vec<(String, String, u64)>,
@@ -390,12 +697,21 @@ pub struct Comment {
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SpanStyle {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub font_family: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub font_weight: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub font_size: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<Rgba>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub decoration: Option<Decoration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub italic: Option<bool>,
+    /// A hyperlink (URL) on these characters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 impl SpanStyle {
@@ -408,6 +724,12 @@ impl SpanStyle {
             color: patch.color.or(self.color),
             decoration: patch.decoration.or(self.decoration),
             italic: patch.italic.or(self.italic),
+            // An empty link in a patch removes the link.
+            link: match &patch.link {
+                Some(l) if l.is_empty() => None,
+                Some(l) => Some(l.clone()),
+                None => self.link.clone(),
+            },
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -421,6 +743,23 @@ pub struct TextSpan {
     pub start: usize,
     pub end: usize,
     pub style: SpanStyle,
+}
+
+/// The link run around char `c`, joining neighboring spans with the same link: start, end, URL.
+/// A caret just after a link still counts as in it.
+pub fn link_at(spans: &[TextSpan], c: usize) -> Option<(usize, usize, String)> {
+    let linked = |sp: &&TextSpan| sp.style.link.is_some();
+    let sp = spans.iter().filter(linked).find(|sp| sp.start <= c && c < sp.end).or_else(|| spans.iter().filter(linked).find(|sp| sp.start < c && c == sp.end))?;
+    let url = sp.style.link.clone()?;
+    let same = |s: &TextSpan| s.style.link.as_ref() == Some(&url);
+    let (mut a, mut b) = (sp.start, sp.end);
+    while let Some(s) = spans.iter().find(|s| s.end == a && same(s)) {
+        a = s.start;
+    }
+    while let Some(s) = spans.iter().find(|s| s.start == b && same(s)) {
+        b = s.end;
+    }
+    Some((a, b, url))
 }
 
 /// Apply a style patch to chars [start, end), splitting and merging spans as needed.
@@ -510,6 +849,27 @@ pub fn replace_text(n: &mut Node, find: &str, with: &str) -> usize {
         n.text = next;
     }
     starts.len()
+}
+
+/// Use `to` wherever the document uses the font family `from`: text layers, their styled runs, and
+/// text styles. Weights and italics stay; they resolve to `to`'s nearest installed face.
+pub fn replace_font(doc: &mut Document, from: &str, to: &str) {
+    let ids: Vec<NodeId> = doc.nodes.values().filter(|n| n.kind == Kind::Text && (n.font_family == from || n.spans.iter().any(|sp| sp.style.font_family.as_deref() == Some(from)))).map(|n| n.id).collect();
+    for id in ids {
+        let n = doc.node_mut(id);
+        if n.font_family == from {
+            n.font_family = to.to_string();
+        }
+        for sp in n.spans.iter_mut().filter(|sp| sp.style.font_family.as_deref() == Some(from)) {
+            sp.style.font_family = Some(to.to_string());
+        }
+    }
+    for st in &mut doc.styles {
+        if let StyleValue::Text(t) = &mut st.value
+            && t.font_family == from {
+                t.font_family = to.to_string();
+            }
+    }
 }
 
 /// Paragraphs after an edit: list formatting follows its paragraph, and new
@@ -605,6 +965,8 @@ pub struct TextStyle {
     pub letter_spacing: f32,
     pub decoration: Decoration,
     pub text_case: TextCase,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub italic: bool,
 }
 
 impl TextStyle {
@@ -617,6 +979,7 @@ impl TextStyle {
             letter_spacing: n.letter_spacing,
             decoration: n.decoration,
             text_case: n.text_case,
+            italic: n.italic,
         }
     }
     pub fn apply(&self, n: &mut Node) {
@@ -627,6 +990,7 @@ impl TextStyle {
         n.letter_spacing = self.letter_spacing;
         n.decoration = self.decoration;
         n.text_case = self.text_case;
+        n.italic = self.italic;
     }
 }
 
@@ -635,6 +999,8 @@ pub enum StyleValue {
     Paint(Vec<Paint>),
     Text(TextStyle),
     Effect(Vec<Shadow>),
+    /// Figma's grid styles: a frame's layout guides.
+    Grid(Vec<LayoutGrid>),
 }
 
 /// A shared style that layers link to; editing it updates every user.
@@ -643,6 +1009,36 @@ pub struct Style {
     pub id: StyleId,
     pub name: String,
     pub value: StyleValue,
+    /// A library style this file uses (read-only here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<Remote>,
+}
+
+/// Where a library asset copied into this file came from: the library file's id and the
+/// asset's id there. Components, styles and variables from libraries live in the file as
+/// hidden, read-only copies, so it renders even when the library goes missing.
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Remote {
+    pub lib: String,
+    pub key: u64,
+    /// The asset's content hash and the library's publish version when it was copied (on the
+    /// asset's root layer only); compared to tell when the library has an update.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub hash: u64,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub version: u32,
+}
+
+/// A library this file has added (Figma's team libraries, for local files): another .katachi file.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LibraryRef {
+    /// The library file's `Document::id`; finds it again after a move or rename.
+    pub id: String,
+    pub name: String,
+    /// Relative to this file when possible.
+    pub path: String,
+    /// Offered in Assets and the pickers.
+    pub enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -685,6 +1081,10 @@ impl BlendMode {
         BlendMode::Color,
         BlendMode::Luminosity,
     ];
+    /// From Figma's name for it ("MULTIPLY", "COLOR_BURN"; anything else is Normal).
+    pub fn from_figma(name: Option<&str>) -> Self {
+        BlendMode::ALL.into_iter().find(|b| Some(b.css().replace('-', "_").to_uppercase().as_str()) == name).unwrap_or_default()
+    }
     /// CSS / SVG `mix-blend-mode` keyword.
     pub fn css(self) -> &'static str {
         match self {
@@ -715,20 +1115,33 @@ pub enum ExportFormat {
     Jpg,
     Svg,
     Pdf,
+    Webp,
 }
 
 impl ExportFormat {
+    pub const ALL: [ExportFormat; 5] = [ExportFormat::Png, ExportFormat::Jpg, ExportFormat::Webp, ExportFormat::Svg, ExportFormat::Pdf];
     pub fn ext(self) -> &'static str {
         match self {
             ExportFormat::Png => "png",
             ExportFormat::Jpg => "jpg",
             ExportFormat::Svg => "svg",
             ExportFormat::Pdf => "pdf",
+            ExportFormat::Webp => "webp",
         }
     }
     pub fn raster(self) -> bool {
-        matches!(self, ExportFormat::Png | ExportFormat::Jpg)
+        matches!(self, ExportFormat::Png | ExportFormat::Jpg | ExportFormat::Webp)
     }
+}
+
+/// How big a raster export is, typed into one field as in Figma: "2x" scales (by `scale`),
+/// "512w" and "512h" fix the width or height in pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize)]
+pub enum ExportSize {
+    #[default]
+    Scale,
+    Width(f32),
+    Height(f32),
 }
 
 /// One export preset on a layer, like Figma's Export rows.
@@ -737,11 +1150,61 @@ pub struct ExportSetting {
     pub scale: f32,
     pub format: ExportFormat,
     pub suffix: String,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub size: ExportSize,
+    /// JPG quality, 1 to 100.
+    #[serde(default = "jpg_quality", skip_serializing_if = "is_jpg_quality")]
+    pub quality: u8,
+}
+
+fn jpg_quality() -> u8 {
+    92
+}
+fn is_jpg_quality(q: &u8) -> bool {
+    *q == jpg_quality()
 }
 
 impl Default for ExportSetting {
     fn default() -> Self {
-        Self { scale: 1.0, format: ExportFormat::Png, suffix: String::new() }
+        Self { scale: 1.0, format: ExportFormat::Png, suffix: String::new(), size: ExportSize::Scale, quality: jpg_quality() }
+    }
+}
+
+impl ExportSetting {
+    /// The size field's text: "2x", "512w", "512h".
+    pub fn size_label(&self) -> String {
+        let n = |v: f32| ((v * 100.0).round() / 100.0).to_string();
+        match self.size {
+            ExportSize::Scale => format!("{}x", n(self.scale)),
+            ExportSize::Width(w) => format!("{}w", n(w)),
+            ExportSize::Height(h) => format!("{}h", n(h)),
+        }
+    }
+
+    /// Read what was typed into the size field ("2.5x", "2.5", "512w", "512 h"); false if it
+    /// isn't a size, leaving the preset as it was.
+    pub fn set_size(&mut self, text: &str) -> bool {
+        let t = text.trim().to_lowercase().replace(' ', "");
+        let (num, unit) = match t.chars().last() {
+            Some(c @ ('x' | 'w' | 'h')) => (&t[..t.len() - 1], c),
+            _ => (t.as_str(), 'x'),
+        };
+        let Some(v) = num.parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0) else { return false };
+        match unit {
+            'w' => self.size = ExportSize::Width(v),
+            'h' => self.size = ExportSize::Height(v),
+            _ => (self.size, self.scale) = (ExportSize::Scale, v.min(64.0)),
+        }
+        true
+    }
+
+    /// The raster scale that gives this preset's size for content `size` big.
+    pub fn scale_for(&self, size: Vec2) -> f32 {
+        match self.size {
+            ExportSize::Scale => self.scale,
+            ExportSize::Width(w) => w / size.x.max(0.01),
+            ExportSize::Height(h) => h / size.y.max(0.01),
+        }
     }
 }
 
@@ -793,7 +1256,7 @@ impl LayoutGrid {
             GridAlign::Stretch => (((hi - lo) - 2.0 * self.margin - gutters) / n as f32, lo + self.margin),
             GridAlign::Min => (self.size, lo + self.margin),
             GridAlign::Max => (self.size, hi - self.margin - (self.size * n as f32 + gutters)),
-            GridAlign::Center => (self.size, (lo + hi) / 2.0 - (self.size * n as f32 + gutters) / 2.0 + self.margin),
+            GridAlign::Center => (self.size, (lo + hi) / 2.0 - (self.size * n as f32 + gutters) / 2.0),
         };
         (0..n).map(|i| {
             let a = start + i as f32 * (track + self.gutter);
@@ -887,6 +1350,33 @@ pub enum PaintKind {
     Linear,
     Radial,
     Image,
+    /// Sweeps around `from`, starting toward `to` and turning toward the width handle.
+    Angular,
+    /// Like radial, with diamond-shaped rings whose corners sit on the handles.
+    Diamond,
+}
+
+impl PaintKind {
+    /// In Figma's paint type menu order.
+    pub const ALL: [PaintKind; 6] = [PaintKind::Solid, PaintKind::Linear, PaintKind::Radial, PaintKind::Angular, PaintKind::Diamond, PaintKind::Image];
+    pub fn is_gradient(self) -> bool {
+        !matches!(self, PaintKind::Solid | PaintKind::Image)
+    }
+}
+
+/// Figma's GRADIENT_* paint type names.
+pub fn gradient_kind(figma: &str) -> PaintKind {
+    match figma {
+        "GRADIENT_LINEAR" => PaintKind::Linear,
+        "GRADIENT_ANGULAR" => PaintKind::Angular,
+        "GRADIENT_DIAMOND" => PaintKind::Diamond,
+        _ => PaintKind::Radial,
+    }
+}
+
+/// An imported width handle, kept only where it differs from the derived one (circles stay small).
+pub fn explicit_width(p: &Paint, w: Pos2) -> Option<Pos2> {
+    (w.distance(p.width_point()) > 1e-4).then_some(w)
 }
 
 /// How an image fills its layer.
@@ -951,6 +1441,11 @@ pub struct Paint {
     pub from: Pos2,
     #[serde(default, skip_serializing_if = "is_default")]
     pub to: Pos2,
+    /// Figma's third gradient handle: the end of the second axis of radial, angular, and
+    /// diamond gradients (an ellipse when it's not perpendicular to `to` at the same length).
+    /// None = derived from `from` and `to`, a circle in the unit square.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width_to: Option<Pos2>,
     /// Key into `Document::images`.
     #[serde(default, skip_serializing_if = "is_default")]
     pub image: String,
@@ -962,6 +1457,9 @@ pub struct Paint {
     /// Image paints: color adjustments.
     #[serde(default, skip_serializing_if = "is_default")]
     pub adjust: ImageAdjust,
+    /// How this paint mixes with the paints and layers under it (Figma's per-paint blend).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub blend: BlendMode,
 }
 
 /// Figma's image adjustments, each -1..=1 (0 = unchanged).
@@ -1022,11 +1520,21 @@ impl Paint {
             stops: vec![],
             from: Pos2::ZERO,
             to: Pos2::ZERO,
+            width_to: None,
             image: String::new(),
             scale_mode: ScaleMode::Fill,
             tile_scale: 1.0,
             adjust: ImageAdjust::default(),
+            blend: BlendMode::Normal,
         }
+    }
+
+    /// An image fill showing the document image stored under `key`.
+    pub fn image(key: String) -> Self {
+        let mut p = Self::solid(Rgba::WHITE);
+        p.convert(PaintKind::Image);
+        p.image = key;
+        p
     }
 
     /// Switch kind, seeding Figma's defaults from the current color.
@@ -1038,7 +1546,7 @@ impl Paint {
         let base = if self.kind == PaintKind::Solid { self.color.with_alpha(255) } else { self.stops.first().map_or(Rgba::BLACK, |s| s.1) };
         match kind {
             PaintKind::Solid => self.color = base.with_alpha(a),
-            PaintKind::Linear | PaintKind::Radial => {
+            _ if kind.is_gradient() => {
                 if self.stops.len() < 2 {
                     self.stops = vec![(0.0, base), (1.0, base.with_alpha(0))];
                 }
@@ -1047,9 +1555,10 @@ impl Paint {
                 } else {
                     (pos2(0.5, 0.5), pos2(1.0, 0.5))
                 };
+                self.width_to = None;
                 self.color = Rgba::WHITE.with_alpha(a);
             }
-            PaintKind::Image => self.color = Rgba::WHITE.with_alpha(a),
+            _ => self.color = Rgba::WHITE.with_alpha(a),
         }
         self.kind = kind;
     }
@@ -1075,12 +1584,28 @@ impl Paint {
         stops.last().unwrap().1
     }
 
+    /// The width handle, explicit or derived (perpendicular to `from`-`to`, same length).
+    pub fn width_point(&self) -> Pos2 {
+        let d = self.to - self.from;
+        self.width_to.unwrap_or(self.from + vec2(-d.y, d.x))
+    }
+
     /// Gradient parameter for a point in the layer's unit square.
     pub fn gradient_t(&self, p: Pos2) -> f32 {
         let d = self.to - self.from;
+        let q = p - self.from;
+        if self.kind == PaintKind::Linear {
+            return q.dot(d) / d.length_sq().max(1e-6);
+        }
+        // Coordinates along the two handle axes: q = a * d + b * w.
+        let w = self.width_point() - self.from;
+        let det = d.x * w.y - d.y * w.x;
+        let det = if det.abs() < 1e-9 { 1e-9 } else { det };
+        let (a, b) = ((q.x * w.y - q.y * w.x) / det, (d.x * q.y - d.y * q.x) / det);
         match self.kind {
-            PaintKind::Radial => (p - self.from).length() / d.length().max(1e-6),
-            _ => (p - self.from).dot(d) / d.length_sq().max(1e-6),
+            PaintKind::Angular => b.atan2(a).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU,
+            PaintKind::Diamond => a.abs() + b.abs(),
+            _ => a.hypot(b),
         }
     }
 }
@@ -1092,23 +1617,85 @@ pub enum EffectKind {
     InnerShadow,
     LayerBlur,
     BackgroundBlur,
+    Noise,
+    Texture,
+    Glass,
 }
 
 impl EffectKind {
+    /// Every type, in the order of Figma's effect type menu.
+    pub const ALL: [EffectKind; 7] =
+        [EffectKind::DropShadow, EffectKind::InnerShadow, EffectKind::LayerBlur, EffectKind::BackgroundBlur, EffectKind::Noise, EffectKind::Texture, EffectKind::Glass];
     pub fn label(self) -> &'static str {
         match self {
             EffectKind::DropShadow => "Drop shadow",
             EffectKind::InnerShadow => "Inner shadow",
             EffectKind::LayerBlur => "Layer blur",
             EffectKind::BackgroundBlur => "Background blur",
+            EffectKind::Noise => "Noise",
+            EffectKind::Texture => "Texture",
+            EffectKind::Glass => "Glass",
         }
     }
     pub fn is_shadow(self) -> bool {
         matches!(self, EffectKind::DropShadow | EffectKind::InnerShadow)
     }
+    pub fn is_blur(self) -> bool {
+        matches!(self, EffectKind::LayerBlur | EffectKind::BackgroundBlur)
+    }
+    /// Effects drawn from what's behind the layer.
+    pub fn is_backdrop(self) -> bool {
+        matches!(self, EffectKind::BackgroundBlur | EffectKind::Glass)
+    }
 }
 
-/// A layer effect. Blurs use only `blur`; shadows use everything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum NoiseType {
+    #[default]
+    Mono,
+    Duo,
+    Multi,
+}
+
+impl NoiseType {
+    pub fn label(self) -> &'static str {
+        match self {
+            NoiseType::Mono => "Mono",
+            NoiseType::Duo => "Duo",
+            NoiseType::Multi => "Multitone",
+        }
+    }
+}
+
+/// A progressive blur ramps linearly from `start_blur` at `start` to the effect's `blur` at
+/// `end`; both points are in the layer's unit square, as in Figma.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Progressive {
+    pub start: Pos2,
+    pub end: Pos2,
+    pub start_blur: f32,
+}
+
+impl Default for Progressive {
+    fn default() -> Self {
+        Self { start: pos2(0.5, 0.0), end: pos2(0.5, 1.0), start_blur: 0.0 }
+    }
+}
+
+/// Glass settings; its frost is the effect's `blur`. Ratios are 0..1, `depth` is in px and
+/// `angle` in degrees: the direction light travels, counter-clockwise from +x.
+#[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Glass {
+    pub refraction: f32,
+    pub depth: f32,
+    pub dispersion: f32,
+    pub angle: f32,
+    pub light: f32,
+}
+
+/// A layer effect. Blurs use only `blur`; shadows use color, offset, blur and spread. `blur` is
+/// Figma's `radius` for every type: texture strength and glass frost too.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Shadow {
     #[serde(default)]
@@ -1118,12 +1705,92 @@ pub struct Shadow {
     pub blur: f32,
     pub spread: f32,
     pub visible: bool,
+    /// Drop shadows: Figma's "Show behind transparent areas". Off, the shadow is knocked out
+    /// behind the layer.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub show_behind: bool,
+    /// Layer and background blurs: set for a progressive blur.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progressive: Option<Progressive>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub noise: NoiseType,
+    /// Noise and texture grain size, in px.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub size: f32,
+    /// Noise: the share of grains shown, 0..1.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub density: f32,
+    /// Duotone noise's second color. Multitone noise uses only `color`'s alpha, as its opacity.
+    #[serde(default = "transparent", skip_serializing_if = "is_transparent")]
+    pub color2: Rgba,
+    /// Texture: keep the distorted layer inside its original shape.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub clip: bool,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub glass: Glass,
+}
+
+fn transparent() -> Rgba {
+    Rgba([0, 0, 0, 0])
+}
+fn is_transparent(c: &Rgba) -> bool {
+    *c == transparent()
 }
 
 impl Default for Shadow {
     /// Figma's default drop shadow.
     fn default() -> Self {
-        Self { kind: EffectKind::DropShadow, color: Rgba([0, 0, 0, 64]), offset: vec2(0.0, 4.0), blur: 4.0, spread: 0.0, visible: true }
+        Self {
+            kind: EffectKind::DropShadow,
+            color: Rgba([0, 0, 0, 64]),
+            offset: vec2(0.0, 4.0),
+            blur: 4.0,
+            spread: 0.0,
+            visible: true,
+            show_behind: false,
+            progressive: None,
+            noise: NoiseType::Mono,
+            size: 0.0,
+            density: 0.0,
+            color2: transparent(),
+            clip: false,
+            glass: Glass::default(),
+        }
+    }
+}
+
+impl Shadow {
+    /// A new effect of `kind` with Figma's starting settings.
+    pub fn of(kind: EffectKind) -> Self {
+        let d = Self { kind, ..Self::default() };
+        match kind {
+            EffectKind::DropShadow | EffectKind::InnerShadow => d,
+            EffectKind::LayerBlur | EffectKind::BackgroundBlur => Self { offset: Vec2::ZERO, ..d },
+            EffectKind::Noise => Self { offset: Vec2::ZERO, color: Rgba([0, 0, 0, 64]), color2: Rgba([255, 255, 255, 64]), size: 1.0, density: 0.5, ..d },
+            EffectKind::Texture => Self { offset: Vec2::ZERO, size: 4.0, blur: 4.0, clip: true, ..d },
+            EffectKind::Glass => Self { offset: Vec2::ZERO, blur: 4.0, glass: Glass { refraction: 0.8, depth: 20.0, dispersion: 0.5, angle: -45.0, light: 0.8 }, ..d },
+        }
+    }
+
+    /// Switch type, keeping settings between kinds that share them (shadow to shadow, blur to blur).
+    pub fn set_kind(&mut self, kind: EffectKind) {
+        if (self.kind.is_shadow() && kind.is_shadow()) || (self.kind.is_blur() && kind.is_blur()) {
+            self.kind = kind;
+        } else {
+            *self = Self { visible: self.visible, ..Self::of(kind) };
+        }
+    }
+
+    /// The blur at unit-square point `t` along a progressive blur (0 at its start, 1 at its end).
+    pub fn blur_at(&self, t: f32) -> f32 {
+        match self.progressive {
+            Some(p) => p.start_blur + (self.blur - p.start_blur) * t.clamp(0.0, 1.0),
+            None => self.blur,
+        }
+    }
+
+    pub fn max_blur(&self) -> f32 {
+        self.progressive.map_or(self.blur, |p| self.blur.max(p.start_blur))
     }
 }
 
@@ -1207,6 +1874,9 @@ pub struct Node {
     /// Ignores the parent's auto layout.
     #[serde(skip_serializing_if = "dflt::absolute")]
     pub absolute: bool,
+    /// In a grid auto layout: how many columns and rows this layer's cell spans.
+    #[serde(skip_serializing_if = "dflt::grid_span")]
+    pub grid_span: [u32; 2],
     #[serde(skip_serializing_if = "dflt::bool_op")]
     pub bool_op: BoolOp,
     /// Clips the layers above it in the same parent.
@@ -1221,6 +1891,12 @@ pub struct Node {
     /// Prototype interactions.
     #[serde(skip_serializing_if = "dflt::reactions")]
     pub reactions: Vec<Reaction>,
+    /// Frames: prototype scrolling.
+    #[serde(skip_serializing_if = "dflt::overflow")]
+    pub overflow: Overflow,
+    /// Children of scrolling frames: scroll along, stay fixed, or stick.
+    #[serde(skip_serializing_if = "dflt::scroll_pos")]
+    pub scroll_pos: ScrollPos,
     /// Properties driven by variables.
     #[serde(skip_serializing_if = "dflt::bindings")]
     pub bindings: Vec<(Bindable, VarId)>,
@@ -1236,6 +1912,8 @@ pub struct Node {
     pub text_style: Option<StyleId>,
     #[serde(skip_serializing_if = "dflt::effect_style")]
     pub effect_style: Option<StyleId>,
+    #[serde(skip_serializing_if = "dflt::grid_style")]
+    pub grid_style: Option<StyleId>,
     /// Components and sets: property definitions.
     #[serde(skip_serializing_if = "dflt::comp_props")]
     pub comp_props: Vec<CompProp>,
@@ -1268,6 +1946,9 @@ pub struct Node {
     pub font_weight: u16,
     #[serde(skip_serializing_if = "dflt::font_family")]
     pub font_family: String,
+    /// The family's italic face (Figma's "Italic" font styles).
+    #[serde(skip_serializing_if = "dflt::italic")]
+    pub italic: bool,
     #[serde(skip_serializing_if = "dflt::text_sizing")]
     pub text_sizing: TextSizing,
     #[serde(skip_serializing_if = "dflt::text_align")]
@@ -1286,6 +1967,13 @@ pub struct Node {
     /// Extra space after each paragraph.
     #[serde(skip_serializing_if = "dflt::paragraph_spacing")]
     pub paragraph_spacing: f32,
+    /// How far each paragraph's first line starts in (Figma's paragraph indent).
+    #[serde(skip_serializing_if = "dflt::paragraph_indent")]
+    pub paragraph_indent: f32,
+    /// Figma's vertical trim "Cap height to baseline": the box starts at the first line's cap
+    /// height and ends at the last line's baseline (off is "Standard").
+    #[serde(skip_serializing_if = "dflt::vertical_trim")]
+    pub vertical_trim: bool,
     /// End overflowing text with an ellipsis.
     #[serde(skip_serializing_if = "dflt::truncate")]
     pub truncate: bool,
@@ -1303,6 +1991,23 @@ pub struct Node {
     pub lines: Vec<String>,
     #[serde(skip_serializing_if = "dflt::expanded")]
     pub expanded: bool,
+    /// Components and sets: the description shown in Assets and Dev Mode.
+    #[serde(skip_serializing_if = "dflt::description")]
+    pub description: String,
+    /// A nested instance inside a component whose properties show on the component's instances
+    /// (Figma's "Expose properties from nested instances").
+    #[serde(skip_serializing_if = "dflt::exposed")]
+    pub exposed: bool,
+    /// Frames and sections: Dev Mode's "Ready for dev" status.
+    #[serde(skip_serializing_if = "dflt::ready")]
+    pub ready: bool,
+    /// Dev Mode annotations: notes pinned to the layer, labeled on the canvas.
+    #[serde(skip_serializing_if = "dflt::annotations")]
+    pub annotations: Vec<String>,
+    /// A layer copied from a library (part of a library component): read-only, and kept off
+    /// the pages (only instances of it show).
+    #[serde(skip_serializing_if = "dflt::remote")]
+    pub remote: Option<Remote>,
 }
 
 /// Serialization leaves out fields at `Node::default()`'s values; `#[serde(default)]` fills
@@ -1347,18 +2052,22 @@ mod dflt {
         max_size: [Option<f32>; 2],
         constraints: [Constraint; 2],
         absolute: bool,
+        grid_span: [u32; 2],
         bool_op: BoolOp,
         is_mask: bool,
         grids: Vec<LayoutGrid>,
         exports: Vec<ExportSetting>,
         blend: BlendMode,
         reactions: Vec<Reaction>,
+        overflow: Overflow,
+        scroll_pos: ScrollPos,
         bindings: Vec<(Bindable, VarId)>,
         modes: Vec<(u64, usize)>,
         fill_style: Option<StyleId>,
         stroke_style: Option<StyleId>,
         text_style: Option<StyleId>,
         effect_style: Option<StyleId>,
+        grid_style: Option<StyleId>,
         comp_props: Vec<CompProp>,
         prop_bind: Vec<(String, PropTarget)>,
         prop_values: Vec<(String, PropValue)>,
@@ -1371,6 +2080,7 @@ mod dflt {
         font_size: f32,
         font_weight: u16,
         font_family: String,
+        italic: bool,
         text_sizing: TextSizing,
         text_align: TextAlign,
         text_valign: VAlign,
@@ -1379,11 +2089,18 @@ mod dflt {
         decoration: Decoration,
         text_case: TextCase,
         paragraph_spacing: f32,
+        paragraph_indent: f32,
+        vertical_trim: bool,
         truncate: bool,
         max_lines: u32,
         spans: Vec<TextSpan>,
         lists: Vec<ListLine>,
         expanded: bool,
+        description: String,
+        exposed: bool,
+        ready: bool,
+        annotations: Vec<String>,
+        remote: Option<Remote>,
     );
 }
 
@@ -1430,18 +2147,22 @@ impl Default for Node {
             max_size: [None; 2],
             constraints: [Constraint::Min; 2],
             absolute: false,
+            grid_span: [1, 1],
             bool_op: BoolOp::Union,
             is_mask: false,
             grids: vec![],
             exports: vec![],
             blend: BlendMode::Normal,
             reactions: vec![],
+            overflow: Overflow::None,
+            scroll_pos: ScrollPos::Scroll,
             bindings: vec![],
             modes: vec![],
             fill_style: None,
             stroke_style: None,
             text_style: None,
             effect_style: None,
+            grid_style: None,
             comp_props: vec![],
             prop_bind: vec![],
             prop_values: vec![],
@@ -1454,6 +2175,7 @@ impl Default for Node {
             font_size: 12.0,
             font_weight: 400,
             font_family: "Inter".into(),
+            italic: false,
             text_sizing: TextSizing::AutoWidth,
             text_align: TextAlign::Left,
             text_valign: VAlign::Top,
@@ -1462,12 +2184,19 @@ impl Default for Node {
             decoration: Decoration::None,
             text_case: TextCase::Original,
             paragraph_spacing: 0.0,
+            paragraph_indent: 0.0,
+            vertical_trim: false,
             truncate: false,
             max_lines: 0,
             spans: vec![],
             lists: vec![],
             lines: vec![],
             expanded: true,
+            description: String::new(),
+            exposed: false,
+            ready: false,
+            annotations: vec![],
+            remote: None,
         }
     }
 }
@@ -1522,6 +2251,15 @@ impl Node {
     /// Whether the shape encloses area that fills can paint.
     pub fn has_area(&self) -> bool {
         self.kind != Kind::Vector || self.paths.iter().any(|p| p.closed)
+    }
+
+    /// Whether a drop shadow must be knocked out behind this layer: Figma hides it there unless
+    /// "Show behind transparent areas" is on, which only shows where no opaque fill covers it.
+    /// Groups cast their children's shadow and are left alone.
+    pub fn knocks_out_shadow(&self) -> bool {
+        self.kind != Kind::Group
+            && self.shadows.iter().any(|s| s.visible && s.kind == EffectKind::DropShadow && !s.show_behind)
+            && !(self.has_area() && self.fills.iter().any(|f| f.visible && f.kind == PaintKind::Solid && f.color.a() == 255))
     }
 
     /// Re-derive `rect` so it tightly wraps every contour (anchors relative to it).
@@ -1633,6 +2371,15 @@ impl Node {
     pub fn first_fill(&self) -> Option<Rgba> {
         self.fills.iter().rev().find(|p| p.visible && p.kind == PaintKind::Solid).map(|p| p.color)
     }
+
+    /// Children bottom to top as painted: auto layout's "First on top" stacking reverses them.
+    pub fn paint_order(&self) -> Vec<NodeId> {
+        let mut v = self.children.clone();
+        if self.layout.reverse_z && self.layout.mode != LayoutMode::None {
+            v.reverse();
+        }
+        v
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1646,6 +2393,25 @@ pub struct Page {
     /// Where the page was last viewed: world center x, y and zoom (saved in the file, as Figma does).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<[f32; 3]>,
+    /// Ruler guides dragged onto the page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guides: Vec<Guide>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub prototype: ProtoSettings,
+}
+
+/// Which way a ruler guide runs: an X guide is a vertical line at an x offset, Y horizontal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Axis {
+    X,
+    Y,
+}
+
+/// A page guide from the rulers (Figma's `Guide`: an axis and a world offset).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Guide {
+    pub axis: Axis,
+    pub offset: f32,
 }
 
 pub const PAGE_BG: Rgba = Rgba::rgb(0xF5, 0xF5, 0xF5);
@@ -1667,6 +2433,16 @@ pub struct Document {
     pub collections: Vec<Collection>,
     #[serde(default)]
     pub variables: Vec<Variable>,
+    /// A random id given on first save; files using this one as a library find it by it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    /// Libraries added to this file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub libraries: Vec<LibraryRef>,
+    /// As a library: the last publish's version (counting from 1) and unix time. Files using
+    /// it only see updates once it's published again, as in Figma.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub published: (u32, u64),
     #[serde(skip)]
     pub cache: SyncCache,
 }
@@ -1727,13 +2503,151 @@ struct FileJson {
 
 /// Read a .katachi file's text.
 pub fn parse_file(text: &str) -> Result<Document, String> {
-    serde_json::from_str::<FileJson>(text).map(|f| f.document).map_err(|e| e.to_string())
+    let mut doc = from_json::<FileJson>(text)?.document;
+    crate::collab::repair(&mut doc);
+    doc.next_id = doc.nodes.keys().map(|k| k + 1).fold(doc.next_id, u64::max);
+    Ok(doc)
 }
 
-/// A .katachi file's text.
+/// A .katachi file's text. Images no paint uses any more (deleted or replaced) are left out.
 pub fn file_json(doc: &Document) -> String {
+    let used = used_images(doc);
+    let json = if doc.images.keys().all(|k| used.contains(k.as_str())) {
+        to_json(doc)
+    } else {
+        let mut pruned = doc.clone();
+        pruned.images.retain(|k, _| used.contains(k.as_str()));
+        to_json(&pruned)
+    };
+    format!(r#"{{"katachi":1,"document":{json}}}"#)
+}
+
+/// Image keys that paints refer to: on layers, their instance snapshots, and paint styles.
+fn used_images(doc: &Document) -> std::collections::HashSet<&str> {
+    fn add<'a>(n: &'a Node, out: &mut std::collections::HashSet<&'a str>) {
+        out.extend(n.fills.iter().chain(&n.strokes).map(|p| p.image.as_str()));
+        if let Some(s) = &n.synced {
+            add(s, out);
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    for n in doc.nodes.values() {
+        add(n, &mut out);
+    }
+    for s in &doc.styles {
+        if let StyleValue::Paint(ps) = &s.value {
+            out.extend(ps.iter().map(|p| p.image.as_str()));
+        }
+    }
+    out
+}
+
+/// JSON for files, the clipboard and multiplayer. serde_json writes NaN and infinity as `null`,
+/// which strict readers reject; if any slipped in, a lenient round trip turns them into numbers.
+pub fn to_json<T: Serialize + serde::de::DeserializeOwned>(v: &T) -> String {
     // Straight to text: going through a serde_json::Value doubles the time on big files.
-    format!(r#"{{"katachi":1,"document":{}}}"#, serde_json::to_string(doc).unwrap_or_default())
+    let s = serde_json::to_string(v).unwrap_or_default();
+    // Base64 image data can't contain these, so they only show up for real nulls.
+    if !(s.contains(":null") || s.contains(",null") || s.contains("[null")) {
+        return s;
+    }
+    serde_json::from_str(&s).ok().and_then(|x| T::deserialize(Lenient(x)).ok()).and_then(|t| serde_json::to_string(&t).ok()).unwrap_or(s)
+}
+
+/// Parse JSON from `to_json`, or from older versions that wrote non-finite numbers as `null`:
+/// those read as 0, or as the property's default on layers.
+pub fn from_json<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
+    serde_json::from_str(text).or_else(|e| {
+        let v: serde_json::Value = serde_json::from_str(text).map_err(|_| e.to_string())?;
+        T::deserialize(Lenient(v)).map_err(|_| e.to_string())
+    })
+}
+
+/// A `serde_json::Value` deserializer that reads `null` floats as 0 and drops `null` layer fields.
+struct Lenient(serde_json::Value);
+
+/// Map keys: strings, or numbers written as strings (node ids).
+struct Key(String);
+
+impl serde::de::IntoDeserializer<'_, serde_json::Error> for Lenient {
+    type Deserializer = Self;
+    fn into_deserializer(self) -> Self {
+        self
+    }
+}
+
+impl serde::de::IntoDeserializer<'_, serde_json::Error> for Key {
+    type Deserializer = Self;
+    fn into_deserializer(self) -> Self {
+        self
+    }
+}
+
+fn lenient_map<'de>(m: serde_json::Map<String, serde_json::Value>) -> serde::de::value::MapDeserializer<'de, impl Iterator<Item = (Key, Lenient)>, serde_json::Error> {
+    serde::de::value::MapDeserializer::new(m.into_iter().map(|(k, v)| (Key(k), Lenient(v))))
+}
+
+impl<'de> serde::Deserializer<'de> for Lenient {
+    type Error = serde_json::Error;
+    fn deserialize_any<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        match self.0 {
+            serde_json::Value::Array(a) => v.visit_seq(serde::de::value::SeqDeserializer::new(a.into_iter().map(Lenient))),
+            serde_json::Value::Object(m) => v.visit_map(lenient_map(m)),
+            other => other.deserialize_any(v),
+        }
+    }
+    fn deserialize_f32<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        self.deserialize_f64(v)
+    }
+    fn deserialize_f64<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        if self.0.is_null() { v.visit_f64(0.0) } else { self.deserialize_any(v) }
+    }
+    fn deserialize_option<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        if self.0.is_null() { v.visit_none() } else { v.visit_some(self) }
+    }
+    fn deserialize_newtype_struct<V: serde::de::Visitor<'de>>(self, _: &'static str, v: V) -> Result<V::Value, Self::Error> {
+        v.visit_newtype_struct(self)
+    }
+    fn deserialize_struct<V: serde::de::Visitor<'de>>(self, name: &'static str, _: &'static [&'static str], v: V) -> Result<V::Value, Self::Error> {
+        match self.0 {
+            // Every layer field has a default, which beats 0 (an opacity of 0 hides the layer).
+            serde_json::Value::Object(mut m) if name == "Node" => {
+                m.retain(|_, x| !x.is_null());
+                v.visit_map(lenient_map(m))
+            }
+            other => Lenient(other).deserialize_any(v),
+        }
+    }
+    fn deserialize_enum<V: serde::de::Visitor<'de>>(self, name: &'static str, variants: &'static [&'static str], v: V) -> Result<V::Value, Self::Error> {
+        use serde::de::IntoDeserializer;
+        match self.0 {
+            serde_json::Value::Object(m) => serde::de::value::MapAccessDeserializer::new(lenient_map(m)).deserialize_enum(name, variants, v),
+            serde_json::Value::String(s) => v.visit_enum(IntoDeserializer::<serde_json::Error>::into_deserializer(s)),
+            other => other.deserialize_enum(name, variants, v),
+        }
+    }
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 char str string bytes byte_buf unit unit_struct seq tuple tuple_struct map identifier ignored_any
+    }
+}
+
+impl<'de> serde::Deserializer<'de> for Key {
+    type Error = serde_json::Error;
+    fn deserialize_any<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        v.visit_string(self.0)
+    }
+    fn deserialize_u64<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        match self.0.parse() {
+            Ok(n) => v.visit_u64(n),
+            Err(_) => v.visit_string(self.0),
+        }
+    }
+    fn deserialize_u32<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        self.deserialize_u64(v)
+    }
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u128 f32 f64 char str string bytes byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map struct enum identifier ignored_any
+    }
 }
 
 mod images_b64 {
@@ -1767,7 +2681,7 @@ pub enum Order {
 impl Default for Document {
     fn default() -> Self {
         Self {
-            pages: vec![Page { name: "Page 1".into(), children: vec![], background: PAGE_BG, flows: vec![], view: None }],
+            pages: vec![Page { name: "Page 1".into(), children: vec![], background: PAGE_BG, flows: vec![], view: None, guides: vec![], prototype: Default::default() }],
             nodes: HashMap::new(),
             next_id: 1,
             images: HashMap::new(),
@@ -1775,6 +2689,9 @@ impl Default for Document {
             comments: vec![],
             collections: vec![],
             variables: vec![],
+            id: String::new(),
+            libraries: vec![],
+            published: (0, 0),
             cache: SyncCache::default(),
         }
     }
@@ -1797,9 +2714,12 @@ impl Document {
     pub fn ancestors(&self, id: NodeId) -> Vec<NodeId> {
         let mut out = vec![];
         let mut cur = self.nodes.get(&id).and_then(|n| n.parent);
-        while let Some(p) = cur {
+        // Bounded, so a corrupt parent cycle can't hang.
+        while let Some(p) = cur
+            && out.len() < self.nodes.len()
+        {
             out.push(p);
-            cur = self.nodes[&p].parent;
+            cur = self.nodes.get(&p).and_then(|n| n.parent);
         }
         out
     }
@@ -1986,10 +2906,41 @@ impl Document {
         self.variables.iter().find(|v| v.id == id)
     }
 
+    /// A variable's value in its first mode, following aliases (its type, for pickers).
+    pub fn resolve_first(&self, id: VarId) -> Option<VarValue> {
+        let mut cur = id;
+        for _ in 0..8 {
+            match self.variable(cur)?.values.first()? {
+                VarValue::Alias(next) => cur = *next,
+                v => return Some(v.clone()),
+            }
+        }
+        None
+    }
+
+    /// Whether `id` is `target` or reaches it through aliases in any mode (an alias to it would loop).
+    pub fn aliases_to(&self, id: VarId, target: VarId) -> bool {
+        let mut seen = vec![];
+        let mut todo = vec![id];
+        while let Some(cur) = todo.pop() {
+            if cur == target {
+                return true;
+            }
+            if seen.contains(&cur) {
+                continue;
+            }
+            seen.push(cur);
+            if let Some(v) = self.variable(cur) {
+                todo.extend(v.values.iter().filter_map(|x| if let VarValue::Alias(a) = x { Some(*a) } else { None }));
+            }
+        }
+        false
+    }
+
     pub fn add_collection(&mut self, name: String) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.collections.push(Collection { id, name, modes: vec!["Mode 1".into()] });
+        self.collections.push(Collection { id, name, modes: vec!["Mode 1".into()], remote: None });
         id
     }
 
@@ -1997,7 +2948,7 @@ impl Document {
         let id = self.next_id;
         self.next_id += 1;
         let modes = self.collections.iter().find(|c| c.id == collection).map_or(1, |c| c.modes.len());
-        self.variables.push(Variable { id, name, collection, values: vec![value; modes] });
+        self.variables.push(Variable { id, name, collection, values: vec![value; modes], scopes: vec![], code_syntax: Default::default(), remote: None });
         id
     }
 
@@ -2079,6 +3030,20 @@ impl Document {
                 (Bindable::FontSize, VarValue::Number(v)) => n.font_size = v.max(1.0),
                 (Bindable::Text, VarValue::Text(t)) => n.text = t,
                 (Bindable::Visible, VarValue::Bool(b)) => n.visible = b,
+                (Bindable::LineHeight, VarValue::Number(v)) => n.line_height = LineHeight::Px(v.max(0.0)),
+                (Bindable::LetterSpacing, VarValue::Number(v)) => n.letter_spacing = v,
+                (Bindable::ParagraphSpacing, VarValue::Number(v)) => n.paragraph_spacing = v.max(0.0),
+                (Bindable::FontFamily, VarValue::Text(t)) => n.font_family = t,
+                (Bindable::FontWeight, VarValue::Number(v)) => n.font_weight = v.clamp(1.0, 1000.0) as u16,
+                (Bindable::MinWidth, VarValue::Number(v)) => n.min_size[0] = Some(v.max(0.0)),
+                (Bindable::MaxWidth, VarValue::Number(v)) => n.max_size[0] = Some(v.max(0.0)),
+                (Bindable::MinHeight, VarValue::Number(v)) => n.min_size[1] = Some(v.max(0.0)),
+                (Bindable::MaxHeight, VarValue::Number(v)) => n.max_size[1] = Some(v.max(0.0)),
+                (Bindable::EffectColor, VarValue::Color(c)) => n.shadows.iter_mut().take(1).for_each(|s| s.color = c),
+                (Bindable::EffectBlur, VarValue::Number(v)) => n.shadows.iter_mut().take(1).for_each(|s| s.blur = v.max(0.0)),
+                (Bindable::EffectSpread, VarValue::Number(v)) => n.shadows.iter_mut().take(1).for_each(|s| s.spread = v),
+                (Bindable::EffectX, VarValue::Number(v)) => n.shadows.iter_mut().take(1).for_each(|s| s.offset.x = v),
+                (Bindable::EffectY, VarValue::Number(v)) => n.shadows.iter_mut().take(1).for_each(|s| s.offset.y = v),
                 _ => {}
             }
         }
@@ -2099,6 +3064,14 @@ impl Document {
             Bindable::FontSize => a.font_size != b.font_size,
             Bindable::Text => a.text != b.text,
             Bindable::Visible => a.visible != b.visible,
+            Bindable::LineHeight => a.line_height != b.line_height,
+            Bindable::LetterSpacing => a.letter_spacing != b.letter_spacing,
+            Bindable::ParagraphSpacing => a.paragraph_spacing != b.paragraph_spacing,
+            Bindable::FontFamily => a.font_family != b.font_family,
+            Bindable::FontWeight => a.font_weight != b.font_weight,
+            Bindable::MinWidth | Bindable::MinHeight => a.min_size != b.min_size,
+            Bindable::MaxWidth | Bindable::MaxHeight => a.max_size != b.max_size,
+            Bindable::EffectColor | Bindable::EffectBlur | Bindable::EffectSpread | Bindable::EffectX | Bindable::EffectY => a.shadows != b.shadows,
         }
     }
 
@@ -2117,6 +3090,20 @@ impl Document {
             (Bindable::FontSize, VarValue::Number(v)) => n.font_size == v.max(1.0),
             (Bindable::Text, VarValue::Text(t)) => n.text == *t,
             (Bindable::Visible, VarValue::Bool(b)) => n.visible == *b,
+            (Bindable::LineHeight, VarValue::Number(v)) => n.line_height == LineHeight::Px(v.max(0.0)),
+            (Bindable::LetterSpacing, VarValue::Number(v)) => n.letter_spacing == *v,
+            (Bindable::ParagraphSpacing, VarValue::Number(v)) => n.paragraph_spacing == v.max(0.0),
+            (Bindable::FontFamily, VarValue::Text(t)) => n.font_family == *t,
+            (Bindable::FontWeight, VarValue::Number(v)) => n.font_weight == v.clamp(1.0, 1000.0) as u16,
+            (Bindable::MinWidth, VarValue::Number(v)) => n.min_size[0] == Some(v.max(0.0)),
+            (Bindable::MaxWidth, VarValue::Number(v)) => n.max_size[0] == Some(v.max(0.0)),
+            (Bindable::MinHeight, VarValue::Number(v)) => n.min_size[1] == Some(v.max(0.0)),
+            (Bindable::MaxHeight, VarValue::Number(v)) => n.max_size[1] == Some(v.max(0.0)),
+            (Bindable::EffectColor, VarValue::Color(c)) => n.shadows.first().is_none_or(|s| s.color == *c),
+            (Bindable::EffectBlur, VarValue::Number(v)) => n.shadows.first().is_none_or(|s| s.blur == v.max(0.0)),
+            (Bindable::EffectSpread, VarValue::Number(v)) => n.shadows.first().is_none_or(|s| s.spread == *v),
+            (Bindable::EffectX, VarValue::Number(v)) => n.shadows.first().is_none_or(|s| s.offset.x == *v),
+            (Bindable::EffectY, VarValue::Number(v)) => n.shadows.first().is_none_or(|s| s.offset.y == *v),
             _ => true,
         }
     }
@@ -2129,18 +3116,19 @@ impl Document {
     pub fn add_style(&mut self, name: String, value: StyleValue) -> StyleId {
         let id = self.next_id;
         self.next_id += 1;
-        self.styles.push(Style { id, name, value });
+        self.styles.push(Style { id, name, value, remote: None });
         id
     }
 
     /// Push style values into every linked layer; links to deleted styles fall away.
     pub fn apply_styles(&mut self) {
-        if self.styles.is_empty() && self.nodes.values().all(|n| n.fill_style.is_none() && n.stroke_style.is_none() && n.text_style.is_none() && n.effect_style.is_none()) {
+        let linked = |n: &Node| n.fill_style.is_some() || n.stroke_style.is_some() || n.text_style.is_some() || n.effect_style.is_some() || n.grid_style.is_some();
+        if self.styles.is_empty() && !self.nodes.values().any(|n| linked(n)) {
             return;
         }
         let styles: HashMap<StyleId, StyleValue> = self.styles.iter().map(|s| (s.id, s.value.clone())).collect();
         for arc in self.nodes.values_mut() {
-            if arc.fill_style.is_none() && arc.stroke_style.is_none() && arc.text_style.is_none() && arc.effect_style.is_none() {
+            if !linked(arc) {
                 continue;
             }
             // Work on a copy and only write back real changes, so layers stay shared with undo.
@@ -2159,7 +3147,7 @@ impl Document {
             Some(s) => (
                 s.fills != n.fills,
                 s.strokes != n.strokes,
-                (s.font_family != n.font_family || s.font_size != n.font_size || s.font_weight != n.font_weight || s.line_height != n.line_height || s.letter_spacing != n.letter_spacing),
+                (s.font_family != n.font_family || s.font_size != n.font_size || s.font_weight != n.font_weight || s.italic != n.italic || s.line_height != n.line_height || s.letter_spacing != n.letter_spacing || s.decoration != n.decoration || s.text_case != n.text_case),
                 s.shadows != n.shadows,
             ),
             None => (false, false, false, false),
@@ -2192,6 +3180,14 @@ impl Document {
             }
             _ => n.effect_style = None,
         }
+        match n.grid_style.and_then(|id| styles.get(&id)) {
+            Some(StyleValue::Grid(g)) => {
+                if n.synced.as_ref().is_none_or(|s| s.grids == n.grids) {
+                    n.grids = g.clone()
+                }
+            }
+            _ => n.grid_style = None,
+        }
     }
 
     /// Create an instance of `comp` with its top-left at `at`.
@@ -2200,11 +3196,11 @@ impl Document {
         if let Some(set) = c.parent.map(|p| &self.nodes[&p]).filter(|p| p.kind == Kind::ComponentSet) {
             c.name = set.name.clone();
         }
-        let mut n = Node { children: vec![], name: c.name.clone(), ..c.clone() };
+        let mut n = Node { children: vec![], name: c.name.clone(), remote: None, ..c.clone() };
         n.kind = Kind::Instance;
         n.component = Some(comp);
         n.source = Some(comp);
-        n.synced = Some(Box::new(Node { children: vec![], ..c }));
+        n.synced = Some(Box::new(Node { children: vec![], remote: None, ..c }));
         n.rect = Rect::from_min_size(at, n.rect.size());
         let id = self.insert(page, parent, index, n);
         self.sync_instance(id);
@@ -2235,7 +3231,7 @@ impl Document {
             if let Some(src) = self.nodes[&id].source.and_then(|s| self.nodes.get(&s)).cloned() {
                 let n = self.node_mut(id);
                 let keep = n.rect;
-                *n = Node { id: n.id, parent: n.parent, children: n.children.clone(), kind: n.kind, component: n.component, source: n.source, synced: None, ..(*src).clone() };
+                *n = Node { id: n.id, parent: n.parent, children: n.children.clone(), kind: n.kind, component: n.component, source: n.source, synced: None, remote: n.remote.clone(), ..(*src).clone() };
                 n.rect = keep;
                 n.synced = Some(Box::new(Node { children: vec![], ..n.clone() }));
             }
@@ -2246,6 +3242,52 @@ impl Document {
             n.rect = Rect::from_min_size(n.rect.min, size);
         }
         self.sync_instance(inst);
+        self.reflow();
+    }
+
+    /// The instance's own layers (itself and its descendants outside nested instances).
+    fn own_layers(&self, inst: NodeId) -> Vec<NodeId> {
+        std::iter::once(inst)
+            .chain(self.descendants(inst).into_iter().filter(|&d| !self.ancestors(d).iter().take_while(|a| **a != inst).any(|a| self.nodes[a].kind == Kind::Instance)))
+            .collect()
+    }
+
+    /// Which property groups an instance overrides anywhere in its layers.
+    pub fn instance_overrides(&self, inst: NodeId) -> Vec<Override> {
+        let layers: Vec<NodeId> = std::iter::once(inst).chain(self.descendants(inst)).collect();
+        Override::ALL
+            .into_iter()
+            .filter(|o| layers.iter().any(|d| self.nodes[d].synced.as_deref().is_some_and(|s| o.differs(&self.nodes[d], s))))
+            .collect()
+    }
+
+    /// Drop one kind of override across an instance (Figma's "Reset fill" and the like).
+    pub fn reset_override(&mut self, inst: NodeId, o: Override) {
+        for d in std::iter::once(inst).chain(self.descendants(inst)) {
+            let Some(snap) = self.nodes[&d].synced.as_deref().filter(|s| o.differs(&self.nodes[&d], s)).cloned() else { continue };
+            o.copy(&snap, self.node_mut(d));
+        }
+        self.sync_instance(inst);
+        self.reflow();
+    }
+
+    /// Figma's "Push changes to main component": the instance's overrides become the main
+    /// component's values, so every other instance picks them up too.
+    pub fn push_to_main(&mut self, inst: NodeId) {
+        // A library component is read-only here: it changes in its library.
+        if self.nodes[&inst].component.is_none_or(|c| self.nodes.get(&c).is_none_or(|c| c.remote.is_some())) {
+            return;
+        }
+        for d in self.own_layers(inst) {
+            let n = self.nodes[&d].clone();
+            let (Some(snap), Some(src)) = (n.synced.as_deref(), n.source.filter(|s| self.nodes.contains_key(s))) else { continue };
+            for o in Override::ALL.into_iter().filter(|o| o.differs(&n, snap) && !(d == inst && *o == Override::Name)) {
+                o.copy(&n, self.node_mut(src));
+            }
+            if n.layout != snap.layout {
+                self.node_mut(src).layout = n.layout;
+            }
+        }
         self.reflow();
     }
 
@@ -2329,9 +3371,9 @@ impl Document {
                     e
                 }
                 None => {
-                    let mut n = Node { children: vec![], ..(*src).clone() };
+                    let mut n = Node { children: vec![], remote: None, ..(*src).clone() };
                     n.source = Some(cid);
-                    n.synced = Some(Box::new(Node { children: vec![], ..(*src).clone() }));
+                    n.synced = Some(Box::new(Node { children: vec![], remote: None, ..(*src).clone() }));
                     // Nested instances keep pointing at their own component.
                     let id = self.insert(page, Some(parent), None, n);
                     by_source.insert(cid, id);
@@ -2409,6 +3451,15 @@ impl Document {
     fn mark_synced(&self, inst: NodeId, revs: &mut HashMap<NodeId, u64>) {
         if let Some(key) = self.inst_key(inst, revs) {
             self.cache.0.lock().unwrap().insts.insert(inst, key);
+        }
+    }
+
+    /// A component's description: its own, or its component set's.
+    pub fn description_of(&self, comp: NodeId) -> &str {
+        let c = &self.nodes[&comp];
+        match c.parent.map(|p| &self.nodes[&p]) {
+            Some(set) if set.kind == Kind::ComponentSet && c.description.is_empty() => &set.description,
+            _ => &c.description,
         }
     }
 
@@ -2637,6 +3688,9 @@ impl Document {
             .copied()
             .filter(|c| self.nodes[c].visible && !self.nodes[c].absolute)
             .collect();
+        if l.mode == LayoutMode::Grid {
+            return self.layout_grid(f, &n, &kids, [pt, pr, pb, pl], &out);
+        }
         if l.wrap && h {
             return self.layout_wrap(f, &n, &kids, [pt, pr, pb, pl], &out);
         }
@@ -2653,8 +3707,16 @@ impl Document {
             let m = p0 + p1 + fixed_main + fill_now + if l.space_between { 0.0 } else { gaps };
             size = along(m, cross(size));
         }
+        // Baseline alignment: each layer drops by how far its baseline sits above the lowest one.
+        let bases: Vec<f32> = if h && l.cross == AxisAlign::Baseline {
+            let b: Vec<f32> = kids.iter().map(|c| &self.nodes[c]).map(|k| if fills(k, ca) { f32::NAN } else { self.baseline_of(k) + out(k) }).collect();
+            let top = b.iter().copied().filter(|x| !x.is_nan()).fold(0.0, f32::max);
+            b.into_iter().map(|x| if x.is_nan() { 0.0 } else { top - x }).collect()
+        } else {
+            vec![0.0; kids.len()]
+        };
         if n.sizing[ca] == Sizing::Hug {
-            let c = kids.iter().map(|c| &self.nodes[c]).filter(|k| !fills(k, ca)).map(|k| cross(lsize(k))).fold(0.0, f32::max);
+            let c = kids.iter().zip(&bases).map(|(c, o)| (&self.nodes[c], o)).filter(|(k, _)| !fills(k, ca)).map(|(k, o)| o + cross(lsize(k))).fold(0.0, f32::max);
             size = along(main(size), q0 + q1 + c);
         }
         for axis in 0..2 {
@@ -2674,14 +3736,14 @@ impl Document {
             0.0
         } else {
             match l.main {
-                AxisAlign::Min => 0.0,
+                AxisAlign::Min | AxisAlign::Baseline => 0.0,
                 AxisAlign::Center => free / 2.0,
                 AxisAlign::Max => free,
             }
         };
         let origin = n.rect.min;
         let mut cursor = main(origin.to_vec2()) + p0 + lead;
-        for c in kids {
+        for (i, c) in kids.into_iter().enumerate() {
             let k = self.nodes[&c].clone();
             let o = out(&k);
             let mut ks = lsize(&k);
@@ -2697,6 +3759,7 @@ impl Document {
             }
             let off = match l.cross {
                 AxisAlign::Min => 0.0,
+                AxisAlign::Baseline => bases[i],
                 AxisAlign::Center => (inner_cross - cross(ks)) / 2.0,
                 AxisAlign::Max => inner_cross - cross(ks),
             };
@@ -2727,14 +3790,24 @@ impl Document {
             used += if row.is_empty() { s.x } else { l.gap + s.x };
             row.push((c, s));
         }
-        let heights: Vec<f32> = rows.iter().map(|r| r.iter().map(|(_, s)| s.y).fold(0.0, f32::max)).collect();
+        // Baseline rows: each layer's drop below the row top; the row is as tall as its lowest bottom.
+        let baseline = l.cross == AxisAlign::Baseline;
+        let drops: Vec<Vec<f32>> = rows
+            .iter()
+            .map(|r| {
+                let b: Vec<f32> = r.iter().map(|(c, _)| if baseline { self.baseline_of(&self.nodes[c]) + out(&self.nodes[c]) } else { 0.0 }).collect();
+                let top = b.iter().copied().fold(0.0, f32::max);
+                b.into_iter().map(|x| top - x).collect()
+            })
+            .collect();
+        let heights: Vec<f32> = rows.iter().zip(&drops).map(|(r, d)| r.iter().zip(d).map(|((_, s), o)| o + s.y).fold(0.0, f32::max)).collect();
         if n.sizing[1] == Sizing::Hug {
             let content = heights.iter().sum::<f32>() + l.cross_gap * (rows.len() as f32 - 1.0).max(0.0);
             let h = clamp_size(n, 1, pt + pb + content);
             self.node_mut(f).rect = Rect::from_min_size(n.rect.min, vec2(n.rect.width(), h));
         }
         let mut y = n.rect.min.y + pt;
-        for (row, &rh) in rows.iter().zip(&heights) {
+        for ((row, &rh), drop) in rows.iter().zip(&heights).zip(&drops) {
             let widths: f32 = row.iter().map(|(_, s)| s.x).sum();
             let count = row.len() as f32;
             let free = inner_w - widths - l.gap * (count - 1.0).max(0.0);
@@ -2742,16 +3815,17 @@ impl Document {
                 (0.0, (inner_w - widths) / (count - 1.0))
             } else {
                 let lead = match l.main {
-                    AxisAlign::Min => 0.0,
+                    AxisAlign::Min | AxisAlign::Baseline => 0.0,
                     AxisAlign::Center => free / 2.0,
                     AxisAlign::Max => free,
                 };
                 (lead, l.gap)
             };
             let mut x = n.rect.min.x + pl + lead;
-            for &(c, s) in row {
+            for (&(c, s), d) in row.iter().zip(drop) {
                 let off = match l.cross {
                     AxisAlign::Min => 0.0,
+                    AxisAlign::Baseline => *d,
                     AxisAlign::Center => (rh - s.y) / 2.0,
                     AxisAlign::Max => rh - s.y,
                 };
@@ -2763,6 +3837,104 @@ impl Document {
                 x += s.x + gap;
             }
             y += rh + l.cross_gap;
+        }
+    }
+
+    /// Distance from a layer's top to its first text baseline: text uses its first line, auto
+    /// layout frames their first child's, anything else its bottom edge (as Figma does).
+    fn baseline_of(&self, k: &Node) -> f32 {
+        if k.kind == Kind::Text && k.rotation == 0.0 {
+            let rows = if k.lines.is_empty() { k.text.matches('\n').count() + 1 } else { k.lines.len() };
+            return crate::text::draw_offset(k, rows).y + k.font_size * crate::text::ASCENT;
+        }
+        if k.layout.mode != LayoutMode::None
+            && k.rotation == 0.0
+            && let Some(c) = k.children.iter().map(|c| &self.nodes[c]).find(|c| c.visible && !c.absolute)
+        {
+            return c.aabb().min.y - k.rect.min.y + self.baseline_of(c);
+        }
+        k.aabb().height()
+    }
+
+    /// Grid auto layout: children fill cells row by row, each spanning `grid_span` cells (CSS grid's
+    /// sparse auto-placement); rows are added when the children outnumber the cells.
+    fn layout_grid(&mut self, f: NodeId, n: &Node, kids: &[NodeId], [pt, pr, pb, pl]: [f32; 4], out: &dyn Fn(&Node) -> f32) {
+        let l = n.layout;
+        let cols = l.grid[0].max(1) as usize;
+        let gaps = [l.gap, l.cross_gap];
+        let mut taken: Vec<Vec<bool>> = vec![];
+        let mut placed: Vec<(NodeId, [usize; 2], [usize; 2])> = vec![];
+        let mut cursor = 0;
+        for &c in kids {
+            let span = self.nodes[&c].grid_span;
+            let (cs, rs) = ((span[0].max(1) as usize).min(cols), span[1].max(1) as usize);
+            let mut i = cursor;
+            loop {
+                let (r, col) = (i / cols, i % cols);
+                if taken.len() < r + rs {
+                    taken.resize(r + rs, vec![false; cols]);
+                }
+                if col + cs <= cols && (r..r + rs).all(|y| (col..col + cs).all(|x| !taken[y][x])) {
+                    for row in &mut taken[r..r + rs] {
+                        row[col..col + cs].fill(true);
+                    }
+                    placed.push((c, [col, r], [cs, rs]));
+                    cursor = i + cs;
+                    break;
+                }
+                i += 1;
+            }
+        }
+        let counts = [cols, (l.grid[1] as usize).max(taken.len()).max(1)];
+        let pad = [pl + pr, pt + pb];
+        let fills = |k: &Node, axis: usize| k.sizing[axis] == Sizing::Fill && (k.kind != Kind::Text || k.text_sizing != TextSizing::AutoWidth);
+        let lsize = |k: &Node| k.aabb().size() + Vec2::splat(2.0 * out(k));
+        let mut size = n.rect.size();
+        let mut track = [0.0; 2];
+        for a in 0..2 {
+            let gap_sum = gaps[a] * (counts[a] as f32 - 1.0);
+            track[a] = match l.tracks[a] {
+                Some(t) => t,
+                // Hugging Fill tracks are as big as the biggest single-cell layer.
+                None if n.sizing[a] == Sizing::Hug => placed
+                    .iter()
+                    .filter(|(c, _, s)| s[a] == 1 && !fills(&self.nodes[c], a))
+                    .map(|(c, _, _)| lsize(&self.nodes[c])[a])
+                    .fold(0.0, f32::max),
+                None => ((size[a] - pad[a] - gap_sum) / counts[a] as f32).max(0.0),
+            };
+            if n.sizing[a] == Sizing::Hug {
+                size[a] = clamp_size(n, a, pad[a] + track[a] * counts[a] as f32 + gap_sum);
+            }
+        }
+        if size != n.rect.size() {
+            self.node_mut(f).rect = Rect::from_min_size(n.rect.min, size);
+        }
+        let origin = n.rect.min + vec2(pl, pt);
+        let place = |a: AxisAlign, free: f32| match a {
+            AxisAlign::Min | AxisAlign::Baseline => 0.0,
+            AxisAlign::Center => free / 2.0,
+            AxisAlign::Max => free,
+        };
+        for (c, at, span) in placed {
+            let cell_min = origin + vec2(at[0] as f32 * (track[0] + gaps[0]), at[1] as f32 * (track[1] + gaps[1]));
+            let cell = vec2(span[0] as f32 * track[0] + (span[0] - 1) as f32 * gaps[0], span[1] as f32 * track[1] + (span[1] - 1) as f32 * gaps[1]);
+            let k = self.nodes[&c].clone();
+            let o = out(&k);
+            let mut ks = lsize(&k);
+            for a in 0..2 {
+                if fills(&k, a) {
+                    ks[a] = clamp_size(&k, a, cell[a]);
+                }
+            }
+            if (ks - lsize(&k)).length() > 1e-4 && k.rotation == 0.0 {
+                self.set_rect(c, Rect::from_min_size(k.rect.min, ks - Vec2::splat(2.0 * o)));
+            }
+            let target = cell_min + vec2(place(l.main, cell.x - ks.x), place(l.cross, cell.y - ks.y)) + Vec2::splat(o);
+            let cur = self.nodes[&c].aabb().min;
+            if cur != target {
+                self.translate(c, target - cur);
+            }
         }
     }
 
@@ -2938,6 +4110,18 @@ impl Document {
         list.insert(j, n);
     }
 
+    /// Move an auto layout child `steps` places along the flow, skipping hidden and absolute siblings.
+    pub fn step_in_flow(&mut self, id: NodeId, steps: isize) {
+        let (page, parent) = (self.page_of(id), self.nodes[&id].parent);
+        let list = self.children_of(page, parent).clone();
+        let flow: Vec<usize> = (0..list.len()).filter(|&i| self.nodes[&list[i]].visible && !self.nodes[&list[i]].absolute).collect();
+        let Some(k) = flow.iter().position(|&i| list[i] == id) else { return };
+        let to = flow[(k as isize + steps).clamp(0, flow.len() as isize - 1) as usize];
+        let list = self.children_of_mut(page, parent);
+        let n = list.remove(flow[k]);
+        list.insert(to, n);
+    }
+
     /// Copy subtrees into a standalone fragment (roots first, in z order).
     pub fn extract(&self, ids: &[NodeId]) -> Vec<Node> {
         let mut out = vec![];
@@ -2950,6 +4134,7 @@ impl Document {
 
     /// Insert a fragment from `extract` under `parent` with fresh ids. Returns new root ids.
     pub fn paste(&mut self, frag: &[Node], page: usize, parent: Option<NodeId>, index: Option<usize>) -> Vec<NodeId> {
+        let frag = &clean_fragment(frag);
         let in_frag: std::collections::HashSet<NodeId> = frag.iter().map(|n| n.id).collect();
         let mut map: HashMap<NodeId, NodeId> = HashMap::new();
         let mut roots = vec![];
@@ -3002,7 +4187,7 @@ impl Document {
                 }
                 return self.hit_in(&n.children, p, tol).or(Some(id));
             }
-            if let Some(h) = self.hit_in(&n.children, p, tol) {
+            if let Some(h) = self.hit_in(&n.paint_order(), p, tol) {
                 return Some(h);
             }
             if self.hit_self(n, p, tol) {
@@ -3054,6 +4239,37 @@ impl Document {
     }
 }
 
+/// A fragment (from the clipboard, possibly hand-edited) made safe to paste: parent links that
+/// loop become roots, and parents come before their children, as `extract` writes them.
+pub fn clean_fragment(frag: &[Node]) -> Vec<Node> {
+    let mut nodes = frag.to_vec();
+    let at: HashMap<NodeId, usize> = nodes.iter().enumerate().map(|(i, n)| (n.id, i)).collect();
+    for i in 0..nodes.len() {
+        let (mut cur, mut steps) = (nodes[i].parent, 0);
+        while let Some(&p) = cur.and_then(|p| at.get(&p))
+            && steps <= nodes.len()
+        {
+            if p == i {
+                nodes[i].parent = None;
+                break;
+            }
+            (cur, steps) = (nodes[p].parent, steps + 1);
+        }
+    }
+    let (mut out, mut placed) = (Vec::with_capacity(nodes.len()), std::collections::HashSet::new());
+    while !nodes.is_empty() {
+        let (ready, mut wait): (Vec<Node>, Vec<Node>) = nodes.into_iter().partition(|n| n.parent.is_none_or(|p| !at.contains_key(&p) || placed.contains(&p)));
+        if ready.is_empty() {
+            // Only possible with duplicate ids; paste the rest as roots.
+            wait.iter_mut().for_each(|n| n.parent = None);
+        }
+        placed.extend(ready.iter().map(|n| n.id));
+        out.extend(ready);
+        nodes = wait;
+    }
+    out
+}
+
 /// Copy each property from `src` unless the instance layer overrode it
 /// (its value no longer matches what was last copied).
 fn merge_from(e: &mut Node, src: &Node) {
@@ -3067,11 +4283,11 @@ fn merge_from(e: &mut Node, src: &Node) {
     }
     take!(
         name, visible, opacity, fills, strokes, stroke_width, stroke_sides, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, min_size, max_size, constraints, absolute,
-        paths, even_odd, text, font_size, font_weight, font_family, text_sizing, text_align, text_valign, line_height, letter_spacing,
-        decoration, text_case, paragraph_spacing, truncate, max_lines, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, fill_style,
-        stroke_style, text_style, effect_style, prop_bind, is_mask, blend, bindings, modes, spans, lists
+        paths, even_odd, text, font_size, font_weight, font_family, italic, text_sizing, text_align, text_valign, line_height, letter_spacing,
+        decoration, text_case, paragraph_spacing, paragraph_indent, vertical_trim, truncate, max_lines, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, overflow, scroll_pos, fill_style,
+        stroke_style, text_style, effect_style, grid_style, prop_bind, is_mask, blend, bindings, modes, spans, lists, exposed, grid_span, grids, arc, bool_op
     );
-    e.synced = Some(Box::new(Node { children: vec![], synced: None, ..src.clone() }));
+    e.synced = Some(Box::new(Node { children: vec![], synced: None, remote: None, ..src.clone() }));
 }
 
 /// Tight bounds of a cubic Bezier: endpoints plus the curve's extrema on each axis.
@@ -3210,6 +4426,67 @@ mod tests {
     }
 
     #[test]
+    fn non_finite_numbers_save_and_old_files_with_nulls_open() {
+        let mut d = Document::default();
+        let a = d.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 0., 10., 10.)));
+        d.node_mut(a).opacity = f32::NAN;
+        d.node_mut(a).rect.min.x = f32::INFINITY;
+        d.node_mut(a).dash = vec![4., f32::NAN];
+        d.node_mut(a).min_size = [None, Some(f32::NAN)];
+        d.node_mut(a).line_height = LineHeight::Px(f32::NAN);
+        d.node_mut(a).fills[0].stops = vec![(f32::NAN, Rgba::BLACK)];
+        d.comments.push(Comment { id: 1, page: 0, at: pos2(f32::NAN, 1.), anchor: None, messages: vec![], resolved: false });
+        // What older versions wrote: plain serde_json, NaN as null.
+        let old = format!(r#"{{"katachi":1,"document":{}}}"#, serde_json::to_string(&d).unwrap());
+        assert!(old.contains("null") && serde_json::from_str::<FileJson>(&old).is_err());
+        let back = parse_file(&old).expect("old file opens");
+        let n = back.node(a);
+        assert_eq!((n.opacity, n.rect.min.x, n.dash.clone(), n.min_size, n.line_height), (1.0, 0.0, vec![4., 0.], [None, None], LineHeight::Px(0.0)));
+        assert_eq!(n.fills[0].stops[0].0, 0.0);
+        assert_eq!(back.comments[0].at, pos2(0., 1.));
+        // New saves never contain the nulls in the first place.
+        let new = file_json(&d);
+        assert!(serde_json::from_str::<FileJson>(&new).is_ok(), "{new}");
+    }
+
+    #[test]
+    fn loading_repairs_cycles_missing_parents_and_pages() {
+        let mut d = Document::default();
+        let a = d.insert(0, None, None, Node::new(Kind::Frame, r(0., 0., 10., 10.)));
+        let b = d.insert(0, Some(a), None, Node::new(Kind::Frame, r(0., 0., 5., 5.)));
+        let c = d.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 0., 5., 5.)));
+        // a and b inside each other, c inside itself, a dangling child, and no pages.
+        d.node_mut(a).parent = Some(b);
+        d.node_mut(b).children.push(a);
+        d.node_mut(c).parent = Some(c);
+        d.node_mut(c).children = vec![c, 999];
+        d.pages.clear();
+        d.next_id = 1;
+        let back = parse_file(&file_json(&d)).unwrap();
+        assert_eq!(back.pages.len(), 1);
+        assert_eq!(back.ancestors(c), Vec::<NodeId>::new());
+        assert!(back.node(c).children.is_empty());
+        assert!(back.ancestors(a).len() + back.ancestors(b).len() == 1, "one of the pair is top level, the other inside it");
+        assert!(back.next_id > c, "new layers don't reuse ids");
+        // ancestors() itself never loops, even on a document that wasn't repaired.
+        assert!(d.ancestors(a).len() <= d.nodes.len());
+    }
+
+    #[test]
+    fn paste_survives_out_of_order_and_cyclic_fragments() {
+        let mut d = Document::default();
+        let mut parent = Node::new(Kind::Frame, r(0., 0., 10., 10.));
+        let mut kid = Node::new(Kind::Rectangle, r(0., 0., 5., 5.));
+        (parent.id, kid.id, kid.parent) = (1, 2, Some(1));
+        let ids = d.paste(&[kid.clone(), parent.clone()], 0, None, None);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(d.node(ids[0]).children.len(), 1, "the child lands in its parent");
+        parent.parent = Some(2);
+        let ids = d.paste(&[parent, kid], 0, None, None);
+        assert_eq!(ids.len(), 1, "the loop is cut");
+    }
+
+    #[test]
     fn group_ungroup_and_scale() {
         let mut d = Document::default();
         let a = d.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 0., 10., 10.)));
@@ -3225,6 +4502,81 @@ mod tests {
         assert_eq!(d.ungroup(g), vec![a, b]);
         assert_eq!(d.pages[0].children, vec![a, b]);
         assert!(!d.nodes.contains_key(&g));
+    }
+
+    #[test]
+    fn baseline_alignment_lines_up_text() {
+        let mut d = Document::default();
+        let mut f = Node::new(Kind::Frame, r(0., 0., 300., 10.));
+        f.layout = AutoLayout { mode: LayoutMode::Horizontal, cross: AxisAlign::Baseline, ..Default::default() };
+        f.sizing = [Sizing::Hug; 2];
+        let f = d.insert(0, None, None, f);
+        let text = |size: f32| Node { text: "Hi".into(), font_size: size, ..Node::new(Kind::Text, r(0., 0., 20., size * 1.21)) };
+        let big = d.insert(0, Some(f), None, text(32.));
+        let small = d.insert(0, Some(f), None, text(12.));
+        let rect = d.insert(0, Some(f), None, Node::new(Kind::Rectangle, r(0., 0., 10., 10.)));
+        d.reflow();
+        let base = |id: NodeId| d.node(id).rect.min.y + d.node(id).font_size * crate::text::ASCENT;
+        assert!((base(big) - base(small)).abs() < 1e-3, "baselines meet");
+        assert_eq!(d.node(big).rect.min.y, 0.0, "the tallest text sits at the top");
+        assert!((d.node(rect).rect.max.y - base(big)).abs() < 1e-3, "a shape sits on the baseline");
+        assert_eq!(d.node(f).rect.height(), d.node(small).rect.max.y.max(d.node(big).rect.max.y), "hugs the dropped text");
+    }
+
+    #[test]
+    fn grid_layout_places_spans_and_sizes_tracks() {
+        let mut d = Document::default();
+        let mut f = Node::new(Kind::Frame, r(0., 0., 220., 10.));
+        f.layout = AutoLayout { mode: LayoutMode::Grid, grid: [3, 1], gap: 10., cross_gap: 5., padding: [0., 10., 0., 10.], ..Default::default() };
+        f.sizing = [Sizing::Fixed, Sizing::Hug];
+        let f = d.insert(0, None, None, f);
+        let kid = |d: &mut Document| d.insert(0, Some(f), None, Node::new(Kind::Rectangle, r(0., 0., 20., 30.)));
+        let a = kid(&mut d);
+        let wide = kid(&mut d);
+        d.node_mut(wide).grid_span = [2, 1];
+        d.node_mut(wide).sizing[0] = Sizing::Fill;
+        let c = kid(&mut d);
+        let e = kid(&mut d);
+        d.reflow();
+        // Columns: (220 - 20 padding - 20 gaps) / 3 = 60 wide. Rows hug the 30-tall layers.
+        assert_eq!(d.node(a).rect, r(10., 0., 20., 30.));
+        assert_eq!(d.node(wide).rect, r(80., 0., 130., 30.), "spans two columns and fills them");
+        assert_eq!(d.node(c).rect.min, pos2(10., 35.), "next row");
+        assert_eq!(d.node(e).rect.min, pos2(80., 35.));
+        assert_eq!(d.node(f).rect.height(), 65.0, "rows grew to fit: 2 x 30 + 5");
+        // Fixed tracks.
+        d.node_mut(f).layout.tracks = [Some(40.), None];
+        d.reflow();
+        assert_eq!(d.node(e).rect.min.x, 60.0);
+    }
+
+    #[test]
+    fn first_on_top_reverses_paint_and_hits() {
+        let mut d = Document::default();
+        let mut f = Node::new(Kind::Frame, r(0., 0., 100., 100.));
+        f.layout = AutoLayout { mode: LayoutMode::Horizontal, gap: -50., ..Default::default() };
+        let f = d.insert(0, None, None, f);
+        let a = d.insert(0, Some(f), None, Node::new(Kind::Rectangle, r(0., 0., 60., 60.)));
+        let b = d.insert(0, Some(f), None, Node::new(Kind::Rectangle, r(0., 0., 60., 60.)));
+        d.reflow();
+        assert_eq!(d.hit(0, pos2(30., 30.), 0.), Some(b), "last on top");
+        d.node_mut(f).layout.reverse_z = true;
+        assert_eq!(d.node(f).paint_order(), vec![b, a]);
+        assert_eq!(d.hit(0, pos2(30., 30.), 0.), Some(a), "first on top");
+    }
+
+    #[test]
+    fn step_in_flow_skips_hidden_siblings() {
+        let mut d = Document::default();
+        let f = d.insert(0, None, None, Node::new(Kind::Frame, r(0., 0., 100., 100.)));
+        let ids: Vec<NodeId> = (0..4).map(|_| d.insert(0, Some(f), None, Node::new(Kind::Rectangle, r(0., 0., 10., 10.)))).collect();
+        d.node_mut(ids[1]).visible = false;
+        d.step_in_flow(ids[0], 1);
+        assert_eq!(d.node(f).children, vec![ids[1], ids[2], ids[0], ids[3]]);
+        d.step_in_flow(ids[0], 5);
+        assert_eq!(d.node(f).children, vec![ids[1], ids[2], ids[3], ids[0]]);
+        d.step_in_flow(ids[0], -1);
+        assert_eq!(d.node(f).children, vec![ids[1], ids[2], ids[0], ids[3]]);
     }
 
     #[test]
@@ -3309,6 +4661,16 @@ mod tests {
         assert_eq!(p.gradient_t(pos2(0.3, 0.5)), 0.5, "top-to-bottom by default");
         p.convert(PaintKind::Radial);
         assert_eq!(p.gradient_t(pos2(0.5, 0.0)), 1.0);
+        // A width handle at half length squashes the circle into an ellipse.
+        p.width_to = Some(pos2(0.5, 0.75));
+        assert!((p.gradient_t(pos2(0.5, 0.75)) - 1.0).abs() < 1e-5);
+        assert!((p.gradient_t(pos2(1.0, 0.5)) - 1.0).abs() < 1e-5);
+        p.convert(PaintKind::Diamond);
+        assert_eq!(p.width_to, None);
+        assert!((p.gradient_t(pos2(0.75, 0.75)) - 1.0).abs() < 1e-5, "corners on the handles");
+        p.convert(PaintKind::Angular);
+        assert_eq!(p.gradient_t(pos2(1.0, 0.5)), 0.0, "starts toward the end handle");
+        assert!((p.gradient_t(pos2(0.5, 1.0)) - 0.25).abs() < 1e-5, "then clockwise");
         p.convert(PaintKind::Solid);
         assert_eq!(p.color, Rgba::rgb(255, 0, 0));
     }
@@ -3321,6 +4683,22 @@ mod tests {
         assert!(json.contains("AQID+g=="), "{json}");
         let back: Document = serde_json::from_str(&json).unwrap();
         assert_eq!(back.images["abc"].as_slice(), &[1, 2, 3, 250]);
+    }
+
+    #[test]
+    fn saving_drops_images_no_paint_uses() {
+        let mut d = Document::default();
+        d.images.insert("gone".into(), std::sync::Arc::new(vec![1]));
+        d.images.insert("kept".into(), std::sync::Arc::new(vec![2]));
+        let mut p = Paint::solid(Rgba::WHITE);
+        (p.kind, p.image) = (PaintKind::Image, "kept".into());
+        // Only an instance's snapshot of its component still shows it.
+        let mut n = Node::new(Kind::Rectangle, r(0., 0., 1., 1.));
+        n.synced = Some(Box::new(Node { fills: vec![p], ..Node::default() }));
+        d.insert(0, None, None, n);
+        let back = parse_file(&file_json(&d)).unwrap();
+        assert!(back.images.contains_key("kept") && !back.images.contains_key("gone"));
+        assert_eq!(d.images.len(), 2, "the open document keeps them (undo may bring a paint back)");
     }
 
     fn al_frame(d: &mut Document, mode: LayoutMode) -> NodeId {
@@ -3660,8 +5038,8 @@ mod tests {
         assert_eq!(d.node(i).name, d.node(set).name, "named after the set");
         // Boolean and text properties drive bound layers.
         d.node_mut(set).comp_props = vec![
-            CompProp { name: "Show label".into(), default: PropValue::Bool(true) },
-            CompProp { name: "Label".into(), default: PropValue::Text("Go".into()) },
+            CompProp { name: "Show label".into(), default: PropValue::Bool(true), preferred: vec![] },
+            CompProp { name: "Label".into(), default: PropValue::Text("Go".into()), preferred: vec![] },
         ];
         for c in [a, b] {
             let lbl = d.node(c).children[1];
@@ -3753,5 +5131,33 @@ mod tests {
         let g = d.insert(0, Some(f), None, Node::new(Kind::Frame, r(0., 0., 50., 50.)));
         d.reparent(f, 0, Some(g), None);
         assert_eq!(d.node(f).parent, None);
+    }
+
+    #[test]
+    fn aliases_text_bindings_and_scopes() {
+        let mut d = Document::default();
+        let c = d.add_collection("Theme".into());
+        let base = d.add_variable(c, "size/base".into(), VarValue::Number(20.0));
+        let lh = d.add_variable(c, "text/line".into(), VarValue::Alias(base));
+        let fam = d.add_variable(c, "font/body".into(), VarValue::Text("Georgia".into()));
+        let shade = d.add_variable(c, "shadow".into(), VarValue::Color(Rgba::rgb(1, 2, 3)));
+        assert_eq!(d.resolve_first(lh), Some(VarValue::Number(20.0)), "aliases resolve to the target's value");
+        assert!(d.aliases_to(lh, base) && !d.aliases_to(base, lh), "an alias back would loop");
+        let mut t = Node::new(Kind::Text, r(0., 0., 50., 20.));
+        t.shadows = vec![Shadow::default()];
+        t.bindings = vec![(Bindable::LineHeight, lh), (Bindable::FontFamily, fam), (Bindable::MinWidth, base), (Bindable::EffectColor, shade)];
+        let t = d.insert(0, None, None, t);
+        d.apply_variables();
+        let n = d.node(t);
+        assert_eq!((n.line_height, n.font_family.as_str(), n.min_size[0], n.shadows[0].color), (LineHeight::Px(20.0), "Georgia", Some(20.0), Rgba::rgb(1, 2, 3)));
+        d.variables.iter_mut().find(|v| v.id == base).unwrap().values[0] = VarValue::Number(24.0);
+        d.apply_variables();
+        assert_eq!(d.node(t).line_height, LineHeight::Px(24.0), "editing the target moves the alias");
+        // Scopes: "Show in" limits which pickers offer a variable.
+        let v = d.variables.iter_mut().find(|v| v.id == base).unwrap();
+        v.scopes = Bindable::from_scope("CORNER_RADIUS");
+        assert!(v.shows_in(Bindable::Radius) && !v.shows_in(Bindable::Gap));
+        assert_eq!(Bindable::from_scope("WIDTH_HEIGHT").len(), 6);
+        assert!(Bindable::from_scope("ALL_SCOPES").is_empty());
     }
 }

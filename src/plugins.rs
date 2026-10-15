@@ -38,6 +38,9 @@ pub fn lap(label: &str, t: &mut std::time::Instant) {
     *t = std::time::Instant::now();
 }
 
+/// How long one event's code may run before it's stopped (an endless loop would freeze the app).
+const TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(if cfg!(test) { 3 } else { 10 });
+
 /// A running plugin: its JS runtime stays alive between events.
 pub struct Session {
     rt: rquickjs::Runtime,
@@ -45,14 +48,23 @@ pub struct Session {
     pub name: String,
     storage: Option<(std::path::PathBuf, String)>,
     all_pages: bool,
+    /// When the current event's code must stop; none between events.
+    deadline: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// Enabled libraries (id, file), for figma.importComponentByKeyAsync.
+    libs: Vec<(String, std::sync::Arc<Document>)>,
 }
 
 impl Session {
     /// Start a plugin: define `figma` (and `__html__`), then run its main code.
-    /// `id` names its clientStorage file; `html` is the manifest's UI file.
-    pub fn start(doc: &mut Document, page: usize, sel: &[NodeId], name: &str, id: Option<&str>, code: &str, html: Option<&str>) -> Result<(Session, Outcome), String> {
+    /// `id` names its clientStorage file; `html` is the manifest's UI file; `libs` are the
+    /// document's enabled libraries.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start(doc: &mut Document, page: usize, sel: &[NodeId], name: &str, id: Option<&str>, code: &str, html: Option<&str>, libs: Vec<(String, std::sync::Arc<Document>)>) -> Result<(Session, Outcome), String> {
         let rt = rquickjs::Runtime::new().map_err(|e| e.to_string())?;
         rt.set_memory_limit(512 << 20);
+        let deadline: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>> = Default::default();
+        let d = deadline.clone();
+        rt.set_interrupt_handler(Some(Box::new(move || d.lock().unwrap().is_some_and(|t| std::time::Instant::now() > t))));
         let ctx = rquickjs::Context::full(&rt).map_err(|e| e.to_string())?;
         let storage = id.map(|id| {
             let safe: String = id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
@@ -62,7 +74,7 @@ impl Session {
         });
         // Other pages load only for small documents or plugins that ask for them (like Figma's dynamic pages).
         let all_pages = doc.nodes.len() < 20_000 || code.contains("loadAllPagesAsync") || code.contains("figma.root");
-        let mut s = Session { rt, ctx, name: name.to_string(), storage, all_pages };
+        let mut s = Session { rt, ctx, name: name.to_string(), storage, all_pages, deadline, libs };
         let init = format!(
             "globalThis.__html__ = {}; __storage = {};",
             serde_json::to_string(html.unwrap_or("")).unwrap_or_default(),
@@ -98,19 +110,48 @@ impl Session {
         })
     }
 
-    /// Load the page into JS, run `js`, settle promises, and apply the changes.
+    /// `run`, stopped if it takes longer than `TIME_LIMIT`. Plugins keep running across events.
     fn step(&mut self, doc: &mut Document, page: usize, sel: &[NodeId], js: &str) -> Result<Outcome, String> {
-        let mut t = std::time::Instant::now();
-        let snap = crate::plugin_doc::snapshot(doc, page, sel, self.all_pages).to_string();
-        lap("snapshot", &mut t);
-        self.eval(&format!("__reset(); __load({snap});"))?;
-        self.eval(js)?;
+        *self.deadline.lock().unwrap() = Some(std::time::Instant::now() + TIME_LIMIT);
+        let out = self.run(doc, page, sel, js);
+        let late = self.deadline.lock().unwrap().take().is_some_and(|t| std::time::Instant::now() > t);
+        if late && out.is_err() {
+            return Err("Script took too long and was stopped".into());
+        }
+        out
+    }
+
+    /// Run pending promise jobs until none are left.
+    fn settle(&self) -> Result<(), String> {
         for _ in 0..100_000 {
             match self.rt.execute_pending_job() {
                 Ok(true) => continue,
                 Ok(false) => break,
                 Err(e) => return Err(format!("{e:?}")),
             }
+        }
+        Ok(())
+    }
+
+    /// Load the page into JS, run `js`, settle promises, and apply the changes.
+    fn run(&mut self, doc: &mut Document, page: usize, sel: &[NodeId], js: &str) -> Result<Outcome, String> {
+        let mut t = std::time::Instant::now();
+        let snap = crate::plugin_doc::snapshot(doc, page, sel, self.all_pages).to_string();
+        lap("snapshot", &mut t);
+        self.eval(&format!("__reset(); __load({snap});"))?;
+        self.eval(js)?;
+        self.settle()?;
+        // figma.importComponentByKeyAsync: copy the library components the script is waiting
+        // on into the document, hand them over, and let it carry on.
+        for _ in 0..8 {
+            let keys: Vec<String> = self.ctx.with(|ctx| ctx.eval::<String, _>("__importKeys()")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+            if keys.is_empty() {
+                break;
+            }
+            let roots: Vec<NodeId> = keys.iter().filter_map(|k| crate::library::import_key(doc, &self.libs, k)).collect();
+            let trees: Vec<Value> = roots.into_iter().map(|root| crate::plugin_doc::tree(doc, root)).collect();
+            self.eval(&format!("__resolveImports({});", Value::Array(trees)))?;
+            self.settle()?;
         }
         let result: String = self.ctx.with(|ctx| ctx.eval::<String, _>("__collect()").map_err(|e| e.to_string()))?;
         let out: Value = serde_json::from_str(&result).map_err(|e| e.to_string())?;
@@ -161,7 +202,7 @@ impl Session {
 /// Run plugin code once, headless, and apply what it changed.
 #[cfg(test)]
 pub fn run(doc: &mut Document, page: usize, sel: &[NodeId], code: &str) -> Result<Outcome, String> {
-    Session::start(doc, page, sel, "Script", None, code, None).map(|(_, out)| out)
+    Session::start(doc, page, sel, "Script", None, code, None, vec![]).map(|(_, out)| out)
 }
 
 // ---------- installed plugins ----------
@@ -270,7 +311,7 @@ mod tests {
             };
             figma.on("selectionchange", () => figma.ui.postMessage({ type: "sel", n: figma.currentPage.selection.length }));
         "#;
-        let (mut s, out) = Session::start(&mut d, 0, &[], "Shapes", None, code, Some("<p>UI</p>")).unwrap();
+        let (mut s, out) = Session::start(&mut d, 0, &[], "Shapes", None, code, Some("<p>UI</p>"), vec![]).unwrap();
         let ui = out.ui.unwrap();
         assert_eq!((ui.html.as_str(), ui.width, ui.height), ("<p>UI</p>", 240.0, 120.0));
         assert_eq!(out.outbox, vec![r#"{"type":"hello","layers":0}"#.to_string()]);
@@ -283,6 +324,21 @@ mod tests {
         assert!(s.emit(&mut d, 0, &[], "currentpagechange").unwrap().is_none(), "not listening");
         let out = s.message(&mut d, 0, &[], r#"{"type":"done"}"#).unwrap();
         assert!(out.closed && out.notes == vec!["Bye".to_string()]);
+    }
+
+    #[test]
+    fn endless_scripts_are_stopped_and_the_plugin_lives_on() {
+        let mut d = Document::default();
+        let err = run(&mut d, 0, &[], "while (true) {}").err().unwrap();
+        assert_eq!(err, "Script took too long and was stopped");
+        let err = run(&mut d, 0, &[], "await Promise.resolve(); for (;;) {}").err().unwrap();
+        assert_eq!(err, "Script took too long and was stopped", "async code too");
+        // The limit is per event: a UI plugin that sat idle longer than it still answers.
+        let code = "figma.showUI(__html__); figma.ui.onmessage = () => figma.createRectangle();";
+        let (mut s, _) = Session::start(&mut d, 0, &[], "Idle", None, code, Some(""), vec![]).unwrap();
+        std::thread::sleep(TIME_LIMIT + std::time::Duration::from_millis(100));
+        s.message(&mut d, 0, &[], "{}").unwrap();
+        assert_eq!(d.nodes.len(), 1);
     }
 
     #[test]

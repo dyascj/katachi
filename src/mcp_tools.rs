@@ -147,6 +147,7 @@ impl App {
                 let lang = match args["language"].as_str() {
                     Some("swiftui") => crate::codegen::Lang::SwiftUi,
                     Some("compose") => crate::codegen::Lang::Compose,
+                    Some("tailwind") => crate::codegen::Lang::Tailwind,
                     _ => crate::codegen::Lang::Css,
                 };
                 let mut out = String::new();
@@ -196,13 +197,24 @@ impl App {
                         }
                     }
                 }
+                // Enabled libraries' components; execute_code places one with
+                // `(await figma.importComponentByKeyAsync(key)).createInstance()`.
+                for (r, lib) in self.enabled_libs() {
+                    for (page, id, name) in crate::library::components(&lib) {
+                        let n = lib.node(id);
+                        out.push(json!({
+                            "key": format!("{}:{id}", r.id), "type": "COMPONENT", "name": name, "library": r.name, "page": lib.pages[page].name,
+                            "width": n.rect.width(), "height": n.rect.height(),
+                        }));
+                    }
+                }
                 text(Value::Array(out).to_string())
             }
             "execute_code" => {
                 let code = args["code"].as_str().ok_or("missing code")?;
                 let before = self.doc.clone();
-                let sel = self.sel.clone();
-                let out = match crate::plugins::Session::start(&mut self.doc, self.page, &sel, "MCP", None, code, None) {
+                let (sel, libs) = (self.sel.clone(), self.plugin_libs());
+                let out = match crate::plugins::Session::start(&mut self.doc, self.page, &sel, "MCP", None, code, None, libs) {
                     Ok((_, out)) => out,
                     Err(e) => {
                         self.doc = before;
@@ -239,7 +251,7 @@ impl App {
                     (Some(i), _, _) => i,
                     (None, Some(name), Some(true)) => {
                         self.checkpoint();
-                        self.doc.pages.push(crate::doc::Page { name: name.to_string(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None });
+                        self.doc.pages.push(crate::doc::Page { name: name.to_string(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, guides: vec![], prototype: Default::default() });
                         self.doc.pages.len() - 1
                     }
                     _ => return Err(format!("no page {want}")),

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Katachi
+GenericName=Design Tool
+Comment=Design interfaces, prototypes, and graphics
+Exec=katachi %F
+Icon=io.github.dyascj.Katachi
+Terminal=false
+Categories=Graphics;VectorGraphics;Development;
+Keywords=design;figma;ui;ux;prototype;vector;interface;
+MimeType=application/x-katachi;
+StartupWMClass=io.github.dyascj.Katachi
+StartupNotify=true

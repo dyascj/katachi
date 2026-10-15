@@ -15,6 +15,8 @@ const ASSET: &str = if cfg!(target_os = "macos") {
     "Katachi-macos.app.tar.gz"
 } else if cfg!(windows) {
     "Katachi-windows.zip"
+} else if cfg!(target_arch = "aarch64") {
+    "Katachi-linux-aarch64.tar.gz"
 } else {
     "Katachi-linux-x86_64.tar.gz"
 };
@@ -39,7 +41,7 @@ pub struct Updater {
 impl Updater {
     /// Check now and every six hours, unless this is a development build.
     pub fn start() -> Self {
-        let off = cfg!(debug_assertions) || cfg!(test) || std::env::var_os("KATACHI_NO_UPDATE").is_some() || !crate::settings::load().check_updates;
+        let off = cfg!(debug_assertions) || cfg!(test) || std::env::var_os("KATACHI_NO_UPDATE").is_some() || !crate::settings::load().check_updates || managed().is_some();
         let u = Updater { state: Arc::new(Mutex::new(State::Idle)), seen: State::Idle, wake: Arc::default() };
         // Windows can't delete a running exe, so the last update's old copy goes now.
         if cfg!(windows) && let Ok(exe) = std::env::current_exe() {
@@ -78,32 +80,39 @@ impl Updater {
         }
         let now = self.state.lock().unwrap().clone();
         let changed = now != self.seen;
-        if changed && let State::Ready(_) = &now {
-            restart();
-        }
         self.seen = now;
         changed
+    }
+
+    /// Installed and waiting for a restart.
+    pub fn ready(&self) -> bool {
+        matches!(self.seen, State::Ready(_))
+    }
+
+    /// Quit and start the installed version. Callers make sure nothing is unsaved first.
+    pub fn restart(&self) {
+        restart();
     }
 
     pub fn button_label(&self) -> Option<&'static str> {
         match &self.seen {
             State::Available { .. } => Some("Update now"),
             State::Installing(_) => Some("Updating…"),
-            State::Ready(_) => Some("Restarting…"),
+            State::Ready(_) => Some("Restart to update"),
             State::Failed(_) => Some("Update failed"),
             State::Idle => None,
         }
     }
 
     pub fn busy(&self) -> bool {
-        matches!(self.seen, State::Installing(_) | State::Ready(_))
+        matches!(self.seen, State::Installing(_))
     }
 
     pub fn tooltip(&self) -> String {
         match &self.seen {
             State::Available { version, .. } => format!("Katachi {version} is available. Installs and restarts."),
             State::Installing(v) => format!("Installing Katachi {v}"),
-            State::Ready(v) => format!("Katachi {v} installed"),
+            State::Ready(v) => format!("Katachi {v} is installed. Restart to use it."),
             State::Failed(e) => format!("{e}\nClick to try again."),
             State::Idle => String::new(),
         }
@@ -130,13 +139,40 @@ impl Updater {
         drop(s);
         let (state, wake) = (self.state.clone(), self.wake.clone());
         std::thread::spawn(move || {
-            let done = install(&url, &sig).map_or_else(|e| State::Failed(format!("Couldn't update: {e}")), |()| State::Ready(version));
+            let done = install(&url, &sig, &version).map_or_else(|e| State::Failed(format!("Couldn't update: {e}")), |()| State::Ready(version));
             *state.lock().unwrap() = done;
             if let Some(ctx) = wake.lock().unwrap().as_ref() {
                 ctx.request_repaint();
             }
         });
     }
+}
+
+/// Why this copy can't update itself, when something else installs updates: a package manager
+/// (installed under /usr), an AppImage or Flatpak (read-only), or a folder this user can't write.
+pub fn managed() -> Option<&'static str> {
+    static M: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *M.get_or_init(managed_now)
+}
+
+fn managed_now() -> Option<&'static str> {
+    if cfg!(target_os = "macos") || cfg!(windows) {
+        return None;
+    }
+    if std::env::var_os("APPIMAGE").is_some() {
+        return Some("This AppImage is updated by downloading the new one.");
+    }
+    if std::env::var_os("FLATPAK_ID").is_some() || std::env::var_os("SNAP").is_some() {
+        return Some("Updates come from your software store.");
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let probe = dir.join(".katachi-write-test");
+    if exe.starts_with("/usr") || std::fs::write(&probe, b"").is_err() {
+        return Some("Updates come from your package manager.");
+    }
+    let _ = std::fs::remove_file(probe);
+    None
 }
 
 /// Ask GitHub for the latest release; Some when it's newer than `current` and has this platform's build.
@@ -164,11 +200,13 @@ pub fn newer(tag: &str, current: &str) -> bool {
 }
 
 fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
-    let out = std::process::Command::new("curl")
-        .args(["-fsSL", "--retry", "2", "-H", "User-Agent: Katachi"])
-        .args(args)
-        .output()
-        .map_err(|e| format!("curl: {e}"))?;
+    let out = match std::process::Command::new("curl").args(["-fsSL", "--retry", "2", "-H", "User-Agent: Katachi"]).args(args).output() {
+        // Some Linux installs ship wget but not curl.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !cfg!(windows) => {
+            std::process::Command::new("wget").args(["-qO-", "--tries=3", "--header=User-Agent: Katachi"]).args(args).output().map_err(|_| "neither curl nor wget is installed".to_string())?
+        }
+        r => r.map_err(|e| format!("curl: {e}"))?,
+    };
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
@@ -179,17 +217,23 @@ fn curl_text(url: &str) -> Result<String, String> {
     curl(&[url]).map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
-/// Whether `sig` (a .minisig file's text) is a valid signature of `data` by the release key.
-pub fn verified(data: &[u8], sig: &str) -> bool {
+/// Whether `sig` (a .minisig file's text) is a valid signature of `data` by the release key, and
+/// its signed comment names `comment` (CI signs "Katachi v0.4.0 <asset>"), so an older signed
+/// build can't be passed off as a newer one.
+pub fn verified(data: &[u8], sig: &str, comment: &str) -> bool {
     let Ok(pk) = minisign_verify::PublicKey::from_base64(PUBLIC_KEY) else { return false };
     let Ok(sig) = minisign_verify::Signature::decode(sig) else { return false };
-    pk.verify(data, &sig, false).is_ok()
+    pk.verify(data, &sig, false).is_ok() && sig.trusted_comment() == comment
 }
 
-fn install(url: &str, sig_url: &str) -> Result<(), String> {
+fn signed_comment(version: &str) -> String {
+    format!("Katachi v{version} {ASSET}")
+}
+
+fn install(url: &str, sig_url: &str, version: &str) -> Result<(), String> {
     let data = curl(&[url])?;
     let sig = curl_text(sig_url)?;
-    if !verified(&data, &sig) {
+    if !verified(&data, &sig, &signed_comment(version)) {
         return Err("the download's signature doesn't match".into());
     }
     let target = install_target()?;
@@ -213,6 +257,14 @@ fn install(url: &str, sig_url: &str) -> Result<(), String> {
     };
     if !fresh.exists() {
         return Err("the download is missing the app".into());
+    }
+    // Never swap in a build this machine can't run (another CPU, or a newer system library).
+    if !cfg!(target_os = "macos") {
+        let ran = std::process::Command::new(&fresh).arg("--version").output();
+        if !ran.as_ref().is_ok_and(|o| o.status.success() && o.stdout.starts_with(b"katachi ")) {
+            let _ = std::fs::remove_dir_all(&stage);
+            return Err("the new version doesn't run on this system".into());
+        }
     }
     // Move the running copy aside (allowed even while it runs), put the new one in its place.
     let old = parent.join(if cfg!(target_os = "macos") { ".Katachi-old.app" } else if cfg!(windows) { "katachi.old.exe" } else { ".katachi-old" });
@@ -273,7 +325,7 @@ mod tests {
     fn live_release_is_signed() {
         let Some(State::Available { version, url, sig }) = check("0.0.1").unwrap() else { panic!("no release with a signed {ASSET}") };
         let data = curl(&[&url]).unwrap();
-        assert!(verified(&data, &curl_text(&sig).unwrap()), "{version}: {ASSET} doesn't match its signature");
+        assert!(verified(&data, &curl_text(&sig).unwrap(), &signed_comment(&version)), "{version}: {ASSET} doesn't match its signature");
         eprintln!("Katachi {version}: {ASSET} ({} MB) verified", data.len() >> 20);
     }
 
@@ -291,8 +343,9 @@ mod tests {
     fn only_release_signed_downloads_install() {
         // Signed with the release key.
         let sig = "untrusted comment: signature from minisign secret key\nRUQKsFj9GVe/+3EEA6Zds7Ncw7J2OBBHvXGvAHELYzKbel7k//o880elLYk6u4oirUkDuaExd6f6Lz5wrT43umXI925K9GudQgY=\ntrusted comment: test\ndi06iVvvVOGA1NkFmpibCA7q+GPrDziuu/mBhwf1KgNUtzqpitYS+XqJCF6HMpocXjQtIV2p+J8fWTotP5XEDg==\n";
-        assert!(verified(b"hello katachi\n", sig));
-        assert!(!verified(b"hello katachi!\n", sig), "a changed download fails");
-        assert!(!verified(b"hello katachi\n", "garbage"));
+        assert!(verified(b"hello katachi\n", sig, "test"));
+        assert!(!verified(b"hello katachi!\n", sig, "test"), "a changed download fails");
+        assert!(!verified(b"hello katachi\n", "garbage", "test"));
+        assert!(!verified(b"hello katachi\n", sig, "Katachi v9.9.9 x"), "a signature for another version fails");
     }
 }

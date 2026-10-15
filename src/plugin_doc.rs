@@ -83,14 +83,17 @@ fn map(m: [[f64; 3]; 2], x: f64, y: f64) -> Pos2 {
 }
 
 /// Figma's gradientTransform maps the layer's unit square onto gradient space, where a linear
-/// gradient runs (0, 0.5) -> (1, 0.5) and a radial one is centered at (0.5, 0.5) with radius 0.5.
+/// gradient runs (0, 0.5) -> (1, 0.5) and the others are centered at (0.5, 0.5) with radius 0.5
+/// (the width handle at (0.5, 1)).
 fn gradient_transform(p: &Paint) -> Value {
     let (a, d) = (p.from, p.to - p.from);
     let (a, d) = ((a.x as f64, a.y as f64), (d.x as f64, d.y as f64));
+    let w = p.width_point() - p.from;
+    let w = (w.x as f64, w.y as f64);
     let m = if p.kind == PaintKind::Linear {
         [[d.0, -d.1, a.0 + 0.5 * d.1], [d.1, d.0, a.1 - 0.5 * d.0]]
     } else {
-        [[2.0 * d.0, -2.0 * d.1, a.0 - d.0 + d.1], [2.0 * d.1, 2.0 * d.0, a.1 - d.1 - d.0]]
+        [[2.0 * d.0, 2.0 * w.0, a.0 - d.0 - w.0], [2.0 * d.1, 2.0 * w.1, a.1 - d.1 - w.1]]
     };
     let t = inverse(m).unwrap_or([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]);
     json!([[t[0][0], t[0][1], t[0][2]], [t[1][0], t[1][1], t[1][2]]])
@@ -99,8 +102,13 @@ fn gradient_transform(p: &Paint) -> Value {
 pub fn paint_json(p: &Paint, bound: Option<VarId>) -> Value {
     let mut v = match p.kind {
         PaintKind::Solid => json!({ "type": "SOLID", "color": rgb(p.color), "opacity": unit(p.color.a()) }),
-        PaintKind::Linear | PaintKind::Radial => json!({
-            "type": if p.kind == PaintKind::Linear { "GRADIENT_LINEAR" } else { "GRADIENT_RADIAL" },
+        PaintKind::Linear | PaintKind::Radial | PaintKind::Angular | PaintKind::Diamond => json!({
+            "type": match p.kind {
+                PaintKind::Linear => "GRADIENT_LINEAR",
+                PaintKind::Angular => "GRADIENT_ANGULAR",
+                PaintKind::Diamond => "GRADIENT_DIAMOND",
+                _ => "GRADIENT_RADIAL",
+            },
             "gradientStops": p.stops.iter().map(|(t, c)| json!({ "position": t, "color": rgba(*c) })).collect::<Vec<_>>(),
             "gradientTransform": gradient_transform(p),
             "opacity": unit(p.color.a()),
@@ -116,7 +124,7 @@ pub fn paint_json(p: &Paint, bound: Option<VarId>) -> Value {
         }
     };
     v["visible"] = json!(p.visible);
-    v["blendMode"] = json!("NORMAL");
+    v["blendMode"] = json!(if p.blend == BlendMode::Normal { "NORMAL".into() } else { blend_json(p.blend) });
     if let Some(id) = bound {
         v["boundVariables"] = json!({ "color": alias(id) });
     }
@@ -129,7 +137,7 @@ pub fn paint_from(v: &Value, doc: &Document, layer: Option<egui::Vec2>) -> Optio
         "SOLID" => Paint::solid(color_from(v.get("color")?, opacity)),
         t @ ("GRADIENT_LINEAR" | "GRADIENT_RADIAL" | "GRADIENT_ANGULAR" | "GRADIENT_DIAMOND") => {
             let mut p = Paint::solid(Rgba::WHITE.with_alpha(byte(opacity)));
-            p.kind = if t == "GRADIENT_LINEAR" { PaintKind::Linear } else { PaintKind::Radial };
+            p.kind = gradient_kind(t);
             p.stops = v["gradientStops"].as_array()?.iter().map(|s| (f(s, "position").unwrap_or(0.0) as f32, color_from(&s["color"], 1.0))).collect();
             let t: Option<[[f64; 3]; 2]> = v["gradientTransform"].as_array().and_then(|rows| {
                 let row = |i: usize| -> Option<[f64; 3]> {
@@ -143,6 +151,7 @@ pub fn paint_from(v: &Value, doc: &Document, layer: Option<egui::Vec2>) -> Optio
                 (p.from, p.to) = (map(m, 0.0, 0.5), map(m, 1.0, 0.5));
             } else {
                 (p.from, p.to) = (map(m, 0.5, 0.5), map(m, 1.0, 0.5));
+                p.width_to = crate::doc::explicit_width(&p, map(m, 0.5, 1.0));
             }
             p
         }
@@ -180,33 +189,118 @@ pub fn paint_from(v: &Value, doc: &Document, layer: Option<egui::Vec2>) -> Optio
         _ => return None,
     };
     p.visible = v["visible"].as_bool().unwrap_or(true);
+    p.blend = BlendMode::from_figma(v["blendMode"].as_str());
     Some(p)
 }
 
-fn effect_json(s: &Shadow) -> Value {
-    json!({
-        "type": match s.kind { EffectKind::DropShadow => "DROP_SHADOW", EffectKind::InnerShadow => "INNER_SHADOW", EffectKind::LayerBlur => "LAYER_BLUR", EffectKind::BackgroundBlur => "BACKGROUND_BLUR" },
-        "color": rgba(s.color), "offset": { "x": s.offset.x, "y": s.offset.y }, "radius": s.blur, "spread": s.spread,
-        "visible": s.visible, "blendMode": "NORMAL", "showShadowBehindNode": false,
-    })
+pub fn effect_json(s: &Shadow) -> Value {
+    let kind = match s.kind {
+        EffectKind::DropShadow => "DROP_SHADOW",
+        EffectKind::InnerShadow => "INNER_SHADOW",
+        EffectKind::LayerBlur => "LAYER_BLUR",
+        EffectKind::BackgroundBlur => "BACKGROUND_BLUR",
+        EffectKind::Noise => "NOISE",
+        EffectKind::Texture => "TEXTURE",
+        EffectKind::Glass => "GLASS",
+    };
+    let vector = |p: Pos2| json!({ "x": p.x, "y": p.y });
+    match s.kind {
+        EffectKind::LayerBlur | EffectKind::BackgroundBlur => match s.progressive {
+            Some(p) => json!({
+                "type": kind, "radius": s.blur, "visible": s.visible, "blurType": "PROGRESSIVE",
+                "startRadius": p.start_blur, "startOffset": vector(p.start), "endOffset": vector(p.end),
+            }),
+            None => json!({ "type": kind, "radius": s.blur, "visible": s.visible, "blurType": "NORMAL" }),
+        },
+        EffectKind::Noise => {
+            let mut v = json!({
+                "type": kind, "color": rgba(s.color), "visible": s.visible, "blendMode": "NORMAL", "noiseSize": s.size, "density": s.density,
+                "noiseType": match s.noise { NoiseType::Mono => "MONOTONE", NoiseType::Duo => "DUOTONE", NoiseType::Multi => "MULTITONE" },
+            });
+            match s.noise {
+                NoiseType::Duo => v["secondaryColor"] = rgba(s.color2),
+                NoiseType::Multi => v["opacity"] = json!(s.color.a() as f64 / 255.0),
+                NoiseType::Mono => {}
+            }
+            v
+        }
+        EffectKind::Texture => json!({ "type": kind, "visible": s.visible, "noiseSize": s.size, "radius": s.blur, "clipToShape": s.clip }),
+        EffectKind::Glass => json!({
+            "type": kind, "visible": s.visible, "radius": s.blur, "lightIntensity": s.glass.light, "lightAngle": s.glass.angle,
+            "refraction": s.glass.refraction, "depth": s.glass.depth, "dispersion": s.glass.dispersion,
+        }),
+        _ => json!({
+            "type": kind, "color": rgba(s.color), "offset": { "x": s.offset.x, "y": s.offset.y }, "radius": s.blur, "spread": s.spread,
+            "visible": s.visible, "blendMode": "NORMAL", "showShadowBehindNode": s.show_behind,
+        }),
+    }
 }
 
-fn effect_from(v: &Value) -> Option<Shadow> {
+pub fn effect_from(v: &Value) -> Option<Shadow> {
     let kind = match v["type"].as_str()? {
         "DROP_SHADOW" => EffectKind::DropShadow,
         "INNER_SHADOW" => EffectKind::InnerShadow,
         "LAYER_BLUR" => EffectKind::LayerBlur,
         "BACKGROUND_BLUR" => EffectKind::BackgroundBlur,
+        "NOISE" => EffectKind::Noise,
+        "TEXTURE" => EffectKind::Texture,
+        "GLASS" => EffectKind::Glass,
         _ => return None,
     };
-    Some(Shadow {
+    let d = Shadow::of(kind);
+    let num = |k: &str, or: f32| f(v, k).map_or(or, |x| x as f32);
+    let point = |k: &str, or: Pos2| pos2(f(&v[k], "x").map_or(or.x, |x| x as f32), f(&v[k], "y").map_or(or.y, |y| y as f32));
+    let mut s = Shadow {
         kind,
-        color: v.get("color").map_or(Rgba([0, 0, 0, 64]), |c| color_from(c, 1.0)),
-        offset: vec2(f(&v["offset"], "x").unwrap_or(0.0) as f32, f(&v["offset"], "y").unwrap_or(0.0) as f32),
-        blur: f(v, "radius").unwrap_or(0.0) as f32,
-        spread: f(v, "spread").unwrap_or(0.0) as f32,
         visible: v["visible"].as_bool().unwrap_or(true),
-    })
+        blur: num("radius", if kind.is_shadow() || kind.is_blur() { 0.0 } else { d.blur }),
+        ..d
+    };
+    match kind {
+        EffectKind::DropShadow | EffectKind::InnerShadow => {
+            s.color = v.get("color").map_or(d.color, |c| color_from(c, 1.0));
+            s.offset = vec2(f(&v["offset"], "x").unwrap_or(0.0) as f32, f(&v["offset"], "y").unwrap_or(0.0) as f32);
+            s.spread = num("spread", 0.0);
+            s.show_behind = v["showShadowBehindNode"].as_bool().unwrap_or(false);
+        }
+        EffectKind::LayerBlur | EffectKind::BackgroundBlur => {
+            if v["blurType"].as_str() == Some("PROGRESSIVE") {
+                let p = Progressive::default();
+                s.progressive = Some(Progressive { start: point("startOffset", p.start), end: point("endOffset", p.end), start_blur: num("startRadius", 0.0) });
+            }
+        }
+        EffectKind::Noise => {
+            s.size = num("noiseSize", d.size);
+            s.density = num("density", d.density);
+            s.color = v.get("color").map_or(d.color, |c| color_from(c, 1.0));
+            s.noise = match v["noiseType"].as_str() {
+                Some("DUOTONE") => NoiseType::Duo,
+                Some("MULTITONE") => NoiseType::Multi,
+                _ => NoiseType::Mono,
+            };
+            if let Some(c) = v.get("secondaryColor") {
+                s.color2 = color_from(c, 1.0);
+            }
+            if s.noise == NoiseType::Multi {
+                s.color = s.color.with_alpha((num("opacity", 0.25).clamp(0.0, 1.0) * 255.0).round() as u8);
+            }
+        }
+        EffectKind::Texture => {
+            s.size = num("noiseSize", d.size);
+            s.clip = v["clipToShape"].as_bool().unwrap_or(true);
+        }
+        EffectKind::Glass => {
+            let g = d.glass;
+            s.glass = Glass {
+                refraction: num("refraction", g.refraction),
+                depth: num("depth", g.depth),
+                dispersion: num("dispersion", g.dispersion),
+                angle: num("lightAngle", g.angle),
+                light: num("lightIntensity", g.light),
+            };
+        }
+    }
+    Some(s)
 }
 
 pub fn weight_of(style: &str) -> (u16, bool) {
@@ -282,17 +376,57 @@ fn sizing_json(s: Sizing) -> &'static str {
         Sizing::Fill => "FILL",
     }
 }
+fn export_json(e: &crate::doc::ExportSetting) -> Value {
+    use crate::doc::{ExportFormat, ExportSize};
+    let format = match e.format {
+        ExportFormat::Png => "PNG",
+        ExportFormat::Jpg => "JPG",
+        ExportFormat::Svg => "SVG",
+        ExportFormat::Pdf => "PDF",
+        ExportFormat::Webp => "WEBP",
+    };
+    let (kind, value) = match e.size {
+        ExportSize::Scale => ("SCALE", e.scale),
+        ExportSize::Width(w) => ("WIDTH", w),
+        ExportSize::Height(h) => ("HEIGHT", h),
+    };
+    let mut v = json!({ "format": format, "suffix": e.suffix });
+    if e.format.raster() {
+        v["constraint"] = json!({ "type": kind, "value": value });
+    }
+    v
+}
+fn export_from(v: &Value) -> crate::doc::ExportSetting {
+    use crate::doc::{ExportFormat, ExportSetting, ExportSize};
+    let mut e = ExportSetting { suffix: v["suffix"].as_str().unwrap_or("").to_string(), ..Default::default() };
+    e.format = match v["format"].as_str().unwrap_or("") {
+        "JPG" => ExportFormat::Jpg,
+        "SVG" => ExportFormat::Svg,
+        "PDF" => ExportFormat::Pdf,
+        "WEBP" => ExportFormat::Webp,
+        _ => ExportFormat::Png,
+    };
+    let value = v["constraint"]["value"].as_f64().map(|x| x as f32).filter(|x| *x > 0.0).unwrap_or(1.0);
+    match v["constraint"]["type"].as_str().unwrap_or("SCALE") {
+        "WIDTH" => e.size = ExportSize::Width(value),
+        "HEIGHT" => e.size = ExportSize::Height(value),
+        _ => e.scale = value,
+    }
+    e
+}
 fn align_json(a: AxisAlign) -> &'static str {
     match a {
         AxisAlign::Min => "MIN",
         AxisAlign::Center => "CENTER",
         AxisAlign::Max => "MAX",
+        AxisAlign::Baseline => "BASELINE",
     }
 }
 fn align_from(s: &str) -> AxisAlign {
     match s {
         "CENTER" => AxisAlign::Center,
         "MAX" => AxisAlign::Max,
+        "BASELINE" => AxisAlign::Baseline,
         _ => AxisAlign::Min,
     }
 }
@@ -328,44 +462,118 @@ fn prop_json(v: &PropValue) -> (&'static str, Value) {
 
 // ---------- prototyping ----------
 
+/// JavaScript key codes for Key/Gamepad triggers (letters, digits, and the common named keys).
+const KEY_CODES: [(egui::Key, u32); 11] = [
+    (egui::Key::Backspace, 8),
+    (egui::Key::Tab, 9),
+    (egui::Key::Enter, 13),
+    (egui::Key::Escape, 27),
+    (egui::Key::Space, 32),
+    (egui::Key::ArrowLeft, 37),
+    (egui::Key::ArrowUp, 38),
+    (egui::Key::ArrowRight, 39),
+    (egui::Key::ArrowDown, 40),
+    (egui::Key::Delete, 46),
+    (egui::Key::Minus, 189),
+];
+
+fn key_code(k: egui::Key) -> Option<u32> {
+    KEY_CODES.iter().find(|(key, _)| *key == k).map(|(_, c)| *c).or_else(|| {
+        let mut name = k.name().chars();
+        match (name.next(), name.next()) {
+            (Some(c), None) if c.is_ascii_alphanumeric() => Some(c.to_ascii_uppercase() as u32),
+            _ => None,
+        }
+    })
+}
+
+fn key_from_code(c: u32) -> Option<egui::Key> {
+    KEY_CODES.iter().find(|(_, code)| *code == c).map(|(k, _)| *k).or_else(|| egui::Key::from_name(&char::from_u32(c)?.to_string()))
+}
+
+const EASINGS: [(Easing, &str); 11] = [
+    (Easing::Linear, "LINEAR"),
+    (Easing::EaseIn, "EASE_IN"),
+    (Easing::EaseOut, "EASE_OUT"),
+    (Easing::EaseInOut, "EASE_IN_AND_OUT"),
+    (Easing::EaseInBack, "EASE_IN_BACK"),
+    (Easing::EaseOutBack, "EASE_OUT_BACK"),
+    (Easing::EaseInOutBack, "EASE_IN_AND_OUT_BACK"),
+    (Easing::Gentle, "GENTLE"),
+    (Easing::Quick, "QUICK"),
+    (Easing::Bouncy, "BOUNCY"),
+    (Easing::Slow, "SLOW"),
+];
+
 fn reaction_json(r: &Reaction) -> Value {
     let trigger = match r.trigger {
         Trigger::OnClick => json!({ "type": "ON_CLICK" }),
         Trigger::OnHover => json!({ "type": "ON_HOVER" }),
         Trigger::WhilePressed => json!({ "type": "ON_PRESS" }),
         Trigger::AfterDelay(ms) => json!({ "type": "AFTER_TIMEOUT", "timeout": ms as f32 / 1000.0 }),
+        Trigger::MouseEnter => json!({ "type": "MOUSE_ENTER", "delay": 0 }),
+        Trigger::MouseLeave => json!({ "type": "MOUSE_LEAVE", "delay": 0 }),
+        Trigger::OnDrag => json!({ "type": "ON_DRAG" }),
+        Trigger::Key(k, m) => {
+            let mods = [(m.shift, 16), (m.command, if cfg!(target_os = "macos") { 91 } else { 17 }), (m.alt, 18)].into_iter().filter(|x| x.0).map(|x| x.1);
+            json!({ "type": "ON_KEY_DOWN", "device": "KEYBOARD", "keyCodes": mods.chain(key_code(k)).collect::<Vec<u32>>() })
+        }
     };
     let t = r.transition;
+    let easing = match t.easing {
+        Easing::Custom([x1, y1, x2, y2]) => json!({ "type": "CUSTOM_CUBIC_BEZIER", "easingFunctionCubicBezier": { "x1": x1, "y1": y1, "x2": x2, "y2": y2 } }),
+        e => json!({ "type": EASINGS.iter().find(|x| x.0 == e).map_or("EASE_OUT", |x| x.1) }),
+    };
     let transition = match t.kind {
         TransitionKind::Instant => Value::Null,
         k => json!({
             "type": match k { TransitionKind::Dissolve => "DISSOLVE", TransitionKind::SmartAnimate => "SMART_ANIMATE", TransitionKind::MoveIn => "MOVE_IN", TransitionKind::Push => "PUSH", _ => "SLIDE_IN" },
             "direction": match t.direction { Direction::Left => "LEFT", Direction::Right => "RIGHT", Direction::Up => "TOP", Direction::Down => "BOTTOM" },
-            "duration": t.duration, "easing": { "type": "EASE_OUT" },
+            "duration": t.duration, "easing": easing,
         }),
     };
-    let action = match &r.action {
+    let node = |id: &NodeId, nav: &str| json!({ "type": "NODE", "destinationId": id.to_string(), "navigation": nav, "transition": transition });
+    let mut action = match &r.action {
         Action::None => Value::Null,
-        Action::Navigate(id) => json!({ "type": "NODE", "destinationId": id.to_string(), "navigation": "NAVIGATE", "transition": transition }),
-        Action::OpenOverlay(id) => json!({ "type": "NODE", "destinationId": id.to_string(), "navigation": "OVERLAY", "transition": transition }),
+        Action::Navigate(id) => node(id, "NAVIGATE"),
+        Action::OpenOverlay(id) => node(id, "OVERLAY"),
+        Action::SwapOverlay(id) => node(id, "SWAP"),
+        Action::ScrollTo(id) => node(id, "SCROLL_TO"),
+        Action::ChangeTo(id) => node(id, "CHANGE_TO"),
         Action::Back => json!({ "type": "BACK" }),
         Action::CloseOverlay => json!({ "type": "CLOSE" }),
         Action::OpenUrl(u) => json!({ "type": "URL", "url": u }),
+        Action::SetVariable(var, val) => json!({ "type": "SET_VARIABLE", "variableId": format!("VariableID:{var}"), "variableValue": { "type": "VARIABLE_DATA", "value": var_value_json(val) } }),
     };
+    if r.overlay.position == OverlayPos::Manual && action.is_object() {
+        action["overlayRelativePosition"] = json!({ "x": r.overlay.offset.x, "y": r.overlay.offset.y });
+    }
     json!({ "trigger": trigger, "actions": if action.is_null() { vec![] } else { vec![action] } })
 }
 
 fn reaction_from(v: &Value, refs: &Refs) -> Option<Reaction> {
-    let trigger = match v["trigger"]["type"].as_str()? {
-        "ON_HOVER" | "MOUSE_ENTER" => Trigger::OnHover,
+    let tr = &v["trigger"];
+    let trigger = match tr["type"].as_str()? {
+        "ON_HOVER" => Trigger::OnHover,
         "ON_PRESS" | "MOUSE_DOWN" => Trigger::WhilePressed,
-        "AFTER_TIMEOUT" => Trigger::AfterDelay((f(&v["trigger"], "timeout").unwrap_or(0.8) * 1000.0) as u32),
+        "AFTER_TIMEOUT" => Trigger::AfterDelay((f(tr, "timeout").unwrap_or(0.8) * 1000.0) as u32),
+        "MOUSE_ENTER" => Trigger::MouseEnter,
+        "MOUSE_LEAVE" => Trigger::MouseLeave,
+        "ON_DRAG" => Trigger::OnDrag,
+        "ON_KEY_DOWN" => {
+            let codes: Vec<u32> = tr["keyCodes"].as_array().into_iter().flatten().filter_map(|c| c.as_u64()).map(|c| c as u32).collect();
+            let key = codes.iter().find_map(|&c| (![16, 17, 18, 91].contains(&c)).then(|| key_from_code(c)).flatten())?;
+            let m = egui::Modifiers { shift: codes.contains(&16), alt: codes.contains(&18), command: codes.contains(&17) || codes.contains(&91), ..Default::default() };
+            Trigger::Key(key, m)
+        }
         _ => Trigger::OnClick,
     };
     // Figma allows several actions per trigger; Katachi plays the first.
     let a = v["actions"].as_array().and_then(|a| a.first()).or(v.get("action"))?;
     let t = &a["transition"];
     let transition = if t.is_object() {
+        let e = &t["easing"];
+        let bez = &e["easingFunctionCubicBezier"];
         Transition {
             kind: match t["type"].as_str() {
                 Some("DISSOLVE") => TransitionKind::Dissolve,
@@ -382,24 +590,68 @@ fn reaction_from(v: &Value, refs: &Refs) -> Option<Reaction> {
                 _ => Direction::Left,
             },
             duration: f(t, "duration").unwrap_or(0.3) as f32,
+            easing: match e["type"].as_str() {
+                Some("CUSTOM_CUBIC_BEZIER") => Easing::Custom(["x1", "y1", "x2", "y2"].map(|k| f(bez, k).unwrap_or(0.0) as f32)),
+                Some(name) => EASINGS.iter().find(|x| x.1 == name).map_or(Easing::EaseOut, |x| x.0),
+                None => Easing::EaseOut,
+            },
         }
     } else {
         Transition::default()
     };
+    let mut overlay = OverlaySettings::default();
+    if let Some(o) = a.get("overlayRelativePosition").filter(|o| o.is_object()) {
+        overlay.position = OverlayPos::Manual;
+        overlay.offset = vec2(f(o, "x").unwrap_or(0.0) as f32, f(o, "y").unwrap_or(0.0) as f32);
+    }
     let action = match a["type"].as_str()? {
         "NODE" => {
             let dest = refs.node(a["destinationId"].as_str()?)?;
-            if a["navigation"].as_str() == Some("OVERLAY") { Action::OpenOverlay(dest) } else { Action::Navigate(dest) }
+            match a["navigation"].as_str() {
+                Some("OVERLAY") => Action::OpenOverlay(dest),
+                Some("SWAP") => Action::SwapOverlay(dest),
+                Some("SCROLL_TO") => Action::ScrollTo(dest),
+                Some("CHANGE_TO") => Action::ChangeTo(dest),
+                _ => Action::Navigate(dest),
+            }
         }
         "BACK" => Action::Back,
         "CLOSE" => Action::CloseOverlay,
         "URL" => Action::OpenUrl(a["url"].as_str()?.to_string()),
+        "SET_VARIABLE" => Action::SetVariable(refs.var(a["variableId"].as_str()?)?, var_value_from(&a["variableValue"]["value"], refs)?),
         _ => return None,
     };
-    Some(Reaction { trigger, action, transition })
+    Some(Reaction { trigger, action, transition, overlay })
 }
 
 // ---------- layers ----------
+
+/// A node's `boundVariables` fields for a property. Paints and effects bind inside the paint or
+/// effect object, so they have none here.
+fn bound_keys(b: Bindable) -> &'static [&'static str] {
+    match b {
+        Bindable::Opacity => &["opacity"],
+        Bindable::Radius => &["topLeftRadius", "topRightRadius", "bottomRightRadius", "bottomLeftRadius"],
+        Bindable::Width => &["width"],
+        Bindable::Height => &["height"],
+        Bindable::Gap => &["itemSpacing"],
+        Bindable::Padding => &["paddingLeft", "paddingRight", "paddingTop", "paddingBottom"],
+        Bindable::StrokeWidth => &["strokeWeight"],
+        Bindable::FontSize => &["fontSize"],
+        Bindable::Text => &["characters"],
+        Bindable::Visible => &["visible"],
+        Bindable::LineHeight => &["lineHeight"],
+        Bindable::LetterSpacing => &["letterSpacing"],
+        Bindable::ParagraphSpacing => &["paragraphSpacing"],
+        Bindable::FontFamily => &["fontFamily"],
+        Bindable::FontWeight => &["fontWeight"],
+        Bindable::MinWidth => &["minWidth"],
+        Bindable::MaxWidth => &["maxWidth"],
+        Bindable::MinHeight => &["minHeight"],
+        Bindable::MaxHeight => &["maxHeight"],
+        Bindable::Fill | Bindable::Stroke | Bindable::EffectColor | Bindable::EffectBlur | Bindable::EffectSpread | Bindable::EffectX | Bindable::EffectY => &[],
+    }
+}
 
 /// One layer as the plugin API sees it (without children).
 pub fn node_json(doc: &Document, id: NodeId) -> Value {
@@ -437,6 +689,7 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
         "topLeftRadius": corners[0], "topRightRadius": corners[1], "bottomRightRadius": corners[2], "bottomLeftRadius": corners[3],
         "constraints": { "horizontal": constraint_json(n.constraints[0]), "vertical": constraint_json(n.constraints[1]) },
         "layoutPositioning": if n.absolute { "ABSOLUTE" } else { "AUTO" },
+        "exportSettings": n.exports.iter().map(export_json).collect::<Vec<_>>(),
         "layoutSizingHorizontal": sizing_json(n.sizing[0]), "layoutSizingVertical": sizing_json(n.sizing[1]),
         "minWidth": n.min_size[0], "minHeight": n.min_size[1], "maxWidth": n.max_size[0], "maxHeight": n.max_size[1],
         "fillStyleId": n.fill_style.map(|s| format!("S:{s}")).unwrap_or_default(),
@@ -450,6 +703,8 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
     let (main, cross) = if parent_mode == LayoutMode::Horizontal { (0, 1) } else { (1, 0) };
     v["layoutGrow"] = json!(if parent_mode != LayoutMode::None && n.sizing[main] == Sizing::Fill { 1 } else { 0 });
     v["layoutAlign"] = json!(if parent_mode != LayoutMode::None && n.sizing[cross] == Sizing::Fill { "STRETCH" } else { "INHERIT" });
+    v["gridColumnSpan"] = json!(n.grid_span[0]);
+    v["gridRowSpan"] = json!(n.grid_span[1]);
     if let Some(s) = n.stroke_sides {
         for (k, w) in ["strokeTopWeight", "strokeRightWeight", "strokeBottomWeight", "strokeLeftWeight"].iter().zip(s) {
             v[*k] = json!(w);
@@ -457,25 +712,23 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
     }
     let mut bv = serde_json::Map::new();
     for (b, var) in &n.bindings {
-        let keys: &[&str] = match b {
-            Bindable::Opacity => &["opacity"],
-            Bindable::Radius => &["topLeftRadius", "topRightRadius", "bottomRightRadius", "bottomLeftRadius"],
-            Bindable::Width => &["width"],
-            Bindable::Height => &["height"],
-            Bindable::Gap => &["itemSpacing"],
-            Bindable::Padding => &["paddingLeft", "paddingRight", "paddingTop", "paddingBottom"],
-            Bindable::StrokeWidth => &["strokeWeight"],
-            Bindable::FontSize => &["fontSize"],
-            Bindable::Text => &["characters"],
-            Bindable::Visible => &["visible"],
-            Bindable::Fill | Bindable::Stroke => &[],
-        };
-        for k in keys {
+        for k in bound_keys(*b) {
             bv.insert(k.to_string(), alias(*var));
         }
     }
     v["boundVariables"] = Value::Object(bv);
+    v["annotations"] = json!(n.annotations.iter().map(|a| json!({ "label": a })).collect::<Vec<_>>());
+    if n.kind.is_frame() {
+        v["devStatus"] = if n.ready { json!({ "type": "READY_FOR_DEV" }) } else { Value::Null };
+    }
+    if n.kind == Kind::Instance {
+        v["isExposedInstance"] = json!(n.exposed);
+    }
     v["reactions"] = json!(n.reactions.iter().map(reaction_json).collect::<Vec<_>>());
+    if n.kind.is_frame() {
+        v["overflowDirection"] = json!(match n.overflow { Overflow::None => "NONE", Overflow::Vertical => "VERTICAL", Overflow::Horizontal => "HORIZONTAL", Overflow::Both => "BOTH" });
+    }
+    v["scrollBehavior"] = json!(match n.scroll_pos { ScrollPos::Scroll => "SCROLLS", ScrollPos::Fixed => "FIXED", ScrollPos::Sticky => "STICKY_SCROLLS" });
     v["explicitVariableModes"] = Value::Object(n.modes.iter().map(|(c, m)| (format!("VariableCollectionId:{c}"), json!(format!("{c}:{m}")))).collect());
     if !n.prop_bind.is_empty() {
         let refs: serde_json::Map<String, Value> = n
@@ -501,7 +754,13 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
             LayoutMode::None => "NONE",
             LayoutMode::Horizontal => "HORIZONTAL",
             LayoutMode::Vertical => "VERTICAL",
+            LayoutMode::Grid => "GRID",
         });
+        v["itemReverseZIndex"] = json!(l.reverse_z);
+        v["gridColumnCount"] = json!(l.grid[0].max(1));
+        v["gridRowCount"] = json!(l.grid[1]);
+        v["gridColumnGap"] = json!(l.gap);
+        v["gridRowGap"] = json!(l.cross_gap);
         v["layoutWrap"] = json!(if l.wrap { "WRAP" } else { "NO_WRAP" });
         v["itemSpacing"] = json!(l.gap);
         v["counterAxisSpacing"] = json!(l.cross_gap);
@@ -519,7 +778,7 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
     if n.kind == Kind::Text {
         v["characters"] = json!(n.text);
         v["fontSize"] = json!(n.font_size);
-        v["fontName"] = json!({ "family": n.font_family, "style": crate::text::weight_name(n.font_weight) });
+        v["fontName"] = json!({ "family": n.font_family, "style": crate::text::style_name(n.font_weight, n.italic) });
         v["textAlignHorizontal"] = json!(match n.text_align {
             TextAlign::Left => "LEFT",
             TextAlign::Center => "CENTER",
@@ -542,6 +801,8 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
         v["textCase"] = json!(case_json(n.text_case));
         v["textDecoration"] = json!(deco_json(n.decoration));
         v["paragraphSpacing"] = json!(n.paragraph_spacing);
+        v["paragraphIndent"] = json!(n.paragraph_indent);
+        v["leadingTrim"] = json!(if n.vertical_trim { "CAP_HEIGHT" } else { "NONE" });
         v["textTruncation"] = json!(if n.truncate { "ENDING" } else { "DISABLED" });
         v["maxLines"] = if n.max_lines > 0 { json!(n.max_lines) } else { Value::Null };
         v["textStyleId"] = json!(n.text_style.map(|s| format!("S:{s}")).unwrap_or_default());
@@ -561,8 +822,15 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
         let mut defs = serde_json::Map::new();
         for p in &n.comp_props {
             let (t, d) = prop_json(&p.default);
-            defs.insert(p.name.clone(), json!({ "type": t, "defaultValue": d }));
+            let mut def = json!({ "type": t, "defaultValue": d });
+            if !p.preferred.is_empty() {
+                def["preferredValues"] = json!(p.preferred.iter().map(|c| json!({ "type": "COMPONENT", "key": c.to_string() })).collect::<Vec<_>>());
+            }
+            defs.insert(p.name.clone(), def);
         }
+        v["description"] = json!(n.description);
+        // What importComponentByKeyAsync takes: "libraryId:nodeId" for a library's component.
+        v["key"] = json!(n.remote.as_ref().map_or(id.to_string(), |r| format!("{}:{}", r.lib, r.key)));
         if n.kind == Kind::ComponentSet {
             for (k, opts) in doc.variant_props(id) {
                 defs.insert(k, json!({ "type": "VARIANT", "defaultValue": opts.first(), "variantOptions": opts }));
@@ -595,13 +863,15 @@ fn style_json(s: &Style) -> Value {
             v["type"] = json!("PAINT");
             v["paints"] = json!(p.iter().map(|p| paint_json(p, None)).collect::<Vec<_>>());
         }
+        // The plugin API's layout grids aren't modeled; grid styles show by name only.
+        StyleValue::Grid(_) => v["type"] = json!("GRID"),
         StyleValue::Effect(e) => {
             v["type"] = json!("EFFECT");
             v["effects"] = json!(e.iter().map(effect_json).collect::<Vec<_>>());
         }
         StyleValue::Text(t) => {
             v["type"] = json!("TEXT");
-            v["fontName"] = json!({ "family": t.font_family, "style": crate::text::weight_name(t.font_weight) });
+            v["fontName"] = json!({ "family": t.font_family, "style": crate::text::style_name(t.font_weight, t.italic) });
             v["fontSize"] = json!(t.font_size);
             v["lineHeight"] = line_height_json(t.line_height);
             v["letterSpacing"] = json!({ "unit": "PERCENT", "value": t.letter_spacing });
@@ -627,6 +897,16 @@ fn var_type(doc: &Document, v: &Variable) -> &'static str {
     "FLOAT"
 }
 
+/// Figma scope names for a variable's "Show in" list.
+fn var_scopes(v: &Variable) -> Vec<&'static str> {
+    let mut out: Vec<&str> = v.scopes.iter().map(|b| b.scope()).collect();
+    out.dedup();
+    if out.is_empty() {
+        out.push("ALL_SCOPES");
+    }
+    out
+}
+
 fn var_value_json(v: &VarValue) -> Value {
     match v {
         VarValue::Color(c) => rgba(*c),
@@ -638,16 +918,19 @@ fn var_value_json(v: &VarValue) -> Value {
 }
 
 /// Pages (the current one, or all of them), styles, and variables as Figma-shaped JSON.
-pub fn snapshot(doc: &Document, page: usize, sel: &[NodeId], all_pages: bool) -> Value {
-    fn tree(doc: &Document, id: NodeId) -> Value {
-        let mut v = node_json(doc, id);
-        let n = doc.node(id);
-        if n.kind.is_container() {
-            v["children"] = json!(n.children.iter().map(|&c| tree(doc, c)).collect::<Vec<_>>());
-        }
-        v
+/// A layer and its descendants as plugin JSON.
+pub fn tree(doc: &Document, id: NodeId) -> Value {
+    let mut v = node_json(doc, id);
+    let n = doc.node(id);
+    if n.kind.is_container() {
+        v["children"] = json!(n.children.iter().map(|&c| tree(doc, c)).collect::<Vec<_>>());
     }
+    v
+}
+
+pub fn snapshot(doc: &Document, page: usize, sel: &[NodeId], all_pages: bool) -> Value {
     json!({
+        "remote": doc.nodes.values().filter(|n| n.parent.is_none() && n.remote.is_some()).map(|n| tree(doc, n.id)).collect::<Vec<_>>(),
         "pages": doc.pages.iter().enumerate().map(|(i, p)| {
             let loaded = all_pages || i == page;
             json!({ "name": p.name, "loaded": loaded, "children": if loaded { p.children.iter().map(|&c| tree(doc, c)).collect::<Vec<_>>() } else { vec![] },
@@ -664,7 +947,8 @@ pub fn snapshot(doc: &Document, page: usize, sel: &[NodeId], all_pages: bool) ->
             let modes: serde_json::Map<String, Value> = v.values.iter().enumerate().map(|(i, x)| (format!("{}:{i}", v.collection), var_value_json(x))).collect();
             json!({
                 "id": format!("VariableID:{}", v.id), "name": v.name, "variableCollectionId": format!("VariableCollectionId:{}", v.collection),
-                "resolvedType": var_type(doc, v), "valuesByMode": modes, "description": "", "scopes": ["ALL_SCOPES"],
+                "resolvedType": var_type(doc, v), "valuesByMode": modes, "description": "", "scopes": var_scopes(v),
+                "codeSyntax": { "WEB": v.code_syntax[0], "iOS": v.code_syntax[1], "ANDROID": v.code_syntax[2] },
             })
         }).collect::<Vec<_>>(),
     })
@@ -725,9 +1009,11 @@ fn apply_styles_and_variables(doc: &mut Document, out: &Value, refs: &mut Refs) 
             Some("EFFECT") => StyleValue::Effect(s["effects"].as_array().into_iter().flatten().filter_map(effect_from).collect()),
             Some("TEXT") => {
                 let size = f(s, "fontSize").unwrap_or(12.0) as f32;
+                let (font_weight, italic) = weight_of(s["fontName"]["style"].as_str().unwrap_or("Regular"));
                 StyleValue::Text(TextStyle {
                     font_family: s["fontName"]["family"].as_str().unwrap_or("Inter").to_string(),
-                    font_weight: weight_of(s["fontName"]["style"].as_str().unwrap_or("Regular")).0,
+                    font_weight,
+                    italic,
                     font_size: size,
                     line_height: line_height_from(&s["lineHeight"]),
                     letter_spacing: letter_spacing_from(&s["letterSpacing"], size),
@@ -799,6 +1085,13 @@ fn apply_styles_and_variables(doc: &mut Document, out: &Value, refs: &mut Refs) 
         let values: Vec<(usize, VarValue)> = v["valuesByMode"].as_object().into_iter().flatten().filter_map(|(m, x)| Some((refs.mode(m)?.1, var_value_from(x, refs)?))).collect();
         if let Some(var) = doc.variables.iter_mut().find(|x| x.id == id) {
             var.name = v["name"].as_str().unwrap_or(&var.name).to_string();
+            if let Some(sc) = v["scopes"].as_array() {
+                var.scopes = sc.iter().filter_map(|x| x.as_str()).flat_map(Bindable::from_scope).collect();
+                var.scopes.dedup();
+            }
+            for (i, k) in ["WEB", "iOS", "ANDROID"].into_iter().enumerate() {
+                var.code_syntax[i] = v["codeSyntax"][k].as_str().unwrap_or_default().to_string();
+            }
             for (i, x) in values {
                 if let Some(slot) = var.values.get_mut(i) {
                     *slot = x;
@@ -875,6 +1168,18 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
     if changed("locked") {
         n.locked = v["locked"].as_bool().unwrap_or(false);
     }
+    if changed("description") {
+        n.description = s("description").to_string();
+    }
+    if changed("isExposedInstance") {
+        n.exposed = v["isExposedInstance"].as_bool().unwrap_or(false);
+    }
+    if changed("devStatus") {
+        n.ready = v["devStatus"]["type"].as_str() == Some("READY_FOR_DEV");
+    }
+    if changed("annotations") {
+        n.annotations = v["annotations"].as_array().into_iter().flatten().filter_map(|a| a["label"].as_str().or(a["labelMarkdown"].as_str()).map(String::from)).collect();
+    }
     if changed("isMask") {
         n.is_mask = v["isMask"].as_bool().unwrap_or(false);
     }
@@ -947,6 +1252,14 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
     if changed("layoutPositioning") {
         n.absolute = s("layoutPositioning") == "ABSOLUTE";
     }
+    if changed("exportSettings") {
+        n.exports = v["exportSettings"].as_array().into_iter().flatten().map(export_from).collect();
+    }
+    for (k, i) in [("gridColumnSpan", 0), ("gridRowSpan", 1)] {
+        if changed(k) {
+            n.grid_span[i] = num(k).unwrap_or(1.0).max(1.0) as u32;
+        }
+    }
     for (k, i, max) in [("minWidth", 0, false), ("minHeight", 1, false), ("maxWidth", 0, true), ("maxHeight", 1, true)] {
         if changed(k) {
             let val = num(k).filter(|x| x.is_finite() && *x > 0.0);
@@ -960,8 +1273,26 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
             l.mode = match s("layoutMode") {
                 "HORIZONTAL" => LayoutMode::Horizontal,
                 "VERTICAL" => LayoutMode::Vertical,
+                "GRID" => LayoutMode::Grid,
                 _ => LayoutMode::None,
             };
+            if l.mode == LayoutMode::Grid && l.grid[0] == 0 {
+                l.grid = [2, 2];
+            }
+        }
+        if changed("itemReverseZIndex") {
+            l.reverse_z = v["itemReverseZIndex"].as_bool().unwrap_or(false);
+        }
+        for (k, i) in [("gridColumnCount", 0), ("gridRowCount", 1)] {
+            if changed(k) {
+                l.grid[i] = num(k).unwrap_or(0.0).max(0.0) as u32;
+            }
+        }
+        if changed("gridColumnGap") {
+            l.gap = num("gridColumnGap").unwrap_or(0.0);
+        }
+        if changed("gridRowGap") {
+            l.cross_gap = num("gridRowGap").unwrap_or(0.0);
         }
         if changed("layoutWrap") {
             l.wrap = s("layoutWrap") == "WRAP";
@@ -1049,11 +1380,11 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
             n.font_family = v["fontName"]["family"].as_str().unwrap_or("Inter").to_string();
             let (w, italic) = weight_of(v["fontName"]["style"].as_str().unwrap_or("Regular"));
             n.font_weight = w;
-            n.spans.retain(|sp| sp.style.italic.is_none());
-            if italic {
-                let len = n.text.chars().count();
-                n.spans = style_range(&n.spans, len, 0, len, &SpanStyle { italic: Some(true), ..Default::default() });
+            n.italic = italic;
+            for sp in &mut n.spans {
+                sp.style.italic = None;
             }
+            n.spans.retain(|sp| !sp.style.is_empty());
         }
         if changed("textAlignHorizontal") {
             n.text_align = match s("textAlignHorizontal") {
@@ -1092,6 +1423,12 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
         }
         if changed("paragraphSpacing") {
             n.paragraph_spacing = num("paragraphSpacing").unwrap_or(0.0).max(0.0);
+        }
+        if changed("paragraphIndent") {
+            n.paragraph_indent = num("paragraphIndent").unwrap_or(0.0).max(0.0);
+        }
+        if changed("leadingTrim") {
+            n.vertical_trim = s("leadingTrim") == "CAP_HEIGHT";
         }
         if changed("textTruncation") {
             n.truncate = s("textTruncation") == "ENDING";
@@ -1172,27 +1509,32 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
     // Variables bound to properties.
     if changed("boundVariables") {
         let bv = &v["boundVariables"];
-        n.bindings.retain(|(b, _)| matches!(b, Bindable::Fill | Bindable::Stroke));
+        n.bindings.retain(|(b, _)| bound_keys(*b).is_empty());
         let pick = |keys: &[&str]| keys.iter().find_map(|k| bv[*k]["id"].as_str().and_then(|s| refs.var(s)));
-        for (b, keys) in [
-            (Bindable::Opacity, &["opacity"][..]),
-            (Bindable::Radius, &["cornerRadius", "topLeftRadius", "topRightRadius", "bottomLeftRadius", "bottomRightRadius"][..]),
-            (Bindable::Width, &["width"][..]),
-            (Bindable::Height, &["height"][..]),
-            (Bindable::Gap, &["itemSpacing"][..]),
-            (Bindable::Padding, &["paddingLeft", "paddingRight", "paddingTop", "paddingBottom"][..]),
-            (Bindable::StrokeWidth, &["strokeWeight"][..]),
-            (Bindable::FontSize, &["fontSize"][..]),
-            (Bindable::Text, &["characters"][..]),
-            (Bindable::Visible, &["visible"][..]),
-        ] {
-            if let Some(var) = pick(keys) {
+        for b in Bindable::ALL {
+            let radius: &[&str] = if b == Bindable::Radius { &["cornerRadius"] } else { &[] };
+            if let Some(var) = pick(bound_keys(b)).or_else(|| pick(radius)) {
                 n.bindings.push((b, var));
             }
         }
     }
     if changed("reactions") {
         n.reactions = v["reactions"].as_array().into_iter().flatten().filter_map(|r| reaction_from(r, refs)).collect();
+    }
+    if changed("overflowDirection") {
+        n.overflow = match v["overflowDirection"].as_str() {
+            Some("VERTICAL") => Overflow::Vertical,
+            Some("HORIZONTAL") => Overflow::Horizontal,
+            Some("BOTH") => Overflow::Both,
+            _ => Overflow::None,
+        };
+    }
+    if changed("scrollBehavior") {
+        n.scroll_pos = match v["scrollBehavior"].as_str() {
+            Some("FIXED") => ScrollPos::Fixed,
+            Some("STICKY_SCROLLS") => ScrollPos::Sticky,
+            _ => ScrollPos::Scroll,
+        };
     }
     if changed("explicitVariableModes") {
         n.modes = v["explicitVariableModes"].as_object().into_iter().flatten().filter_map(|(_, m)| refs.mode(m.as_str()?)).collect();
@@ -1211,7 +1553,8 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
                     _ => return None,
                 };
                 // Figma suffixes names with "#id"; Katachi binds by plain name.
-                Some(CompProp { name: name.split('#').next().unwrap_or(name).to_string(), default })
+                let preferred = d["preferredValues"].as_array().into_iter().flatten().filter_map(|p| refs.node(p["key"].as_str()?)).collect();
+                Some(CompProp { name: name.split('#').next().unwrap_or(name).to_string(), default, preferred })
             })
             .collect();
     }
@@ -1239,7 +1582,7 @@ pub fn apply(doc: &mut Document, out: &Value) -> HashMap<String, NodeId> {
         let i = match p["id"].as_str().and_then(|s| s.strip_prefix("page:")).and_then(|s| s.parse::<usize>().ok()).filter(|i| *i < doc.pages.len()) {
             Some(i) => i,
             None => {
-                doc.pages.push(Page { name: name.clone(), children: vec![], background: PAGE_BG, flows: vec![], view: None });
+                doc.pages.push(Page { name: name.clone(), children: vec![], background: PAGE_BG, flows: vec![], view: None, guides: vec![], prototype: Default::default() });
                 doc.pages.len() - 1
             }
         };

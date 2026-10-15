@@ -1,6 +1,6 @@
 //! App state, document actions, undo, clipboard, files, and keyboard shortcuts.
 
-use crate::doc::{AutoLayout, BoolOp, Document, Kind, LayoutMode, Node, NodeId, Order, Sizing};
+use crate::doc::{AutoLayout, Bindable, BoolOp, Document, Kind, LayoutMode, Node, NodeId, Order, Sizing};
 use crate::render::View;
 use egui::{Event, Key, Modifiers, Pos2, Rect, Vec2, vec2};
 use std::path::PathBuf;
@@ -25,6 +25,8 @@ pub enum Tool {
     Text,
     /// C: drop comment pins.
     Comment,
+    /// Z: click zooms in, Alt-click out, drag a box to zoom to it.
+    Zoom,
 }
 
 impl Tool {
@@ -59,21 +61,52 @@ pub enum Drag {
     Rotate { base: Document, center: Pos2, start_angle: f32, start_rot: f32, deg: f32 },
     Create { base: Document, start: Pos2, id: NodeId },
     Marquee { start: Pos2, base_sel: Vec<NodeId> },
+    /// Vector edit: selecting anchors in a box, added to `base_sel`.
+    PointMarquee { start: Pos2, base_sel: Vec<crate::vector_edit::PointRef> },
     Vector { base: Document, id: NodeId, grab: crate::vector_edit::Grab },
     PenHandle,
     Pencil { points: Vec<Pos2> },
     /// Prototype tab: dragging a connection from a layer to a frame.
     Connect { from: NodeId },
+    /// Zoom tool: the box to zoom to.
+    Zoom { start: Pos2 },
+    /// A ruler guide being dragged (or just pulled out of a ruler).
+    Guide { index: usize },
+    /// Smart selection: a spacing handle sets every gap along `axis` (0 = row) at once.
+    Spacing { base: Document, axis: usize, items: Vec<(NodeId, Rect)>, gap: f32, start: Pos2 },
+    /// Smart selection: one layer dragged by its center knob onto another's slot swaps them.
+    Swap { base: Document, id: NodeId, axis: usize, items: Vec<(NodeId, Rect)>, start: Pos2 },
+    /// A gradient handle or stop on the canvas.
+    Gradient { grab: GradGrab },
+    /// An auto layout frame's gap or padding handle (`Grip::Gap` / `Grip::Padding`).
+    LayoutSpacing { base: Document, id: NodeId, grip: Grip, start: Pos2 },
 }
 
 impl Drag {
     /// The document as it was when the drag began (drags re-apply themselves to it each frame).
     pub fn base_mut(&mut self) -> Option<&mut Document> {
         match self {
-            Drag::Move { base, .. } | Drag::Resize { base, .. } | Drag::Rotate { base, .. } | Drag::Create { base, .. } | Drag::Vector { base, .. } => Some(base),
+            Drag::Move { base, .. }
+            | Drag::Resize { base, .. }
+            | Drag::Rotate { base, .. }
+            | Drag::Create { base, .. }
+            | Drag::Vector { base, .. }
+            | Drag::Spacing { base, .. }
+            | Drag::LayoutSpacing { base, .. }
+            | Drag::Swap { base, .. } => Some(base),
             _ => None,
         }
     }
+}
+
+/// One file to export: the layers to render, the base file name, and the preset.
+pub type ExportJob = (Vec<NodeId>, String, crate::doc::ExportSetting);
+
+/// "Name" + suffix + "@2x" for scaled rasters, with the format's extension.
+pub fn export_file_name(name: &str, p: &crate::doc::ExportSetting) -> String {
+    let scaled = p.format.raster() && p.size == crate::doc::ExportSize::Scale && p.scale != 1.0;
+    let scale = if scaled { format!("@{}x", crate::canvas::num(p.scale)) } else { String::new() };
+    format!("{}.{}", crate::export::safe_name(&format!("{name}{}{scale}", p.suffix)), p.format.ext())
 }
 
 /// What the pointer grabbed on the selection frame.
@@ -83,6 +116,38 @@ pub enum Grip {
     Resize(i8, i8),
     /// Just outside a corner.
     Rotate,
+    /// Smart selection: a gap's spacing handle along this axis (0 = row).
+    Spacing(usize),
+    /// Smart selection: a layer's center knob.
+    Swap(NodeId),
+    /// A selected auto layout frame's gap handle.
+    Gap,
+    /// A selected auto layout frame's padding handle: top, right, bottom, left.
+    Padding(usize),
+    /// A handle of the gradient being edited.
+    Gradient(GradGrab),
+}
+
+/// Parts of Figma's on-canvas gradient editor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GradGrab {
+    From,
+    To,
+    /// The second axis of radial, angular, and diamond gradients.
+    Width,
+    Stop(usize),
+    /// The line between the stops: a click adds a stop there.
+    Line,
+}
+
+/// The gradient paint whose editor popover is open; its handles show on the canvas.
+#[derive(Clone, Copy, Debug)]
+pub struct GradientEdit {
+    pub stroke: bool,
+    pub index: usize,
+    /// The paint row's id (its editor keeps the selected stop under it).
+    pub ui: egui::Id,
+    pub stop: usize,
 }
 
 /// Mouse-down state for the move tool, resolved into a click or a drag.
@@ -109,6 +174,8 @@ pub enum Want {
     OpenDialog,
     CloseTab,
     Home,
+    /// Quitting was cancelled: tabs already answered "Don't save" must ask again next time.
+    KeepOpen,
 }
 
 /// A plugin with a UI, running until it closes.
@@ -126,6 +193,14 @@ pub struct PluginRun {
 }
 
 const CLIP_TAG: &str = "katachi/nodes:";
+
+/// One undo step: the document, and the selection and page it was edited with, so undo and
+/// redo bring back what was selected and go to the page where the change happened (as in Figma).
+struct Snapshot {
+    doc: Document,
+    sel: Vec<NodeId>,
+    page: usize,
+}
 
 pub struct App {
     pub doc: Document,
@@ -145,6 +220,14 @@ pub struct App {
     pub renaming: Option<(NodeId, String)>,
     pub renaming_page: Option<(usize, String)>,
     pub guides: Vec<[Pos2; 2]>,
+    /// Equal-spacing markers while snapping: world segments across each matching gap.
+    pub gap_marks: Vec<[Pos2; 2]>,
+    /// Z held down: the tool to go back to on release, and when Z went down.
+    pub zoom_hold: Option<(Tool, f64)>,
+    /// The selected ruler guide on this page (Backspace deletes it).
+    pub guide_sel: Option<usize>,
+    /// Pressed a ruler (new guide on this axis) or an existing guide; a drag moves it.
+    pub guide_grab: Option<(crate::doc::Axis, Option<usize>)>,
     pub frame_labels: Vec<(NodeId, Rect)>,
     pub layer_drag: Option<NodeId>,
     pub canvas_rect: Option<Rect>,
@@ -154,8 +237,8 @@ pub struct App {
     /// Zoom to this layer on the next frame (after page switches settle).
     pub zoom_target: Option<NodeId>,
     pub left_tab_assets: bool,
-    /// Assets panel previews: component -> (content key, texture).
-    pub asset_thumbs: std::collections::HashMap<NodeId, (u64, egui::TextureHandle)>,
+    /// Assets panel previews: (library id, "" for this file; component) -> (content key, texture).
+    pub asset_thumbs: std::collections::HashMap<(String, NodeId), (u64, egui::TextureHandle)>,
     /// Last tool used in each toolbar group (move, frame, shape, pen, text).
     pub tool_groups: [Tool; 6],
     pub presenting: Option<crate::prototype::Presentation>,
@@ -166,6 +249,8 @@ pub struct App {
     pub vector_edit: Option<crate::vector_edit::VectorEdit>,
     pub vector_grabbed: Option<crate::vector_edit::Grab>,
     pub vector_start: Pos2,
+    /// Vector edit: the press landed on empty canvas outside the path (a click there leaves edit mode).
+    pub vector_outside: bool,
     /// Cmd+\ hides the side panels.
     pub ui_hidden: bool,
     pub rulers: bool,
@@ -189,6 +274,9 @@ pub struct App {
     debug_plugin: Option<PathBuf>,
     /// The last layers copied here, for Paste to replace.
     pub clip_frag: Option<Vec<Node>>,
+    /// The V key went down as a key (not as a paste), and a paste arrived, since V last went up.
+    v_pressed: bool,
+    pasted: bool,
     /// Find and replace (Cmd F): (open, query, replacement, focus the field next frame).
     pub find: (bool, String, String, bool),
     /// Plugins > Run script console.
@@ -201,7 +289,6 @@ pub struct App {
     pub dev_mode: bool,
     pub code_lang: crate::codegen::Lang,
     pub show_comments: bool,
-    pub show_resolved: bool,
     pub draft_comment: Option<(crate::doc::Comment, String)>,
     pub open_comment: Option<u64>,
     pub comment_reply: String,
@@ -210,6 +297,15 @@ pub struct App {
     /// Properties copied with Cmd+Alt+C.
     pub style_clip: Option<Node>,
     pub layer_search: Option<String>,
+    /// Where the canvas was right-clicked (world), for the menu's "Select layer".
+    pub menu_at: Option<Pos2>,
+    pub batch_rename: Option<crate::panels::BatchRename>,
+    /// Cmd K's link field while editing text: the characters it links and the URL typed so far.
+    pub link_edit: Option<(usize, usize, String)>,
+    /// Focus the link field on its next frame.
+    pub focus_link: bool,
+    /// The Replace fonts dialog: each missing family and its chosen replacement.
+    pub replace_fonts: Option<Vec<(String, String)>>,
     /// This session's crash-recovery autosave.
     recovery: PathBuf,
     last_autosave: f64,
@@ -217,8 +313,8 @@ pub struct App {
     autosave_gen: std::sync::Arc<std::sync::Mutex<u64>>,
     /// Autosaves from sessions that crashed, offered on launch.
     pub recoverable: Vec<PathBuf>,
-    undo: Vec<Document>,
-    redo: Vec<Document>,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
     /// In a multiplayer session: nodes this user changed after each undo checkpoint.
     undo_touched: Vec<std::collections::HashSet<NodeId>>,
     redo_touched: Vec<std::collections::HashSet<NodeId>>,
@@ -229,6 +325,18 @@ pub struct App {
     pub collab_port: u16,
     /// Pointer in world space this frame (shared as presence).
     pub pointer_world: Option<Pos2>,
+    /// Cursor chat ("/") while open: the message, when it was last typed in (0 = just opened),
+    /// and where the bubble sits on screen.
+    pub chat: Option<(String, f64, Pos2)>,
+    /// The collaborator whose view this user follows, and the page and view last taken from
+    /// them (anything else changing it means the user took over).
+    pub following: Option<u32>,
+    follow_view: Option<(usize, View)>,
+    /// The text editor's caret (character index), shared so others see where you type.
+    pub caret: Option<usize>,
+    pub comment_filter: crate::comments::Filter,
+    /// Messages seen per comment thread, for unread dots: what others added since then.
+    pub comment_read: std::collections::HashMap<u64, usize>,
     /// Text layers' last measured inputs, so unchanged text isn't re-laid out every frame.
     pub text_keys: std::collections::HashMap<NodeId, u64>,
     in_gesture: bool,
@@ -237,14 +345,28 @@ pub struct App {
     pub draft_name: Option<String>,
     pub want: Option<Want>,
     pub dirty: bool,
-    pub export_scale: f32,
-    pub export_svg: bool,
+    /// The Export section's preset for layers that have none of their own.
+    pub export_default: crate::doc::ExportSetting,
+    /// Shift Cmd E's Export dialog, while open: the layers unticked in it.
+    pub export_dialog: Option<std::collections::HashSet<NodeId>>,
     pub confirm: Option<After>,
     pub prev_sel: Vec<NodeId>,
+    pub gradient_edit: Option<GradientEdit>,
+    /// The last opacity digit typed and when, for two-digit values.
+    /// The last opacity digit, when, and the selection it applied to.
+    last_digit: Option<(u8, f64, Vec<NodeId>)>,
+    pub eyedrop: Option<crate::paint_ui::Eyedrop>,
     pub allow_close: bool,
     pub toast: Option<(String, f64)>,
-    title: String,
     screenshot: Option<(PathBuf, u32)>,
+    /// Library files this document uses, as last read, by library id.
+    pub libs: std::collections::HashMap<String, crate::library::Loaded>,
+    /// Library changes waiting for review (Figma's "Library updates available").
+    pub lib_updates: Vec<crate::library::Change>,
+    pub show_libraries: bool,
+    pub review_updates: bool,
+    /// Whether the window had focus last frame: regaining it re-checks the libraries.
+    pub focused: bool,
 }
 
 impl App {
@@ -266,6 +388,10 @@ impl App {
             renaming: None,
             renaming_page: None,
             guides: vec![],
+            gap_marks: vec![],
+            zoom_hold: None,
+            guide_sel: None,
+            guide_grab: None,
             frame_labels: vec![],
             layer_drag: None,
             canvas_rect: None,
@@ -281,6 +407,7 @@ impl App {
             vector_edit: None,
             vector_grabbed: None,
             vector_start: Pos2::ZERO,
+            vector_outside: false,
             ui_hidden: false,
             rulers: false,
             outline_mode: false,
@@ -288,6 +415,8 @@ impl App {
             show_history: false,
             find: (false, String::new(), String::new(), false),
             clip_frag: None,
+            v_pressed: false,
+            pasted: false,
             plugin: None,
             own_title_bar: false,
             appearance: crate::appearance::load(),
@@ -304,7 +433,6 @@ impl App {
             dev_mode: false,
             code_lang: crate::codegen::Lang::Css,
             show_comments: false,
-            show_resolved: false,
             draft_comment: None,
             open_comment: None,
             comment_reply: String::new(),
@@ -312,6 +440,11 @@ impl App {
             var_collection: None,
             style_clip: None,
             layer_search: None,
+            menu_at: None,
+            batch_rename: None,
+            replace_fonts: None,
+            link_edit: None,
+            focus_link: false,
             recovery: {
                 // Unique per window, even for two opened in the same millisecond.
                 static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -335,20 +468,33 @@ impl App {
             collab_address: String::new(),
             collab_port: 7878,
             pointer_world: None,
+            chat: None,
+            following: None,
+            follow_view: None,
+            caret: None,
+            comment_filter: Default::default(),
+            comment_read: Default::default(),
             text_keys: Default::default(),
             in_gesture: false,
             path: None,
             draft_name: None,
             want: None,
             dirty: false,
-            export_scale: 1.0,
-            export_svg: false,
+            export_default: Default::default(),
+            export_dialog: None,
             confirm: None,
             prev_sel: vec![],
             allow_close: false,
             toast: None,
-            title: String::new(),
+            gradient_edit: None,
+            last_digit: None,
+            eyedrop: None,
             screenshot: std::env::var_os("KATACHI_SCREENSHOT").map(|p| (PathBuf::from(p), 0)),
+            libs: Default::default(),
+            lib_updates: vec![],
+            show_libraries: false,
+            review_updates: false,
+            focused: false,
         };
         app.recoverable = crate::files::orphaned_recoveries(&app.recovery);
         if let Some(p) = path {
@@ -359,6 +505,11 @@ impl App {
             app.page = pg.min(app.doc.pages.len() - 1);
         }
         app
+    }
+
+    /// The window title while this file is on screen.
+    pub fn window_title(&self) -> String {
+        format!("{}{} - Katachi", self.display_name(), if self.dirty { " (Edited)" } else { "" })
     }
 
     /// The file's name, as tabs and the title show it.
@@ -411,6 +562,11 @@ impl App {
         }
     }
 
+    #[cfg(test)]
+    pub fn recovery_path(&self) -> &std::path::Path {
+        &self.recovery
+    }
+
     /// The work is saved or deliberately discarded: drop this session's autosave.
     pub fn clear_recovery(&self) {
         let mut g = self.autosave_gen.lock().unwrap();
@@ -435,7 +591,7 @@ impl App {
         // Attribute pending multiplayer changes to the step they belong to before starting a new one.
         self.sync_collab(f64::MAX);
         // ponytail: whole-document snapshots, switch to an op log when docs get big
-        self.undo.push(self.doc.clone());
+        self.undo.push(Snapshot { doc: self.doc.clone(), sel: self.sel.clone(), page: self.page });
         self.undo_touched.push(Default::default());
         if self.undo.len() > 200 {
             self.undo.remove(0);
@@ -452,7 +608,29 @@ impl App {
         c.me.page = self.page;
         c.me.selection = self.sel.clone();
         c.me.cursor = self.pointer_world;
+        c.me.chat = self.chat.as_ref().map(|ch| ch.0.clone()).filter(|t| !t.is_empty());
+        c.me.view = self.canvas_rect.map(|r| Rect::from_min_max(self.view.to_world(r.min), self.view.to_world(r.max)));
+        c.me.caret = self.editing_text.zip(self.caret);
+        let was = c.status.clone();
         let (touched, remote) = c.tick(&mut self.doc, now);
+        let status = (c.status != was).then(|| c.status.clone());
+        // Spotlight: follow whoever turns it on (Escape stops), and stop when they turn it off.
+        for (id, on) in std::mem::take(&mut c.spotlights) {
+            if on {
+                let name = c.peers.get(&id).map_or(String::new(), |p| p.name.clone());
+                self.following = Some(id);
+                self.toast = Some((format!("{name} is spotlighting. Press Esc to stop following."), 0.0));
+            } else if self.following == Some(id) {
+                self.following = None;
+            }
+        }
+        if self.following.is_some_and(|id| !c.peers.contains_key(&id)) {
+            self.following = None;
+        }
+        // Others' edits are changes to save too.
+        if !remote.is_empty() {
+            self.dirty = true;
+        }
         // A drag rebuilds the document from its starting copy every frame; that copy needs
         // others' changes too, or they'd vanish (and go out as deletions) mid-drag.
         if !remote.is_empty()
@@ -460,15 +638,51 @@ impl App {
         {
             crate::collab::apply(base, &remote);
         }
-        if !c.connected {
-            self.collab = None;
-            self.toast("Disconnected from the session".into());
-            return;
+        match status {
+            Some(crate::collab::Status::Reconnecting(0)) => self.toast("Connection lost. Reconnecting...".into()),
+            Some(crate::collab::Status::Connected) => self.toast("Reconnected to the session".into()),
+            Some(crate::collab::Status::Disconnected(why)) => self.toast(why),
+            _ => {}
         }
         if let Some(t) = self.undo_touched.last_mut() {
             t.extend(touched);
         }
         self.sel.retain(|id| self.doc.nodes.contains_key(id));
+    }
+
+    /// Click on a collaborator's avatar (Figma): follow them, or stop if already following.
+    pub fn toggle_follow(&mut self, id: u32) {
+        self.following = if self.following == Some(id) { None } else { Some(id) };
+        self.follow_view = None;
+    }
+
+    /// Spotlight me: ask everyone else in the session to follow this user.
+    pub fn toggle_spotlight(&mut self) {
+        if let Some(c) = self.collab.as_mut() {
+            c.me.spotlight = !c.me.spotlight;
+            self.following = None;
+        }
+    }
+
+    /// While following: show the leader's page and the part of it on their screen. A view or
+    /// page changed by anything else since the last frame means the user took over: stop.
+    pub fn follow(&mut self, screen: Rect) {
+        let Some(id) = self.following else { return self.follow_view = None };
+        if self.follow_view.is_some_and(|(page, view)| page != self.page || view != self.view) {
+            self.following = None;
+            self.follow_view = None;
+            return;
+        }
+        let Some(p) = self.collab.as_ref().and_then(|c| c.peers.get(&id)).cloned() else { return };
+        if p.page != self.page && p.page < self.doc.pages.len() {
+            self.select_page(p.page);
+            self.view_ready = true;
+        }
+        if let Some(v) = p.view {
+            let zoom = (screen.width() / v.width()).min(screen.height() / v.height()).clamp(0.02, 256.0);
+            self.view = View { zoom, pan: screen.center().to_vec2() - v.center().to_vec2() * zoom };
+        }
+        self.follow_view = Some((self.page, self.view));
     }
 
     /// Bring back only the given nodes from a snapshot (multiplayer undo leaves others' work alone).
@@ -508,43 +722,63 @@ impl App {
     }
 
     pub fn undo(&mut self) {
+        // A drag rebuilds the document from its starting copy each frame; undoing under it
+        // would be overwritten and leave history out of step.
+        if self.drag.is_some() {
+            return;
+        }
         self.sync_collab(f64::MAX);
-        if let Some(d) = self.undo.pop() {
+        if let Some(s) = self.undo.pop() {
             let touched = self.undo_touched.pop().unwrap_or_default();
-            if self.collab.is_some() {
-                let current = self.doc.clone();
-                self.restore_nodes(&d, &touched);
-                self.redo.push(current);
-            } else {
-                self.redo.push(std::mem::replace(&mut self.doc, d));
-            }
+            let current = self.swap_in(s.doc, &touched);
+            self.redo.push(current);
             self.redo_touched.push(touched);
-            self.after_history();
+            self.after_history(s.sel, s.page);
         }
     }
 
     pub fn redo(&mut self) {
+        if self.drag.is_some() {
+            return;
+        }
         self.sync_collab(f64::MAX);
-        if let Some(d) = self.redo.pop() {
+        if let Some(s) = self.redo.pop() {
             let touched = self.redo_touched.pop().unwrap_or_default();
-            if self.collab.is_some() {
-                let current = self.doc.clone();
-                self.restore_nodes(&d, &touched);
-                self.undo.push(current);
-            } else {
-                self.undo.push(std::mem::replace(&mut self.doc, d));
-            }
+            let current = self.swap_in(s.doc, &touched);
+            self.undo.push(current);
             self.undo_touched.push(touched);
-            self.after_history();
+            self.after_history(s.sel, s.page);
         }
     }
 
-    fn after_history(&mut self) {
+    /// Bring back a snapshot's document (in a multiplayer session, only the nodes this user
+    /// touched) and return the current state for the other stack.
+    fn swap_in(&mut self, doc: Document, touched: &std::collections::HashSet<NodeId>) -> Snapshot {
+        let old = if self.collab.is_some() {
+            let current = self.doc.clone();
+            self.restore_nodes(&doc, touched);
+            current
+        } else {
+            std::mem::replace(&mut self.doc, doc)
+        };
+        Snapshot { doc: old, sel: self.sel.clone(), page: self.page }
+    }
+
+    fn after_history(&mut self, sel: Vec<NodeId>, page: usize) {
         self.dirty = true;
         self.vector_edit = None;
         self.editing_text = None;
-        self.page = self.page.min(self.doc.pages.len() - 1);
+        let page = page.min(self.doc.pages.len() - 1);
+        if page != self.page {
+            if self.page < self.doc.pages.len() {
+                self.remember_view();
+            }
+            self.page = page;
+            self.view_ready = false;
+        }
+        self.sel = sel;
         self.sel.retain(|id| self.doc.nodes.contains_key(id));
+        self.guide_sel = None;
     }
 
     // ---------- selection & structure ----------
@@ -576,6 +810,7 @@ impl App {
             self.end_text_edit();
             self.page = i;
             self.sel.clear();
+            self.guide_sel = None;
             self.view_ready = false;
         }
     }
@@ -637,6 +872,53 @@ impl App {
             }
             self.sel = vec![g];
         }
+    }
+
+    /// Shift X: swap the selection's fill and stroke paints, with their styles and variables.
+    pub fn swap_fill_stroke(&mut self) {
+        if self.sel.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for id in self.sel.clone() {
+            let n = self.doc.node_mut(id);
+            if n.kind == Kind::Group {
+                continue;
+            }
+            std::mem::swap(&mut n.fills, &mut n.strokes);
+            std::mem::swap(&mut n.fill_style, &mut n.stroke_style);
+            for (b, _) in &mut n.bindings {
+                *b = match *b {
+                    Bindable::Fill => Bindable::Stroke,
+                    Bindable::Stroke => Bindable::Fill,
+                    other => other,
+                };
+            }
+            if !n.strokes.is_empty() && n.stroke_width <= 0.0 {
+                n.stroke_width = 1.0;
+            }
+        }
+        self.doc.reflow();
+    }
+
+    /// Figma's number keys set the selection's opacity: 1 = 10% ... 9 = 90%, 0 = 100%, and two
+    /// digits typed quickly an exact value (4 then 5 = 45%, 0 then 0 = 0%), in one undo step.
+    pub fn opacity_key(&mut self, digit: u8, now: f64) {
+        if self.sel.is_empty() {
+            return;
+        }
+        let pct = match self.last_digit.take() {
+            Some((first, t, sel)) if now - t < 0.6 && sel == self.sel => (first * 10 + digit) as f32,
+            _ => {
+                self.checkpoint();
+                self.last_digit = Some((digit, now, self.sel.clone()));
+                if digit == 0 { 100.0 } else { digit as f32 * 10.0 }
+            }
+        };
+        for id in self.sel.clone() {
+            self.doc.node_mut(id).opacity = pct / 100.0;
+        }
+        self.doc.reflow();
     }
 
     pub fn flip_selection(&mut self, horizontal: bool) {
@@ -715,6 +997,7 @@ impl App {
             if n.kind == Kind::Text && src.kind == Kind::Text {
                 n.font_family = src.font_family.clone();
                 n.font_weight = src.font_weight;
+                n.italic = src.italic;
                 n.font_size = src.font_size;
                 n.line_height = src.line_height;
                 n.letter_spacing = src.letter_spacing;
@@ -723,6 +1006,7 @@ impl App {
                 n.text_case = src.text_case;
             }
         }
+        self.doc.reflow();
     }
 
     /// Combine the selection into a live boolean, or change the op of a selected boolean.
@@ -747,6 +1031,58 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Backspace while a gradient's handles are showing removes its selected stop, keeping at
+    /// least two, and never deletes the layer under the open editor.
+    pub fn delete_gradient_stop(&mut self, ctx: &egui::Context) {
+        let (Some(g), Some(&id)) = (self.gradient_edit, self.sel.first()) else { return };
+        let n = self.doc.node(id);
+        let stops = (if g.stroke { &n.strokes } else { &n.fills }).get(g.index).map_or(0, |p| p.stops.len());
+        if stops <= 2 || g.stop >= stops {
+            return;
+        }
+        self.checkpoint();
+        let n = self.doc.node_mut(id);
+        (if g.stroke { &mut n.strokes } else { &mut n.fills })[g.index].stops.remove(g.stop);
+        ctx.data_mut(|d| d.insert_temp(g.ui.with("stop"), g.stop.saturating_sub(1)));
+        self.doc.reflow();
+    }
+
+    /// Right-click > Move to page: the selection goes to another page at the same positions.
+    pub fn move_to_page(&mut self, to: usize) {
+        let roots = self.sel_roots();
+        if roots.is_empty() || to == self.page || to >= self.doc.pages.len() {
+            return;
+        }
+        self.checkpoint();
+        // Flow starting points belong to their page.
+        self.doc.pages[self.page].flows.retain(|f| !roots.contains(f));
+        for id in roots {
+            self.doc.reparent(id, to, None, None);
+        }
+        self.doc.reflow();
+        self.sel.clear();
+        self.toast(format!("Moved to {}", self.doc.pages[to].name));
+    }
+
+    /// Visible, unlocked layers under world point `p`, top first (right-click > Select layer).
+    pub fn layers_at(&self, p: Pos2) -> Vec<NodeId> {
+        fn walk(doc: &Document, list: &[NodeId], p: Pos2, tol: f32, out: &mut Vec<NodeId>) {
+            for &id in list.iter().rev() {
+                let n = doc.node(id);
+                if !n.visible || n.locked || (n.kind.is_frame() && n.clip && !n.rect.contains(n.to_local(p))) {
+                    continue;
+                }
+                walk(doc, &n.paint_order(), p, tol, out);
+                if doc.hit_self(n, p, tol) || (n.kind.is_container() && n.rect.contains(n.to_local(p))) {
+                    out.push(id);
+                }
+            }
+        }
+        let mut out = vec![];
+        walk(&self.doc, &self.doc.pages[self.page].children, p, 2.0 / self.view.zoom, &mut out);
+        out
     }
 
     /// Shift+A: turn selected frames into auto layout, or wrap other selections in a new one.
@@ -842,9 +1178,20 @@ impl App {
         }
     }
 
+    /// Cmd A: the selection's siblings (or the page's layers), skipping locked ones as Figma does.
     pub fn select_all(&mut self) {
+        self.sel = self.unselected_siblings(&[]);
+    }
+
+    /// Shift Cmd A: the selection's siblings that aren't selected.
+    pub fn select_inverse(&mut self) {
+        let sel = self.sel.clone();
+        self.sel = self.unselected_siblings(&sel);
+    }
+
+    fn unselected_siblings(&self, except: &[NodeId]) -> Vec<NodeId> {
         let parent = self.sel.first().and_then(|&s| self.doc.node(s).parent);
-        self.sel = self.doc.children_of(self.page, parent).clone();
+        self.doc.children_of(self.page, parent).iter().copied().filter(|id| !except.contains(id) && !self.doc.node(*id).locked).collect()
     }
 
     pub fn nudge(&mut self, d: Vec2) {
@@ -852,8 +1199,25 @@ impl App {
             return;
         }
         self.checkpoint();
-        for id in self.sel_roots() {
-            self.doc.translate(id, d);
+        // Later layers first when stepping forward, so a run of selected siblings moves together.
+        let mut roots = self.doc.sort_by_z(&self.sel_roots());
+        if d.x + d.y > 0.0 {
+            roots.reverse();
+        }
+        for id in roots {
+            // Children of auto layout step through the flow instead of moving (Figma).
+            let flow = self.doc.node(id).parent.map(|p| self.doc.node(p).layout).filter(|l| l.mode != LayoutMode::None && !self.doc.node(id).absolute);
+            let Some(l) = flow else {
+                self.doc.translate(id, d);
+                continue;
+            };
+            let sign = |v: f32| (v > 0.0) as isize - (v < 0.0) as isize;
+            let step = match l.mode {
+                LayoutMode::Horizontal => sign(d.x),
+                LayoutMode::Vertical => sign(d.y),
+                _ => sign(d.x) + sign(d.y) * l.grid[0].max(1) as isize,
+            };
+            self.doc.step_in_flow(id, step);
         }
         self.doc.reflow();
     }
@@ -879,6 +1243,65 @@ impl App {
                 self.sel.clear();
             }
         }
+    }
+
+    /// Object > Lock all / Unlock all: the page's layers (locking the top level covers the rest).
+    pub fn lock_all(&mut self, lock: bool) {
+        let roots = self.doc.pages[self.page].children.clone();
+        let all: Vec<NodeId> = if lock { roots } else { roots.iter().flat_map(|&r| std::iter::once(r).chain(self.doc.descendants(r))).collect() };
+        let ids: Vec<NodeId> = all.into_iter().filter(|&id| self.doc.node(id).locked != lock).collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for id in ids {
+            self.doc.node_mut(id).locked = lock;
+        }
+        if lock {
+            self.sel.clear();
+        }
+    }
+
+    /// Alt Shift Cmd R: selected frames take the size of their contents; the contents stay put.
+    /// Auto layout frames switch to hug instead.
+    pub fn resize_to_fit(&mut self) {
+        let frames: Vec<NodeId> = self
+            .sel
+            .iter()
+            .copied()
+            .filter(|&id| {
+                let n = self.doc.node(id);
+                n.kind.is_frame() && n.kind != Kind::Instance && n.rotation == 0.0 && !n.children.is_empty()
+            })
+            .collect();
+        if frames.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for id in frames {
+            if self.doc.node(id).layout.mode != LayoutMode::None {
+                self.doc.node_mut(id).sizing = [Sizing::Hug, Sizing::Hug];
+            } else {
+                let b = self.doc.bounds(&self.doc.node(id).children.clone());
+                self.doc.set_rect_with(id, b, false);
+            }
+        }
+        self.doc.reflow();
+    }
+
+    /// Remove fill: the selection keeps its strokes and effects but loses every fill.
+    pub fn remove_fills(&mut self) {
+        let ids: Vec<NodeId> = self.sel.iter().copied().filter(|&id| !self.doc.node(id).fills.is_empty()).collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for id in ids {
+            let n = self.doc.node_mut(id);
+            n.fills.clear();
+            n.fill_style = None;
+        }
+        self.doc.reflow();
     }
 
     pub fn align(&mut self, a: Align) {
@@ -917,20 +1340,22 @@ impl App {
             return;
         }
         let frag = self.doc.extract(&roots);
-        if let Ok(json) = serde_json::to_string(&frag) {
-            ctx.copy_text(format!("{CLIP_TAG}{json}"));
-        }
+        ctx.copy_text(format!("{CLIP_TAG}{}", crate::doc::to_json(&frag)));
         self.clip_frag = Some(frag);
     }
 
-    pub fn paste_text(&mut self, text: &str) {
-        if let Some(frag) = text.strip_prefix(CLIP_TAG).and_then(|j| serde_json::from_str::<Vec<Node>>(j).ok()) {
+    /// Paste clipboard text: copied layers, SVG markup, or plain text. `over` is Shift Cmd V
+    /// (Paste over selection): the layers go just above the selection, never into a selected frame.
+    pub fn paste_text(&mut self, text: &str, over: bool) {
+        if let Some(frag) = clip_layers(text) {
             self.checkpoint();
             // Paste into a selected frame, otherwise next to the original.
-            let parent = match self.sel.as_slice() {
-                [one] if self.doc.node(*one).kind.is_frame() => Some(*one),
-                [one, ..] => self.doc.node(*one).parent,
-                [] => None,
+            let top = self.doc.sort_by_z(&self.sel_roots()).last().copied();
+            let (parent, mut at) = match self.sel.as_slice() {
+                _ if over => top.map_or((None, None), |t| (self.doc.node(t).parent, Some(self.doc.index_in_parent(t) + 1))),
+                [one] if self.doc.node(*one).kind.is_frame() => (Some(*one), None),
+                [one, ..] => (self.doc.node(*one).parent, None),
+                [] => (None, None),
             };
             // Pasting a main component that still exists makes an instance of it.
             let in_frag: std::collections::HashSet<NodeId> = frag.iter().map(|n| n.id).collect();
@@ -938,11 +1363,12 @@ impl App {
             for root in frag.iter().filter(|n| !n.parent.is_some_and(|p| in_frag.contains(&p))) {
                 let live = self.doc.nodes.get(&root.id).is_some_and(|n| n.kind == Kind::Component);
                 if root.kind == Kind::Component && live {
-                    out.push(self.doc.instantiate(root.id, self.page, parent, None, root.rect.min));
+                    out.push(self.doc.instantiate(root.id, self.page, parent, at, root.rect.min));
                 } else {
                     let sub: Vec<Node> = frag.iter().filter(|n| n.id == root.id || self.frag_descends(&frag, n.id, root.id)).cloned().collect();
-                    out.extend(self.doc.paste(&sub, self.page, parent, None));
+                    out.extend(self.doc.paste(&sub, self.page, parent, at));
                 }
+                at = at.map(|i| i + 1);
             }
             self.doc.reflow();
             self.sel = out;
@@ -959,9 +1385,10 @@ impl App {
         }
     }
 
-    /// Shift Cmd R: put the copied layers where each selected layer is, replacing it.
+    /// Shift Cmd R: put the copied layers where each selected layer is, replacing it. Layers
+    /// copied in another tab (or window) come from the system clipboard.
     pub fn paste_to_replace(&mut self) {
-        let Some(frag) = self.clip_frag.clone() else {
+        let Some(frag) = clipboard_text().as_deref().and_then(clip_layers).or_else(|| self.clip_frag.clone()) else {
             self.toast("Copy something first".into());
             return;
         };
@@ -997,20 +1424,42 @@ impl App {
                 && b.shadows == a.shadows
                 && b.radius == a.radius
                 && b.component == a.component
-                && (a.kind != Kind::Text || (b.font_family == a.font_family && b.font_size == a.font_size && b.font_weight == a.font_weight))
+                && (a.kind != Kind::Text || same_font(&a, b))
         };
-        let page = self.doc.pages[self.page].children.clone();
+        self.select_where(same);
+    }
+
+    /// Edit > Select all with same fill, stroke, effect, font or instance (searches the page).
+    /// Does nothing when the selected layer has none of that property.
+    pub fn select_same(&mut self, what: Same) {
+        let Some(&first) = self.sel.first() else { return };
+        let a = self.doc.node(if what == Same::Instance { self.owning_instance(first).unwrap_or(first) } else { first }).clone();
+        let same = |b: &Node| match what {
+            Same::Fill => !a.fills.is_empty() && a.first_fill().map_or(b.fills == a.fills, |c| b.first_fill() == Some(c)),
+            Same::Stroke => !a.strokes.is_empty() && b.strokes == a.strokes && b.stroke_width == a.stroke_width,
+            Same::Effect => !a.shadows.is_empty() && b.shadows == a.shadows,
+            Same::Font => a.kind == Kind::Text && b.kind == Kind::Text && same_font(&a, b),
+            Same::Instance => a.kind == Kind::Instance && b.kind == Kind::Instance && b.component == a.component,
+        };
+        if same(&a) {
+            self.select_where(same);
+        }
+    }
+
+    /// Select every visible, unlocked layer on the page that passes `f`.
+    fn select_where(&mut self, f: impl Fn(&Node) -> bool) {
+        let page = &self.doc.pages[self.page].children;
         self.sel = page
             .iter()
             .flat_map(|&r| std::iter::once(r).chain(self.doc.descendants(r)))
             .filter(|&id| {
                 let n = self.doc.node(id);
-                n.visible && !n.locked && same(n)
+                n.visible && !n.locked && f(n)
             })
             .collect();
     }
 
-    /// Copy the selection as SVG markup, a PNG image, or CSS.
+    /// Copy the selection as SVG markup, a PNG image, CSS, or code in Dev Mode's language.
     pub fn copy_as(&mut self, ctx: &egui::Context, what: &str) {
         let roots = self.sel_roots();
         if roots.is_empty() {
@@ -1019,6 +1468,7 @@ impl App {
         match what {
             "svg" => ctx.copy_text(crate::export::to_svg(&self.doc, &roots)),
             "css" => ctx.copy_text(roots.iter().map(|&id| crate::codegen::css(&self.doc, id)).collect::<Vec<_>>().join("\n\n")),
+            "code" => ctx.copy_text(roots.iter().map(|&id| crate::codegen::generate(&self.doc, id, self.code_lang)).collect::<Vec<_>>().join("\n\n")),
             _ => match crate::export::encode(&self.doc, &crate::export::to_svg(&self.doc, &roots), crate::doc::ExportFormat::Png, 2.0).ok().and_then(|png| image::load_from_memory(&png).ok()) {
                 Some(img) => {
                     let rgba = img.to_rgba8();
@@ -1156,6 +1606,49 @@ impl App {
         }
     }
 
+    /// Selected instances (or the instances selected layers sit in), each once.
+    fn selected_instances(&self) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = self.sel.iter().filter_map(|&s| self.owning_instance(s)).collect();
+        out.dedup();
+        out
+    }
+
+    /// "Push changes to main component" for every selected instance, as one undo step.
+    pub fn push_selection_to_main(&mut self) {
+        let insts = self.selected_instances();
+        if insts.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for i in insts {
+            self.doc.push_to_main(i);
+        }
+    }
+
+    /// "Reset all changes" on every selected instance.
+    pub fn reset_selection_instances(&mut self) {
+        let insts = self.selected_instances();
+        if insts.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for i in insts {
+            self.doc.reset_instance(i);
+        }
+    }
+
+    /// Dev Mode's "Mark as ready for dev" on the selected frames and sections (or clear it when
+    /// the first already is), as one undo step.
+    pub fn toggle_ready_for_dev(&mut self) {
+        let frames: Vec<NodeId> = self.sel.iter().copied().filter(|&s| self.doc.node(s).kind.is_frame() && self.doc.node(s).kind != Kind::Instance).collect();
+        let Some(&first) = frames.first() else { return };
+        let on = !self.doc.node(first).ready;
+        self.checkpoint();
+        for f in frames {
+            self.doc.node_mut(f).ready = on;
+        }
+    }
+
     /// The instance a layer belongs to (itself or nearest instance ancestor).
     pub fn owning_instance(&self, id: NodeId) -> Option<NodeId> {
         std::iter::once(id).chain(self.doc.ancestors(id)).find(|a| self.doc.node(*a).kind == Kind::Instance)
@@ -1166,6 +1659,10 @@ impl App {
             self.toast("Main component is missing".into());
             return;
         };
+        // A library component lives in its library file (Figma offers to open it).
+        if let Some((lib, _)) = crate::library::remote_root(&self.doc, c) {
+            return self.open_library(&lib);
+        }
         let page = self.doc.page_of(c);
         if page != self.page {
             self.select_page(page);
@@ -1192,6 +1689,7 @@ impl App {
     // ---------- text & pen ----------
 
     pub fn end_text_edit(&mut self) {
+        self.link_edit = None;
         if let Some(id) = self.editing_text.take()
             && self.doc.nodes.get(&id).is_some_and(|n| n.text.trim().is_empty()) {
                 self.doc.remove(id);
@@ -1248,8 +1746,10 @@ impl App {
             Ok(doc) => {
                 self.reset_to(App::new(None));
                 self.doc = doc;
+                self.read_all_comments();
                 crate::files::add_recent(&p);
                 self.path = Some(p);
+                self.refresh_libraries();
             }
             Err(e) => self.toast(format!("Couldn't open file: {e}")),
         }
@@ -1284,6 +1784,11 @@ impl App {
 
     pub fn save_to(&mut self, path: PathBuf) -> bool {
         self.remember_view();
+        // Files get their library id on first save; library paths follow the file to its folder.
+        if self.doc.id.is_empty() {
+            self.doc.id = crate::library::new_id();
+        }
+        self.rebase_libraries(path.parent());
         let json = self.document_json();
         match crate::files::write_atomic(&path, json.as_bytes()) {
             Ok(()) => {
@@ -1301,65 +1806,75 @@ impl App {
         }
     }
 
+    /// Export jobs for `ids`: each layer's presets, or the panel's default when it has none.
+    pub fn export_jobs(&self, ids: &[NodeId]) -> Vec<ExportJob> {
+        let mut jobs = vec![];
+        for &id in ids {
+            let n = self.doc.node(id);
+            let presets = if n.exports.is_empty() { vec![self.export_default.clone()] } else { n.exports.clone() };
+            for p in presets {
+                jobs.push((vec![id], n.name.clone(), p));
+            }
+        }
+        jobs
+    }
+
     /// Export the selection (or page) with each layer's presets, or the panel's default.
     pub fn export(&mut self, ctx: &egui::Context) {
         self.fit_all_texts(ctx);
-        use crate::doc::{ExportFormat, ExportSetting};
-        let ids = if self.sel.is_empty() { self.doc.pages[self.page].children.clone() } else { self.sel_roots() };
-        if ids.is_empty() {
-            return;
-        }
-        let fallback = ExportSetting { scale: self.export_scale, format: if self.export_svg { ExportFormat::Svg } else { ExportFormat::Png }, suffix: String::new() };
-        // Each job: (ids to render, base name, preset).
-        let mut jobs: Vec<(Vec<NodeId>, String, ExportSetting)> = vec![];
-        if self.sel.is_empty() {
-            jobs.push((ids.clone(), self.doc.pages[self.page].name.clone(), fallback.clone()));
-        } else {
-            for &id in &ids {
-                let n = self.doc.node(id);
-                let presets = if n.exports.is_empty() { vec![fallback.clone()] } else { n.exports.clone() };
-                for p in presets {
-                    jobs.push((vec![id], n.name.clone(), p));
-                }
+        let jobs = if self.sel.is_empty() {
+            let page = &self.doc.pages[self.page];
+            if page.children.is_empty() {
+                return;
             }
-        }
-        let file_name = |name: &str, p: &ExportSetting| {
-            let scale = if p.format.raster() && p.scale != 1.0 { format!("@{}x", crate::canvas::num(p.scale)) } else { String::new() };
-            format!("{}{}{}.{}", name.replace('/', "-"), p.suffix, scale, p.format.ext())
+            vec![(page.children.clone(), page.name.clone(), self.export_default.clone())]
+        } else {
+            self.export_jobs(&self.sel_roots())
         };
         // One file: ask where. Several: ask for a folder.
-        let targets: Vec<std::path::PathBuf> = if jobs.len() == 1 {
-            let (_, name, p) = &jobs[0];
+        let targets: Vec<PathBuf> = if let [(_, name, p)] = &jobs[..] {
             let ext = p.format.ext();
-            match rfd::FileDialog::new().add_filter(ext.to_uppercase(), &[ext]).set_file_name(file_name(name, p)).save_file() {
+            match rfd::FileDialog::new().add_filter(ext.to_uppercase(), &[ext]).set_file_name(export_file_name(name, p)).save_file() {
                 Some(path) => vec![path],
                 None => return,
             }
         } else {
             match rfd::FileDialog::new().pick_folder() {
-                Some(dir) => jobs.iter().map(|(_, name, p)| dir.join(file_name(name, p))).collect(),
+                Some(dir) => crate::export::unique_names(jobs.iter().map(|(_, name, p)| export_file_name(name, p)).collect()).into_iter().map(|f| dir.join(f)).collect(),
                 None => return,
             }
         };
+        self.write_exports(&jobs, &targets);
+    }
+
+    /// Export `ids` with their presets into `dir`, as the Export dialog does.
+    pub fn export_layers_to(&mut self, ctx: &egui::Context, ids: &[NodeId], dir: &std::path::Path) {
+        self.fit_all_texts(ctx);
+        let jobs = self.export_jobs(ids);
+        let targets: Vec<PathBuf> = crate::export::unique_names(jobs.iter().map(|(_, name, p)| export_file_name(name, p)).collect()).into_iter().map(|f| dir.join(f)).collect();
+        self.write_exports(&jobs, &targets);
+    }
+
+    /// Render each job and write it to its path; a toast says how it went.
+    fn write_exports(&mut self, jobs: &[ExportJob], targets: &[PathBuf]) {
         let mut done = 0;
-        for ((ids, _, p), path) in jobs.iter().zip(&targets) {
+        for ((ids, _, p), path) in jobs.iter().zip(targets) {
             // A slice exports whatever lies inside it.
-            let svg = match ids.as_slice() {
+            let (svg, size) = match ids.as_slice() {
                 [one] if self.doc.node(*one).kind == Kind::Slice => {
                     let n = self.doc.node(*one);
-                    crate::export::region_svg(&self.doc, self.page, n.aabb(), n.id)
+                    (crate::export::region_svg(&self.doc, self.page, n.aabb(), n.id), n.aabb().size())
                 }
-                _ => crate::export::to_svg(&self.doc, ids),
+                _ => (crate::export::to_svg(&self.doc, ids), crate::export::export_bounds(&self.doc, ids).size()),
             };
-            match crate::export::encode(&self.doc, &svg, p.format, p.scale).and_then(|d| std::fs::write(path, d).map_err(|e| e.to_string())) {
+            match crate::export::encode_preset(&self.doc, &svg, p, size).and_then(|d| std::fs::write(path, d).map_err(|e| e.to_string())) {
                 Ok(()) => done += 1,
                 Err(e) => return self.toast(format!("Export failed: {e}")),
             }
         }
-        self.toast(if done == 1 {
-            format!("Exported {}", targets[0].file_name().unwrap_or_default().to_string_lossy())
-        } else {
-            format!("Exported {done} files")
+        self.toast(match targets {
+            [one] if done == 1 => format!("Exported {}", one.file_name().unwrap_or_default().to_string_lossy()),
+            _ => format!("Exported {done} files"),
         });
     }
 
@@ -1440,10 +1955,11 @@ impl App {
             if let Some(doc) = doc {
                 self.checkpoint();
                 self.doc = doc;
+                self.read_all_comments();
                 self.sel.clear();
                 self.page = 0;
                 self.view_ready = false;
-                self.toast("Version restored (undo with ⌘Z)".into());
+                self.toast(crate::chrome::keys("Version restored (undo with ⌘Z)"));
             }
         }
         self.show_history = open;
@@ -1456,7 +1972,8 @@ impl App {
         let before = self.doc.clone();
         let sel = self.sel.clone();
         let mut session = None;
-        let res = crate::plugins::Session::start(&mut self.doc, self.page, &sel, name, id, code, html).map(|(s, out)| {
+        let libs = self.plugin_libs();
+        let res = crate::plugins::Session::start(&mut self.doc, self.page, &sel, name, id, code, html, libs).map(|(s, out)| {
             session = Some(s);
             out
         });
@@ -1526,7 +2043,7 @@ impl App {
                 let max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
             }
-            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, &self.title, egui::FontId::proportional(12.5), crate::appearance::muted(&ctx));
+            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, self.window_title(), egui::FontId::proportional(12.5), crate::appearance::muted(&ctx));
             ui.painter().hline(r.x_range(), r.max.y - 0.5, egui::Stroke::new(1.0, line));
         });
     }
@@ -1534,7 +2051,7 @@ impl App {
     /// The appearance window, and keeping the window's desktop blur in step with glass.
     fn appearance_frame(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         self.settings_window(ctx);
-        let want = (self.appearance.glass, self.appearance.blur);
+        let want = (self.appearance.glass_on(), self.appearance.blur);
         if self.glass_applied != Some(want) {
             crate::appearance::set_window_glass(frame, want.0, want.1);
             self.glass_applied = Some(want);
@@ -1772,9 +2289,22 @@ impl App {
         }
         let mut open = true;
         let mut action: Option<&str> = None;
+        let (mut kick, mut follow) = (None, None);
         crate::chrome::window(ctx, "Multiplayer session", &mut open, 320.0, |ui| {
             if let Some(c) = &self.collab {
+                use crate::collab::Status;
+                let (dot, status) = match &c.status {
+                    Status::Connected => (egui::Color32::from_rgb(0x14, 0xAE, 0x5C), "Connected".to_string()),
+                    Status::Reconnecting(0) => (egui::Color32::from_rgb(0xFF, 0xA6, 0x29), "Connection lost. Reconnecting...".to_string()),
+                    Status::Reconnecting(n) => (egui::Color32::from_rgb(0xFF, 0xA6, 0x29), format!("Reconnecting (attempt {})...", n + 1)),
+                    Status::Disconnected(why) => (egui::Color32::from_rgb(0xF2, 0x48, 0x22), format!("Disconnected. {why}.")),
+                };
                 ui.label(egui::RichText::new(if c.hosting { "Hosting a live session" } else { "In a live session" }).strong());
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(r.center(), 4.0, dot);
+                    ui.label(status);
+                });
                 ui.horizontal(|ui| {
                     ui.label("Address");
                     ui.monospace(&c.address);
@@ -1782,19 +2312,51 @@ impl App {
                         ui.ctx().copy_text(c.address.clone());
                     }
                 });
+                if c.hosting {
+                    ui.label(egui::RichText::new("Others on your network join with this full address, code included.").small());
+                }
                 ui.separator();
-                ui.label(format!("{} (you)", c.me.name));
-                for p in c.peers.values() {
+                let swatch = |ui: &mut egui::Ui, color: usize| {
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    ui.painter().circle_filled(r.center(), 6.0, crate::collab::peer_color(color));
+                };
+                ui.horizontal(|ui| {
+                    swatch(ui, c.me.color);
+                    ui.label(format!("{} (you)", c.me.name));
+                    if c.me.spotlight {
+                        ui.label(egui::RichText::new("Spotlighting").small());
+                    }
+                });
+                for (&id, p) in &c.peers {
                     ui.horizontal(|ui| {
-                        let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                        ui.painter().circle_filled(r.center(), 6.0, crate::collab::PEER_COLORS[p.color % crate::collab::PEER_COLORS.len()]);
+                        swatch(ui, p.color);
                         ui.label(&p.name);
+                        if p.spotlight {
+                            ui.label(egui::RichText::new("Spotlighting").small());
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Only the host runs the relay, so only the host can remove people.
+                            if c.relay.is_some() && ui.small_button("Remove").on_hover_text(format!("Remove {} from the session", p.name)).clicked() {
+                                kick = Some(id);
+                            }
+                            if ui.small_button(if self.following == Some(id) { "Stop following" } else { "Follow" }).clicked() {
+                                follow = Some(id);
+                            }
+                        });
                     });
                 }
                 ui.separator();
-                if ui.button("Leave session").clicked() {
-                    action = Some("leave");
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Leave session").clicked() {
+                        action = Some("leave");
+                    }
+                    if matches!(c.status, Status::Disconnected(_)) && ui.button("Try again").clicked() {
+                        action = Some("retry");
+                    }
+                    if ui.button(if c.me.spotlight { "Stop spotlight" } else { "Spotlight me" }).clicked() {
+                        action = Some("spotlight");
+                    }
+                });
             } else {
                 ui.horizontal(|ui| {
                     ui.label("Your name");
@@ -1813,15 +2375,30 @@ impl App {
                 ui.separator();
                 ui.label(egui::RichText::new("Join").strong());
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.collab_address).hint_text("192.168.1.20:7878").desired_width(180.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.collab_address).hint_text("192.168.1.20:7878/code").desired_width(180.0));
                     if ui.add_enabled(!self.collab_address.trim().is_empty(), egui::Button::new("Join")).clicked() {
                         action = Some("join");
                     }
                 });
             }
         });
+        if let (Some(id), Some(r)) = (kick, self.collab.as_ref().and_then(|c| c.relay.as_ref())) {
+            r.kick(id);
+        }
+        if let Some(id) = follow {
+            self.toggle_follow(id);
+        }
         match action {
-            Some("leave") => self.collab = None,
+            Some("leave") => {
+                self.collab = None;
+                self.following = None;
+            }
+            Some("retry") => {
+                if let Some(c) = self.collab.as_mut() {
+                    c.reconnect();
+                }
+            }
+            Some("spotlight") => self.toggle_spotlight(),
             Some("host") => self.host_session(ctx),
             Some("join") => {
                 if self.dirty {
@@ -1841,11 +2418,12 @@ impl App {
         match listener {
             Ok(l) => {
                 let port = l.local_addr().map_or(self.collab_port, |a| a.port());
-                crate::collab::serve(l, self.doc.clone());
-                let shared = format!("{}:{port}", crate::collab::local_ip());
-                self.join_session(ctx, &format!("127.0.0.1:{port}"), true);
+                let relay = crate::collab::serve(l, self.doc.clone(), crate::collab::session_token());
+                let shared = format!("{}:{port}/{}", crate::collab::local_ip(), relay.token);
+                self.join_session(ctx, &format!("127.0.0.1:{port}/{}", relay.token), true);
                 if let Some(c) = self.collab.as_mut() {
                     c.address = shared;
+                    c.relay = Some(relay);
                 }
             }
             Err(e) => self.toast(format!("Couldn't start a session: {e}")),
@@ -1864,6 +2442,7 @@ impl App {
                     self.view_ready = false;
                 }
                 self.doc = doc;
+                self.read_all_comments();
                 self.sel.clear();
                 self.page = 0;
                 self.undo.clear();
@@ -1933,10 +2512,7 @@ impl App {
             Ok((f, images)) => {
                 for (id, bytes) in images {
                     let key = self.add_image(bytes);
-                    let mut p = crate::doc::Paint::solid(crate::doc::Rgba::WHITE);
-                    p.convert(crate::doc::PaintKind::Image);
-                    p.image = key;
-                    self.doc.node_mut(id).fills = vec![p];
+                    self.doc.node_mut(id).fills = vec![crate::doc::Paint::image(key)];
                 }
                 if centered {
                     let size = self.doc.node(f).rect.size();
@@ -1978,16 +2554,61 @@ impl App {
         let size = vec2(img.width() as f32, img.height() as f32);
         let key = self.add_image(bytes);
         let mut n = Node::new(Kind::Rectangle, Rect::from_center_size(at.round(), size));
-        let mut p = crate::doc::Paint::solid(crate::doc::Rgba::WHITE);
-        p.convert(crate::doc::PaintKind::Image);
-        p.image = key;
-        n.fills = vec![p];
+        n.fills = vec![crate::doc::Paint::image(key)];
         n.name = name.to_string();
         let parent = self.frame_at(at, &[]);
         let id = self.doc.insert(self.page, parent, None, n);
         self.sel = vec![id];
         self.tool = Tool::Move;
         Some(id)
+    }
+
+    /// An image dropped on a layer that shows one (or on any layer, with Alt) replaces its image,
+    /// as in Figma; other fills give way to it.
+    pub fn replace_fill_image(&mut self, id: NodeId, bytes: Vec<u8>) -> Option<NodeId> {
+        image::load_from_memory(&bytes).ok()?;
+        self.checkpoint();
+        let key = self.add_image(bytes);
+        let n = self.doc.node_mut(id);
+        match n.fills.iter_mut().rev().find(|p| p.kind == crate::doc::PaintKind::Image) {
+            Some(p) => p.image = key,
+            None => n.fills = vec![crate::doc::Paint::image(key)],
+        }
+        n.fill_style = None;
+        Some(id)
+    }
+
+    /// Cmd V with an image on the clipboard (a screenshot, say): an image layer at natural size,
+    /// in the middle of the view or of the selected frame.
+    pub fn paste_clipboard_image(&mut self) -> bool {
+        let Some(img) = clipboard_image() else { return false };
+        let mut png = std::io::Cursor::new(vec![]);
+        if img.write_to(&mut png, image::ImageFormat::Png).is_err() {
+            return false;
+        }
+        let frame = match self.sel[..] {
+            [f] if self.doc.node(f).kind.is_frame() => Some(f),
+            _ => None,
+        };
+        let at = frame.map_or(self.view_center_world(), |f| self.doc.node(f).rect.center());
+        let Some(id) = self.place_image(png.into_inner(), "Image", at) else { return false };
+        if let Some(f) = frame
+            && self.doc.node(id).parent != Some(f)
+        {
+            self.doc.reparent(id, self.page, Some(f), None);
+            self.doc.reflow();
+        }
+        true
+    }
+
+    /// Edit > Paste (and Paste over selection): the clipboard's text or layers, else its image.
+    pub fn paste_from_menu(&mut self, ctx: &egui::Context, over: bool) {
+        match clipboard_text().filter(|t| !t.is_empty()) {
+            Some(t) => self.paste_text(&t, over),
+            // No direct access (or nothing there): let egui read it.
+            None if !self.paste_clipboard_image() => ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste),
+            None => {}
+        }
     }
 
     /// Alt Cmd O: strokes become filled vectors. Layers that also have fills become a group of both.
@@ -2071,19 +2692,83 @@ impl App {
     // ---------- shortcuts ----------
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.data(|d| d.get_temp::<egui::Id>(egui::Id::new(crate::prototype::RECORDING_KEY))).is_some() {
+            return;
+        }
         let typing = ctx.egui_wants_keyboard_input();
-        let events = ctx.input(|i| i.events.clone());
+        let (events, m) = ctx.input(|i| (i.events.clone(), i.modifiers));
+        // A text shortcut eats its key's side effects this frame: Shift Cmd X's cut, Alt >'s "≥".
+        let mut swallow = false;
+        let mut eaten: Vec<Key> = vec![];
         for e in events {
             match e {
+                // egui turns every Cmd C, X and V into a clipboard event, Alt and Shift chords
+                // included, so those shortcuts (copy and paste properties, copy as PNG,
+                // strikethrough) arrive here instead of as keys.
+                Event::Copy | Event::Cut if m.alt || m.shift => {
+                    let key = if e == Event::Copy { Key::C } else { Key::X };
+                    if self.text_shortcut(ctx, key, m, typing) {
+                        swallow = true;
+                    } else {
+                        self.key(ctx, key, m, typing);
+                    }
+                }
+                Event::Paste(_) if m.alt => {
+                    self.pasted = true;
+                    self.key(ctx, Key::V, m, typing);
+                }
                 Event::Copy if !typing => self.copy(ctx),
                 Event::Cut if !typing => {
                     self.copy(ctx);
                     self.delete_selection();
                 }
-                Event::Paste(t) if !typing => self.paste_text(&t),
-                Event::Key { key, pressed: true, modifiers: m, .. } => self.key(ctx, key, m, typing),
+                Event::Paste(t) if !typing => {
+                    self.pasted = true;
+                    self.paste_text(&t, m.shift);
+                }
+                // Cmd V with no text on the clipboard (an image, say) reaches egui only as the V
+                // key's release: the press was taken as a paste that found nothing to deliver.
+                Event::Key { key: Key::V, pressed: false, modifiers: km, .. } => {
+                    let (seen, pasted) = (std::mem::take(&mut self.v_pressed), std::mem::take(&mut self.pasted));
+                    if !typing && !seen && !pasted {
+                        if km.alt { self.key(ctx, Key::V, km, typing) } else { void(self.paste_clipboard_image()) }
+                    }
+                }
+                Event::Key { key, pressed: true, modifiers: m, .. } => {
+                    self.v_pressed |= key == Key::V;
+                    if self.text_shortcut(ctx, key, m, typing) {
+                        swallow = true;
+                        eaten.push(key);
+                    } else {
+                        let linking = m.command && !m.alt && key == Key::K && self.text_selection(ctx).is_some();
+                        self.key(ctx, key, m, typing);
+                        if linking {
+                            eaten.push(key);
+                        }
+                    }
+                }
+                // Holding Z zooms for a moment, then hands back the previous tool (Figma).
+                Event::Key { key: Key::Z, pressed: false, .. } => {
+                    if let Some((prev, t0)) = self.zoom_hold.take()
+                        && ctx.input(|i| i.time) - t0 > 0.4
+                        && self.tool == Tool::Zoom
+                    {
+                        self.set_tool(prev);
+                    }
+                }
                 _ => {}
             }
+        }
+        // The text editor would also act on these (Ctrl U and Ctrl K delete to the paragraph's
+        // start and end in egui on Windows and Linux), so they stop here.
+        if swallow || !eaten.is_empty() {
+            ctx.input_mut(|i| {
+                i.events.retain(|e| match e {
+                    Event::Text(_) | Event::Cut => !swallow,
+                    Event::Key { key, pressed: true, .. } => !eaten.contains(key),
+                    _ => true,
+                })
+            });
         }
     }
 
@@ -2091,13 +2776,15 @@ impl App {
         let cmd = m.command;
         // Global shortcuts that work even while a field has focus.
         match (cmd, m.shift, key) {
+            // Figma: Cmd K links the characters selected in the text editor.
+            (true, false, Key::K) if !m.alt && self.text_selection(ctx).is_some() => return self.create_link(ctx),
             (true, false, Key::Slash | Key::K) if !m.alt => return self.toggle_quick_actions(),
-            (true, false, Key::Comma) => return self.open_settings(crate::settings::Tab::Account),
+            (true, false, Key::Comma) if !m.alt => return self.open_settings(crate::settings::Tab::Account),
             (true, false, Key::S) => return void(self.save(false)),
             (true, true, Key::S) => return void(self.save(true)),
-            (true, false, Key::O) => return self.request_open(),
+            (true, false, Key::O) if !m.alt => return self.request_open(),
             (true, false, Key::N) => return self.request_new(),
-            (true, true, Key::E) => return self.export(ctx),
+            (true, true, Key::E) => return self.export_dialog = Some(Default::default()),
             (true, false, Key::F) => {
                 self.find.0 = true;
                 self.find.3 = true;
@@ -2107,13 +2794,29 @@ impl App {
             (true, true, Key::Num8) => return self.toggle_list(ctx, crate::doc::ListKind::Bullet),
             _ => {}
         }
-        if key == Key::Escape && self.editing_text.is_some() {
+        if key == Key::Escape && self.link_edit.is_some() {
+            self.link_edit = None;
+            self.focus_text = true;
+            return;
+        }
+        if key == Key::Escape && self.editing_text.is_some() && self.quick.is_none() {
             return self.end_text_edit();
         }
-        if self.vector_edit.is_some() && !typing && !cmd {
-            match key {
-                Key::Escape | Key::Enter => return self.exit_vector_edit(),
-                Key::Delete | Key::Backspace => return self.vector_delete_points(),
+        if let Some(ve) = self.vector_edit.as_mut().filter(|_| !typing) {
+            use crate::vector_edit::VTool;
+            match (cmd, m.shift, key) {
+                (true, false, Key::J) => return self.vector_join(),
+                // Escape first ends the path being drawn, then drops back to Move, then leaves.
+                (false, _, Key::Escape) if ve.drawing.is_some() => return ve.drawing = None,
+                (false, _, Key::Escape) if ve.tool != VTool::Move => return ve.tool = VTool::Move,
+                (false, _, Key::Escape | Key::Enter) => return self.exit_vector_edit(),
+                (false, _, Key::Delete | Key::Backspace) => return self.vector_delete_points(),
+                (false, false, Key::V) => return ve.tool = VTool::Move,
+                (false, false, Key::P) => return ve.tool = VTool::Pen,
+                (false, false, Key::Y) => {
+                    ve.drawing = None;
+                    return ve.tool = VTool::Cut;
+                }
                 _ => {}
             }
         }
@@ -2121,17 +2824,22 @@ impl App {
             return;
         }
         let step = if m.shift { self.prefs.big_nudge } else { self.prefs.nudge };
-        // Ctrl+G: show/hide layout guides.
-        if m.ctrl && !m.mac_cmd && !m.alt && key == Key::G {
+        // Figma binds a few commands to the Control key on macOS and to other chords elsewhere.
+        // The Control key alone only reads as `ctrl && !command` on a Mac (elsewhere Ctrl is Cmd).
+        let mac_ctrl = m.ctrl && !m.command;
+        let pc = !cfg!(target_os = "macos");
+        // Layout guides: Ctrl G on macOS, Ctrl Shift 4 elsewhere.
+        if (mac_ctrl && !m.alt && !m.shift && key == Key::G) || (pc && cmd && m.shift && !m.alt && key == Key::Num4) {
             self.show_grids = !self.show_grids;
             return;
         }
-        // Ctrl+Cmd+M: use as mask.
-        if m.ctrl && m.mac_cmd && key == Key::M {
+        // Use as mask: Ctrl Cmd M on macOS, Ctrl Alt M elsewhere.
+        if key == Key::M && ((m.ctrl && m.mac_cmd) || (pc && cmd && m.alt && !m.shift)) {
             return self.toggle_mask();
         }
-        // Ctrl+Alt arrangement shortcuts (Figma on macOS).
-        if m.ctrl && m.alt && !m.mac_cmd {
+        // Distribute and tidy up: Ctrl Alt on macOS, Alt Shift elsewhere (Ctrl Alt T opens a
+        // terminal on many Linux desktops, so it isn't used there).
+        if (mac_ctrl && m.alt) || (pc && m.alt && m.shift && !cmd) {
             match key {
                 Key::H => return self.distribute_selection(true),
                 Key::V => return self.distribute_selection(false),
@@ -2146,16 +2854,15 @@ impl App {
             (true, false, true, Key::C) => self.style_clip = self.sel.first().map(|&id| self.doc.node(id).clone()),
             (true, false, true, Key::V) => self.paste_style(),
             (true, true, false, Key::R) => self.paste_to_replace(),
+            (true, true, true, Key::R) => self.resize_to_fit(),
             (true, false, false, Key::Y) => self.outline_mode = !self.outline_mode,
+            (false, true, false, Key::Quote) => self.toggle_pref(|p| &mut p.pixel_grid),
+            (true, true, false, Key::Quote) => self.toggle_pref(|p| &mut p.snap_to_pixels),
             (true, false, true, Key::O) => self.outline_stroke_selection(),
             (true, false, true, Key::A) => self.select_matching(),
+            (true, true, false, Key::A) => self.select_inverse(),
             (true, true, false, Key::C) => self.copy_as(ctx, "png"),
-            (true, false, false, Key::R) => {
-                if let Some(&id) = self.sel.first() {
-                    self.left_tab_assets = false;
-                    self.renaming = Some((id, self.doc.node(id).name.clone()));
-                }
-            }
+            (true, false, false, Key::R) => self.rename_selection(),
             (true, false, false, Key::Backslash) => self.ui_hidden = !self.ui_hidden,
             (false, true, false, Key::R) => self.rulers = !self.rulers,
             (false, true, false, Key::D) => self.dev_mode = !self.dev_mode,
@@ -2175,6 +2882,8 @@ impl App {
             (false, false, true, Key::S) => self.align(Align::Bottom),
             (false, true, false, Key::H) => self.flip_selection(true),
             (false, true, false, Key::V) => self.flip_selection(false),
+            (false, true, false, Key::X) => self.swap_fill_stroke(),
+            (false, false, false, k) if digit(k).is_some() => self.opacity_key(digit(k).unwrap_or(0), ctx.input(|i| i.time)),
             (false, shift, false, Key::Tab) => {
                 // Tab cycles layers in Figma; stop egui from moving widget focus instead.
                 ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
@@ -2211,13 +2920,15 @@ impl App {
             (true, _, _, Key::Equals | Key::Plus) => self.zoom_step(ctx, 2.0),
             (true, _, _, Key::Minus) => self.zoom_step(ctx, 0.5),
             (false, true, _, Key::Num0) => self.zoom_to(ctx, None, true),
-            (false, true, _, Key::Num1) => self.zoom_to(ctx, None, false),
+            (false, true, _, Key::Num1 | Key::Exclamationmark) => self.zoom_to(ctx, None, false),
             (false, true, _, Key::Num2) => {
                 let s = self.sel_roots();
                 if !s.is_empty() {
                     self.zoom_to(ctx, Some(s), false)
                 }
             }
+            (false, _, _, Key::Delete | Key::Backspace) if self.guide_sel.is_some() && self.sel.is_empty() => self.delete_guide(),
+            (false, _, _, Key::Delete | Key::Backspace) if self.gradient_edit.is_some() => self.delete_gradient_stop(ctx),
             (false, _, _, Key::Delete | Key::Backspace) => self.delete_selection(),
             (false, _, _, Key::ArrowLeft) => self.nudge(vec2(-step, 0.0)),
             (false, _, _, Key::ArrowRight) => self.nudge(vec2(step, 0.0)),
@@ -2225,6 +2936,8 @@ impl App {
             (false, _, _, Key::ArrowDown) => self.nudge(vec2(0.0, step)),
             // Escape that closes a popover or menu does only that (Figma keeps the selection).
             (false, false, false, Key::Escape) if egui::Popup::is_any_open(ctx) => {}
+            // Escape stops following (a spotlight too) before it touches the selection.
+            (false, false, false, Key::Escape) if self.following.is_some() => self.following = None,
             // Escape with Find open closes Find and keeps the selection.
             (false, false, false, Key::Escape) if self.find.0 => self.find.0 = false,
             (false, false, false, Key::Escape) => {
@@ -2268,7 +2981,17 @@ impl App {
             (false, false, false, Key::P) => self.set_tool(Tool::Pen),
             (false, false, false, Key::T) => self.set_tool(Tool::Text),
             (false, false, false, Key::C) => self.set_tool(Tool::Comment),
+            (false, false, false, Key::Z) if self.vector_edit.is_none() && self.pen.is_empty() => {
+                if self.tool != Tool::Zoom {
+                    self.zoom_hold = Some((self.tool, ctx.input(|i| i.time)));
+                    self.set_tool(Tool::Zoom);
+                }
+            }
+            (false, false, false, Key::N) => self.zoom_frame(ctx, 1),
+            (false, true, false, Key::N) => self.zoom_frame(ctx, -1),
+            (false, false, false, Key::I) if !self.sel.is_empty() => self.start_eyedrop(crate::paint_ui::EyeTarget::Fill),
             (false, true, false, Key::C) => self.show_comments = !self.show_comments,
+            (false, false, false, Key::Slash) => self.open_chat(ctx),
             _ => {}
         }
     }
@@ -2276,6 +2999,23 @@ impl App {
     pub fn zoom_step(&mut self, ctx: &egui::Context, f: f32) {
         let c = ctx.content_rect().center();
         self.view.zoom_at(c, f);
+    }
+
+    /// N / Shift N: zoom to the next / previous top-level frame, in layers-panel order (top
+    /// first), counting from the frame in view (or holding the selection).
+    pub fn zoom_frame(&mut self, ctx: &egui::Context, step: isize) {
+        let frames: Vec<NodeId> = self.doc.pages[self.page].children.iter().rev().copied().filter(|&f| self.doc.node(f).kind.is_frame() && self.doc.node(f).visible).collect();
+        if frames.is_empty() {
+            return;
+        }
+        let center = self.view.to_world(self.canvas_rect.unwrap_or(ctx.content_rect()).center());
+        let cur = frames
+            .iter()
+            .position(|&f| self.doc.node(f).aabb().contains(center))
+            .or_else(|| self.sel.first().and_then(|&s| frames.iter().position(|&f| f == crate::prototype::top_frame(&self.doc, s))));
+        let n = frames.len() as isize;
+        let i = cur.map_or(if step > 0 { 0 } else { n - 1 }, |c| (c as isize + step).rem_euclid(n));
+        self.zoom_to(ctx, Some(vec![frames[i as usize]]), false);
     }
 
     /// Zoom to fit `ids` (None = whole page); `actual` = 100% centered on content.
@@ -2296,10 +3036,70 @@ impl App {
 
 fn void(_: bool) {}
 
+/// Layers copied from Katachi, from clipboard text.
+fn clip_layers(text: &str) -> Option<Vec<Node>> {
+    // Anything can be on the clipboard: parse leniently and repair the layer tree.
+    crate::doc::from_json::<Vec<Node>>(text.strip_prefix(CLIP_TAG)?).ok().map(|f| crate::doc::clean_fragment(&f))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The clipboard as tests see it (they never touch the real one): text, image.
+    pub static TEST_CLIPBOARD: std::cell::RefCell<(Option<String>, Option<image::RgbaImage>)> = const { std::cell::RefCell::new((None, None)) };
+}
+
+/// The system clipboard's text, read directly (egui only hands it over inside a paste event).
+fn clipboard_text() -> Option<String> {
+    #[cfg(test)]
+    return TEST_CLIPBOARD.with(|c| c.borrow().0.clone());
+    #[cfg(not(test))]
+    arboard::Clipboard::new().ok()?.get_text().ok()
+}
+
+/// An image on the system clipboard; egui doesn't deliver these at all.
+fn clipboard_image() -> Option<image::RgbaImage> {
+    #[cfg(test)]
+    return TEST_CLIPBOARD.with(|c| c.borrow().1.clone());
+    #[cfg(not(test))]
+    {
+        let img = arboard::Clipboard::new().ok()?.get_image().ok()?;
+        image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned())
+    }
+}
+
+fn same_font(a: &Node, b: &Node) -> bool {
+    b.font_family == a.font_family && b.font_size == a.font_size && b.font_weight == a.font_weight
+}
+
+/// What Edit > Select all with same... compares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Same {
+    Fill,
+    Stroke,
+    Effect,
+    Font,
+    Instance,
+}
+
+impl Same {
+    pub const MENU: [(Same, &str); 5] = [
+        (Same::Fill, "Select all with same fill"),
+        (Same::Stroke, "Select all with same stroke"),
+        (Same::Effect, "Select all with same effect"),
+        (Same::Font, "Select all with same font"),
+        (Same::Instance, "Select all with same instance"),
+    ];
+}
+
+/// The number key's digit.
+fn digit(k: Key) -> Option<u8> {
+    [Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9].iter().position(|d| *d == k).map(|i| i as u8)
+}
+
 impl eframe::App for App {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         // Glass lets the (blurred) desktop through wherever panels are translucent.
-        if self.appearance.glass { [0.0; 4] } else { visuals.panel_fill.to_normalized_gamma_f32() }
+        if self.appearance.glass_on() { [0.0; 4] } else { visuals.panel_fill.to_normalized_gamma_f32() }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -2308,8 +3108,12 @@ impl eframe::App for App {
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.presentation_ui(ui));
             return;
         }
+        self.eyedropper(&ctx);
         self.shortcuts(&ctx);
         self.title_bar(ui);
+        // The fill and stroke rows say which gradient editor is open, if any.
+        self.gradient_edit = None;
+        self.offer_swatches(&ctx);
         if !self.ui_hidden {
             self.left_panel(ui);
             self.right_panel(ui);
@@ -2324,22 +3128,27 @@ impl eframe::App for App {
         self.collab_window(&ctx);
         self.recovery_prompt(&ctx);
         self.console_window(&ctx);
+        self.batch_rename_window(&ctx);
+        self.export_window(&ctx);
+        self.replace_fonts_window(&ctx);
         self.quick_actions(&ctx);
         self.plugin_frame(&ctx, frame);
         self.appearance_frame(&ctx, frame);
         self.mcp_frame(&ctx);
         self.variables_window(&ctx);
+        let focused = ctx.input(|i| i.focused);
+        if focused && !self.focused {
+            self.refresh_libraries();
+        }
+        self.focused = focused;
+        self.libraries_window(&ctx);
+        self.library_updates(&ctx);
         self.autosave(ctx.input(|i| i.time));
         self.debug_screenshot(&ctx);
 
         // A gesture (and its single undo step) ends when the pointer is up and no field is focused.
         if !ctx.input(|i| i.pointer.any_down()) && !ctx.egui_wants_keyboard_input() {
             self.in_gesture = false;
-        }
-        let title = format!("{}{} – Katachi", self.display_name(), if self.dirty { " (Edited)" } else { "" });
-        if title != self.title {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
-            self.title = title;
         }
     }
 }
@@ -2365,7 +3174,13 @@ impl App {
         ) {
             Some(0) => choice = Some(false),
             Some(2) => choice = Some(true),
-            Some(_) => self.confirm = None,
+            Some(_) => {
+                self.confirm = None;
+                if after == After::Close {
+                    self.allow_close = false;
+                    self.want = Some(Want::KeepOpen);
+                }
+            }
             None => {}
         }
         let Some(save) = choice else { return };
@@ -2375,7 +3190,7 @@ impl App {
         self.confirm = None;
         match after {
             After::Close => {
-                self.clear_recovery();
+                // The autosave goes when the window really closes (another tab may still cancel).
                 self.allow_close = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }

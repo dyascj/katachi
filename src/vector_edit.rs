@@ -1,8 +1,9 @@
-//! Vector edit mode: move anchors and handles, add and delete points, toggle smooth corners.
+//! Vector edit mode: move anchors and handles, add and delete points, toggle smooth corners,
+//! marquee points, bend, continue paths with the pen, cut segments, and join endpoints.
 
 use crate::app::{App, Drag};
 use crate::canvas::BLUE;
-use crate::doc::{Document, Kind, NodeId, PathPoint, rotate};
+use crate::doc::{Document, Kind, NodeId, PathPoint, SubPath, rotate};
 use egui::{Color32, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2, vec2};
 
 /// Anchor address: (subpath, index).
@@ -13,11 +14,39 @@ pub enum Grab {
     Anchor(PointRef),
     /// `true` = outgoing handle.
     Handle(PointRef, bool),
+    /// Pull mirrored handles out of an anchor: dragging after a pen click, or Cmd-dragging an
+    /// anchor (Figma's Bend).
+    Pull(PointRef),
+    /// Cmd-drag on a segment bends it through the pointer: (subpath, segment start, t).
+    Segment(usize, usize, f32),
 }
 
+/// Vector edit mode's own tools, as in Figma's toolbar while editing a path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum VTool {
+    #[default]
+    Move,
+    /// P: add points, continue open paths from their ends.
+    Pen,
+    /// Y: click a segment to cut the path there.
+    Cut,
+}
+
+#[derive(Default)]
 pub struct VectorEdit {
     pub id: NodeId,
     pub selected: Vec<PointRef>,
+    pub tool: VTool,
+    /// Pen: the open subpath being extended at its end.
+    pub drawing: Option<usize>,
+}
+
+/// Reverse a contour's direction: handles swap sides.
+fn reverse(pts: &mut [PathPoint]) {
+    pts.reverse();
+    for p in pts {
+        std::mem::swap(&mut p.h_in, &mut p.h_out);
+    }
 }
 
 impl Document {
@@ -61,7 +90,8 @@ impl App {
     /// Enter vector edit mode, converting simple shapes to paths first.
     pub fn enter_vector_edit(&mut self, id: NodeId) {
         let kind = self.doc.node(id).kind;
-        if matches!(kind, Kind::Rectangle | Kind::Ellipse) {
+        // Shapes become paths on their first edit, as in Figma.
+        if matches!(kind, Kind::Rectangle | Kind::Ellipse | Kind::Polygon | Kind::Star) {
             self.sel = vec![id];
             self.flatten_selection();
         } else if kind != Kind::Vector {
@@ -69,13 +99,17 @@ impl App {
         }
         let id = self.sel.first().copied().unwrap_or(id);
         if self.doc.node(id).kind == Kind::Vector {
-            self.vector_edit = Some(VectorEdit { id, selected: vec![] });
+            self.vector_edit = Some(VectorEdit { id, ..Default::default() });
             self.sel = vec![id];
         }
     }
 
     pub fn exit_vector_edit(&mut self) {
-        self.vector_edit = None;
+        // A pen click that never got a second point leaves nothing behind.
+        if let Some(id) = self.vector_edit.take().map(|v| v.id).filter(|id| self.doc.nodes.get(id).is_some_and(|n| n.paths.iter().any(|sp| sp.points.len() < 2))) {
+            self.doc.node_mut(id).paths.retain(|sp| sp.points.len() >= 2);
+            self.doc.refit_vector_keep(id);
+        }
     }
 
     /// What the pointer at screen `s` grabs in edit mode.
@@ -125,10 +159,42 @@ impl App {
         best.map(|(_, si, i, t)| (si, i, t))
     }
 
+    /// Whether `r` is the first or last anchor of an open contour.
+    fn is_open_end(&self, (si, pi): PointRef) -> bool {
+        let Some(ve) = &self.vector_edit else { return false };
+        self.doc.node(ve.id).paths.get(si).is_some_and(|sp| !sp.closed && (pi == 0 || pi + 1 == sp.points.len()))
+    }
+
     /// Mouse down in edit mode. Returns false if the press should leave edit mode.
-    pub fn vector_press(&mut self, s: Pos2, shift: bool) -> bool {
-        let Some(id) = self.vector_edit.as_ref().map(|v| v.id) else { return false };
-        match self.vector_grab(s) {
+    pub fn vector_press(&mut self, s: Pos2, mods: egui::Modifiers) -> bool {
+        let Some((id, tool)) = self.vector_edit.as_ref().map(|v| (v.id, v.tool)) else { return false };
+        let shift = mods.shift;
+        self.vector_outside = false;
+        let grab = self.vector_grab(s);
+        match tool {
+            VTool::Pen => return self.pen_press(s, grab),
+            VTool::Cut => {
+                if let Some((si, i, t)) = self.segment_at(s) {
+                    self.checkpoint();
+                    self.cut_at(si, i, t);
+                }
+                return true;
+            }
+            VTool::Move => {}
+        }
+        // Cmd: bend. On an anchor, pull out smooth handles; on a segment, curve it.
+        if mods.command {
+            if let Some(Grab::Anchor(r)) = grab {
+                self.vector_edit.as_mut().unwrap().selected = vec![r];
+                self.vector_grabbed = Some(Grab::Pull(r));
+                return true;
+            }
+            if let Some((si, i, t)) = self.segment_at(s) {
+                self.vector_grabbed = Some(Grab::Segment(si, i, t));
+                return true;
+            }
+        }
+        match grab {
             Some(Grab::Anchor(r)) => {
                 let ve = self.vector_edit.as_mut().unwrap();
                 if shift {
@@ -163,14 +229,169 @@ impl App {
                     self.vector_grabbed = Some(Grab::Anchor(r));
                     return true;
                 }
+                // Empty canvas: a drag marquees points (Shift adds to them); a click outside the
+                // path leaves edit mode.
                 let inside = self.doc.node(id).aabb().expand(8.0 / self.view.zoom).contains(self.view.to_world(s));
-                if inside {
+                if !shift {
                     self.vector_edit.as_mut().unwrap().selected.clear();
-                    self.vector_grabbed = None;
                 }
-                inside
+                self.vector_grabbed = None;
+                self.vector_outside = !inside;
+                true
+            }
+            Some(_) => true,
+        }
+    }
+
+    /// Marquee in edit mode: anchors inside the world rect, added to `base`.
+    pub fn vector_marquee(&mut self, r: Rect, base: &[PointRef]) {
+        let Some(id) = self.vector_edit.as_ref().map(|v| v.id) else { return };
+        let mut sel = base.to_vec();
+        for (si, sp) in self.doc.node(id).paths.iter().enumerate() {
+            for (pi, pt) in sp.points.iter().enumerate() {
+                if r.contains(world(self, id, pt.p)) && !sel.contains(&(si, pi)) {
+                    sel.push((si, pi));
+                }
             }
         }
+        self.vector_edit.as_mut().unwrap().selected = sel;
+    }
+
+    /// Pen in edit mode: click an open end to continue from it, click empty canvas to add a point
+    /// (drag for handles), click the path's other end to close it or another open end to join.
+    fn pen_press(&mut self, s: Pos2, grab: Option<Grab>) -> bool {
+        let ve = self.vector_edit.as_ref().unwrap();
+        let (id, drawing) = (ve.id, ve.drawing);
+        if let Some(Grab::Anchor(r)) = grab.filter(|g| matches!(g, Grab::Anchor(r) if self.is_open_end(*r))) {
+            let len = self.doc.node(id).paths[r.0].points.len();
+            match drawing {
+                None => {
+                    // Continue from here: flip the contour so new points go on its end.
+                    self.checkpoint();
+                    if r.1 == 0 && len > 1 {
+                        reverse(&mut self.doc.node_mut(id).paths[r.0].points);
+                    }
+                    let ve = self.vector_edit.as_mut().unwrap();
+                    ve.drawing = Some(r.0);
+                    ve.selected = vec![(r.0, len - 1)];
+                }
+                Some(si) if (si, self.doc.node(id).paths[si].points.len() - 1) != r => {
+                    let end = (si, self.doc.node(id).paths[si].points.len() - 1);
+                    self.vector_edit.as_mut().unwrap().selected = vec![end, r];
+                    self.vector_join();
+                }
+                _ => {}
+            }
+            return true;
+        }
+        self.checkpoint();
+        let p = local(self, id, self.view.to_world(s));
+        let n = self.doc.node_mut(id);
+        let si = drawing.unwrap_or_else(|| {
+            n.paths.push(SubPath::default());
+            n.paths.len() - 1
+        });
+        n.paths[si].points.push(PathPoint { p, ..Default::default() });
+        let r = (si, n.paths[si].points.len() - 1);
+        self.doc.refit_vector_keep(id);
+        let ve = self.vector_edit.as_mut().unwrap();
+        ve.drawing = Some(si);
+        ve.selected = vec![r];
+        self.vector_grabbed = Some(Grab::Pull(r));
+        true
+    }
+
+    /// The Pen tool over a lone selected path's open end continues that path (Figma).
+    pub fn pen_continue(&mut self, s: Pos2) -> bool {
+        let [id] = self.sel[..] else { return false };
+        if self.doc.node(id).kind != Kind::Vector {
+            return false;
+        }
+        self.vector_edit = Some(VectorEdit { id, tool: VTool::Pen, ..Default::default() });
+        match self.vector_grab(s) {
+            Some(Grab::Anchor(r)) if self.is_open_end(r) => {
+                self.tool = crate::app::Tool::Move;
+                self.pen_press(s, Some(Grab::Anchor(r)))
+            }
+            _ => {
+                self.vector_edit = None;
+                false
+            }
+        }
+    }
+
+    /// Cut tool: split segment `i` of contour `si` at `t`, opening the path there.
+    fn cut_at(&mut self, si: usize, i: usize, t: f32) {
+        let id = self.vector_edit.as_ref().unwrap().id;
+        let n = self.doc.node_mut(id);
+        let sp = n.paths[si].clone();
+        let k = sp.points.len();
+        let mut pts = sp.points;
+        let (a2, mid, b2) = split(pts[i], pts[(i + 1) % k], t);
+        pts[i] = a2;
+        pts[(i + 1) % k] = b2;
+        let head = PathPoint { h_out: Vec2::ZERO, ..mid };
+        let tail = PathPoint { h_in: Vec2::ZERO, ..mid };
+        if sp.closed {
+            // From the cut all the way around back to it.
+            let mut open = vec![tail];
+            open.extend_from_slice(&pts[i + 1..]);
+            open.extend_from_slice(&pts[..=i]);
+            open.push(head);
+            n.paths[si] = SubPath { points: open, closed: false };
+        } else {
+            let mut first = pts[..=i].to_vec();
+            first.push(head);
+            let mut second = vec![tail];
+            second.extend_from_slice(&pts[i + 1..]);
+            n.paths[si] = SubPath { points: first, closed: false };
+            n.paths.insert(si + 1, SubPath { points: second, closed: false });
+        }
+        let ve = self.vector_edit.as_mut().unwrap();
+        ve.selected.clear();
+        ve.drawing = None;
+        self.doc.refit_vector_keep(id);
+    }
+
+    /// Cmd J: join the two selected open ends. Both ends of one path close it; ends of two paths
+    /// make one path, merging the meeting points when they sit on top of each other.
+    pub fn vector_join(&mut self) {
+        let Some(ve) = &self.vector_edit else { return };
+        let (id, sel) = (ve.id, ve.selected.clone());
+        let [a, b] = sel[..] else { return self.toast("Select two open endpoints to join".into()) };
+        if a == b || !self.is_open_end(a) || !self.is_open_end(b) {
+            return self.toast("Select two open endpoints to join".into());
+        }
+        self.checkpoint();
+        let n = self.doc.node_mut(id);
+        if a.0 == b.0 {
+            let pts = &mut n.paths[a.0].points;
+            if pts[0].p.distance(pts[pts.len() - 1].p) < 0.5 && pts.len() > 2 {
+                let last = pts.pop().unwrap();
+                pts[0].h_in = last.h_in;
+            }
+            n.paths[a.0].closed = true;
+        } else {
+            let mut p1 = n.paths[a.0].points.clone();
+            let mut p2 = n.paths[b.0].points.clone();
+            if a.1 == 0 {
+                reverse(&mut p1);
+            }
+            if b.1 != 0 {
+                reverse(&mut p2);
+            }
+            if p1[p1.len() - 1].p.distance(p2[0].p) < 0.5 {
+                let first = p2.remove(0);
+                p1.last_mut().unwrap().h_out = first.h_out;
+            }
+            p1.extend(p2);
+            n.paths[a.0].points = p1;
+            n.paths.remove(b.0);
+        }
+        let ve = self.vector_edit.as_mut().unwrap();
+        ve.selected.clear();
+        ve.drawing = None;
+        self.doc.refit_vector_keep(id);
     }
 
     pub fn vector_drag_start(&mut self) -> Option<Drag> {
@@ -192,6 +413,19 @@ impl App {
                         pt.p += d;
                     }
                 }
+            }
+            Grab::Pull((si, pi)) => {
+                if let Some(pt) = n.paths.get_mut(si).and_then(|sp| sp.points.get_mut(pi)) {
+                    (pt.h_out, pt.h_in) = (d, -d);
+                }
+            }
+            Grab::Segment(si, i, t) => {
+                // Moving both control points by D moves the curve at t by 3t(1-t)D.
+                let sp = &mut n.paths[si];
+                let k = sp.points.len();
+                let m = d / (3.0 * t * (1.0 - t));
+                sp.points[i].h_out += m;
+                sp.points[(i + 1) % k].h_in += m;
             }
             Grab::Handle((si, pi), out) => {
                 let pt = &mut n.paths[si].points[pi];
@@ -215,6 +449,7 @@ impl App {
         if ve.selected.is_empty() {
             return;
         }
+        ve.drawing = None;
         let (id, mut sel) = (ve.id, std::mem::take(&mut ve.selected));
         self.checkpoint();
         sel.sort();
@@ -298,9 +533,9 @@ impl App {
                 let mut moved = false;
                 ui.horizontal(|ui| {
                     ui.label("X");
-                    moved |= ui.add(egui::DragValue::new(&mut x).speed(0.5)).changed();
+                    moved |= ui.add(egui::DragValue::new(&mut x).range(-1e6..=1e6).speed(0.5)).changed();
                     ui.label("Y");
-                    moved |= ui.add(egui::DragValue::new(&mut y).speed(0.5)).changed();
+                    moved |= ui.add(egui::DragValue::new(&mut y).range(-1e6..=1e6).speed(0.5)).changed();
                 });
                 if moved {
                     self.begin_edit();
@@ -315,7 +550,20 @@ impl App {
                 ui.label(format!("{} points selected", many.len()));
             }
         }
+        let keys = crate::chrome::keys;
         ui.horizontal(|ui| {
+            let ve = self.vector_edit.as_mut().unwrap();
+            for (t, label, key) in [(VTool::Move, "Move", "V"), (VTool::Pen, "Pen", "P"), (VTool::Cut, "Cut", "Y")] {
+                if ui.selectable_label(ve.tool == t, label).on_hover_text(keys(key)).clicked() {
+                    ve.tool = t;
+                    ve.drawing = None;
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.add_enabled(selected.len() == 2, egui::Button::new("Join")).on_hover_text(format!("Join two open endpoints ({})", keys("⌘J"))).clicked() {
+                self.vector_join();
+            }
             if ui.add_enabled(!selected.is_empty(), egui::Button::new("Bend")).on_hover_text("Smooth or straighten the selected points (double-click a point)").clicked() {
                 self.checkpoint();
                 for &at in &selected {
@@ -327,14 +575,18 @@ impl App {
             }
         });
         ui.add_space(4.0);
-        ui.label(egui::RichText::new("Click a segment to add a point. Drag points or their handles; Shift-click selects several.").small().color(muted));
+        ui.label(egui::RichText::new("Click a segment to add a point. Drag points or their handles, or drag a box around several; Shift adds. Cmd-drag bends.").small().color(muted));
     }
 
-    pub fn draw_vector_edit(&self, painter: &Painter) {
+    pub fn draw_vector_edit(&self, painter: &Painter, ptr: Option<Pos2>) {
         let Some(ve) = &self.vector_edit else { return };
         let Some(n) = self.doc.nodes.get(&ve.id) else { return };
         painter.add(crate::render::stroke_mesh(&crate::render::node_path(n, &self.view, 0.0), 1.0, BLUE));
         let sc = |p: Pos2| self.view.to_screen(world(self, ve.id, p));
+        // Pen: a rubber band from the end being drawn to the pointer.
+        if let (Some(last), Some(p), None) = (ve.drawing.and_then(|si| n.paths.get(si)).and_then(|sp| sp.points.last()), ptr, &self.drag) {
+            painter.line_segment([sc(last.p), p], Stroke::new(1.0, BLUE));
+        }
         for (si, sp) in n.paths.iter().enumerate() {
             for (pi, pt) in sp.points.iter().enumerate() {
                 let selected = ve.selected.contains(&(si, pi));

@@ -1,7 +1,7 @@
 //! Infinite canvas: navigation, tools, selection, snapping, and on-canvas overlays.
 
-use crate::app::{App, Drag, Grip, Press, Tool};
-use crate::doc::{Kind, LayoutMode, Node, NodeId, Order, PathPoint, Sizing, rotate};
+use crate::app::{App, Drag, GradGrab, Grip, Press, Tool};
+use crate::doc::{Axis, Guide, Kind, LayoutMode, Node, NodeId, Order, PathPoint, Sizing, rotate};
 use crate::render::{self, View};
 use egui::{
     Color32, CornerRadius, CursorIcon, FontId, Key, Painter, PointerButton, Pos2, Rect, Sense, Stroke, StrokeKind,
@@ -13,6 +13,10 @@ const TEXT_EDIT_ID: &str = "katachi-text-edit";
 pub const BLUE: Color32 = Color32::from_rgb(0x0D, 0x99, 0xFF);
 pub const PURPLE: Color32 = Color32::from_rgb(0x97, 0x47, 0xFF);
 const SNAP: Color32 = Color32::from_rgb(0xF2, 0x48, 0x22);
+/// Ruler thickness, in screen points.
+const RULER: f32 = 20.0;
+/// Figma's pink for spacing: equal-gap markers and smart selection handles.
+const GAP: Color32 = Color32::from_rgb(0xFF, 0x24, 0xBD);
 
 pub fn num(v: f32) -> String {
     let r = (v * 100.0).round() / 100.0;
@@ -43,6 +47,7 @@ impl App {
         if let Some(t) = self.zoom_target.take().filter(|t| self.doc.nodes.contains_key(t)) {
             self.view = View::fit(self.doc.node(t).aabb(), rect, 1.0);
         }
+        self.follow(rect);
         if let Some(ve) = &self.vector_edit
             && (self.sel != [ve.id] || !self.doc.nodes.contains_key(&ve.id) || self.tool != Tool::Move) {
                 self.vector_edit = None;
@@ -94,7 +99,7 @@ impl App {
         self.hover = None;
         if self.drag.is_none() && self.tool == Tool::Move && resp.hovered() && !panning
             && let (Some(s), Some(w)) = (ptr, world)
-                && self.handle_at(s).is_none() {
+                && self.handle_at(s).is_none() && self.guide_at(s).is_none() {
                     self.hover = self.target_at(w, s, mods.command);
                 }
 
@@ -107,6 +112,7 @@ impl App {
             }
         if secondary_pressed && resp.hovered()
             && let (Some(s), Some(w)) = (ptr, world) {
+                self.menu_at = Some(w);
                 match self.target_at(w, s, mods.command) {
                     Some(t) if !self.sel.contains(&t) => self.sel = vec![t],
                     None => self.sel.clear(),
@@ -143,28 +149,54 @@ impl App {
                 self.on_double_click(w);
             }
         if let (Some(drop), Some(p)) = (resp.dnd_release_payload::<crate::panels::AssetDrag>(), hover_pos) {
-            // Instance dropped from the Assets tab, centered under the pointer.
-            if self.doc.nodes.contains_key(&drop.0) {
+            // Instance dropped from the Assets tab, centered under the pointer. A library's
+            // component is copied in first.
+            if drop.1.is_some() || self.doc.nodes.contains_key(&drop.0) {
                 self.checkpoint();
-                let w = self.view.to_world(p);
-                let size = self.doc.node(drop.0).rect.size();
-                let parent = self.frame_at(w, &[]);
-                let i = self.doc.instantiate(drop.0, self.page, parent, None, (w - size / 2.0).round());
-                self.sel = vec![i];
+                let comp = match &drop.1 {
+                    Some(lib) => self.import_component(lib, drop.0),
+                    None => Some(drop.0),
+                };
+                if let Some(comp) = comp {
+                    let w = self.view.to_world(p);
+                    let size = self.doc.node(comp).rect.size();
+                    let mut parent = self.frame_at(w, &[]);
+                    // Never into an instance (its layers come from its main) or the component itself.
+                    while let Some(p) = parent.filter(|&p| self.owning_instance(p).is_some() || p == comp || self.doc.is_ancestor(comp, p)) {
+                        parent = self.doc.node(p).parent;
+                    }
+                    let i = self.doc.instantiate(comp, self.page, parent, None, self.px(w - size / 2.0));
+                    self.sel = vec![i];
+                }
             }
         }
         crate::chrome::context_menu(&resp, |ui| self.context_menu(ui));
 
         self.text_editor(ui, &painter);
         self.draw_overlays(&painter, ptr);
+        // Gradient handles edit what the open paint popover shows, so pressing one keeps it open.
+        let on_gradient = matches!(self.drag, Some(Drag::Gradient { .. })) || hover_pos.filter(|_| resp.hovered()).and_then(|p| self.gradient_hit(p)).is_some();
+        crate::chrome::pin_popovers(ui.ctx(), on_gradient || self.eyedrop.is_some());
+        if let Some(g) = self.gradient_edit {
+            ui.data_mut(|d| d.insert_temp(g.ui.with("stop"), g.stop));
+        }
         // Dev Mode shows distances on hover; design mode needs Alt.
         if (mods.alt || self.dev_mode) && self.drag.is_none() {
             self.draw_measurements(&painter);
         }
+        if self.dev_mode {
+            if let Some(h) = self.hover.filter(|h| self.doc.nodes.contains_key(h)) {
+                self.draw_dev_spacing(&painter, h);
+            }
+            self.draw_annotations(&painter);
+        }
+        self.draw_guides(&painter, rect);
         if self.rulers {
             self.draw_rulers(&painter, rect);
         }
         self.draw_peers(&painter);
+        self.draw_follow(&painter, rect);
+        self.cursor_chat(ui, rect);
         self.comment_hits = self.draw_comment_pins(&painter);
         self.comment_popups(ui.ctx());
         self.set_cursor(ui, ptr, panning);
@@ -173,8 +205,9 @@ impl App {
     }
 
     /// Files dropped on the canvas: images become image-filled rectangles, SVGs become vectors.
+    /// An image dropped on a layer with an image fill (or on any layer with Alt) replaces its image.
     fn accept_drops(&mut self, ui: &Ui, at: Pos2) {
-        let files = ui.input(|i| i.raw.dropped_files.clone());
+        let (files, alt) = ui.input(|i| (i.raw.dropped_files.clone(), i.modifiers.alt));
         let mut placed = vec![];
         let mut offset = 0.0;
         for f in files {
@@ -199,7 +232,12 @@ impl App {
                 return;
             }
             let is_svg = f.name.to_lowercase().ends_with(".svg") || f.path.as_ref().is_some_and(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg")));
-            let id = if is_svg { self.import_svg(&bytes, &name, w, true) } else { self.place_image(bytes, &name, w) };
+            let onto = self.doc.hit(self.page, w, 0.0).filter(|&t| alt || self.doc.node(t).fills.iter().any(|p| p.kind == crate::doc::PaintKind::Image));
+            let id = match onto {
+                _ if is_svg => self.import_svg(&bytes, &name, w, true),
+                Some(t) => self.replace_fill_image(t, bytes),
+                None => self.place_image(bytes, &name, w),
+            };
             placed.extend(id);
             offset += 20.0;
         }
@@ -242,10 +280,10 @@ impl App {
         let mut changed = false;
         for id in ids {
             let n = self.doc.node(id);
-            crate::text::ensure_font(&ctx, &n.font_family, n.font_weight);
+            crate::text::ensure_font(&ctx, &n.font_family, n.font_weight, n.italic);
             for sp in &n.spans {
                 let fam = sp.style.font_family.as_deref().unwrap_or(&n.font_family);
-                crate::text::ensure_font(&ctx, fam, sp.style.font_weight.unwrap_or(n.font_weight));
+                crate::text::ensure_font(&ctx, fam, sp.style.font_weight.unwrap_or(n.font_weight), sp.style.italic.unwrap_or(n.italic));
             }
             let key = text_key(&ctx, n);
             if self.text_keys.get(&id) == Some(&key) {
@@ -358,10 +396,165 @@ impl App {
             (x, y) if x != 0 && y != 0 => return Some(Grip::Resize(x, y)),
             _ => {}
         }
+        if let Some(g) = self.smart_grip_at(s).or_else(|| self.layout_grip_at(s)) {
+            return Some(g);
+        }
         let corner = [b.left_top(), b.right_top(), b.left_bottom(), b.right_bottom()]
             .iter()
             .any(|c| c.distance(s) < 20.0);
         (corner && !b.expand(5.0).contains(s)).then_some(Grip::Rotate)
+    }
+
+    /// The gradient whose handles are on the canvas: its layer and paint.
+    fn edited_gradient(&self) -> Option<(NodeId, crate::doc::Paint)> {
+        let g = self.gradient_edit?;
+        let [id] = self.sel[..] else { return None };
+        let n = self.doc.node(id);
+        let p = if g.stroke { n.strokes.get(g.index) } else { n.fills.get(g.index) }?;
+        p.kind.is_gradient().then(|| (id, p.clone()))
+    }
+
+    fn set_edited_gradient(&mut self, id: NodeId, p: crate::doc::Paint) {
+        let Some(g) = self.gradient_edit else { return };
+        let n = self.doc.node_mut(id);
+        let paints = if g.stroke { &mut n.strokes } else { &mut n.fills };
+        if let Some(slot) = paints.get_mut(g.index) {
+            *slot = p;
+        }
+    }
+
+    /// Screen positions of a gradient's start, end, and width handles (paints live in the
+    /// layer's unrotated unit square).
+    fn gradient_handles(&self, id: NodeId, p: &crate::doc::Paint) -> [Pos2; 3] {
+        let n = self.doc.node(id);
+        [p.from, p.to, p.width_point()].map(|q| self.view.to_screen(rotate(n.rect.min + q.to_vec2() * n.rect.size(), n.rect.center(), n.rotation)))
+    }
+
+    fn gradient_hit(&self, s: Pos2) -> Option<GradGrab> {
+        if self.vector_edit.is_some() || self.editing_text.is_some() {
+            return None;
+        }
+        let (id, p) = self.edited_gradient()?;
+        let [a, b, w] = self.gradient_handles(id, &p);
+        let near = |q: Pos2| q.distance(s) <= 7.0;
+        if p.kind != crate::doc::PaintKind::Linear && near(w) {
+            return Some(GradGrab::Width);
+        }
+        if near(a) {
+            return Some(GradGrab::From);
+        }
+        if near(b) {
+            return Some(GradGrab::To);
+        }
+        if let Some(i) = p.stops.iter().position(|(t, _)| near(a.lerp(b, *t))) {
+            return Some(GradGrab::Stop(i));
+        }
+        let t = line_t(a, b, s);
+        (a.lerp(b, t).distance(s) <= 4.0).then_some(GradGrab::Line)
+    }
+
+    /// Add a stop where world point `w` falls on the gradient line, colored as the gradient is there.
+    fn add_gradient_stop(&mut self, w: Pos2) -> Option<usize> {
+        let (id, mut p) = self.edited_gradient()?;
+        let [a, b, _] = self.gradient_handles(id, &p);
+        let t = line_t(a, b, self.view.to_screen(w));
+        let i = p.stops.partition_point(|s| s.0 <= t);
+        p.stops.insert(i, (t, p.sample(t)));
+        self.set_edited_gradient(id, p);
+        self.gradient_edit.as_mut()?.stop = i;
+        Some(i)
+    }
+
+    /// A click on the gradient editor: the line adds a stop, a stop or end selects it.
+    fn gradient_click(&mut self, g: GradGrab, w: Pos2) {
+        let Some((_, p)) = self.edited_gradient() else { return };
+        let stop = match g {
+            GradGrab::Line => {
+                self.checkpoint();
+                self.add_gradient_stop(w)
+            }
+            GradGrab::Stop(i) => Some(i),
+            GradGrab::From => Some(0),
+            GradGrab::To => Some(p.stops.len().saturating_sub(1)),
+            GradGrab::Width => None,
+        };
+        if let (Some(i), Some(e)) = (stop, self.gradient_edit.as_mut()) {
+            e.stop = i;
+        }
+    }
+
+    /// Move a gradient handle or stop to world point `w`.
+    fn drag_gradient(&mut self, grab: &mut GradGrab, w: Pos2) {
+        let Some((id, mut p)) = self.edited_gradient() else { return };
+        let n = self.doc.node(id);
+        let l = rotate(w, n.rect.center(), -n.rotation);
+        let q = pos2((l.x - n.rect.min.x) / n.rect.width().max(1e-6), (l.y - n.rect.min.y) / n.rect.height().max(1e-6));
+        let linear = p.kind == crate::doc::PaintKind::Linear;
+        match *grab {
+            // Radial, angular, and diamond gradients move as a whole by their center.
+            GradGrab::From if !linear => {
+                let d = q - p.from;
+                p.to += d;
+                if let Some(wt) = &mut p.width_to {
+                    *wt += d;
+                }
+                p.from = q;
+            }
+            GradGrab::From => p.from = q,
+            GradGrab::To => {
+                // The width axis turns and scales with the main one (complex multiplication by new / old).
+                if let Some(wt) = p.width_to {
+                    let (od, nd, ow) = (p.to - p.from, q - p.from, wt - p.from);
+                    let r = vec2(nd.x * od.x + nd.y * od.y, nd.y * od.x - nd.x * od.y) / od.length_sq().max(1e-12);
+                    p.width_to = Some(p.from + vec2(ow.x * r.x - ow.y * r.y, ow.x * r.y + ow.y * r.x));
+                }
+                p.to = q;
+            }
+            GradGrab::Width => p.width_to = Some(q),
+            GradGrab::Stop(i) if i < p.stops.len() => {
+                let [a, b, _] = self.gradient_handles(id, &p);
+                let mut s = p.stops.remove(i);
+                s.0 = line_t(a, b, self.view.to_screen(w));
+                let j = p.stops.partition_point(|x| x.0 <= s.0);
+                p.stops.insert(j, s);
+                *grab = GradGrab::Stop(j);
+                if let Some(e) = self.gradient_edit.as_mut() {
+                    e.stop = j;
+                }
+            }
+            _ => return,
+        }
+        self.set_edited_gradient(id, p);
+    }
+
+    /// Figma's gradient editor on the canvas: the line from start to end with its stops, and the handles.
+    fn draw_gradient_handles(&self, painter: &Painter) {
+        let Some((id, p)) = self.edited_gradient() else { return };
+        let [a, b, w] = self.gradient_handles(id, &p);
+        let shadow = Stroke::new(3.0, Color32::from_black_alpha(70));
+        let line = Stroke::new(1.5, Color32::WHITE);
+        let knob = |c: Pos2, r: f32| {
+            painter.circle(c, r, Color32::WHITE, Stroke::new(1.0, Color32::from_black_alpha(90)));
+        };
+        if p.kind != crate::doc::PaintKind::Linear {
+            painter.line_segment([a, w], shadow);
+            painter.extend(egui::Shape::dashed_line(&[a, w], line, 4.0, 3.0));
+            knob(w, 4.0);
+        }
+        painter.line_segment([a, b], shadow);
+        painter.line_segment([a, b], line);
+        knob(a, 5.0);
+        knob(b, 5.0);
+        let sel = self.gradient_edit.map_or(0, |g| g.stop);
+        for (i, (t, c)) in p.stops.iter().enumerate() {
+            let r = Rect::from_center_size(a.lerp(b, *t), vec2(12.0, 12.0));
+            painter.rect_filled(r.expand(1.0), 3.0, Color32::from_black_alpha(70));
+            painter.rect_filled(r, 3.0, Color32::WHITE);
+            painter.rect_filled(r.shrink(2.0), 2.0, c.to32());
+            if i == sel {
+                painter.rect_stroke(r.expand(1.5), 4.0, Stroke::new(1.5, BLUE), StrokeKind::Outside);
+            }
+        }
     }
 
     fn on_press(&mut self, s: Pos2, w: Pos2, mods: egui::Modifiers) {
@@ -378,7 +571,21 @@ impl App {
                 return;
             }
         }
-        if tool == Tool::Move && self.vector_edit.is_some() && self.vector_press(s, mods.shift) {
+        // Rulers pull out new guides; the move tool grabs existing ones.
+        let ruler = self.ruler_at(s);
+        // Selection and gradient handles win over a guide under them (snapped edges sit on guides).
+        let over_handle = self.handle_at(s).is_some() || self.gradient_hit(s).is_some();
+        let guide = if ruler.is_none() && !over_handle { self.guide_at(s) } else { None };
+        self.guide_sel = guide;
+        if let Some(axis) = ruler.or(guide.map(|i| self.doc.pages[self.page].guides[i].axis)) {
+            if guide.is_some() {
+                self.sel.clear();
+            }
+            self.guide_grab = Some((axis, guide));
+            self.press = Some(Press { world: w, target: None, handle: None, toggle_off: false });
+            return;
+        }
+        if tool == Tool::Move && self.vector_edit.is_some() && self.vector_press(s, mods) {
             self.press = Some(Press { world: w, target: None, handle: None, toggle_off: false });
             return;
         }
@@ -391,6 +598,10 @@ impl App {
         match tool {
             Tool::Move | Tool::Scale => {
                 self.vector_edit = None;
+                if let Some(g) = self.gradient_hit(s) {
+                    self.press = Some(Press { world: w, target: None, handle: Some(Grip::Gradient(g)), toggle_off: false });
+                    return;
+                }
                 let handle = self.handle_at(s);
                 let target = if handle.is_some() { None } else { self.target_at(w, s, mods.command) };
                 let mut toggle_off = false;
@@ -423,6 +634,9 @@ impl App {
                     self.pending_frame = target;
                 }
             }
+            Tool::Pen if self.pen.is_empty() && self.pen_continue(s) => {
+                self.press = Some(Press { world: w, target: None, handle: None, toggle_off: false });
+            }
             Tool::Pen => {
                 let close = self.pen.len() >= 2 && self.view.to_screen(self.pen[0].p).distance(s) < 8.0;
                 if close {
@@ -433,7 +647,7 @@ impl App {
                     if let (true, Some(last)) = (mods.shift, self.pen.last()) {
                         p = snap_angle(last.p, p);
                     }
-                    self.pen.push(PathPoint { p: p.round(), ..Default::default() });
+                    self.pen.push(PathPoint { p: self.px(p), ..Default::default() });
                 }
             }
             _ => self.press = Some(Press { world: w, target: None, handle: None, toggle_off: false }),
@@ -448,9 +662,26 @@ impl App {
             return;
         };
         self.pending_frame = None;
+        if let Some((axis, index)) = self.guide_grab.take() {
+            self.checkpoint();
+            let guides = &mut self.doc.pages[self.page].guides;
+            let index = index.unwrap_or_else(|| {
+                guides.push(Guide { axis, offset: 0.0 });
+                guides.len() - 1
+            });
+            self.guide_sel = Some(index);
+            self.drag = Some(Drag::Guide { index });
+            return;
+        }
         let start = press.world;
-        if self.vector_edit.is_some() {
-            self.drag = self.vector_drag_start();
+        if let Some(ve) = &self.vector_edit {
+            self.drag = match self.vector_grabbed {
+                None if ve.tool == crate::vector_edit::VTool::Move => {
+                    self.vector_outside = false;
+                    Some(Drag::PointMarquee { start, base_sel: ve.selected.clone() })
+                }
+                _ => self.vector_drag_start(),
+            };
             self.vector_start = start;
             return;
         }
@@ -460,7 +691,12 @@ impl App {
         }
         self.drag = match self.tool {
             Tool::Move | Tool::Scale => {
-                if let Some(grip) = press.handle {
+                if let Some(Grip::Gradient(g)) = press.handle {
+                    // One undo step per drag; dragging off the line pulls out a new stop.
+                    self.checkpoint();
+                    let grab = if g == GradGrab::Line { self.add_gradient_stop(start).map_or(g, GradGrab::Stop) } else { g };
+                    Some(Drag::Gradient { grab })
+                } else if let Some(grip) = press.handle {
                     self.checkpoint();
                     let (bounds, rot) = self.sel_frame().unwrap_or((Rect::NOTHING, 0.0));
                     let base = self.doc.clone();
@@ -471,6 +707,12 @@ impl App {
                             let a = (start - c).angle();
                             Some(Drag::Rotate { base, center: c, start_angle: a, start_rot: rot, deg: 0.0 })
                         }
+                        Grip::Gap | Grip::Padding(_) => Some(Drag::LayoutSpacing { base, id: self.sel[0], grip, start }),
+                        Grip::Spacing(_) | Grip::Swap(_) => self.smart_selection().map(|(axis, items)| match grip {
+                            Grip::Swap(id) => Drag::Swap { base, id, axis, items, start },
+                            _ => Drag::Spacing { base, axis, gap: gap_of(&items, axis), items, start },
+                        }),
+                        Grip::Gradient(_) => None,
                     }
                 } else if press.target.is_some() && !self.sel.is_empty() {
                     self.checkpoint();
@@ -485,9 +727,10 @@ impl App {
                 }
             }
             Tool::Pencil => Some(Drag::Pencil { points: vec![start] }),
+            Tool::Zoom => Some(Drag::Zoom { start }),
             t if t.draws_shape() || t == Tool::Text => {
                 self.checkpoint();
-                let start = self.snap_point(start.round(), &[]);
+                let start = self.snap_point(self.px(start), &[]);
                 let parent = if t == Tool::Section { None } else { self.frame_at(start, &[]) };
                 let mut node = self.shape_for(t, Rect::from_min_size(start, Vec2::ZERO));
                 if t == Tool::Text {
@@ -520,6 +763,7 @@ impl App {
                     let now = self.doc.node(id).aabb().min;
                     self.doc.translate(id, from + (w - *start) - now);
                     self.guides.clear();
+                    self.gap_marks.clear();
                     self.drag = Some(drag);
                     return;
                 }
@@ -530,7 +774,7 @@ impl App {
                 }
                 let corr = self.snap(b.translate(d), &roots, [true; 3], [true; 3]);
                 d += corr;
-                let d = (b.min + d).round() - b.min;
+                let d = self.px(b.min + d) - b.min;
                 for id in roots {
                     self.doc.translate(id, d);
                 }
@@ -593,7 +837,7 @@ impl App {
                     if hy == -1 { nb.max.y = 2.0 * c.y - nb.min.y }
                     if hy == 1 { nb.min.y = 2.0 * c.y - nb.max.y }
                 }
-                let nb = Rect::from_two_pos(nb.min.round(), nb.max.round());
+                let nb = Rect::from_two_pos(self.px(nb.min), self.px(nb.max));
                 if rot != 0.0 {
                     // Keep the fixed side planted: move the new center back into world space.
                     let c = rotate(nb.center(), b.center(), rot);
@@ -645,7 +889,8 @@ impl App {
             Drag::Create { base, start, id } => {
                 self.doc = base.clone();
                 let a = *start;
-                let mut b = self.snap_point(w, &[*id]).round();
+                let p = self.snap_point(w, &[*id]);
+                let mut b = self.px(p);
                 if self.doc.node(*id).kind == Kind::Vector {
                     if mods.shift {
                         b = snap_angle(a, b);
@@ -677,6 +922,10 @@ impl App {
                 }
                 self.sel = sel;
             }
+            Drag::PointMarquee { start, base_sel } => {
+                let (r, base) = (Rect::from_two_pos(*start, w), base_sel.clone());
+                self.vector_marquee(r, &base);
+            }
             Drag::Vector { base, id, grab } => {
                 let (base, id, grab) = (base.clone(), *id, *grab);
                 self.vector_drag(&base, id, grab, self.vector_start, w, mods.alt);
@@ -696,13 +945,55 @@ impl App {
                     }
                 }
             }
-            Drag::Pan | Drag::Connect { .. } => {}
+            Drag::Guide { index } => {
+                if let Some(axis) = self.doc.pages[self.page].guides.get(*index).map(|g| g.axis) {
+                    self.doc.pages[self.page].guides[*index].offset = self.px1(if axis == Axis::X { w.x } else { w.y });
+                }
+            }
+            Drag::Spacing { base, axis, items, gap, start } => {
+                self.doc = base.clone();
+                let g = self.px1((*gap + (w - *start)[*axis]).max(0.0));
+                lay_out(&mut self.doc, *axis, items, items[0].1.min[*axis], g);
+            }
+            Drag::Swap { base, id, start, .. } => {
+                self.doc = base.clone();
+                let d = w - *start;
+                self.doc.translate(*id, vec2(self.px1(d.x), self.px1(d.y)));
+            }
+            Drag::Gradient { grab } => self.drag_gradient(grab, w),
+            Drag::LayoutSpacing { base, id, grip, start } => {
+                self.doc = base.clone();
+                let d = w - *start;
+                let mut l = self.doc.node(*id).layout;
+                let a = if l.mode == LayoutMode::Vertical { 1 } else { 0 };
+                match *grip {
+                    Grip::Gap => {
+                        l.gap = self.px1((l.gap + d[a]).max(0.0));
+                        l.space_between = false;
+                    }
+                    Grip::Padding(side) => {
+                        // Dragging inward adds padding. Alt mirrors to the opposite side, Shift sets all four.
+                        let inward = [d.y, -d.x, -d.y, d.x][side];
+                        let v = self.px1((l.padding[side] + inward).max(0.0));
+                        for s in 0..4 {
+                            if s == side || mods.shift || (mods.alt && s == (side + 2) % 4) {
+                                l.padding[s] = v;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                self.doc.node_mut(*id).layout = l;
+                self.doc.reflow();
+            }
+            Drag::Pan | Drag::Connect { .. } | Drag::Zoom { .. } => {}
         }
         self.drag = Some(drag);
     }
 
     fn on_drag_end(&mut self, w: Pos2) {
         self.guides.clear();
+        self.gap_marks.clear();
         self.vector_grabbed = None;
         match self.drag.take() {
             Some(Drag::Connect { from }) => {
@@ -717,8 +1008,43 @@ impl App {
                     self.doc.node_mut(from).reactions.push(crate::doc::Reaction { action: crate::doc::Action::Navigate(t), ..Default::default() });
                 }
             }
+            Some(Drag::Zoom { start }) => {
+                let r = Rect::from_two_pos(start, w);
+                if let Some(screen) = self.canvas_rect {
+                    if r.width().max(r.height()) * self.view.zoom > 4.0 {
+                        self.view = View::fit(r, screen, 256.0);
+                    } else {
+                        self.view.zoom_at(self.view.to_screen(w), 2.0);
+                    }
+                }
+            }
+            Some(Drag::Guide { index }) => {
+                // Dropped back on its ruler (or off the canvas that way): gone.
+                let (s, r) = (self.view.to_screen(w), self.canvas_rect.unwrap_or(Rect::EVERYTHING));
+                let guides = &mut self.doc.pages[self.page].guides;
+                let gone = guides.get(index).is_some_and(|g| match g.axis {
+                    Axis::X => s.x < r.min.x + RULER,
+                    Axis::Y => s.y < r.min.y + RULER,
+                });
+                if gone {
+                    guides.remove(index);
+                    self.guide_sel = None;
+                }
+            }
+            Some(Drag::Swap { base, id, axis, mut items, .. }) => {
+                // Dropped on another layer's slot: trade places. Anywhere else: snap back.
+                self.doc = base;
+                let i = items.iter().position(|(n, _)| *n == id);
+                let j = items.iter().position(|(n, r)| *n != id && r.contains(w));
+                if let (Some(i), Some(j)) = (i, j) {
+                    let g = gap_of(&items, axis);
+                    let first = items[0].1.min[axis];
+                    items.swap(i, j);
+                    lay_out(&mut self.doc, axis, &items, first, g);
+                }
+            }
             Some(Drag::Pencil { points }) => {
-                let pts = smooth_stroke(&points, 1.5 / self.view.zoom);
+                let pts = smooth_stroke(&points, self.prefs.pencil_smoothing / self.view.zoom);
                 if pts.len() >= 2 {
                     self.checkpoint();
                     let parent = self.frame_at(points[0], &[]);
@@ -784,14 +1110,28 @@ impl App {
     }
 
     fn on_click(&mut self, w: Pos2, mods: egui::Modifiers) {
+        if self.guide_grab.take().is_some() {
+            self.press = None;
+            return;
+        }
         if self.vector_edit.is_some() {
             self.press = None;
+            if std::mem::take(&mut self.vector_outside) {
+                // A click on empty canvas outside the path leaves edit mode and selects as usual.
+                self.vector_edit = None;
+                self.on_press(self.view.to_screen(w), w, mods);
+                self.on_click(w, mods);
+            }
             return;
         }
         match self.tool {
             Tool::Move | Tool::Scale => {
                 if let Some(t) = self.pending_frame.take() {
                     if mods.shift { self.sel.push(t) } else { self.sel = vec![t] }
+                }
+                if let Some(Press { handle: Some(Grip::Gradient(g)), .. }) = self.press {
+                    self.press = None;
+                    return self.gradient_click(g, w);
                 }
                 if let Some(p) = self.press.take() {
                     match p.target {
@@ -801,11 +1141,15 @@ impl App {
                     }
                 }
             }
+            Tool::Zoom => {
+                let at = self.view.to_screen(w);
+                self.view.zoom_at(at, if mods.alt { 0.5 } else { 2.0 });
+            }
             Tool::Text => {
                 // Created on release so the new field keeps keyboard focus.
                 self.checkpoint();
                 let parent = self.frame_at(w, &[]);
-                let n = Node::new(Kind::Text, Rect::from_min_size(w.round(), Vec2::ZERO));
+                let n = Node::new(Kind::Text, Rect::from_min_size(self.px(w), Vec2::ZERO));
                 let id = self.doc.insert(self.page, parent, None, n);
                 self.sel = vec![id];
                 self.editing_text = Some(id);
@@ -815,7 +1159,7 @@ impl App {
             t if t.draws_shape() => {
                 // A click without a drag drops a default 100×100 shape.
                 self.checkpoint();
-                let p = w.round();
+                let p = self.px(w);
                 let parent = if t == Tool::Section { None } else { self.frame_at(p, &[]) };
                 let node = self.shape_for(t, Rect::from_min_size(p, vec2(100.0, 100.0)));
                 let id = self.doc.insert(self.page, parent, None, node);
@@ -861,7 +1205,7 @@ impl App {
             return;
         }
         if let [one] = self.sel[..]
-            && matches!(self.doc.node(one).kind, Kind::Vector | Kind::Rectangle | Kind::Ellipse)
+            && matches!(self.doc.node(one).kind, Kind::Vector | Kind::Rectangle | Kind::Ellipse | Kind::Polygon | Kind::Star)
                 && self.doc.node(one).aabb().expand(4.0 / self.view.zoom).contains(w)
             {
                 self.enter_vector_edit(one);
@@ -910,8 +1254,13 @@ impl App {
             if !k.visible || k.absolute {
                 continue;
             }
-            let center = k.aabb().center();
-            let before = if h { center.x < w.x } else { center.y < w.y };
+            let (b, center) = (k.aabb(), k.aabb().center());
+            let before = match pn.layout.mode {
+                // Grids read row by row: rows above, then cells to the left on the pointer's row.
+                LayoutMode::Grid => b.max.y < w.y || (b.min.y <= w.y && center.x < w.x),
+                _ if h => center.x < w.x,
+                _ => center.y < w.y,
+            };
             if before {
                 index = i + 1;
             }
@@ -941,17 +1290,22 @@ impl App {
 
     // ---------- snapping ----------
 
-    fn snap_targets(&self, exclude: &[NodeId]) -> Vec<Rect> {
+    /// Visible siblings of the first excluded layer: what it aligns and spaces against.
+    fn snap_siblings(&self, exclude: &[NodeId]) -> Vec<Rect> {
         let parent = exclude.first().and_then(|&e| self.doc.nodes.get(&e)).and_then(|n| n.parent);
-        let mut out: Vec<Rect> = self
-            .doc
+        self.doc
             .children_of(self.page, parent)
             .iter()
             .filter(|c| !exclude.contains(c))
             .map(|c| self.doc.node(*c))
             .filter(|n| n.visible)
             .map(|n| n.aabb())
-            .collect();
+            .collect()
+    }
+
+    fn snap_targets(&self, exclude: &[NodeId]) -> Vec<Rect> {
+        let parent = exclude.first().and_then(|&e| self.doc.nodes.get(&e)).and_then(|n| n.parent);
+        let mut out = self.snap_siblings(exclude);
         if let Some(p) = parent {
             let pn = self.doc.node(p);
             out.push(pn.aabb());
@@ -972,7 +1326,22 @@ impl App {
                                 out.push(Rect::from_min_max(pos2(r.min.x, b), pos2(r.max.x, b)));
                             }
                         }
-                        crate::doc::GridKind::Grid => {}
+                        // Uniform grids snap on their lines, unless they're too dense to be useful.
+                        crate::doc::GridKind::Grid => {
+                            let step = g.size.max(1.0);
+                            if (r.width() + r.height()) / step <= 400.0 {
+                                let mut x = r.min.x;
+                                while x <= r.max.x {
+                                    out.push(Rect::from_min_max(pos2(x, r.min.y), pos2(x, r.max.y)));
+                                    x += step;
+                                }
+                                let mut y = r.min.y;
+                                while y <= r.max.y {
+                                    out.push(Rect::from_min_max(pos2(r.min.x, y), pos2(r.max.x, y)));
+                                    y += step;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1025,44 +1394,58 @@ impl App {
         }
     }
 
-    /// Correction that snaps the masked edges of `moving` to nearby sibling edges/centers.
-    /// Records guide lines for display.
+    /// Correction that snaps the masked edges of `moving` to nearby sibling edges/centers, or
+    /// to a gap that repeats the spacing between its neighbors (Figma's smart spacing guides).
+    /// Records guide lines and gap markers for display.
     fn snap(&mut self, moving: Rect, exclude: &[NodeId], mx: [bool; 3], my: [bool; 3]) -> Vec2 {
-        if !self.prefs.snap_to_objects {
-            self.guides.clear();
-            return Vec2::ZERO;
-        }
+        self.guides.clear();
+        self.gap_marks.clear();
         let tol = 5.0 / self.view.zoom;
-        let targets = self.snap_targets(exclude);
-        let xs = |r: Rect| [r.min.x, r.center().x, r.max.x];
-        let ys = |r: Rect| [r.min.y, r.center().y, r.max.y];
-        let best = |m: [f32; 3], mask: [bool; 3], t: &dyn Fn(Rect) -> [f32; 3]| {
+        let objects = self.prefs.snap_to_objects;
+        let targets = if objects { self.snap_targets(exclude) } else { vec![] };
+        let sibs = if objects { self.snap_siblings(exclude) } else { vec![] };
+        // Ruler guides always snap.
+        let lines: Vec<Guide> = self.doc.pages[self.page].guides.clone();
+        let vals = |r: Rect, a: usize| [r.min[a], r.center()[a], r.max[a]];
+        let mut corr = Vec2::ZERO;
+        let mut gap_used = [None, None];
+        for (a, mask) in [mx, my].into_iter().enumerate() {
             let mut best: Option<f32> = None;
-            for r in &targets {
-                for (_, mv) in m.iter().enumerate().filter(|(i, _)| mask[*i]) {
-                    for tv in t(*r) {
-                        let d = tv - mv;
-                        if d.abs() < tol && best.is_none_or(|b| d.abs() < b.abs()) {
-                            best = Some(d);
-                        }
+            for (_, mv) in vals(moving, a).iter().enumerate().filter(|(i, _)| mask[*i]) {
+                let on_axis = lines.iter().filter(|g| g.axis as usize == a).map(|g| g.offset);
+                for tv in targets.iter().flat_map(|r| vals(*r, a)).chain(on_axis) {
+                    let d = tv - mv;
+                    if d.abs() < tol && best.is_none_or(|b| d.abs() < b.abs()) {
+                        best = Some(d);
                     }
                 }
             }
-            best
-        };
-        let corr = vec2(best(xs(moving), mx, &xs).unwrap_or(0.0), best(ys(moving), my, &ys).unwrap_or(0.0));
+            let gap = gap_snaps(moving, &sibs, a, mask).into_iter().filter(|(d, _)| d.abs() < tol).min_by(|x, y| x.0.abs().total_cmp(&y.0.abs()));
+            match (best, gap) {
+                (b, Some((d, g))) if b.is_none_or(|b| d.abs() <= b.abs()) => {
+                    corr[a] = d;
+                    gap_used[a] = Some(g);
+                }
+                (Some(b), _) => corr[a] = b,
+                _ => {}
+            }
+        }
         let m = moving.translate(corr);
-        self.guides.clear();
         for r in &targets {
-            for (i, mv) in xs(m).iter().enumerate() {
-                if mx[i] && xs(*r).iter().any(|t| (t - mv).abs() < 0.01) {
+            for (i, mv) in vals(m, 0).iter().enumerate() {
+                if mx[i] && vals(*r, 0).iter().any(|t| (t - mv).abs() < 0.01) {
                     self.guides.push([pos2(*mv, m.min.y.min(r.min.y)), pos2(*mv, m.max.y.max(r.max.y))]);
                 }
             }
-            for (i, mv) in ys(m).iter().enumerate() {
-                if my[i] && ys(*r).iter().any(|t| (t - mv).abs() < 0.01) {
+            for (i, mv) in vals(m, 1).iter().enumerate() {
+                if my[i] && vals(*r, 1).iter().any(|t| (t - mv).abs() < 0.01) {
                     self.guides.push([pos2(m.min.x.min(r.min.x), *mv), pos2(m.max.x.max(r.max.x), *mv)]);
                 }
+            }
+        }
+        for (a, g) in gap_used.into_iter().enumerate() {
+            if let Some(g) = g {
+                self.gap_marks.extend(equal_gaps(m, &sibs, a, g));
             }
         }
         corr
@@ -1070,7 +1453,158 @@ impl App {
 
     fn snap_point(&mut self, p: Pos2, exclude: &[NodeId]) -> Pos2 {
         let r = Rect::from_min_size(p, Vec2::ZERO);
-        p + self.snap(r, exclude, [true, false, false], [true, false, false])
+        p + self.snap(r, exclude, [true, false, true], [true, false, true])
+    }
+
+    // ---------- smart selection ----------
+
+    /// Figma's smart selection: 2+ selected layers in a row or column with equal gaps (within
+    /// 1px). Returns the axis (0 = row) and the layers in order along it.
+    pub fn smart_selection(&self) -> Option<(usize, Vec<(NodeId, Rect)>)> {
+        let roots = self.sel_roots();
+        // Auto layout places its own children (its gap and order are edited there instead).
+        let in_flow = |i: NodeId| !self.doc.node(i).absolute && self.doc.node(i).parent.is_some_and(|p| self.doc.node(p).layout.mode != LayoutMode::None);
+        if roots.len() < 2 || self.vector_edit.is_some() || roots.iter().any(|&i| in_flow(i)) {
+            return None;
+        }
+        (0..2).find_map(|a| {
+            let mut items: Vec<(NodeId, Rect)> = roots.iter().map(|&i| (i, self.doc.node(i).aabb())).collect();
+            items.sort_by(|x, y| x.1.min[a].total_cmp(&y.1.min[a]));
+            let gaps: Vec<f32> = items.windows(2).map(|w| w[1].1.min[a] - w[0].1.max[a]).collect();
+            gaps.iter().all(|g| *g >= 0.0 && (g - gaps[0]).abs() <= 1.0).then_some((a, items))
+        })
+    }
+
+    /// Screen rects of the gaps between smart-selected layers, spanning the selection across.
+    fn smart_gaps(&self, a: usize, items: &[(NodeId, Rect)]) -> Vec<Rect> {
+        let b = self.doc.bounds(&items.iter().map(|(i, _)| *i).collect::<Vec<_>>());
+        items
+            .windows(2)
+            .map(|w| {
+                let (mut lo, mut hi) = (b.min, b.max);
+                lo[a] = w[0].1.max[a];
+                hi[a] = w[1].1.min[a];
+                self.view.rect_to_screen(Rect::from_min_max(lo, hi))
+            })
+            .collect()
+    }
+
+    /// The spacing handle mid-gap, or a layer's center knob, under screen point `s`.
+    fn smart_grip_at(&self, s: Pos2) -> Option<Grip> {
+        let (a, items) = self.smart_selection()?;
+        for g in self.smart_gaps(a, &items) {
+            let d = s - g.center();
+            if d[a].abs() <= 4.0 && d[1 - a].abs() <= 10.0 {
+                return Some(Grip::Spacing(a));
+            }
+        }
+        items.iter().find(|(_, r)| self.view.to_screen(r.center()).distance(s) <= 6.0).map(|(id, _)| Grip::Swap(*id))
+    }
+
+    /// With the pointer over a smart selection: knobs on each layer and a pink handle in each
+    /// gap; the hovered or dragged gaps light up with their size.
+    fn draw_smart_selection(&self, painter: &Painter, ptr: Option<Pos2>) {
+        let Some((a, items)) = self.smart_selection() else { return };
+        let gaps = self.smart_gaps(a, &items);
+        let b = self.view.rect_to_screen(self.doc.bounds(&self.sel_roots()));
+        let dragging = matches!(self.drag, Some(Drag::Spacing { .. }));
+        if !dragging && !ptr.is_some_and(|p| b.expand(4.0).contains(p)) {
+            return;
+        }
+        let hot = dragging || ptr.is_some_and(|p| gaps.iter().any(|g| g.expand(2.0).contains(p)));
+        for g in &gaps {
+            if hot {
+                painter.rect_filled(*g, 0.0, GAP.gamma_multiply(0.2));
+                let mut at = g.center();
+                at[1 - a] = g.max[1 - a] + 12.0;
+                pill(painter, at, num(g.size()[a] / self.view.zoom), GAP);
+            }
+            let mut half = Vec2::ZERO;
+            half[1 - a] = 6.0;
+            painter.line_segment([g.center() - half, g.center() + half], Stroke::new(2.0, GAP));
+        }
+        for (_, r) in &items {
+            painter.circle(self.view.to_screen(r.center()), 3.5, Color32::WHITE, Stroke::new(1.5, GAP));
+        }
+    }
+
+    // ---------- auto layout spacing handles ----------
+
+    /// A lone selected auto layout frame's spacing bands in world space, each with its grip and
+    /// thin axis: the gaps between in-flow children and the four padding bands.
+    fn layout_bands(&self) -> Vec<(Grip, Rect, usize)> {
+        let [id] = self.sel[..] else { return vec![] };
+        let n = self.doc.node(id);
+        if !n.kind.is_frame() || n.rotation != 0.0 || !matches!(n.layout.mode, LayoutMode::Horizontal | LayoutMode::Vertical) || self.vector_edit.is_some() {
+            return vec![];
+        }
+        let l = n.layout;
+        let a = if l.mode == LayoutMode::Horizontal { 0 } else { 1 };
+        let [pt, pr, pb, pl] = l.padding;
+        let inner = Rect::from_min_max(n.rect.min + vec2(pl, pt), n.rect.max - vec2(pr, pb));
+        let kids: Vec<Rect> = n.children.iter().map(|c| self.doc.node(*c)).filter(|k| k.visible && !k.absolute).map(|k| k.aabb()).collect();
+        let mut out = vec![];
+        for w in kids.windows(2) {
+            // Wrapped rows: only neighbors on the same row have a gap between them.
+            let same_row = w[0].min[1 - a] < w[1].max[1 - a] && w[1].min[1 - a] < w[0].max[1 - a];
+            if w[1].min[a] > w[0].max[a] && same_row {
+                let mut r = if l.wrap { w[0].union(w[1]) } else { inner };
+                (r.min[a], r.max[a]) = (w[0].max[a], w[1].min[a]);
+                out.push((Grip::Gap, r, a));
+            }
+        }
+        // Zero padding still gets a grabbable sliver.
+        let r = n.rect;
+        let t = |v: f32| v.max(14.0 / self.view.zoom);
+        out.push((Grip::Padding(0), Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + t(pt))), 1));
+        out.push((Grip::Padding(1), Rect::from_min_max(pos2(r.max.x - t(pr), r.min.y), r.max), 0));
+        out.push((Grip::Padding(2), Rect::from_min_max(pos2(r.min.x, r.max.y - t(pb)), r.max), 1));
+        out.push((Grip::Padding(3), Rect::from_min_max(r.min, pos2(r.min.x + t(pl), r.max.y)), 0));
+        out
+    }
+
+    /// The gap or padding handle (mid-band, as in Figma) under screen point `s`.
+    fn layout_grip_at(&self, s: Pos2) -> Option<Grip> {
+        self.layout_bands().into_iter().find_map(|(g, r, t)| {
+            let r = self.view.rect_to_screen(r);
+            let d = s - r.center();
+            (d[t].abs() <= (r.size()[t] / 2.0).max(4.0) && d[1 - t].abs() <= 10.0).then_some(g)
+        })
+    }
+
+    /// Hovering a selected auto layout frame's gap lights up every gap in pink with its size;
+    /// hovering a padding band lights up that band. Each shows a handle to drag.
+    fn draw_layout_spacing(&self, painter: &Painter, ptr: Option<Pos2>) {
+        let bands = self.layout_bands();
+        let hot = match &self.drag {
+            Some(Drag::LayoutSpacing { grip, .. }) => Some(*grip),
+            _ => ptr.and_then(|p| bands.iter().find(|(_, r, _)| self.view.rect_to_screen(*r).contains(p)).map(|(g, _, _)| *g)),
+        };
+        let Some(hot) = hot else { return };
+        let l = self.doc.node(self.sel[0]).layout;
+        for (g, r, t) in bands.iter().filter(|(g, _, _)| *g == hot) {
+            let r = self.view.rect_to_screen(*r);
+            painter.rect_filled(r, 0.0, GAP.gamma_multiply(0.2));
+            let mut half = Vec2::ZERO;
+            half[1 - t] = 6.0;
+            painter.line_segment([r.center() - half, r.center() + half], Stroke::new(2.0, GAP));
+            let v = match g {
+                Grip::Padding(side) => l.padding[*side],
+                _ => l.gap,
+            };
+            let mut at = r.center();
+            at[1 - t] += 16.0;
+            pill(painter, at, num(v), GAP);
+        }
+    }
+
+    /// `p` on whole pixels when snapping to the pixel grid (Shift Cmd '), else as is.
+    fn px(&self, p: Pos2) -> Pos2 {
+        if self.prefs.snap_to_pixels { p.round() } else { p }
+    }
+
+    fn px1(&self, v: f32) -> f32 {
+        if self.prefs.snap_to_pixels { v.round() } else { v }
     }
 
     // ---------- overlays ----------
@@ -1098,28 +1632,133 @@ impl App {
         }
     }
 
-    /// Collaborators' selections and cursors, in their colors.
+    /// Collaborators in their colors: selections with a name tag, text carets, and cursors
+    /// with their name or their cursor chat message.
     fn draw_peers(&self, painter: &Painter) {
         let Some(c) = &self.collab else { return };
+        let bubble = CornerRadius { nw: 2, ne: 14, sw: 14, se: 14 };
         for p in c.peers.values().filter(|p| p.page == self.page) {
-            let col = crate::collab::PEER_COLORS[p.color % crate::collab::PEER_COLORS.len()];
+            let col = crate::collab::peer_color(p.color);
+            let mut bounds: Option<Rect> = None;
             for id in &p.selection {
                 if let Some(n) = self.doc.nodes.get(id) {
                     let pts = n.corners().map(|q| self.view.to_screen(q)).to_vec();
                     painter.add(egui::Shape::closed_line(pts, Stroke::new(2.0, col)));
+                    let b = self.view.rect_to_screen(n.aabb());
+                    bounds = Some(bounds.map_or(b, |a| a.union(b)));
                 }
+            }
+            // Figma tags someone's selection with their name at its top-left corner.
+            if let Some(b) = bounds {
+                let g = painter.layout_no_wrap(p.name.clone(), FontId::proportional(10.0), Color32::WHITE);
+                let tag = Rect::from_min_size(b.left_top() - vec2(1.0, g.size().y + 5.0), g.size() + vec2(8.0, 4.0));
+                painter.rect_filled(tag, CornerRadius { nw: 3, ne: 3, sw: 0, se: 3 }, col);
+                painter.galley(tag.min + vec2(4.0, 2.0), g, Color32::WHITE);
+            }
+            if let Some((id, i)) = p.caret
+                && let Some(n) = self.doc.nodes.get(&id).filter(|n| n.kind == Kind::Text)
+            {
+                let zoom = self.view.zoom;
+                let galley = crate::text::align_rows(crate::text::layout(painter, n, zoom, Color32::BLACK).0, n, zoom);
+                let at = self.view.to_screen(n.rect.min + crate::text::draw_offset(n, galley.rows.len()));
+                let r = galley.pos_from_cursor(egui::text::CCursor::new(i.min(n.text.chars().count()))).translate(at.to_vec2());
+                painter.line_segment([r.left_top(), r.left_bottom()], Stroke::new(2.0, col));
             }
             if let Some(w) = p.cursor {
                 let s = self.view.to_screen(w);
                 let arrow = vec![s, s + vec2(0.0, 16.0), s + vec2(4.5, 12.0), s + vec2(8.0, 18.5), s + vec2(10.5, 17.3), s + vec2(7.2, 11.0), s + vec2(12.0, 11.0)];
                 painter.add(egui::Shape::convex_polygon(arrow[..3].to_vec(), col, Stroke::NONE));
                 painter.add(egui::Shape::closed_line(arrow, Stroke::new(1.5, col)));
-                let g = painter.layout_no_wrap(p.name.clone(), FontId::proportional(11.0), Color32::WHITE);
-                let pill = Rect::from_min_size(s + vec2(12.0, 18.0), g.size() + vec2(10.0, 4.0));
-                painter.rect_filled(pill, 4.0, col);
-                painter.galley(pill.min + vec2(5.0, 2.0), g, Color32::WHITE);
+                if let Some(msg) = p.chat.as_ref().filter(|m| !m.is_empty()) {
+                    let name = painter.layout_no_wrap(p.name.clone(), FontId::proportional(10.0), Color32::from_white_alpha(210));
+                    let g = painter.layout(msg.clone(), FontId::proportional(13.0), Color32::WHITE, 240.0);
+                    let (nh, size) = (name.size().y, vec2(g.size().x.max(name.size().x), name.size().y + g.size().y));
+                    let r = Rect::from_min_size(s + vec2(12.0, 18.0), size + vec2(20.0, 14.0));
+                    painter.rect_filled(r, bubble, col);
+                    painter.galley(r.min + vec2(10.0, 6.0), name, Color32::WHITE);
+                    painter.galley(r.min + vec2(10.0, 8.0 + nh), g, Color32::WHITE);
+                } else {
+                    let g = painter.layout_no_wrap(p.name.clone(), FontId::proportional(11.0), Color32::WHITE);
+                    let pill = Rect::from_min_size(s + vec2(12.0, 18.0), g.size() + vec2(10.0, 4.0));
+                    painter.rect_filled(pill, 4.0, col);
+                    painter.galley(pill.min + vec2(5.0, 2.0), g, Color32::WHITE);
+                }
             }
         }
+    }
+
+    /// A border in the leader's color and a pill while following someone (or spotlighting).
+    fn draw_follow(&self, painter: &Painter, rect: Rect) {
+        let Some(c) = &self.collab else { return };
+        let (text, col) = match self.following.and_then(|id| c.peers.get(&id)) {
+            Some(p) => (format!("Following {}", p.name), crate::collab::peer_color(p.color)),
+            None if c.me.spotlight => ("Spotlighting: others follow your view".to_string(), crate::collab::peer_color(c.me.color)),
+            None => return,
+        };
+        painter.rect_stroke(rect, 0.0, Stroke::new(3.0, col), StrokeKind::Inside);
+        let g = painter.layout_no_wrap(text, FontId::proportional(12.0), Color32::WHITE);
+        let pill = Rect::from_center_size(rect.center_top() + vec2(0.0, 24.0), g.size() + vec2(20.0, 8.0));
+        painter.rect_filled(pill, CornerRadius::same(10), col);
+        painter.galley(pill.center() - g.size() / 2.0, g, Color32::WHITE);
+    }
+
+    /// Figma's cursor chat ("/"): a message by your pointer that everyone in the session sees.
+    pub fn open_chat(&mut self, ctx: &egui::Context) {
+        let screen = self.canvas_rect.unwrap_or(Rect::ZERO);
+        let at = ctx.input(|i| i.pointer.hover_pos()).filter(|p| screen.contains(*p)).unwrap_or(screen.center());
+        self.chat = Some((String::new(), 0.0, at));
+        // The "/" that opened it isn't part of the message.
+        ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(t) if t == "/")));
+    }
+
+    /// The cursor chat bubble being typed in. It follows the pointer and fades out a few seconds
+    /// after the last keystroke; Escape or a click closes it, Enter starts a new message.
+    fn cursor_chat(&mut self, ui: &Ui, rect: Rect) {
+        const IDLE: f64 = 5.0;
+        let Some((mut text, mut t, mut at)) = self.chat.take() else { return };
+        let (now, hover, pressed, esc, enter) =
+            ui.input(|i| (i.time, i.pointer.hover_pos(), i.pointer.any_pressed(), i.key_pressed(Key::Escape), i.key_pressed(Key::Enter)));
+        if t == 0.0 {
+            t = now;
+        }
+        if esc || pressed || now - t > IDLE {
+            return;
+        }
+        if let Some(h) = hover.filter(|h| rect.contains(*h)) {
+            at = h;
+        }
+        let col = self.collab.as_ref().map_or(BLUE, |c| crate::collab::peer_color(c.me.color));
+        let fade = ((IDLE - (now - t)) as f32).min(1.0);
+        let font = FontId::proportional(13.0);
+        let shown = if text.is_empty() { "Say something".to_string() } else { text.clone() };
+        let width = ui.painter().layout_no_wrap(shown, font.clone(), Color32::WHITE).size().x.clamp(60.0, 240.0) + 4.0;
+        let edit = egui::Area::new(egui::Id::new("cursor-chat")).fixed_pos(at + vec2(14.0, 18.0)).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
+            egui::Frame::NONE.fill(col.gamma_multiply(fade)).corner_radius(CornerRadius { nw: 2, ne: 14, sw: 14, se: 14 }).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
+                egui::TextEdit::singleline(&mut text)
+                    .id(egui::Id::new("cursor-chat-text"))
+                    .frame(egui::Frame::NONE)
+                    .margin(egui::Margin::ZERO)
+                    .font(font)
+                    .text_color(Color32::WHITE.gamma_multiply(fade))
+                    .hint_text(egui::RichText::new("Say something").color(Color32::from_white_alpha(170)))
+                    .char_limit(crate::collab::CHAT_MAX)
+                    .desired_width(width)
+                    .show(ui)
+                    .response
+            })
+            .inner
+        });
+        let edit = edit.inner;
+        edit.request_focus();
+        if edit.changed() {
+            t = now;
+        }
+        if enter {
+            text.clear();
+            t = now;
+        }
+        self.chat = Some((text, t, at));
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
     }
 
     /// Prototype tab: the "+" circle on the right edge of a single selection.
@@ -1142,7 +1781,7 @@ impl App {
         for n in self.doc.nodes.values().filter(|n| !n.reactions.is_empty() && self.doc.page_of(n.id) == self.page) {
             let a = self.view.rect_to_screen(n.aabb());
             for r in &n.reactions {
-                if let crate::doc::Action::Navigate(t) | crate::doc::Action::OpenOverlay(t) = r.action
+                if let crate::doc::Action::Navigate(t) | crate::doc::Action::OpenOverlay(t) | crate::doc::Action::SwapOverlay(t) | crate::doc::Action::ChangeTo(t) | crate::doc::Action::ScrollTo(t) = r.action
                     && let Some(tn) = self.doc.nodes.get(&t) {
                         let b = self.view.rect_to_screen(tn.aabb());
                         noodle(pos2(a.max.x, a.center().y), pos2(b.min.x, b.center().y));
@@ -1192,8 +1831,12 @@ impl App {
             self.outline(painter, h, 2.0);
         }
         if self.vector_edit.is_some() {
-            self.draw_vector_edit(painter);
-            self.draw_pen(painter, ptr);
+            self.draw_vector_edit(painter, ptr);
+            if let (Some(Drag::PointMarquee { start, .. }), Some(p)) = (&self.drag, ptr) {
+                let r = Rect::from_two_pos(self.view.to_screen(*start), p);
+                painter.rect_filled(r, 0.0, BLUE.gamma_multiply(0.1));
+                painter.rect_stroke(r, 0.0, Stroke::new(1.0, BLUE), StrokeKind::Inside);
+            }
             return;
         }
         let roots = self.sel_roots();
@@ -1228,10 +1871,26 @@ impl App {
                 painter.galley(pill.min + vec2(4.0, 2.0), g, Color32::WHITE);
             }
         }
+        if self.editing_text.is_none() && self.tool.selects() && matches!(self.drag, None | Some(Drag::Spacing { .. } | Drag::Swap { .. })) {
+            self.draw_smart_selection(painter, ptr);
+        }
+        self.draw_gradient_handles(painter);
+        if self.editing_text.is_none() && self.tool.selects() && matches!(self.drag, None | Some(Drag::LayoutSpacing { .. })) {
+            self.draw_layout_spacing(painter, ptr);
+        }
         for g in &self.guides {
             painter.line_segment([self.view.to_screen(g[0]), self.view.to_screen(g[1])], Stroke::new(1.0, SNAP));
         }
-        if let (Some(Drag::Marquee { start, .. }), Some(p)) = (&self.drag, ptr) {
+        // Equal gaps: a pink span with end ticks and the gap size, as in Figma.
+        for [a, b] in &self.gap_marks {
+            let (sa, sb) = (self.view.to_screen(*a), self.view.to_screen(*b));
+            let t = (sb - sa).normalized().rot90() * 4.0;
+            for seg in [[sa, sb], [sa - t, sa + t], [sb - t, sb + t]] {
+                painter.line_segment(seg, Stroke::new(1.0, GAP));
+            }
+            pill(painter, sa.lerp(sb, 0.5) + t * 3.0, num(a.distance(*b)), GAP);
+        }
+        if let (Some(Drag::Marquee { start, .. } | Drag::Zoom { start }), Some(p)) = (&self.drag, ptr) {
             let r = Rect::from_two_pos(self.view.to_screen(*start), p);
             painter.rect_filled(r, 0.0, BLUE.gamma_multiply(0.1));
             painter.rect_stroke(r, 0.0, Stroke::new(1.0, BLUE), StrokeKind::Inside);
@@ -1267,9 +1926,9 @@ impl App {
         }
     }
 
-    /// Figma shows a pixel grid from 800% zoom.
+    /// Figma shows a pixel grid from 800% zoom (Cmd ' turns it off).
     fn draw_pixel_grid(&self, painter: &Painter, rect: Rect) {
-        if self.view.zoom < 8.0 {
+        if self.view.zoom < 8.0 || !self.prefs.pixel_grid {
             return;
         }
         let (a, b) = (self.view.to_world(rect.min), self.view.to_world(rect.max));
@@ -1326,16 +1985,100 @@ impl App {
             }
             let (sa, sb) = (v.to_screen(a), v.to_screen(b));
             painter.line_segment([sa, sb], Stroke::new(1.0, red));
-            let g = painter.layout_no_wrap(num(d), FontId::proportional(11.0), Color32::WHITE);
-            let pill = Rect::from_center_size(sa.lerp(sb, 0.5), g.size() + vec2(8.0, 4.0));
-            painter.rect_filled(pill, 2.0, red);
-            painter.galley(pill.min + vec2(4.0, 2.0), g, Color32::WHITE);
+            pill(painter, sa.lerp(sb, 0.5), num(d), red);
+        }
+    }
+
+    /// Dev Mode, hovering an auto layout frame: its padding and the gaps between children, shaded
+    /// pink with their sizes, as Figma shows them.
+    fn draw_dev_spacing(&self, painter: &Painter, id: NodeId) {
+        for (band, size) in spacing_bands(&self.doc, id) {
+            let sr = self.view.rect_to_screen(band);
+            painter.rect_filled(sr, 0.0, GAP.gamma_multiply(0.2));
+            painter.rect_stroke(sr, 0.0, Stroke::new(1.0, GAP.gamma_multiply(0.6)), StrokeKind::Inside);
+            pill(painter, sr.center(), num(size), GAP);
+        }
+    }
+
+    /// Dev Mode annotations: each note as a label to the right of its layer, joined by a leader line.
+    fn draw_annotations(&self, painter: &Painter) {
+        let stroke = Stroke::new(1.0, PURPLE);
+        for n in self.doc.nodes.values().filter(|n| !n.annotations.is_empty() && self.doc.page_of(n.id) == self.page) {
+            let r = self.view.rect_to_screen(n.aabb());
+            let mut y = r.min.y;
+            for note in &n.annotations {
+                let g = painter.layout(note.clone(), FontId::proportional(11.0), Color32::WHITE, 200.0);
+                let label = Rect::from_min_size(pos2(r.max.x + 32.0, y), g.size() + vec2(12.0, 8.0));
+                let from = pos2(r.max.x, r.center().y.clamp(r.min.y, r.max.y));
+                painter.line_segment([from, pos2(label.min.x, label.center().y)], stroke);
+                painter.circle_filled(from, 3.0, PURPLE);
+                painter.rect_filled(label, 4.0, PURPLE);
+                painter.galley(label.min + vec2(6.0, 4.0), g, Color32::WHITE);
+                y = label.max.y + 6.0;
+            }
+        }
+    }
+
+    /// The ruler under screen point `s`, as the axis of the guide it pulls out (top ruler: Y).
+    fn ruler_at(&self, s: Pos2) -> Option<Axis> {
+        let r = self.canvas_rect.filter(|_| self.rulers)?;
+        let (top, left) = (s.y < r.min.y + RULER, s.x < r.min.x + RULER);
+        match (top, left) {
+            (true, false) => Some(Axis::Y),
+            (false, true) => Some(Axis::X),
+            _ => None,
+        }
+    }
+
+    /// The ruler guide within grabbing distance of screen point `s` (move tool only).
+    fn guide_at(&self, s: Pos2) -> Option<usize> {
+        if !self.tool.selects() || self.vector_edit.is_some() {
+            return None;
+        }
+        self.doc.pages[self.page].guides.iter().position(|g| {
+            let at = self.view.to_screen(pos2(g.offset, g.offset));
+            match g.axis {
+                Axis::X => (at.x - s.x).abs() <= 3.0,
+                Axis::Y => (at.y - s.y).abs() <= 3.0,
+            }
+        })
+    }
+
+    pub fn delete_guide(&mut self) {
+        if let Some(i) = self.guide_sel.take().filter(|i| *i < self.doc.pages[self.page].guides.len()) {
+            self.checkpoint();
+            self.doc.pages[self.page].guides.remove(i);
+        }
+    }
+
+    pub fn remove_all_guides(&mut self) {
+        self.guide_sel = None;
+        if !self.doc.pages[self.page].guides.is_empty() {
+            self.checkpoint();
+            self.doc.pages[self.page].guides.clear();
+        }
+    }
+
+    /// Ruler guides: thin red lines across the canvas. The selected one is bolder and shows its
+    /// position next to the ruler.
+    fn draw_guides(&self, painter: &Painter, rect: Rect) {
+        for (i, g) in self.doc.pages[self.page].guides.iter().enumerate() {
+            let on = self.guide_sel == Some(i);
+            let at = self.view.to_screen(pos2(g.offset, g.offset));
+            let (line, label) = match g.axis {
+                Axis::X => ([pos2(at.x, rect.min.y), pos2(at.x, rect.max.y)], pos2(at.x, rect.min.y + RULER + 12.0)),
+                Axis::Y => ([pos2(rect.min.x, at.y), pos2(rect.max.x, at.y)], pos2(rect.min.x + RULER + 20.0, at.y)),
+            };
+            painter.line_segment(line, Stroke::new(if on { 1.5 } else { 1.0 }, SNAP));
+            if on {
+                pill(painter, label, num(g.offset), SNAP);
+            }
         }
     }
 
     /// Shift+R: top and left rulers with the selection's span highlighted.
     fn draw_rulers(&self, painter: &Painter, rect: Rect) {
-        const T: f32 = 20.0;
+        const T: f32 = RULER;
         let bg = painter.ctx().global_style().visuals.panel_fill.to_opaque();
         let line = crate::appearance::border(painter.ctx());
         let text = crate::appearance::muted(painter.ctx());
@@ -1378,21 +2121,38 @@ impl App {
 
     fn set_cursor(&self, ui: &Ui, ptr: Option<Pos2>, panning: bool) {
         let Some(p) = ptr.filter(|_| ui.ui_contains_pointer()) else { return };
+        let guide = match &self.drag {
+            Some(Drag::Guide { index }) => Some(*index),
+            None => self.guide_at(p),
+            _ => None,
+        };
+        let guide = guide.and_then(|i| self.doc.pages[self.page].guides.get(i)).map(|g| g.axis);
         let icon = if panning {
             if ui.input(|i| i.pointer.any_down()) { CursorIcon::Grabbing } else { CursorIcon::Grab }
+        } else if let Some(axis) = guide {
+            if axis == Axis::X { CursorIcon::ResizeHorizontal } else { CursorIcon::ResizeVertical }
         } else {
             match self.tool {
+                Tool::Move | Tool::Scale if self.gradient_hit(p).is_some() => CursorIcon::Grab,
                 Tool::Move | Tool::Scale => match self.handle_at(p) {
                     Some(Grip::Resize(-1, -1) | Grip::Resize(1, 1)) => CursorIcon::ResizeNwSe,
                     Some(Grip::Resize(1, -1) | Grip::Resize(-1, 1)) => CursorIcon::ResizeNeSw,
                     Some(Grip::Resize(_, 0)) => CursorIcon::ResizeHorizontal,
                     Some(Grip::Resize(0, _)) => CursorIcon::ResizeVertical,
                     Some(Grip::Rotate) => CursorIcon::Alias,
+                    Some(Grip::Spacing(0)) => CursorIcon::ResizeHorizontal,
+                    Some(Grip::Spacing(_)) => CursorIcon::ResizeVertical,
+                    Some(Grip::Swap(_)) => CursorIcon::Grab,
+                    Some(Grip::Gap) if self.sel.first().is_some_and(|&f| self.doc.node(f).layout.mode == LayoutMode::Vertical) => CursorIcon::ResizeVertical,
+                    Some(Grip::Gap | Grip::Padding(1 | 3)) => CursorIcon::ResizeHorizontal,
+                    Some(Grip::Padding(_)) => CursorIcon::ResizeVertical,
                     _ => CursorIcon::Default,
                 },
                 Tool::Text => CursorIcon::Text,
                 Tool::Comment => CursorIcon::Cell,
                 Tool::Hand => CursorIcon::Grab,
+                Tool::Zoom if ui.input(|i| i.modifiers.alt) => CursorIcon::ZoomOut,
+                Tool::Zoom => CursorIcon::ZoomIn,
                 _ => CursorIcon::Crosshair,
             }
         };
@@ -1436,7 +2196,7 @@ impl App {
         };
         let local = n.rect.min + crate::text::draw_offset(&n, galley.rows.len());
         let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
-            let g = ui.painter().layout_job(crate::text::job(ui.ctx(), &n, buf.as_str(), zoom, color));
+            let g = crate::text::lay(ui.painter(), &n, buf.as_str(), zoom, color);
             crate::text::align_rows(g, &n, zoom)
         };
         for (off, m) in crate::text::markers(&n, &galley, zoom) {
@@ -1447,21 +2207,22 @@ impl App {
             .fixed_pos(self.view.to_screen(local))
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut text)
-                        .id(egui::Id::new(TEXT_EDIT_ID))
-                        .layouter(&mut layouter)
-                        .frame(egui::Frame::NONE)
-                        .margin(egui::Margin::ZERO)
-                        .desired_width(width)
-                        .desired_rows(1),
-                )
+                egui::TextEdit::multiline(&mut text)
+                    .id(egui::Id::new(TEXT_EDIT_ID))
+                    .layouter(&mut layouter)
+                    .frame(egui::Frame::NONE)
+                    .margin(egui::Margin::ZERO)
+                    .desired_width(width)
+                    .desired_rows(1)
+                    .show(ui)
             })
             .inner;
+        self.caret = out.cursor_range.map(|r| r.primary.index.0);
         if self.focus_text {
-            out.request_focus();
+            out.response.request_focus();
             self.focus_text = false;
         }
+        self.link_popover(ui.ctx(), id, &out.galley, out.galley_pos);
         if text != n.text {
             let node = self.doc.node_mut(id);
             node.spans = crate::doc::shift_spans(&node.spans, &n.text, &text);
@@ -1472,6 +2233,58 @@ impl App {
             }
             node.text = text;
             self.dirty = true;
+        }
+    }
+
+    /// Cmd K while editing: a link field for the selected characters (showing their link, if any).
+    pub fn create_link(&mut self, ctx: &egui::Context) {
+        let (Some(id), Some((a, b))) = (self.editing_text, self.text_selection(ctx)) else { return };
+        let url = crate::doc::link_at(&self.doc.node(id).spans, a).map(|l| l.2).unwrap_or_default();
+        self.link_edit = Some((a, b, url));
+        self.focus_link = true;
+    }
+
+    /// Figma's link popover under the caret: the link there (open, edit, remove), or the field
+    /// for the link Cmd K is adding.
+    fn link_popover(&mut self, ctx: &egui::Context, id: NodeId, galley: &egui::Galley, origin: Pos2) {
+        let Some(caret) = egui::TextEdit::load_state(ctx, egui::Id::new(TEXT_EDIT_ID)).and_then(|s| s.cursor.char_range()).map(|r| r.primary.index) else { return };
+        let found = crate::doc::link_at(&self.doc.node(id).spans, caret.0);
+        let anchor = self.link_edit.as_ref().map(|e| e.0).or(found.as_ref().map(|l| l.0));
+        let Some(anchor) = anchor else { return };
+        let at = origin + galley.pos_from_cursor(egui::text::CCursor::new(anchor)).left_bottom().to_vec2() + vec2(0.0, 6.0);
+        let (mut apply, mut remove) = (None, None);
+        egui::Area::new(egui::Id::new("text-link")).fixed_pos(at).order(egui::Order::Foreground).show(ctx, |ui| {
+            crate::chrome::popover_frame(ui).inner_margin(8).show(ui, |ui| {
+                if let Some((a, b, url)) = &mut self.link_edit {
+                    let r = ui.add(egui::TextEdit::singleline(url).hint_text("Paste or type a link").desired_width(240.0));
+                    if std::mem::take(&mut self.focus_link) {
+                        r.request_focus();
+                    }
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        apply = Some((*a, *b, url.trim().to_string()));
+                    }
+                } else if let Some((a, b, url)) = &found {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Hyperlink::from_label_and_url(url.as_str(), url.as_str()).open_in_new_tab(true));
+                        if ui.small_button("Edit").clicked() {
+                            self.link_edit = Some((*a, *b, url.clone()));
+                            self.focus_link = true;
+                        }
+                        if ui.small_button("Remove link").clicked() {
+                            remove = Some((*a, *b));
+                        }
+                    });
+                }
+            });
+        });
+        // An empty field removes the link; a bare domain gets https, as in Figma.
+        let change = apply.map(|(a, b, url)| (a, b, if url.is_empty() || url.contains(':') { url } else { format!("https://{url}") })).or(remove.map(|(a, b)| (a, b, String::new())));
+        if let Some((a, b, url)) = change {
+            self.checkpoint();
+            let n = self.doc.node_mut(id);
+            n.spans = crate::doc::style_range(&n.spans, n.text.chars().count(), a, b, &crate::doc::SpanStyle { link: Some(url), ..Default::default() });
+            self.link_edit = None;
+            self.focus_text = true;
         }
     }
 
@@ -1525,44 +2338,153 @@ impl App {
         true
     }
 
+    /// Figma's text formatting shortcuts, while editing text or with text layers selected.
+    /// Returns whether one applied (the caller then drops the key's text and clipboard events).
+    pub fn text_shortcut(&mut self, ctx: &egui::Context, key: Key, m: egui::Modifiers, typing: bool) -> bool {
+        let Some(f) = text_fmt_key(key, m) else { return false };
+        // A panel field with focus keeps its keys; the canvas editor doesn't.
+        let editing = self.editing_text.is_some() && (!typing || ctx.memory(|mem| mem.has_focus(egui::Id::new(TEXT_EDIT_ID))));
+        let layers = !typing && self.sel.iter().any(|&i| self.doc.node(i).kind == Kind::Text);
+        (editing || layers) && self.format_text(ctx, f)
+    }
+
+    /// Apply a formatting command to the characters selected in the editor, else to the whole
+    /// edited or selected text layers. Toggles follow the first character or layer, as in Figma.
+    pub fn format_text(&mut self, ctx: &egui::Context, f: TextFmt) -> bool {
+        use crate::doc::{Decoration, LineHeight, SpanStyle};
+        let ids: Vec<NodeId> = match self.editing_text {
+            Some(id) => vec![id],
+            None => self.sel.iter().copied().filter(|&i| self.doc.node(i).kind == Kind::Text).collect(),
+        };
+        let Some(&first) = ids.first() else { return false };
+        let deco = |cur: Decoration, d: Decoration| if cur == d { Decoration::None } else { d };
+        if let (Some((a, b)), Some(id)) = (self.text_selection(ctx), self.editing_text) {
+            let n = self.doc.node(id);
+            let st = n.spans.iter().find(|sp| sp.start <= a && sp.end > a).map(|sp| sp.style.clone()).unwrap_or_default();
+            let family = st.font_family.clone().unwrap_or_else(|| n.font_family.clone());
+            let weight = st.font_weight.unwrap_or(n.font_weight);
+            let patch = match f {
+                TextFmt::Bold => Some(SpanStyle { font_weight: Some(bold_toggle(&family, weight)), ..Default::default() }),
+                TextFmt::Weight(d) => Some(SpanStyle { font_weight: Some(weight_step(&family, weight, d)), ..Default::default() }),
+                TextFmt::Italic => Some(SpanStyle { italic: Some(!st.italic.unwrap_or(n.italic)), ..Default::default() }),
+                TextFmt::Underline => Some(SpanStyle { decoration: Some(deco(st.decoration.unwrap_or(n.decoration), Decoration::Underline)), ..Default::default() }),
+                TextFmt::Strikethrough => Some(SpanStyle { decoration: Some(deco(st.decoration.unwrap_or(n.decoration), Decoration::Strikethrough)), ..Default::default() }),
+                TextFmt::Size(d) => Some(SpanStyle { font_size: Some((st.font_size.unwrap_or(n.font_size) + d).max(1.0)), ..Default::default() }),
+                // Alignment, letter spacing and line height belong to the whole layer here.
+                _ => None,
+            };
+            if let Some(p) = patch {
+                self.checkpoint();
+                let n = self.doc.node_mut(id);
+                n.spans = crate::doc::style_range(&n.spans, n.text.chars().count(), a, b, &p);
+                return true;
+            }
+        }
+        let n0 = self.doc.node(first).clone();
+        self.checkpoint();
+        for id in ids {
+            let n = self.doc.node_mut(id);
+            // Restyling a whole layer replaces that property's per-character overrides.
+            let clear = |n: &mut Node, f: fn(&mut SpanStyle)| {
+                n.spans.iter_mut().for_each(|sp| f(&mut sp.style));
+                n.spans.retain(|sp| !sp.style.is_empty());
+            };
+            match f {
+                TextFmt::Bold => {
+                    n.font_weight = bold_toggle(&n.font_family, if n0.font_weight >= 600 { 700 } else { 400 });
+                    clear(n, |s| s.font_weight = None);
+                }
+                TextFmt::Weight(d) => {
+                    n.font_weight = weight_step(&n.font_family, n.font_weight, d);
+                    clear(n, |s| s.font_weight = None);
+                }
+                TextFmt::Italic => {
+                    n.italic = !n0.italic;
+                    clear(n, |s| s.italic = None);
+                }
+                TextFmt::Underline | TextFmt::Strikethrough => {
+                    n.decoration = deco(n0.decoration, if f == TextFmt::Underline { Decoration::Underline } else { Decoration::Strikethrough });
+                    clear(n, |s| s.decoration = None);
+                }
+                TextFmt::Size(d) => {
+                    n.font_size = (n.font_size + d).max(1.0);
+                    for sp in &mut n.spans {
+                        sp.style.font_size = sp.style.font_size.map(|s| (s + d).max(1.0));
+                    }
+                }
+                TextFmt::Align(a) => n.text_align = a,
+                TextFmt::Letter(d) => n.letter_spacing += d,
+                TextFmt::Line(d) => {
+                    n.line_height = match n.line_height {
+                        LineHeight::Auto => LineHeight::Px((crate::text::line_pitch(n).round() + d).max(1.0)),
+                        LineHeight::Px(v) => LineHeight::Px((v + d).max(1.0)),
+                        LineHeight::Percent(p) => LineHeight::Percent((p + d).max(1.0)),
+                    }
+                }
+            }
+            // Changing a styled value by hand detaches the text style, like the panel.
+            if !matches!(f, TextFmt::Align(_)) {
+                n.text_style = None;
+            }
+        }
+        true
+    }
+
     pub fn context_menu(&mut self, ui: &mut Ui) {
         let has = !self.sel.is_empty();
         let ctx = ui.ctx().clone();
         let item = |ui: &mut Ui, label: &str, short: &str, enabled: bool| {
-            ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(short)).clicked()
+            ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(crate::chrome::keys(short))).clicked()
         };
         if item(ui, "Copy", "⌘C", has) {
             self.copy(&ctx);
             ui.close();
         }
         if item(ui, "Paste", "⌘V", true) {
-            // Reading the system clipboard goes through egui's paste event.
-            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+            self.paste_from_menu(&ctx, false);
             ui.close();
         }
         ui.add_enabled_ui(has, |ui| {
             ui.menu_button("Copy/Paste as", |ui| {
-                for (label, short, what) in [("Copy as PNG", "⇧⌘C", "png"), ("Copy as SVG", "", "svg"), ("Copy as CSS", "", "css")] {
-                    if ui.add(egui::Button::new(label).shortcut_text(short)).clicked() {
+                for (label, short, what) in [("Copy as PNG", "⇧⌘C", "png"), ("Copy as SVG", "", "svg"), ("Copy as CSS", "", "css"), ("Copy as code", "", "code")] {
+                    if ui.add(egui::Button::new(label).shortcut_text(crate::chrome::keys(short))).clicked() {
                         self.copy_as(&ctx, what);
                         ui.close();
                     }
                 }
                 ui.separator();
-                if ui.add(egui::Button::new("Copy properties").shortcut_text("⌥⌘C")).clicked() {
+                if ui.add(egui::Button::new("Copy properties").shortcut_text(crate::chrome::keys("⌥⌘C"))).clicked() {
                     self.style_clip = self.sel.first().map(|&id| self.doc.node(id).clone());
                     ui.close();
                 }
-                if ui.add_enabled(self.style_clip.is_some(), egui::Button::new("Paste properties").shortcut_text("⌥⌘V")).clicked() {
+                if ui.add_enabled(self.style_clip.is_some(), egui::Button::new("Paste properties").shortcut_text(crate::chrome::keys("⌥⌘V"))).clicked() {
                     self.paste_style();
                     ui.close();
                 }
-                if ui.add_enabled(self.clip_frag.is_some(), egui::Button::new("Paste to replace").shortcut_text("⇧⌘R")).clicked() {
+                if ui.add(egui::Button::new("Paste over selection").shortcut_text(crate::chrome::keys("⇧⌘V"))).clicked() {
+                    self.paste_from_menu(&ctx, true);
+                    ui.close();
+                }
+                if ui.add(egui::Button::new("Paste to replace").shortcut_text(crate::chrome::keys("⇧⌘R"))).clicked() {
                     self.paste_to_replace();
                     ui.close();
                 }
             });
         });
+        ui.separator();
+        let under = self.menu_at.map(|p| self.layers_at(p)).unwrap_or_default();
+        if under.len() > 1 {
+            ui.menu_button("Select layer", |ui| {
+                for id in under.into_iter().take(16) {
+                    let n = self.doc.node(id);
+                    let depth = self.doc.ancestors(id).len();
+                    if ui.selectable_label(self.sel == [id], format!("{}{}", "   ".repeat(depth.min(6)), n.name)).clicked() {
+                        self.sel = vec![id];
+                        ui.close();
+                    }
+                }
+            });
+        }
         if item(ui, "Select matching layers", "⌥⌘A", has) {
             self.select_matching();
             ui.close();
@@ -1606,13 +2528,21 @@ impl App {
                     (crate::doc::BoolOp::Intersect, "⌥⇧I"),
                     (crate::doc::BoolOp::Exclude, "⌥⇧E"),
                 ] {
-                    if ui.add(egui::Button::new(format!("{op:?} selection")).shortcut_text(short)).clicked() {
+                    if ui.add(egui::Button::new(format!("{op:?} selection")).shortcut_text(crate::chrome::keys(short))).clicked() {
                         self.boolean_selection(op);
                         ui.close();
                     }
                 }
             });
         });
+        let frames = has && self.sel.iter().all(|&s| self.doc.node(s).kind.is_frame() && self.doc.node(s).kind != Kind::Instance);
+        if frames {
+            let ready = self.doc.node(self.sel[0]).ready;
+            if item(ui, if ready { "Mark as changed" } else { "Mark as ready for dev" }, "", true) {
+                self.toggle_ready_for_dev();
+                ui.close();
+            }
+        }
         let comps = self.sel.len() > 1 && self.sel.iter().all(|&s| self.doc.node(s).kind == Kind::Component);
         if comps && item(ui, "Combine as variants", "", true) {
             self.combine_as_variants();
@@ -1627,12 +2557,20 @@ impl App {
             self.outline_stroke_selection();
             ui.close();
         }
+        if self.vector_edit.is_some() && item(ui, "Join selection", "⌘J", self.vector_edit.as_ref().is_some_and(|ve| ve.selected.len() == 2)) {
+            self.vector_join();
+            ui.close();
+        }
         if item(ui, "Flatten", "⌘E", has) {
             self.flatten_selection();
             ui.close();
         }
         if item(ui, "Frame selection", "⌥⌘G", has) {
             self.group_selection(true);
+            ui.close();
+        }
+        if item(ui, "Add auto layout", "⇧A", has) {
+            self.add_auto_layout();
             ui.close();
         }
         let container = self.sel.iter().any(|&s| self.doc.node(s).kind.is_container());
@@ -1658,7 +2596,7 @@ impl App {
             }
         }
         if let Some(inst) = one.and_then(|id| self.owning_instance(id)) {
-            if item(ui, "Go to main component", "", true) {
+            if item(ui, if self.main_is_remote(inst) { "Open library file" } else { "Go to main component" }, "", true) {
                 self.go_to_main(inst);
                 ui.close();
             }
@@ -1667,11 +2605,7 @@ impl App {
                     ui.close();
                 }
             });
-            if item(ui, "Reset instance", "", true) {
-                self.checkpoint();
-                self.doc.reset_instance(inst);
-                ui.close();
-            }
+            self.instance_menu(ui, inst);
             if item(ui, "Detach instance", "⌥⌘B", true) {
                 self.checkpoint();
                 self.doc.detach_instance(inst);
@@ -1687,7 +2621,179 @@ impl App {
             self.toggle_locked();
             ui.close();
         }
+        if has {
+            ui.separator();
+            if item(ui, "Flip horizontal", "⇧H", true) {
+                self.flip_selection(true);
+                ui.close();
+            }
+            if item(ui, "Flip vertical", "⇧V", true) {
+                self.flip_selection(false);
+                ui.close();
+            }
+            let pages: Vec<(usize, String)> = self.doc.pages.iter().enumerate().filter(|(i, p)| *i != self.page && !crate::panels::is_divider(&p.name)).map(|(i, p)| (i, p.name.clone())).collect();
+            if !pages.is_empty() {
+                ui.menu_button("Move to page", |ui| {
+                    for (i, name) in pages {
+                        if ui.button(name).clicked() {
+                            self.move_to_page(i);
+                            ui.close();
+                        }
+                    }
+                });
+            }
+        } else {
+            // Right-clicking empty canvas: page-wide commands, as in Figma.
+            if item(ui, "Lock all", "", true) {
+                self.lock_all(true);
+                ui.close();
+            }
+            if item(ui, "Unlock all", "", true) {
+                self.lock_all(false);
+                ui.close();
+            }
+            if item(ui, if self.ui_hidden { "Show UI" } else { "Hide UI" }, "⌘\\", true) {
+                self.ui_hidden = !self.ui_hidden;
+                ui.close();
+            }
+            if item(ui, if self.show_comments { "Hide comments" } else { "Show comments" }, "⇧C", true) {
+                self.show_comments = !self.show_comments;
+                ui.close();
+            }
+        }
+        if !self.doc.pages[self.page].guides.is_empty() {
+            ui.separator();
+            if item(ui, "Remove all guides", "", true) {
+                self.remove_all_guides();
+                ui.close();
+            }
+        }
     }
+}
+
+/// An auto layout frame's padding bands and the gaps between its flowing children, each with its
+/// size (world space; empty for other layers and rotated frames).
+pub fn spacing_bands(doc: &crate::doc::Document, id: NodeId) -> Vec<(Rect, f32)> {
+    let n = doc.node(id);
+    if n.layout.mode == crate::doc::LayoutMode::None || n.rotation != 0.0 {
+        return vec![];
+    }
+    let r = n.rect;
+    let [t, rt, b, l] = n.layout.padding;
+    let mut bands: Vec<(Rect, f32)> = vec![
+        (Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + t)), t),
+        (Rect::from_min_max(pos2(r.max.x - rt, r.min.y), r.max), rt),
+        (Rect::from_min_max(pos2(r.min.x, r.max.y - b), r.max), b),
+        (Rect::from_min_max(r.min, pos2(r.min.x + l, r.max.y)), l),
+    ];
+    let horizontal = n.layout.mode == crate::doc::LayoutMode::Horizontal;
+    let kids: Vec<Rect> = n.children.iter().map(|c| doc.node(*c)).filter(|c| c.visible && !c.absolute).map(|c| c.aabb()).collect();
+    let inner = Rect::from_min_max(r.min + vec2(l, t), r.max - vec2(rt, b));
+    for w in kids.windows(2) {
+        let gap = if horizontal {
+            Rect::from_min_max(pos2(w[0].max.x, inner.min.y), pos2(w[1].min.x, inner.max.y))
+        } else {
+            Rect::from_min_max(pos2(inner.min.x, w[0].max.y), pos2(inner.max.x, w[1].min.y))
+        };
+        bands.push((gap, if horizontal { gap.width() } else { gap.height() }));
+    }
+    bands.retain(|(b, s)| *s > 0.0 && b.is_positive());
+    bands
+}
+
+/// A small measurement label centered at `at`: white text on `fill`.
+fn pill(painter: &Painter, at: Pos2, text: String, fill: Color32) {
+    let g = painter.layout_no_wrap(text, FontId::proportional(11.0), Color32::WHITE);
+    let r = Rect::from_center_size(at, g.size() + vec2(8.0, 4.0));
+    painter.rect_filled(r, 2.0, fill);
+    painter.galley(r.min + vec2(4.0, 2.0), g, Color32::WHITE);
+}
+
+/// A text formatting command (Figma's Text menu and its shortcuts).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TextFmt {
+    Bold,
+    Italic,
+    Underline,
+    Strikethrough,
+    Align(crate::doc::TextAlign),
+    /// Font size, in px.
+    Size(f32),
+    /// Steps through the family's installed weights.
+    Weight(i32),
+    /// Letter spacing, in percent.
+    Letter(f32),
+    /// Line height, in px (or percent when set as one).
+    Line(f32),
+}
+
+/// Figma's Text menu, in groups: command, label, shortcut. Also searchable in quick actions.
+pub const TEXT_MENU: &[&[(TextFmt, &str, &str)]] = {
+    use crate::doc::TextAlign;
+    &[
+        &[(TextFmt::Bold, "Bold", "⌘B"), (TextFmt::Italic, "Italic", "⌘I"), (TextFmt::Underline, "Underline", "⌘U"), (TextFmt::Strikethrough, "Strikethrough", "⇧⌘X")],
+        &[
+            (TextFmt::Align(TextAlign::Left), "Text align left", "⌥⌘L"),
+            (TextFmt::Align(TextAlign::Center), "Text align center", "⌥⌘T"),
+            (TextFmt::Align(TextAlign::Right), "Text align right", "⌥⌘R"),
+            (TextFmt::Align(TextAlign::Justify), "Text align justified", "⌥⌘J"),
+        ],
+        &[
+            (TextFmt::Size(1.0), "Increase font size", "⇧⌘>"),
+            (TextFmt::Size(-1.0), "Decrease font size", "⇧⌘<"),
+            (TextFmt::Weight(1), "Increase font weight", "⌥⌘>"),
+            (TextFmt::Weight(-1), "Decrease font weight", "⌥⌘<"),
+            (TextFmt::Letter(1.0), "Increase letter spacing", "⌥>"),
+            (TextFmt::Letter(-1.0), "Decrease letter spacing", "⌥<"),
+            (TextFmt::Line(1.0), "Increase line height", "⌥⇧>"),
+            (TextFmt::Line(-1.0), "Decrease line height", "⌥⇧<"),
+        ],
+    ]
+};
+
+/// Figma's text shortcuts. "<" and ">" are the comma and period keys.
+pub fn text_fmt_key(key: Key, m: egui::Modifiers) -> Option<TextFmt> {
+    use crate::doc::TextAlign;
+    if m.ctrl && !m.command {
+        return None;
+    }
+    Some(match (m.command, m.shift, m.alt, key) {
+        (true, false, false, Key::B) => TextFmt::Bold,
+        (true, false, false, Key::I) => TextFmt::Italic,
+        (true, false, false, Key::U) => TextFmt::Underline,
+        (true, true, false, Key::X) => TextFmt::Strikethrough,
+        (true, false, true, Key::L) => TextFmt::Align(TextAlign::Left),
+        (true, false, true, Key::T) => TextFmt::Align(TextAlign::Center),
+        (true, false, true, Key::R) => TextFmt::Align(TextAlign::Right),
+        (true, false, true, Key::J) => TextFmt::Align(TextAlign::Justify),
+        (true, true, false, Key::Period) => TextFmt::Size(1.0),
+        (true, true, false, Key::Comma) => TextFmt::Size(-1.0),
+        (true, false, true, Key::Period) => TextFmt::Weight(1),
+        (true, false, true, Key::Comma) => TextFmt::Weight(-1),
+        (false, false, true, Key::Period) => TextFmt::Letter(1.0),
+        (false, false, true, Key::Comma) => TextFmt::Letter(-1.0),
+        (false, true, true, Key::Period) => TextFmt::Line(1.0),
+        (false, true, true, Key::Comma) => TextFmt::Line(-1.0),
+        _ => return None,
+    })
+}
+
+/// The installed weight nearest `w`.
+fn nearest_weight(family: &str, w: u16) -> u16 {
+    crate::text::weights_for(family).into_iter().min_by_key(|x| (*x as i32 - w as i32).abs()).unwrap_or(w)
+}
+
+/// Cmd B: bold text goes back to regular, anything lighter to bold.
+fn bold_toggle(family: &str, w: u16) -> u16 {
+    nearest_weight(family, if w >= 600 { 400 } else { 700 })
+}
+
+/// The next installed weight up or down.
+fn weight_step(family: &str, w: u16, d: i32) -> u16 {
+    let ws = crate::text::weights_for(family);
+    let cur = nearest_weight(family, w);
+    let i = ws.iter().position(|x| *x == cur).unwrap_or(0) as i32;
+    ws.get((i + d).clamp(0, ws.len() as i32 - 1) as usize).copied().unwrap_or(w)
 }
 
 /// Everything that affects a text layer's measured size, hashed.
@@ -1695,10 +2801,10 @@ fn text_key(ctx: &egui::Context, n: &Node) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::hash::DefaultHasher::new();
     n.text.hash(&mut h);
-    format!("{:?}", crate::text::font_family(ctx, &n.font_family, n.font_weight)).hash(&mut h);
-    (n.font_size.to_bits(), n.letter_spacing.to_bits(), n.text_sizing as u8, n.text_case as u8).hash(&mut h);
+    format!("{:?}", crate::text::font_family(ctx, &n.font_family, n.font_weight, n.italic)).hash(&mut h);
+    (n.font_size.to_bits(), n.letter_spacing.to_bits(), n.text_sizing as u8, n.text_case as u8, n.italic).hash(&mut h);
     format!("{:?}", n.line_height).hash(&mut h);
-    (n.truncate, n.max_lines, n.paragraph_spacing.to_bits()).hash(&mut h);
+    (n.truncate, n.max_lines, n.paragraph_spacing.to_bits(), n.paragraph_indent.to_bits(), n.vertical_trim).hash(&mut h);
     format!("{:?}", n.lists).hash(&mut h);
     if n.truncate && n.text_sizing == crate::doc::TextSizing::Fixed {
         n.rect.height().to_bits().hash(&mut h);
@@ -1727,6 +2833,11 @@ fn scale_props(n: &mut Node, k: f32) {
         s.blur *= k;
         s.spread *= k;
         s.offset *= k;
+        s.size *= k;
+        s.glass.depth *= k;
+        if let Some(p) = &mut s.progressive {
+            p.start_blur *= k;
+        }
     }
     n.layout.gap *= k;
     n.layout.padding.iter_mut().for_each(|p| *p *= k);
@@ -1771,6 +2882,93 @@ pub fn smooth_stroke(points: &[Pos2], tol: f32) -> Vec<PathPoint> {
             PathPoint { p, h_in: -t, h_out: t }
         })
         .collect()
+}
+
+/// The (first) gap between consecutive `items` along axis `a`.
+fn gap_of(items: &[(NodeId, Rect)], a: usize) -> f32 {
+    items.get(1).map_or(0.0, |n| n.1.min[a] - items[0].1.max[a])
+}
+
+/// A vector of length `v` along axis `a`.
+fn axis_vec(a: usize, v: f32) -> Vec2 {
+    let mut d = Vec2::ZERO;
+    d[a] = v;
+    d
+}
+
+/// Space `items` (in order, from their recorded rects) `g` apart along axis `a`, starting at `from`.
+fn lay_out(doc: &mut crate::doc::Document, a: usize, items: &[(NodeId, Rect)], from: f32, g: f32) {
+    let mut cursor = from;
+    for (id, r) in items {
+        doc.translate(*id, axis_vec(a, cursor - r.min[a]));
+        cursor += r.max[a] - r.min[a] + g;
+    }
+    doc.reflow();
+}
+
+/// Whether `r` and `s` overlap across axis `a`: in the same row (a = 0) or column (a = 1).
+fn across(r: Rect, s: Rect, a: usize) -> bool {
+    let b = 1 - a;
+    r.min[b] < s.max[b] && s.min[b] < r.max[b]
+}
+
+/// Adjacent pairs along axis `a` with empty space between them: each rect and its nearest
+/// neighbor after it in the same row or column.
+fn neighbors(rs: &[Rect], a: usize) -> Vec<(Rect, Rect)> {
+    rs.iter()
+        .filter_map(|p| {
+            let q = rs.iter().filter(|q| q.min[a] > p.max[a] && across(*p, **q, a)).min_by(|x, y| x.min[a].total_cmp(&y.min[a]))?;
+            Some((*p, *q))
+        })
+        .collect()
+}
+
+/// Equal-spacing snaps for `m` along axis `a`: corrections that put a masked edge one existing
+/// gap (between neighbors in its row) away from the nearest neighbor, or center `m` between
+/// its two neighbors. Each is (correction, gap).
+fn gap_snaps(m: Rect, sibs: &[Rect], a: usize, mask: [bool; 3]) -> Vec<(f32, f32)> {
+    let row: Vec<Rect> = sibs.iter().copied().filter(|s| across(m, *s, a)).collect();
+    let gaps: Vec<f32> = neighbors(&row, a).iter().map(|(p, q)| q.min[a] - p.max[a]).collect();
+    let c = m.center()[a];
+    let before = row.iter().filter(|s| s.max[a] <= c).max_by(|x, y| x.max[a].total_cmp(&y.max[a]));
+    let after = row.iter().filter(|s| s.min[a] >= c).min_by(|x, y| x.min[a].total_cmp(&y.min[a]));
+    let mut out = vec![];
+    if let (true, Some(l)) = (mask[0], before) {
+        out.extend(gaps.iter().map(|g| (l.max[a] + g - m.min[a], *g)));
+    }
+    if let (true, Some(r)) = (mask[2], after) {
+        out.extend(gaps.iter().map(|g| (r.min[a] - g - m.max[a], *g)));
+    }
+    if let (true, Some(l), Some(r)) = (mask[1], before, after) {
+        let g = (r.min[a] - l.max[a] - (m.max[a] - m.min[a])) / 2.0;
+        if g > 0.0 {
+            out.push((l.max[a] + g - m.min[a], g));
+        }
+    }
+    out
+}
+
+/// Every gap of size `g` along axis `a` in `m`'s row, as world segments across the gap.
+fn equal_gaps(m: Rect, sibs: &[Rect], a: usize, g: f32) -> Vec<[Pos2; 2]> {
+    let mut row: Vec<Rect> = sibs.iter().copied().filter(|s| across(m, *s, a)).collect();
+    row.push(m);
+    let b = 1 - a;
+    neighbors(&row, a)
+        .into_iter()
+        .filter(|(p, q)| (q.min[a] - p.max[a] - g).abs() < 0.5)
+        .map(|(p, q)| {
+            let mut s = p.max;
+            s[b] = (p.min[b].max(q.min[b]) + p.max[b].min(q.max[b])) / 2.0;
+            let mut e = s;
+            e[a] = q.min[a];
+            [s, e]
+        })
+        .collect()
+}
+
+/// Where `s` projects onto segment a-b, 0 at a and 1 at b.
+fn line_t(a: Pos2, b: Pos2, s: Pos2) -> f32 {
+    ((s - a).dot(b - a) / (b - a).length_sq().max(1e-6)).clamp(0.0, 1.0)
 }
 
 fn snap_angle(from: Pos2, to: Pos2) -> Pos2 {

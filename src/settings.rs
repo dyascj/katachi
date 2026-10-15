@@ -18,11 +18,19 @@ pub struct Prefs {
     pub nudge: f32,
     pub big_nudge: f32,
     pub check_updates: bool,
+    /// Linux: the desktop's own title bar above the tabs instead of tabs in the title bar.
+    pub system_title_bar: bool,
+    /// Shift ': the pixel grid at 800% zoom and above.
+    pub pixel_grid: bool,
+    /// Shift Cmd ': positions and sizes round to whole pixels.
+    pub snap_to_pixels: bool,
+    /// Pencil: how far (screen points) a stroke may stray from the raw pointer path when simplified.
+    pub pencil_smoothing: f32,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { name: String::new(), snap_to_objects: true, highlight_on_hover: true, keep_tool_selected: false, show_dimensions: true, nudge: 1.0, big_nudge: 10.0, check_updates: true }
+        Prefs { name: String::new(), snap_to_objects: true, highlight_on_hover: true, keep_tool_selected: false, show_dimensions: true, nudge: 1.0, big_nudge: 10.0, check_updates: true, system_title_bar: false, pixel_grid: true, snap_to_pixels: true, pencil_smoothing: 1.5 }
     }
 }
 
@@ -35,6 +43,10 @@ pub fn load() -> Prefs {
 }
 
 pub fn save(p: &Prefs) {
+    // Tests share one data folder and run in parallel: keep each one's preferences to itself.
+    if cfg!(test) {
+        return;
+    }
     let _ = crate::files::write_atomic(&path(), serde_json::to_string_pretty(p).unwrap_or_default().as_bytes());
 }
 
@@ -65,25 +77,43 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Frame, Section, Slice", "F or A, ⇧ S, S"),
     ("Rectangle, Line, Arrow, Ellipse", "R, L, ⇧ L, O"),
     ("Pen, Pencil, Text, Comment", "P, ⇧ P, T, C"),
+    ("Vector edit: move, pen, cut, join, bend", "V, P, Y, ⌘ J, ⌘ drag"),
     ("Undo, redo", "⌘ Z, ⇧ ⌘ Z"),
     ("Copy, paste, cut, duplicate", "⌘ C, ⌘ V, ⌘ X, ⌘ D"),
+    ("Paste over selection, paste to replace", "⇧ ⌘ V, ⇧ ⌘ R"),
     ("Copy and paste properties", "⌥ ⌘ C, ⌥ ⌘ V"),
+    ("Select all, inverse, matching layers", "⌘ A, ⇧ ⌘ A, ⌥ ⌘ A"),
     ("Group, frame selection, ungroup", "⌘ G, ⌥ ⌘ G, ⇧ ⌘ G"),
     ("Auto layout, remove auto layout", "⇧ A, ⌥ ⇧ A"),
     ("Create component, detach instance", "⌥ ⌘ K, ⌥ ⌘ B"),
     ("Union, subtract, intersect, exclude", "⌥ ⇧ U, S, I, E"),
     ("Flatten, use as mask", "⌘ E, ⌃ ⌘ M"),
+    ("Resize to fit", "⌥ ⇧ ⌘ R"),
     ("Bring forward, send backward", "⌘ ], ⌘ ["),
     ("Bring to front, send to back", "⌥ ⌘ ], ⌥ ⌘ ["),
     ("Flip horizontal, vertical", "⇧ H, ⇧ V"),
+    ("Pick color (eyedropper)", "I"),
+    ("Swap fill and stroke", "⇧ X"),
+    ("Opacity 10% to 100%, exact (e.g. 4 5)", "1 to 9, 0"),
     ("Distribute, tidy up", "⌃ ⌥ H / V, ⌃ ⌥ T"),
     ("Show or hide, lock", "⇧ ⌘ H, ⇧ ⌘ L"),
+    ("Rename layers (several: batch rename)", "⌘ R"),
     ("Next and previous layer, select parent", "Tab, ⇧ Tab, ⇧ ↵"),
     ("Zoom to fit, 100%, selection", "⇧ 1, ⇧ 0, ⇧ 2"),
+    ("Zoom tool, next and previous frame", "Z, N, ⇧ N"),
     ("Rulers, layout guides, hide UI, outline", "⇧ R, ⌃ G, ⌘ \\, ⌘ Y"),
+    ("Pixel grid, snap to pixel grid", "⇧ ', ⇧ ⌘ '"),
     ("Dev Mode, present", "⇧ D, ⌥ ⌘ ↵"),
-    ("Save, open, place image, export", "⌘ S, ⌘ O, ⇧ ⌘ K, ⇧ ⌘ E"),
+    ("Save, open, place image, export dialog", "⌘ S, ⌘ O, ⇧ ⌘ K, ⇧ ⌘ E"),
+    ("Bold, italic, underline, strikethrough", "⌘ B, ⌘ I, ⌘ U, ⇧ ⌘ X"),
+    ("Text align left, center, right, justified", "⌥ ⌘ L, T, R, J"),
+    ("Font size, font weight", "⇧ ⌘ < / >, ⌥ ⌘ < / >"),
+    ("Letter spacing, line height", "⌥ < / >, ⌥ ⇧ < / >"),
+    ("Bulleted and numbered list", "⇧ ⌘ 8, ⇧ ⌘ 7"),
+    ("Link the selected text (while editing)", "⌘ K"),
     ("Find and replace", "⌘ F"),
+    ("Cursor chat (Esc closes it)", "/"),
+    ("Stop following a collaborator", "Esc"),
     ("Next and previous tab, close tab", "⌃ Tab, ⌃ ⇧ Tab, ⌘ W"),
     ("Settings", "⌘ ,"),
 ];
@@ -131,6 +161,13 @@ impl App {
         self.settings_tab = Some(tab);
     }
 
+    /// Flip a canvas preference from a shortcut or menu, and remember it.
+    pub fn toggle_pref(&mut self, f: fn(&mut Prefs) -> &mut bool) {
+        let on = f(&mut self.prefs);
+        *on = !*on;
+        save(&self.prefs);
+    }
+
     /// The Settings modal. Returns whether appearance changed (so the caller re-applies it).
     pub fn settings_window(&mut self, ctx: &egui::Context) {
         let Some(mut tab) = self.settings_tab else { return };
@@ -173,7 +210,18 @@ impl App {
                         ui.set_width(size.x - 64.0);
                         match tab {
                             Tab::Account => self.account_tab(ui),
-                            Tab::Appearance => appearance_tab(ui, &mut self.appearance),
+                            Tab::Appearance => {
+                                appearance_tab(ui, &mut self.appearance);
+                                if cfg!(target_os = "linux") {
+                                    section(ui, "Window");
+                                    row(ui, "Use the system title bar", "Your desktop's title bar above the tabs, instead of tabs in the title bar", |ui| {
+                                        toggle(ui, &mut self.prefs.system_title_bar);
+                                    });
+                                    if self.prefs.system_title_bar != crate::shell::uses_system_title_bar() {
+                                        ui.label(RichText::new("Restart Katachi to switch title bars.").color(crate::appearance::muted(ui.ctx())));
+                                    }
+                                }
+                            }
                             Tab::Canvas => canvas_tab(ui, &mut self.prefs),
                             Tab::Plugins => self.plugins_tab(ui),
                             Tab::Agents => self.agents_tab(ui),
@@ -212,7 +260,7 @@ impl App {
         theme_row(ui, &mut self.appearance);
         section(ui, "Files");
         row(ui, "Data folder", "Autosaves, recent files, thumbnails and plugins", |ui| {
-            if ui.button("Show in Finder").clicked() {
+            if ui.button(if cfg!(target_os = "macos") { "Show in Finder" } else { "Show in folder" }).clicked() {
                 crate::plugin_view::open_url(&crate::files::data_dir().display().to_string());
             }
         });
@@ -289,9 +337,13 @@ impl App {
         row(ui, "Version", "", |ui| {
             ui.label(env!("CARGO_PKG_VERSION"));
         });
-        row(ui, "Check for updates automatically", "When one is out, Update now appears at the top left", |ui| {
-            toggle(ui, &mut self.prefs.check_updates);
-        });
+        if let Some(why) = crate::update::managed() {
+            row(ui, "Updates", why, |_| {});
+        } else {
+            row(ui, "Check for updates automatically", "When one is out, Update now appears at the top left", |ui| {
+                toggle(ui, &mut self.prefs.check_updates);
+            });
+        }
         row(ui, "Release notes", "What changed in each version", |ui| {
             if ui.button("Open").clicked() {
                 ui.ctx().open_url(egui::OpenUrl::new_tab("https://github.com/dyascj/katachi/releases"));
@@ -328,6 +380,9 @@ fn appearance_tab(ui: &mut Ui, a: &mut crate::appearance::Appearance) {
     row(ui, "Glass panels", "Translucent side panels over a blurred desktop. The canvas and popovers stay solid.", |ui| {
         toggle(ui, &mut a.glass);
     });
+    if a.glass && !a.glass_on() {
+        ui.label(RichText::new("Restart Katachi to turn glass on.").color(crate::appearance::muted(ui.ctx())));
+    }
     ui.add_enabled_ui(a.glass, |ui| {
         let mut pct = (a.panel_opacity * 100.0).round();
         row(ui, "Panel opacity", "", |ui| {
@@ -371,6 +426,15 @@ fn canvas_tab(ui: &mut Ui, p: &mut Prefs) {
     row(ui, "Snap to objects", "Smart guides to other layers' edges and centers", |ui| {
         toggle(ui, &mut p.snap_to_objects);
     });
+    row(ui, "Snap to pixel grid", "Positions and sizes land on whole pixels", |ui| {
+        toggle(ui, &mut p.snap_to_pixels);
+    });
+    row(ui, "Pixel grid", "Show pixel boundaries at 800% zoom and above", |ui| {
+        toggle(ui, &mut p.pixel_grid);
+    });
+    row(ui, "Pencil smoothing", "Higher makes freehand strokes smoother, with fewer points", |ui| {
+        ui.add(egui::Slider::new(&mut p.pencil_smoothing, 0.5..=10.0).show_value(false));
+    });
     section(ui, "Nudge amount");
     row(ui, "Small nudge", "Arrow keys", |ui| {
         ui.add(egui::DragValue::new(&mut p.nudge).range(0.01..=100.0).speed(0.1));
@@ -385,7 +449,7 @@ fn shortcuts_tab(ui: &mut Ui) {
     let muted = crate::appearance::muted(ui.ctx());
     for (what, keys) in SHORTCUTS {
         row(ui, what, "", |ui| {
-            ui.label(RichText::new(*keys).color(muted).monospace());
+            ui.label(RichText::new(crate::chrome::keys(keys)).color(muted));
         });
     }
 }

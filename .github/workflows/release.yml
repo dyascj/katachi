@@ -46,21 +46,52 @@ jobs:
         with:
           files: Katachi-windows.zip
 
+  # Built on AlmaLinux 8 (glibc 2.28) so one binary runs on RHEL 8+, Debian 11+, Ubuntu 20.04+,
+  # Fedora, Arch, and the rest. Everything graphical is loaded at runtime, so nothing else links.
   linux:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - name: Build on glibc 2.28
+        run: |
+          docker run --rm -v "$PWD":/src -w /src almalinux:8 bash -euc '
+            dnf install -y -q gcc gcc-c++ make perl
+            curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal
+            . "$HOME/.cargo/env"
+            cargo build --release
+            chown -R '"$(id -u):$(id -g)"' target'
+      - name: Check the glibc floor
+        run: |
+          need=$(objdump -T target/release/katachi | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
+          echo "Needs $need"
+          [ "$(printf '%s\nGLIBC_2.28\n' "$need" | sort -V | tail -1)" = GLIBC_2.28 ] || { echo "::error::binary needs $need"; exit 1; }
+      - name: Runs on old and new distributions
+        run: |
+          imgs="debian:11 ubuntu:20.04 rockylinux:8 fedora:latest opensuse/leap:15.6"
+          # Arch publishes x86_64 images only.
+          [ "${{ matrix.arch }}" = x86_64 ] && imgs="$imgs archlinux:latest"
+          for img in $imgs; do
+            docker run --rm -v "$PWD/target/release:/k:ro" "$img" /k/katachi --version
+          done
+      - name: Starts and draws a window
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q xvfb mesa-vulkan-drivers libgl1-mesa-dri libegl1 libxkbcommon-x11-0
+          KATACHI_NO_UPDATE=1 KATACHI_SCREENSHOT="$PWD/shot.png" timeout 120 xvfb-run -a -s "-screen 0 1440x900x24" target/release/katachi
+          test -s shot.png
       - name: Package
         run: |
-          cargo build --release
-          mkdir -p dist/katachi
-          cp target/release/katachi scripts/linux-install.sh assets/icon/icon.png LICENSE dist/katachi/
-          tar -czf Katachi-linux-x86_64.tar.gz -C dist katachi
+          sudo apt-get install -y -q rpm
+          scripts/linux-package.sh target/release/katachi ${{ matrix.arch }} dist
       - uses: softprops/action-gh-release@v2
         with:
-          files: Katachi-linux-x86_64.tar.gz
+          files: dist/*
 
   # Sign every asset so the in-app updater can check downloads against the key built into Katachi.
   sign:

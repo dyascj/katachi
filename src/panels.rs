@@ -31,6 +31,8 @@ pub enum Icon {
     ArrowRight,
     /// Auto layout wrap: across, then back on the next row.
     Wrap,
+    /// Grid auto layout: a 2x2 of cells.
+    Grid,
     Opacity,
     Radius,
     PadH,
@@ -53,6 +55,9 @@ pub enum Icon {
     Detach,
     Comment,
     Close,
+    Eyedropper,
+    /// Figma's hexagon "Apply variable".
+    Variable,
 }
 
 use crate::appearance as theme;
@@ -74,8 +79,43 @@ pub const TOOL_GROUPS: [&[(Tool, Icon, &str)]; 6] = [
     &[(Tool::Comment, Icon::Comment, "Comment  C")],
 ];
 
-/// Drag payload: a main component dragged from the Assets tab.
-pub struct AssetDrag(pub NodeId);
+/// Drag payload: a main component dragged from the Assets tab, and its library's id if it's
+/// from one (its id is then the library's).
+pub struct AssetDrag(pub NodeId, pub Option<String>);
+
+/// A component's preview, re-rendered when its content changes. Each tile re-checks its
+/// content every 30 frames (staggered), so a big library costs little per frame.
+fn thumb(ctx: &egui::Context, cache: &mut std::collections::HashMap<(String, NodeId), (u64, egui::TextureHandle)>, doc: &crate::doc::Document, lib: &str, id: NodeId, budget: &mut usize) -> Option<egui::TextureHandle> {
+    use std::hash::{Hash, Hasher};
+    let due = (ctx.cumulative_frame_nr() + id) % 30 == 0;
+    let k = (lib.to_string(), id);
+    if let Some((_, tex)) = cache.get(&k)
+        && (!due || *budget == 0)
+    {
+        return Some(tex.clone());
+    }
+    let mut h = std::hash::DefaultHasher::new();
+    for n in std::iter::once(id).chain(doc.descendants(id)) {
+        serde_json::to_vec(&*doc.nodes[&n]).unwrap_or_default().hash(&mut h);
+    }
+    let key = h.finish();
+    if let Some((old, tex)) = cache.get(&k)
+        && *old == key
+    {
+        return Some(tex.clone());
+    }
+    if *budget == 0 {
+        return None;
+    }
+    *budget -= 1;
+    let b = crate::export::export_bounds(doc, &[id]);
+    let scale = (128.0 / b.width().max(b.height()).max(1.0)).min(4.0);
+    let svg = crate::export::to_svg(doc, &[id]);
+    let (px, [w, hgt]) = crate::export::rasterize(&svg, scale)?;
+    let tex = ctx.load_texture(format!("asset-{lib}-{id}"), egui::ColorImage::from_rgba_premultiplied([w, hgt], &px), egui::TextureOptions::LINEAR);
+    cache.insert(k, (key, tex.clone()));
+    Some(tex)
+}
 
 pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
     let s = Stroke::new(1.2, color);
@@ -211,6 +251,11 @@ pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
             p.line_segment([at(-5., 3.), at(-2., 0.)], s);
             p.line_segment([at(-5., 3.), at(-2., 6.)], s);
         }
+        Icon::Grid => {
+            for (x, y) in [(-3.5, -3.5), (3.5, -3.5), (-3.5, 3.5), (3.5, 3.5)] {
+                p.rect_stroke(Rect::from_center_size(at(x, y), vec2(5.0, 5.0)), 1.0, s, egui::StrokeKind::Middle);
+            }
+        }
         Icon::Opacity => {
             p.circle_stroke(c, 5.0, s);
             let half: Vec<Pos2> = (0..=12).map(|i| {
@@ -299,6 +344,12 @@ pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
             p.line_segment([at(6., -6.), at(2., -6.)], s);
             p.line_segment([at(6., -6.), at(6., -2.)], s);
         }
+        Icon::Eyedropper => {
+            p.line_segment([at(-5., 5.), at(2.5, -2.5)], Stroke::new(2.0, color));
+            p.line_segment([at(-6., 6.), at(-5., 5.)], s);
+            p.circle_filled(at(3.8, -3.8), 2.4, color);
+            p.line_segment([at(0.5, -4.5), at(4.5, -0.5)], s);
+        }
         Icon::Close => {
             p.line_segment([at(-4., -4.), at(4., 4.)], s);
             p.line_segment([at(4., -4.), at(-4., 4.)], s);
@@ -316,6 +367,10 @@ pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
             p.line_segment([at(-6., 2.), at(-2., -2.)], s);
             p.line_segment([at(2., 2.), at(6., -2.)], s);
             p.line_segment([at(-1., -5.), at(1., 5.)], Stroke::new(1.0, color.gamma_multiply(0.7)));
+        }
+        Icon::Variable => {
+            let pts: Vec<Pos2> = (0..6).map(|i| c + egui::Vec2::angled((i as f32 * 60.0 + 30.0).to_radians()) * 6.0).collect();
+            p.add(Shape::closed_line(pts, s));
         }
         Icon::Play => {
             p.add(Shape::convex_polygon(vec![at(-3.5, -5.), at(5., 0.), at(-3.5, 5.)], color, Stroke::NONE));
@@ -351,7 +406,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, selected: bool, size: f32, tip: &str
     };
     ui.painter().rect_filled(rect, 5.0, bg);
     paint_icon(ui.painter(), rect, icon, fg);
-    if tip.is_empty() { resp } else { resp.on_hover_text(tip) }
+    if tip.is_empty() { resp } else { resp.on_hover_text(crate::chrome::keys(tip)) }
 }
 
 fn kind_icon(k: Kind) -> Icon {
@@ -448,14 +503,65 @@ fn sizing_menu(ui: &mut Ui, id: egui::Id, mode: &mut Sizing, can_hug: bool, can_
     changed
 }
 
+/// One export preset row: Figma's size field (type "2x", "1.5", "512w" or "512h", or pick
+/// one), suffix, format, and JPG quality. Returns true when its remove button was clicked.
+fn export_row(ui: &mut Ui, id: egui::Id, p: &mut crate::doc::ExportSetting, removable: bool) -> bool {
+    use crate::doc::ExportFormat;
+    let mut remove = false;
+    ui.horizontal(|ui| {
+        if p.format.raster() {
+            let tid = id.with("size");
+            let mut text = ui.data(|d| d.get_temp::<String>(tid)).unwrap_or_else(|| p.size_label());
+            let r = ui.add(egui::TextEdit::singleline(&mut text).id(tid).desired_width(40.0)).on_hover_text("Scale (2x), width (512w) or height (512h)");
+            if r.has_focus() {
+                ui.data_mut(|d| d.insert_temp(tid, text));
+            } else {
+                if r.lost_focus() {
+                    p.set_size(&text);
+                }
+                ui.data_mut(|d| d.remove::<String>(tid));
+            }
+            let m = icon_button(ui, Icon::Chevron(true), false, 16.0, "Export size");
+            egui::Popup::menu(&m).id(id.with("sizes")).style(crate::chrome::menu_style).show(|ui| {
+                for v in ["0.5x", "0.75x", "1x", "1.5x", "2x", "3x", "4x", "512w", "512h"] {
+                    if ui.selectable_label(p.size_label() == v, v).clicked() {
+                        p.set_size(v);
+                    }
+                }
+            });
+        }
+        if removable {
+            ui.add(egui::TextEdit::singleline(&mut p.suffix).hint_text("Suffix").desired_width(52.0));
+        }
+        egui::ComboBox::from_id_salt(id.with("fmt")).width(56.0).selected_text(p.format.ext().to_uppercase()).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+            for k in ExportFormat::ALL {
+                ui.selectable_value(&mut p.format, k, k.ext().to_uppercase());
+            }
+        });
+        if removable {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                remove = icon_button(ui, Icon::Minus, false, 20.0, "Remove").clicked();
+            });
+        }
+    });
+    if p.format == ExportFormat::Jpg {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Quality").small());
+            ui.add(egui::Slider::new(&mut p.quality, 1..=100).suffix("%"));
+        });
+    }
+    remove
+}
+
 /// 3x3 alignment picker for auto layout (rows = vertical, columns = horizontal position).
 fn align_grid(ui: &mut Ui, l: &mut AutoLayout) {
     let (rect, resp) = ui.allocate_exact_size(vec2(64.0, 64.0), Sense::click());
     let p = ui.painter();
     p.rect_filled(rect, 4.0, theme::subtle(ui.ctx()));
-    let h = l.mode == LayoutMode::Horizontal;
+    // Grids align their children in each cell like a horizontal layout: main = x, cross = y.
+    let h = l.mode != LayoutMode::Vertical;
     let idx = |a: AxisAlign| match a {
-        AxisAlign::Min => 0,
+        AxisAlign::Min | AxisAlign::Baseline => 0,
         AxisAlign::Center => 1,
         AxisAlign::Max => 2,
     };
@@ -500,6 +606,122 @@ fn section_title(ui: &mut Ui, title: &str) -> bool {
     add
 }
 
+/// A name field that commits on Enter or blur, for renames that move rows around (a folder or
+/// group renamed per keystroke would lose its field mid-word). Returns the new text once.
+pub fn commit_field(ui: &mut Ui, id: egui::Id, current: &str, width: f32, framed: bool) -> Option<String> {
+    let mut buf: String = ui.data(|d| d.get_temp(id)).unwrap_or_else(|| current.to_string());
+    let mut field = egui::TextEdit::singleline(&mut buf).id(id).desired_width(width);
+    if !framed {
+        field = field.frame(egui::Frame::NONE);
+    }
+    let r = ui.add(field);
+    if r.has_focus() {
+        ui.data_mut(|d| d.insert_temp(id, buf.clone()));
+    } else {
+        ui.data_mut(|d| d.remove::<String>(id));
+    }
+    (r.lost_focus() && buf != current).then_some(buf)
+}
+
+/// One layout guide's settings (type, count or size, gutter, margin, color).
+fn grid_editor(ui: &mut Ui, id: egui::Id, g: &mut crate::doc::LayoutGrid) {
+    use crate::doc::{GridAlign, GridKind};
+    ui.horizontal(|ui| {
+        for k in [GridKind::Grid, GridKind::Columns, GridKind::Rows] {
+            ui.selectable_value(&mut g.kind, k, format!("{k:?}"));
+        }
+    });
+    egui::Grid::new(id.with("fields")).num_columns(2).show(ui, |ui| {
+        if g.kind == GridKind::Grid {
+            ui.label("Size");
+            ui.add(DragValue::new(&mut g.size).range(1.0..=1000.0));
+            ui.end_row();
+        } else {
+            ui.label("Count");
+            ui.add(DragValue::new(&mut g.count).range(1..=100));
+            ui.end_row();
+            // Figma names the alignments by side: Left/Right for columns, Top/Bottom for rows.
+            let cols = g.kind == GridKind::Columns;
+            let name = |a: GridAlign| match a {
+                GridAlign::Stretch => "Stretch",
+                GridAlign::Center => "Center",
+                GridAlign::Min if cols => "Left",
+                GridAlign::Min => "Top",
+                GridAlign::Max if cols => "Right",
+                GridAlign::Max => "Bottom",
+            };
+            ui.label("Type");
+            dropdown(ui, name(g.align), |ui| {
+                for a in [GridAlign::Stretch, GridAlign::Min, GridAlign::Center, GridAlign::Max] {
+                    ui.selectable_value(&mut g.align, a, name(a));
+                }
+            });
+            ui.end_row();
+            if g.align != GridAlign::Stretch {
+                ui.label(if cols { "Width" } else { "Height" });
+                ui.add(DragValue::new(&mut g.size).range(1.0..=10000.0));
+                ui.end_row();
+            }
+            ui.label("Gutter");
+            ui.add(DragValue::new(&mut g.gutter).range(0.0..=1000.0));
+            ui.end_row();
+            // Centered tracks have no offset in Figma.
+            if g.align != GridAlign::Center {
+                ui.label(if g.align == GridAlign::Stretch { "Margin" } else { "Offset" });
+                ui.add(DragValue::new(&mut g.margin).range(-1000.0..=1000.0));
+                ui.end_row();
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        hex_field(ui, id.with("color"), &mut g.color, 56.0);
+        crate::paint_ui::alpha_field(ui, &mut g.color);
+    });
+}
+
+/// A text style's typography: family, weight, size, line height, letter spacing.
+fn text_style_editor(ui: &mut Ui, id: egui::Id, t: &mut crate::doc::TextStyle) {
+    use crate::doc::LineHeight;
+    use crate::text::{families, weight_name, weights_for};
+    egui::ComboBox::from_id_salt(id.with("family")).selected_text(&t.font_family).width(200.0).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+        for f in families() {
+            ui.selectable_value(&mut t.font_family, f.clone(), f);
+        }
+    });
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt(id.with("weight")).selected_text(weight_name(t.font_weight)).width(110.0).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+            for w in weights_for(&t.font_family) {
+                ui.selectable_value(&mut t.font_weight, w, weight_name(w));
+            }
+        });
+        ui.add(DragValue::new(&mut t.font_size).range(1.0..=1000.0).speed(0.2).custom_formatter(|v, _| num(v as f32)));
+    });
+    ui.horizontal(|ui| {
+        ui.label("Line height");
+        let mut v = match t.line_height {
+            LineHeight::Auto => None,
+            LineHeight::Px(v) | LineHeight::Percent(v) => Some(v),
+        };
+        let mut pct = matches!(t.line_height, LineHeight::Percent(_));
+        let mut auto = v.is_none();
+        ui.checkbox(&mut auto, "Auto");
+        if !auto {
+            let x = v.get_or_insert(if pct { 120.0 } else { t.font_size * 1.2 });
+            ui.add(DragValue::new(x).range(0.0..=1000.0).speed(0.2).custom_formatter(|v, _| num(v as f32)));
+            ui.checkbox(&mut pct, "%");
+        }
+        t.line_height = match (auto, v) {
+            (false, Some(x)) if pct => LineHeight::Percent(x),
+            (false, Some(x)) => LineHeight::Px(x),
+            _ => LineHeight::Auto,
+        };
+    });
+    ui.horizontal(|ui| {
+        ui.label("Letter spacing");
+        ui.add(DragValue::new(&mut t.letter_spacing).speed(0.1).suffix("%").custom_formatter(|v, _| num(v as f32)));
+    });
+}
+
 /// Figma's frame presets: group, then (name, width, height).
 const FRAME_PRESETS: &[(&str, &[(&str, u32, u32)])] = &[
     ("Phone", &[("iPhone 16", 393, 852), ("iPhone 16 Pro", 402, 874), ("iPhone 16 Pro Max", 440, 956), ("iPhone 16 Plus", 430, 932), ("iPhone 14", 390, 844), ("iPhone SE", 320, 568), ("Android Compact", 412, 917), ("Android Medium", 700, 840)]),
@@ -517,17 +739,57 @@ fn dropdown(ui: &mut Ui, text: impl std::fmt::Display, add: impl FnOnce(&mut Ui)
     crate::chrome::menu_button(ui, text.to_string(), add);
 }
 
+/// A small plot of an easing curve, like the one beside Figma's easing menu.
+fn easing_curve(ui: &mut Ui, e: crate::doc::Easing, size: egui::Vec2) {
+    let (r, _) = ui.allocate_exact_size(size, Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(r, 3.0, ui.visuals().extreme_bg_color);
+    // Room above and below for curves that overshoot.
+    let at = |t: f32| egui::pos2(r.min.x + 2.0 + t * (r.width() - 4.0), r.max.y - r.height() * (0.25 + e.at(t) * 0.5));
+    let pts: Vec<egui::Pos2> = (0..=32).map(|i| at(i as f32 / 32.0)).collect();
+    p.add(egui::Shape::line(pts, egui::Stroke::new(1.5, BLUE)));
+}
+
 fn heading(ui: &mut Ui, title: &str) {
     ui.add_space(4.0);
     ui.label(RichText::new(title).strong());
     ui.add_space(2.0);
 }
 
+/// A page named only with dashes ("---") is a divider in the pages list, as in Figma.
+pub fn is_divider(name: &str) -> bool {
+    let t = name.trim();
+    !t.is_empty() && t.chars().all(|c| c == '-')
+}
+
+/// Cmd R with several layers selected: Figma's batch rename.
+pub struct BatchRename {
+    /// `$&` is the current name, `$n` an ascending number, `$N` a descending one. Empty keeps the name.
+    pub to: String,
+    pub start: usize,
+    pub find: String,
+    pub with: String,
+    focus: bool,
+}
+
+impl BatchRename {
+    /// The new name of the `i`th of `count` layers: Match / Replace with first, then Rename to.
+    pub fn name(&self, old: &str, i: usize, count: usize) -> String {
+        let name = if self.find.is_empty() { old.to_string() } else { old.replace(&self.find, &self.with) };
+        if self.to.is_empty() {
+            return name;
+        }
+        // Numbers first, so a name that happens to contain "$n" stays as it is.
+        self.to.replace("$n", &(self.start + i).to_string()).replace("$N", &(self.start + count - 1 - i).to_string()).replace("$&", &name)
+    }
+}
+
 impl App {
     // ---------- left: menu, pages, layers ----------
 
     pub fn left_panel(&mut self, ui: &mut Ui) {
-        if self.sel != self.prev_sel {
+        let reveal = self.sel != self.prev_sel;
+        if reveal {
             self.prev_sel = self.sel.clone();
             for id in self.sel.clone() {
                 for a in self.doc.ancestors(id) {
@@ -561,6 +823,9 @@ impl App {
                 self.assets(ui);
                 return;
             }
+            if self.dev_mode {
+                self.ready_list(ui);
+            }
             self.pages_list(ui);
             ui.separator();
             ui.horizontal(|ui| {
@@ -574,30 +839,87 @@ impl App {
             if let Some(q) = &mut self.layer_search {
                 ui.add(egui::TextEdit::singleline(q).hint_text("Find layers").desired_width(f32::INFINITY));
             }
-            // Only the rows in view are built, so huge files stay fast.
+            // Only the rows in view are built, so huge files stay fast. Figma's layer rows are
+            // 32 points tall; `show_rows` adds item spacing to each row, so there is none.
             let rows = self.layer_rows();
-            let row_h = 28.0;
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, row_h, rows.len(), |ui, range| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                self.layers(ui, &rows[range]);
-            });
+            let row_h = 32.0;
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let view_key = ui.id().with("layers-view");
+            let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+            // A new canvas selection scrolls its first row into view, as in Figma.
+            if reveal && let Some(i) = rows.iter().position(|(id, _)| self.sel.contains(id)) {
+                let (top, h): (f32, f32) = ui.data(|d| d.get_temp(view_key)).unwrap_or_default();
+                let y = i as f32 * row_h;
+                if y < top || y + row_h > top + h {
+                    area = area.vertical_scroll_offset((y + (row_h - h) / 2.0).max(0.0));
+                }
+            }
+            let out = area.show_rows(ui, row_h, rows.len(), |ui, range| self.layers(ui, &rows, range));
+            ui.data_mut(|d| d.insert_temp(view_key, (out.state.offset.y, out.inner_rect.height())));
         });
     }
 
-    /// Assets tab: every main component in the file. Drag one onto the canvas to place an instance.
+    /// Dev Mode's "Ready for dev" list: frames and sections marked ready, on every page. A click
+    /// goes to one.
+    fn ready_list(&mut self, ui: &mut Ui) {
+        let mut ready: Vec<(usize, NodeId, String)> = self.doc.nodes.values().filter(|n| n.ready).map(|n| (self.doc.page_of(n.id), n.id, n.name.clone())).collect();
+        ready.sort_by(|a, b| (a.0, &a.2).cmp(&(b.0, &b.2)));
+        ui.label(RichText::new(format!("Ready for dev ({})", ready.len())).strong());
+        if ready.is_empty() {
+            ui.label(RichText::new("Mark frames ready from the canvas menu.").small().color(theme::muted(ui.ctx())));
+        }
+        for (page, id, name) in ready {
+            let green = Color32::from_rgb(0x14, 0xAE, 0x5C);
+            let text = format!("{name}  ·  {}", self.doc.pages[page].name);
+            if ui.add(egui::Button::selectable(self.sel.contains(&id), RichText::new(text).color(green))).clicked() {
+                if page != self.page {
+                    self.select_page(page);
+                }
+                self.sel = vec![id];
+                self.zoom_target = Some(id);
+            }
+        }
+        ui.separator();
+    }
+
+    /// Assets tab: this file's components, then each enabled library's (by library, then page).
+    /// Drag one onto the canvas to place an instance.
     fn assets(&mut self, ui: &mut Ui) {
         let search_id = ui.id().with("asset-search");
         let mut q: String = ui.data(|d| d.get_temp(search_id)).unwrap_or_default();
         ui.add(egui::TextEdit::singleline(&mut q).hint_text("Search assets").desired_width(f32::INFINITY));
         ui.data_mut(|d| d.insert_temp(search_id, q.clone()));
         let q = q.to_lowercase();
+        ui.horizontal(|ui| {
+            if ui.button("Libraries").clicked() {
+                self.show_libraries = true;
+            }
+            // Any file can be a library; publishing hands its changes to the files using it.
+            let tip = match self.doc.published.0 {
+                0 => "Save, and let files using this one as a library take its changes".to_string(),
+                v => format!("Published version {v}"),
+            };
+            if ui.button("Publish library").on_hover_text(tip).clicked() {
+                self.publish_library();
+            }
+        });
+        if !self.lib_updates.is_empty() && ui.button(RichText::new("Library updates available").color(BLUE)).clicked() {
+            self.review_updates = true;
+        }
+        // Enabled libraries whose files are gone; the Libraries dialog relinks them.
+        let missing: Vec<String> = self.doc.libraries.iter().filter(|r| r.enabled && self.libs.get(&r.id).is_some_and(|l| l.doc.is_none())).map(|r| r.name.clone()).collect();
+        for name in missing {
+            if ui.add(egui::Button::new(RichText::new(format!("{name} is missing")).color(Color32::from_rgb(0xF2, 0x48, 0x22))).frame(false)).on_hover_text("Relink it in Libraries").clicked() {
+                self.show_libraries = true;
+            }
+        }
         ui.add_space(4.0);
         // Sets appear once (placing their first variant); components inside sets don't.
         let mut comps: Vec<(usize, NodeId, String)> = self
             .doc
             .nodes
             .values()
-            .filter(|n| matches!(n.kind, Kind::Component | Kind::ComponentSet) && n.name.to_lowercase().contains(&q))
+            .filter(|n| matches!(n.kind, Kind::Component | Kind::ComponentSet) && n.remote.is_none() && n.name.to_lowercase().contains(&q))
             .filter(|n| !n.parent.is_some_and(|p| self.doc.node(p).kind == Kind::ComponentSet))
             .filter_map(|n| match n.kind {
                 Kind::ComponentSet => n.children.first().map(|&v| (self.doc.page_of(n.id), v, n.name.clone())),
@@ -605,35 +927,29 @@ impl App {
             })
             .collect();
         comps.sort_by(|a, b| (a.0, &a.2).cmp(&(b.0, &b.2)));
-        if comps.is_empty() {
-            ui.label(RichText::new(if q.is_empty() { "Create components with ⌥⌘K to reuse them here." } else { "No components match." }).color(theme::muted(ui.ctx())));
+        let libs: Vec<(String, String, std::sync::Arc<crate::doc::Document>, Vec<(usize, NodeId, String)>)> = self
+            .enabled_libs()
+            .into_iter()
+            .map(|(r, d)| {
+                let items: Vec<_> = crate::library::components(&d).into_iter().filter(|c| c.2.to_lowercase().contains(&q)).collect();
+                (r.id, r.name, d, items)
+            })
+            .filter(|l| !l.3.is_empty())
+            .collect();
+        if comps.is_empty() && libs.is_empty() {
+            ui.label(RichText::new(crate::chrome::keys(if q.is_empty() { "Create components with ⌥⌘K to reuse them here." } else { "No components match." })).color(theme::muted(ui.ctx())));
             return;
         }
-        ui.label(RichText::new("Local components").strong());
         // Thumbnails are rendered a few per frame, so opening a big library doesn't stall.
         let mut budget = 6;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for page in 0..self.doc.pages.len() {
-                let items: Vec<(NodeId, String)> = comps.iter().filter(|c| c.0 == page).map(|c| (c.1, c.2.clone())).collect();
-                if items.is_empty() {
-                    continue;
-                }
-                egui::CollapsingHeader::new(RichText::new(&self.doc.pages[page].name).color(theme::muted(ui.ctx())))
-                    .id_salt(("asset-page", page))
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        let tile = 70.0;
-                        let gap = 8.0;
-                        let cols = ((ui.available_width() + gap) / (tile + gap)).floor().max(1.0) as usize;
-                        for row in items.chunks(cols) {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = gap;
-                                for (id, name) in row {
-                                    self.asset_tile(ui, *id, name, tile, &mut budget);
-                                }
-                            });
-                        }
-                    });
+            if !comps.is_empty() {
+                ui.label(RichText::new("Local components").strong());
+                self.asset_pages(ui, None, &comps, &mut budget);
+            }
+            for (id, name, d, items) in &libs {
+                ui.label(RichText::new(name).strong());
+                self.asset_pages(ui, Some((id, d)), items, &mut budget);
             }
         });
         if budget == 0 {
@@ -641,82 +957,103 @@ impl App {
         }
     }
 
-    /// One component in the Assets grid: a preview over its name. Drag onto the canvas, or
-    /// double-click to place it mid-screen.
-    fn asset_tile(&mut self, ui: &mut Ui, id: NodeId, name: &str, size: f32, budget: &mut usize) {
-        let tex = self.asset_thumb(ui.ctx(), id, budget);
-        let r = ui.dnd_drag_source(ui.id().with(("asset", id)), AssetDrag(id), |ui| {
-            ui.vertical(|ui| {
+    /// Component tiles under collapsible page headers (`lib`: the library they come from).
+    fn asset_pages(&mut self, ui: &mut Ui, lib: Option<(&str, &crate::doc::Document)>, comps: &[(usize, NodeId, String)], budget: &mut usize) {
+        let pages: Vec<String> = lib.map_or(&self.doc, |l| l.1).pages.iter().map(|p| p.name.clone()).collect();
+        for (page, page_name) in pages.iter().enumerate() {
+            let items: Vec<(NodeId, String)> = comps.iter().filter(|c| c.0 == page).map(|c| (c.1, c.2.clone())).collect();
+            if items.is_empty() {
+                continue;
+            }
+            egui::CollapsingHeader::new(RichText::new(page_name).color(theme::muted(ui.ctx())))
+                .id_salt(("asset-page", lib.map(|l| l.0), page))
+                .default_open(true)
+                .show(ui, |ui| {
+                    let tile = 70.0;
+                    let gap = 8.0;
+                    let cols = ((ui.available_width() + gap) / (tile + gap)).floor().max(1.0) as usize;
+                    for row in items.chunks(cols) {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = gap;
+                            for (id, name) in row {
+                                self.asset_tile(ui, lib, *id, name, tile, budget);
+                            }
+                        });
+                    }
+                });
+        }
+    }
+
+    /// One component in the Assets grid: a preview over its name, with its description on hover.
+    /// Drag onto the canvas, or click to place an instance mid-screen, as in Figma.
+    fn asset_tile(&mut self, ui: &mut Ui, lib: Option<(&str, &crate::doc::Document)>, id: NodeId, name: &str, size: f32, budget: &mut usize) {
+        let doc = lib.map_or(&self.doc, |l| l.1);
+        let tex = thumb(ui.ctx(), &mut self.asset_thumbs, doc, lib.map_or("", |l| l.0), id, budget);
+        let desc = doc.description_of(id).to_string();
+        // Click and drag on one widget: egui's drag source starts dragging on press, which
+        // would swallow the click.
+        let clicked = ui
+            .vertical(|ui| {
                 ui.set_width(size);
-                let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
-                let p = ui.painter();
-                p.rect_filled(rect, 6.0, theme::subtle(ui.ctx()));
+                let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click_and_drag());
+                let thumb = |p: &Painter, rect: Rect| {
+                    p.rect_filled(rect, 6.0, theme::subtle(ui.ctx()));
+                    if let Some(tex) = &tex {
+                        let s = tex.size_vec2();
+                        let fit = ((size - 12.0) / s.x).min((size - 12.0) / s.y);
+                        p.image(tex.id(), Rect::from_center_size(rect.center(), s * fit), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+                    } else {
+                        paint_icon(p, Rect::from_center_size(rect.center(), vec2(18.0, 18.0)), Icon::Component, crate::canvas::PURPLE);
+                    }
+                };
+                thumb(ui.painter(), rect);
                 if resp.hovered() {
-                    p.rect_stroke(rect, 6.0, Stroke::new(1.0, BLUE), egui::StrokeKind::Inside);
+                    ui.painter().rect_stroke(rect, 6.0, Stroke::new(1.0, BLUE), egui::StrokeKind::Inside);
                 }
-                if let Some(tex) = &tex {
-                    let s = tex.size_vec2();
-                    let fit = ((size - 12.0) / s.x).min((size - 12.0) / s.y);
-                    p.image(tex.id(), Rect::from_center_size(rect.center(), s * fit), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
-                } else {
-                    paint_icon(p, Rect::from_center_size(rect.center(), vec2(18.0, 18.0)), Icon::Component, crate::canvas::PURPLE);
+                if resp.drag_started() {
+                    egui::DragAndDrop::set_payload(ui.ctx(), AssetDrag(id, lib.map(|l| l.0.to_string())));
+                }
+                // The tile follows the pointer while dragging.
+                if resp.dragged()
+                    && let Some(p) = ui.ctx().pointer_interact_pos()
+                {
+                    thumb(&ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, ui.id().with(("asset-ghost", id)))), Rect::from_center_size(p, vec2(size, size)));
                 }
                 ui.add(egui::Label::new(RichText::new(name).small()).truncate());
                 resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
-            });
-        });
-        let r = r.response.on_hover_text(name);
-        if r.double_clicked() {
+                let tip = if desc.is_empty() { name.to_string() } else { format!("{name}\n{desc}") };
+                resp.on_hover_cursor(egui::CursorIcon::Grab).on_hover_text(tip).clicked()
+            })
+            .inner;
+        if clicked {
             let at = self.view_center_world();
             self.checkpoint();
-            let size = self.doc.node(id).rect.size();
-            let i = self.doc.instantiate(id, self.page, None, None, (at - size / 2.0).round());
+            // A library's component is copied in first; its instance points at the copy.
+            let Some(comp) = (match lib {
+                Some((l, _)) => self.import_component(l, id),
+                None => Some(id),
+            }) else {
+                return;
+            };
+            let size = self.doc.node(comp).rect.size();
+            let i = self.doc.instantiate(comp, self.page, None, None, (at - size / 2.0).round());
             self.sel = vec![i];
         }
     }
 
-    /// A component's preview, re-rendered when its content changes. Each tile re-checks its
-    /// content every 30 frames (staggered), so a big library costs little per frame.
+    /// A component's preview in this file.
     fn asset_thumb(&mut self, ctx: &egui::Context, id: NodeId, budget: &mut usize) -> Option<egui::TextureHandle> {
-        use std::hash::{Hash, Hasher};
-        let due = (ctx.cumulative_frame_nr() + id) % 30 == 0;
-        if let Some((_, tex)) = self.asset_thumbs.get(&id)
-            && (!due || *budget == 0)
-        {
-            return Some(tex.clone());
-        }
-        let mut h = std::hash::DefaultHasher::new();
-        for n in std::iter::once(id).chain(self.doc.descendants(id)) {
-            serde_json::to_vec(&*self.doc.nodes[&n]).unwrap_or_default().hash(&mut h);
-        }
-        let key = h.finish();
-        if let Some((k, tex)) = self.asset_thumbs.get(&id)
-            && *k == key
-        {
-            return Some(tex.clone());
-        }
-        if *budget == 0 {
-            return None;
-        }
-        *budget -= 1;
-        let b = crate::export::export_bounds(&self.doc, &[id]);
-        let scale = (128.0 / b.width().max(b.height()).max(1.0)).min(4.0);
-        let svg = crate::export::to_svg(&self.doc, &[id]);
-        let (px, [w, hgt]) = crate::export::rasterize(&svg, scale)?;
-        let tex = ctx.load_texture(format!("asset-{id}"), egui::ColorImage::from_rgba_premultiplied([w, hgt], &px), egui::TextureOptions::LINEAR);
-        self.asset_thumbs.insert(id, (key, tex.clone()));
-        Some(tex)
+        thumb(ctx, &mut self.asset_thumbs, &self.doc, "", id, budget)
     }
-
     /// The main menu, laid out like Figma's: Actions, then File / Edit / View / Object / Arrange,
     /// then Plugins and Preferences, then Help.
     fn main_menu(&mut self, ui: &mut Ui) {
         use crate::settings::Tab;
         let ctx = ui.ctx().clone();
         ui.set_min_width(220.0);
-        let item = |ui: &mut Ui, label: &str, short: &str| ui.add(egui::Button::new(label).shortcut_text(short)).clicked();
+        let item = |ui: &mut Ui, label: &str, short: &str| ui.add(egui::Button::new(label).shortcut_text(crate::chrome::keys(short))).clicked();
         let has = !self.sel.is_empty();
-        let enabled = |ui: &mut Ui, on: bool, label: &str, short: &str| ui.add_enabled(on, egui::Button::new(label).shortcut_text(short)).clicked();
+        let enabled = |ui: &mut Ui, on: bool, label: &str, short: &str| ui.add_enabled(on, egui::Button::new(label).shortcut_text(crate::chrome::keys(short))).clicked();
         if item(ui, "Back to files", "") {
             self.want = Some(crate::app::Want::Home);
             ui.close();
@@ -766,12 +1103,25 @@ impl App {
                 ui.close();
             }
             if item(ui, "Export…", "⇧⌘E") {
+                self.export_dialog = Some(Default::default());
+                ui.close();
+            }
+            if enabled(ui, has, "Export selection", "") {
                 self.export(&ctx);
                 ui.close();
             }
             ui.separator();
             if item(ui, "Multiplayer session…", "") {
                 self.show_collab = true;
+                ui.close();
+            }
+            let spot = self.collab.as_ref().is_some_and(|c| c.me.spotlight);
+            if enabled(ui, self.collab.is_some(), if spot { "Stop spotlight" } else { "Spotlight me" }, "") {
+                self.toggle_spotlight();
+                ui.close();
+            }
+            if item(ui, "Cursor chat", "/") {
+                self.open_chat(&ctx);
                 ui.close();
             }
         });
@@ -789,8 +1139,20 @@ impl App {
                 self.copy(&ctx);
                 ui.close();
             }
+            if enabled(ui, has, "Copy as code", "") {
+                self.copy_as(&ctx, "code");
+                ui.close();
+            }
             if item(ui, "Paste", "⌘V") {
-                ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                self.paste_from_menu(&ctx, false);
+                ui.close();
+            }
+            if enabled(ui, has, "Paste over selection", "⇧⌘V") {
+                self.paste_from_menu(&ctx, true);
+                ui.close();
+            }
+            if enabled(ui, has, "Paste to replace", "⇧⌘R") {
+                self.paste_to_replace();
                 ui.close();
             }
             if enabled(ui, has, "Duplicate", "⌘D") {
@@ -815,8 +1177,22 @@ impl App {
                 self.select_all();
                 ui.close();
             }
+            if item(ui, "Select inverse", "⇧⌘A") {
+                self.select_inverse();
+                ui.close();
+            }
             if enabled(ui, has, "Select matching layers", "⌥⌘A") {
                 self.select_matching();
+                ui.close();
+            }
+            for (what, label) in crate::app::Same::MENU {
+                if enabled(ui, has, label, "") {
+                    self.select_same(what);
+                    ui.close();
+                }
+            }
+            if enabled(ui, has, "Rename…", "⌘R") {
+                self.rename_selection();
                 ui.close();
             }
             if item(ui, "Find and replace…", "⌘F") {
@@ -826,13 +1202,25 @@ impl App {
             }
         });
         ui.menu_button("View", |ui| {
-            let check = |ui: &mut Ui, on: bool, label: &str, short: &str| ui.add(egui::Button::new(format!("{}{label}", if on { "✓  " } else { "     " })).shortcut_text(short)).clicked();
+            let check = |ui: &mut Ui, on: bool, label: &str, short: &str| ui.add(egui::Button::new(format!("{}{label}", if on { "✓  " } else { "     " })).shortcut_text(crate::chrome::keys(short))).clicked();
             if check(ui, self.show_grids, "Layout guides", "⌃G") {
                 self.show_grids = !self.show_grids;
                 ui.close();
             }
             if check(ui, self.rulers, "Rulers", "⇧R") {
                 self.rulers = !self.rulers;
+                ui.close();
+            }
+            if enabled(ui, !self.doc.pages[self.page].guides.is_empty(), "     Remove all guides", "") {
+                self.remove_all_guides();
+                ui.close();
+            }
+            if check(ui, self.prefs.pixel_grid, "Pixel grid", "⇧'") {
+                self.toggle_pref(|p| &mut p.pixel_grid);
+                ui.close();
+            }
+            if check(ui, self.prefs.snap_to_pixels, "Snap to pixel grid", "⇧⌘'") {
+                self.toggle_pref(|p| &mut p.snap_to_pixels);
                 ui.close();
             }
             if check(ui, self.outline_mode, "Outlines", "⌘Y") {
@@ -868,6 +1256,18 @@ impl App {
                 self.zoom_to(&ctx, Some(self.sel.clone()), false);
                 ui.close();
             }
+            if item(ui, "Zoom to next frame", "N") {
+                self.zoom_frame(&ctx, 1);
+                ui.close();
+            }
+            if item(ui, "Zoom to previous frame", "⇧N") {
+                self.zoom_frame(&ctx, -1);
+                ui.close();
+            }
+            if item(ui, "Zoom tool", "Z") {
+                self.set_tool(crate::app::Tool::Zoom);
+                ui.close();
+            }
             ui.separator();
             if check(ui, self.dev_mode, "Dev Mode", "⇧D") {
                 self.dev_mode = !self.dev_mode;
@@ -875,6 +1275,10 @@ impl App {
             }
             if item(ui, "Local variables", "") {
                 self.show_variables = true;
+                ui.close();
+            }
+            if item(ui, "Libraries…", "") {
+                self.show_libraries = true;
                 ui.close();
             }
         });
@@ -902,6 +1306,15 @@ impl App {
             }
             if enabled(ui, has, "Detach instance", "⌥⌘B") {
                 self.detach_selection();
+                ui.close();
+            }
+            let inst = self.sel.iter().any(|&s| self.owning_instance(s).is_some());
+            if enabled(ui, inst, "Push changes to main component", "") {
+                self.push_selection_to_main();
+                ui.close();
+            }
+            if enabled(ui, inst, "Reset all changes", "") {
+                self.reset_selection_instances();
                 ui.close();
             }
             ui.separator();
@@ -932,6 +1345,19 @@ impl App {
                 self.outline_stroke_selection();
                 ui.close();
             }
+            let two_points = self.vector_edit.as_ref().is_some_and(|ve| ve.selected.len() == 2);
+            if enabled(ui, two_points, "Join selection", "⌘J") {
+                self.vector_join();
+                ui.close();
+            }
+            if enabled(ui, has, "Resize to fit", "⌥⇧⌘R") {
+                self.resize_to_fit();
+                ui.close();
+            }
+            if enabled(ui, has, "Remove fill", "") {
+                self.remove_fills();
+                ui.close();
+            }
             ui.separator();
             if enabled(ui, has, "Flip horizontal", "⇧H") {
                 self.flip_selection(true);
@@ -941,6 +1367,10 @@ impl App {
                 self.flip_selection(false);
                 ui.close();
             }
+            if enabled(ui, has, "Swap fill and stroke", "⇧X") {
+                self.swap_fill_stroke();
+                ui.close();
+            }
             ui.separator();
             if enabled(ui, has, "Show/Hide selection", "⇧⌘H") {
                 self.toggle_visible();
@@ -948,6 +1378,41 @@ impl App {
             }
             if enabled(ui, has, "Lock/Unlock selection", "⇧⌘L") {
                 self.toggle_locked();
+                ui.close();
+            }
+            if item(ui, "Lock all", "") {
+                self.lock_all(true);
+                ui.close();
+            }
+            if item(ui, "Unlock all", "") {
+                self.lock_all(false);
+                ui.close();
+            }
+        });
+        ui.menu_button("Text", |ui| {
+            let text = self.editing_text.is_some() || self.sel.iter().any(|&i| self.doc.node(i).kind == Kind::Text);
+            for group in crate::canvas::TEXT_MENU {
+                for &(f, label, short) in *group {
+                    if enabled(ui, text, label, short) {
+                        self.format_text(&ctx, f);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+            }
+            for (kind, label, short) in [(crate::doc::ListKind::Bullet, "Bulleted list", "⇧⌘8"), (crate::doc::ListKind::Number, "Numbered list", "⇧⌘7")] {
+                if enabled(ui, text, label, short) {
+                    self.toggle_list(&ctx, kind);
+                    ui.close();
+                }
+            }
+            if enabled(ui, self.text_selection(&ctx).is_some(), "Create link", "⌘K") {
+                self.create_link(&ctx);
+                ui.close();
+            }
+            ui.separator();
+            if item(ui, "Replace fonts…", "") {
+                self.open_replace_fonts();
                 ui.close();
             }
         });
@@ -1078,16 +1543,52 @@ impl App {
                 if icon_button(ui, Icon::Plus, false, 22.0, "Add page").clicked() {
                     self.checkpoint();
                     let n = self.doc.pages.len() + 1;
-                    self.doc.pages.push(Page { name: format!("Page {n}"), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None });
+                    self.doc.pages.push(Page { name: format!("Page {n}"), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, guides: vec![], prototype: Default::default() });
                     self.select_page(n - 1);
                 }
             });
         });
-        let mut delete = None;
+        let (mut delete, mut duplicate, mut divider_at) = (None, None, None);
+        // Pages reorder by dragging: the page being dragged, kept across frames.
+        let drag_key = ui.id().with("page-drag");
+        let mut dragging: Option<usize> = ui.data(|d| d.get_temp(drag_key));
+        let mut rects = vec![];
         for i in 0..self.doc.pages.len() {
-            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
             let page_name = self.doc.pages[i].name.clone();
+            let divider = is_divider(&page_name);
+            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), if divider { 13.0 } else { 26.0 }), Sense::click_and_drag());
+            rects.push(rect);
+            if resp.drag_started() {
+                dragging = Some(i);
+            }
             resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, i == self.page, &page_name));
+            crate::chrome::context_menu(&resp, |ui| {
+                if ui.button("Rename").clicked() {
+                    self.renaming_page = Some((i, page_name.clone()));
+                    ui.close();
+                }
+                if !divider && ui.button("Duplicate page").clicked() {
+                    duplicate = Some(i);
+                    ui.close();
+                }
+                if ui.button("Add divider").clicked() {
+                    divider_at = Some(i + 1);
+                    ui.close();
+                }
+                if ui.add_enabled(self.doc.pages.len() > 1, egui::Button::new(if divider { "Delete divider" } else { "Delete page" })).clicked() {
+                    delete = Some(i);
+                    ui.close();
+                }
+            });
+            if divider && !matches!(&self.renaming_page, Some((pi, _)) if *pi == i) {
+                // Figma's page dividers: a line in the list, never opened.
+                let x = rect.x_range().shrink(10.0);
+                ui.painter().hline(x, rect.center().y, Stroke::new(1.0, theme::border(ui.ctx())));
+                if resp.double_clicked() {
+                    self.renaming_page = Some((i, page_name));
+                }
+                continue;
+            }
             if i == self.page {
                 ui.painter().rect_filled(rect, 4.0, theme::subtle(ui.ctx()));
             } else if resp.hovered() {
@@ -1123,16 +1624,37 @@ impl App {
             if resp.double_clicked() {
                 self.renaming_page = Some((i, self.doc.pages[i].name.clone()));
             }
-            crate::chrome::context_menu(&resp, |ui| {
-                if ui.button("Rename").clicked() {
-                    self.renaming_page = Some((i, self.doc.pages[i].name.clone()));
-                    ui.close();
+        }
+        if let Some(from) = dragging {
+            let (ptr, released) = ui.input(|i| (i.pointer.hover_pos(), i.pointer.any_released()));
+            let span = rects.first().map_or(Rect::NOTHING, |f| f.union(*rects.last().unwrap())).expand2(vec2(0.0, 8.0));
+            // The gap the page would go into: before the first row whose middle is below the pointer.
+            if let Some(p) = ptr.filter(|p| span.contains(*p)) {
+                let slot = rects.iter().position(|r| p.y < r.center().y).unwrap_or(rects.len());
+                if slot != from && slot != from + 1 {
+                    let y = rects.get(slot).map_or(span.max.y - 8.0, |r| r.min.y);
+                    ui.painter().hline(span.x_range(), y, Stroke::new(2.0, BLUE));
+                    if released {
+                        self.move_page(from, slot);
+                    }
                 }
-                if ui.add_enabled(self.doc.pages.len() > 1, egui::Button::new("Delete page")).clicked() {
-                    delete = Some(i);
-                    ui.close();
-                }
-            });
+            }
+            if released {
+                dragging = None;
+            }
+        }
+        ui.data_mut(|d| match dragging {
+            Some(i) => {
+                d.insert_temp(drag_key, i);
+            }
+            None => d.remove::<usize>(drag_key),
+        });
+        if let Some(i) = duplicate {
+            self.duplicate_page(i);
+        }
+        if let Some(at) = divider_at {
+            self.checkpoint();
+            self.insert_page(at, Page { name: "---".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, guides: vec![], prototype: Default::default() });
         }
         if let Some(i) = delete {
             self.checkpoint();
@@ -1140,10 +1662,55 @@ impl App {
                 self.doc.remove(id);
             }
             self.doc.pages.remove(i);
+            // Pages after the deleted one move up; stay on the one being viewed.
+            if i < self.page {
+                self.page -= 1;
+            }
             self.page = self.page.min(self.doc.pages.len() - 1);
             self.sel.clear();
             self.view_ready = false;
         }
+    }
+
+    /// Page indices (the open page, comments) after pages move around.
+    fn renumber_pages(&mut self, f: impl Fn(usize) -> usize) {
+        self.page = f(self.page);
+        for c in &mut self.doc.comments {
+            c.page = f(c.page);
+        }
+    }
+
+    fn insert_page(&mut self, at: usize, page: Page) {
+        self.renumber_pages(|p| if p >= at { p + 1 } else { p });
+        self.doc.pages.insert(at, page);
+    }
+
+    /// Move page `from` into the gap `slot` (0 = before the first page, len = after the last).
+    pub fn move_page(&mut self, from: usize, slot: usize) {
+        let to = if slot > from { slot - 1 } else { slot };
+        if to == from || to >= self.doc.pages.len() {
+            return;
+        }
+        self.checkpoint();
+        let p = self.doc.pages.remove(from);
+        self.doc.pages.insert(to, p);
+        self.renumber_pages(|p| match p {
+            p if p == from => to,
+            p if from < p && p <= to => p - 1,
+            p if to <= p && p < from => p + 1,
+            p => p,
+        });
+    }
+
+    /// A copy of a page and everything on it, right after it, opened.
+    pub fn duplicate_page(&mut self, i: usize) {
+        self.checkpoint();
+        let src = self.doc.pages[i].clone();
+        let frag = self.doc.extract(&src.children);
+        self.insert_page(i + 1, Page { name: format!("{} copy", src.name), children: vec![], flows: vec![], ..src });
+        self.doc.paste(&frag, i + 1, None, None);
+        self.doc.reflow();
+        self.select_page(i + 1);
     }
 
     fn layer_rows(&self) -> Vec<(NodeId, usize)> {
@@ -1178,11 +1745,11 @@ impl App {
         out
     }
 
-    fn layers(&mut self, ui: &mut Ui, rows: &[(NodeId, usize)]) {
+    /// The rows in `range` of `rows` (all of them are needed for Shift-click ranges).
+    fn layers(&mut self, ui: &mut Ui, rows: &[(NodeId, usize)], range: std::ops::Range<usize>) {
         let mut rects: Vec<(NodeId, Rect)> = vec![];
-        let shift = ui.input(|i| i.modifiers.shift || i.modifiers.command);
-        for &(id, depth) in rows {
-            // Figma's layer rows are 32 points tall.
+        let (shift, cmd) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
+        for &(id, depth) in &rows[range] {
             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click_and_drag());
             rects.push((id, rect));
             let n = self.doc.node(id).clone();
@@ -1266,8 +1833,19 @@ impl App {
                 } else if at(chev.expand(4.0)) && !self.doc.node(id).children.is_empty() {
                     let n = self.doc.node_mut(id);
                     n.expanded = !n.expanded;
-                } else if shift {
+                } else if cmd {
                     if selected { self.sel.retain(|s| *s != id) } else { self.sel.push(id) }
+                } else if shift && let Some(anchor) = self.sel.last().and_then(|a| rows.iter().position(|r| r.0 == *a)) {
+                    // Shift-click selects the rows from the last selected one to this one; the
+                    // anchor stays last, so the next Shift-click extends from it again.
+                    let i = rows.iter().position(|r| r.0 == id).unwrap_or(anchor);
+                    let mut range: Vec<NodeId> = rows[i.min(anchor)..=i.max(anchor)].iter().map(|r| r.0).collect();
+                    if i > anchor {
+                        range.reverse();
+                    }
+                    self.sel = range;
+                } else if shift {
+                    self.sel.push(id);
                 } else {
                     self.end_text_edit();
                     self.sel = vec![id];
@@ -1288,9 +1866,11 @@ impl App {
         self.layer_drop(ui, &rects);
     }
 
-    /// Drag-and-drop reordering in the layers list.
+    /// Drag-and-drop reordering in the layers list. Dragging a selected row moves every selected
+    /// layer (their top-most roots), keeping their stacking order.
     fn layer_drop(&mut self, ui: &mut Ui, rects: &[(NodeId, Rect)]) {
         let Some(dragged) = self.layer_drag else { return };
+        let moving = if self.sel.contains(&dragged) { self.doc.sort_by_z(&self.sel_roots()) } else { vec![dragged] };
         let (ptr, released) = ui.input(|i| (i.pointer.hover_pos(), i.pointer.any_released()));
         let target = ptr.and_then(|p| {
             rects.iter().find(|(_, r)| p.y >= r.min.y && p.y < r.max.y).map(|&(id, r)| {
@@ -1300,7 +1880,7 @@ impl App {
                 (id, r, zone)
             })
         });
-        let valid = |id: NodeId| id != dragged && !self.doc.is_ancestor(dragged, id);
+        let valid = |id: NodeId| moving.iter().all(|&m| id != m && !self.doc.is_ancestor(m, id));
         if let Some((id, r, zone)) = target.filter(|t| valid(t.0)) {
             let p = ui.painter();
             match zone {
@@ -1316,21 +1896,146 @@ impl App {
                 self.checkpoint();
                 let n = self.doc.node(id);
                 let into_top = zone == 1 || (zone == 2 && n.expanded && !n.children.is_empty());
-                if into_top {
-                    self.doc.reparent(dragged, self.page, Some(id), None);
-                } else {
-                    let parent = n.parent;
-                    let list: Vec<NodeId> = self.doc.children_of(self.page, parent).iter().copied().filter(|c| *c != dragged).collect();
-                    let i = list.iter().position(|c| *c == id).unwrap_or(0);
-                    // The list is drawn top-first, so "above" means a higher z index.
-                    self.doc.reparent(dragged, self.page, parent, Some(if zone == 0 { i + 1 } else { i }));
+                let parent = if into_top { Some(id) } else { n.parent };
+                // Bottom-most first: each goes in just above the one before it.
+                let mut below: Option<NodeId> = None;
+                for &m in &moving {
+                    let list: Vec<NodeId> = self.doc.children_of(self.page, parent).iter().copied().filter(|c| *c != m).collect();
+                    let at = match below {
+                        Some(b) => list.iter().position(|c| *c == b).map_or(list.len(), |i| i + 1),
+                        None if into_top => list.len(),
+                        // The list is drawn top-first, so "above" means a higher z index.
+                        None => list.iter().position(|c| *c == id).map_or(0, |i| if zone == 0 { i + 1 } else { i }),
+                    };
+                    self.doc.reparent(m, self.page, parent, Some(at));
+                    below = Some(m);
                 }
                 self.doc.reflow();
-                self.sel = vec![dragged];
+                self.sel = moving;
             }
         }
         if released {
             self.layer_drag = None;
+        }
+    }
+
+    /// Cmd R: rename one layer in its row, or several at once in the batch rename window.
+    pub fn rename_selection(&mut self) {
+        match self.sel[..] {
+            [] => {}
+            [id] => {
+                self.left_tab_assets = false;
+                self.renaming = Some((id, self.doc.node(id).name.clone()));
+            }
+            _ => self.batch_rename = Some(BatchRename { to: String::new(), start: 1, find: String::new(), with: String::new(), focus: true }),
+        }
+    }
+
+    /// The batch rename window, with a preview of the first few names. Layers are numbered
+    /// bottom to top, so they count up in the order they were made.
+    pub fn batch_rename_window(&mut self, ctx: &egui::Context) {
+        let Some(mut b) = self.batch_rename.take() else { return };
+        let targets = self.doc.sort_by_z(&self.sel);
+        if targets.len() < 2 {
+            return;
+        }
+        let (mut open, mut apply, mut cancel) = (true, false, false);
+        crate::chrome::window(ctx, "Rename layers", &mut open, 300.0, |ui| {
+            let muted = theme::muted(ui.ctx());
+            let field = |ui: &mut Ui, label: &str, buf: &mut String, hint: &str| {
+                ui.label(label);
+                let r = ui.add(egui::TextEdit::singleline(buf).hint_text(hint).desired_width(f32::INFINITY));
+                ui.add_space(4.0);
+                r
+            };
+            let r = field(ui, "Rename to", &mut b.to, "$& keeps the current name");
+            if std::mem::take(&mut b.focus) {
+                r.request_focus();
+            }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("$& name, $n number, $N number descending").small().color(muted));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(egui::DragValue::new(&mut b.start).range(0..=99999)).on_hover_text("Start number");
+                });
+            });
+            ui.add_space(4.0);
+            let f = field(ui, "Match", &mut b.find, "Text to find in names");
+            let w = field(ui, "Replace with", &mut b.with, "");
+            ui.separator();
+            for (i, &id) in targets.iter().take(3).enumerate() {
+                let old = &self.doc.node(id).name;
+                ui.add(egui::Label::new(RichText::new(format!("{old}  \u{2192}  {}", b.name(old, i, targets.len()))).small()).truncate());
+            }
+            if targets.len() > 3 {
+                ui.label(RichText::new(format!("and {} more", targets.len() - 3)).small().color(muted));
+            }
+            ui.add_space(6.0);
+            let enter = [&r, &f, &w].iter().any(|r| r.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), 26.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                apply = enter || ui.add(egui::Button::new(RichText::new("Rename").color(Color32::WHITE)).fill(BLUE).corner_radius(6)).clicked();
+            });
+        });
+        if apply {
+            self.checkpoint();
+            for (i, &id) in targets.iter().enumerate() {
+                let name = b.name(&self.doc.node(id).name, i, targets.len());
+                if !name.trim().is_empty() {
+                    self.doc.node_mut(id).name = name;
+                }
+            }
+        } else if open && !cancel {
+            self.batch_rename = Some(b);
+        }
+    }
+
+    pub fn open_replace_fonts(&mut self) {
+        self.replace_fonts = Some(crate::text::missing_fonts(&self.doc).into_iter().map(|(f, _)| (f, "Inter".to_string())).collect());
+    }
+
+    /// Figma's Replace fonts: each missing family gets an installed one, across the document.
+    pub fn replace_fonts_window(&mut self, ctx: &egui::Context) {
+        let Some(mut picks) = self.replace_fonts.take() else { return };
+        let missing = crate::text::missing_fonts(&self.doc);
+        let (mut open, mut apply) = (true, false);
+        crate::chrome::window(ctx, "Replace fonts", &mut open, 340.0, |ui| {
+            let muted = theme::muted(ui.ctx());
+            if picks.is_empty() {
+                ui.label(RichText::new("Every font in this file is installed.").color(muted));
+                return;
+            }
+            ui.label(RichText::new("These fonts aren't installed. Pick a replacement for each.").color(muted));
+            ui.add_space(6.0);
+            for (i, (from, to)) in picks.iter_mut().enumerate() {
+                let styles = missing.iter().find(|m| m.0 == *from).map_or(String::new(), |m| m.1.iter().map(|&(w, it)| crate::text::style_name(w, it)).collect::<Vec<_>>().join(", "));
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(150.0);
+                        ui.label(RichText::new(from.as_str()).italics().strikethrough());
+                        ui.label(RichText::new(styles).small().color(muted));
+                    });
+                    egui::ComboBox::from_id_salt(("replace-font", i)).width(150.0).selected_text(to.as_str()).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+                        for f in crate::text::families() {
+                            ui.selectable_value(to, f.clone(), f);
+                        }
+                    });
+                });
+            }
+            ui.add_space(6.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), 26.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                apply = ui.add(egui::Button::new(RichText::new("Replace fonts").color(Color32::WHITE)).fill(BLUE).corner_radius(6)).clicked();
+            });
+        });
+        if apply {
+            // One undo step for the whole replacement.
+            self.checkpoint();
+            for (from, to) in &picks {
+                crate::doc::replace_font(&mut self.doc, from, to);
+            }
+            self.doc.reflow();
+            self.toast(format!("Replaced {} font{}", picks.len(), if picks.len() == 1 { "" } else { "s" }));
+        } else if open {
+            self.replace_fonts = Some(picks);
         }
     }
 
@@ -1347,7 +2052,7 @@ impl App {
                 if self.dev_mode {
                     let green = Color32::from_rgb(0x14, 0xAE, 0x5C);
                     let pill = egui::Button::new(RichText::new("Dev Mode").color(Color32::WHITE).strong()).fill(green);
-                    if ui.add(pill).on_hover_text("Leave Dev Mode (⇧D)").clicked() {
+                    if ui.add(pill).on_hover_text(crate::chrome::keys("Leave Dev Mode (⇧D)")).clicked() {
                         self.dev_mode = false;
                     }
                     return;
@@ -1361,18 +2066,43 @@ impl App {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let ctx = ui.ctx().clone();
-                    // Collaborators' avatars; clicking opens the session window.
+                    // Avatars, as in Figma: click someone to follow them; yours has Spotlight me.
                     if let Some(c) = &self.collab {
-                        let mut open = false;
-                        for p in c.peers.values().take(4) {
+                        let avatar = |ui: &mut Ui, name: &str, color: usize, ring: bool| {
                             let (r, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
-                            let col = crate::collab::PEER_COLORS[p.color % crate::collab::PEER_COLORS.len()];
+                            let col = crate::collab::peer_color(color);
                             ui.painter().circle_filled(r.center(), 10.0, col);
-                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, p.name.chars().next().unwrap_or('?').to_string(), FontId::proportional(10.0), Color32::WHITE);
-                            open |= resp.on_hover_text(&p.name).clicked();
+                            if ring {
+                                ui.painter().circle_stroke(r.center(), 11.5, Stroke::new(1.5, col));
+                            }
+                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, name.chars().next().unwrap_or('?').to_string(), FontId::proportional(10.0), Color32::WHITE);
+                            resp
+                        };
+                        let mut follow = None;
+                        for (&id, p) in c.peers.iter().rev().take(4) {
+                            let tip = if self.following == Some(id) { format!("Stop following {}", p.name) } else { format!("Follow {}", p.name) };
+                            if avatar(ui, &p.name, p.color, self.following == Some(id)).on_hover_text(tip).clicked() {
+                                follow = Some(id);
+                            }
                         }
-                        if open {
-                            self.show_collab = true;
+                        let me = avatar(ui, &c.me.name, c.me.color, c.me.spotlight).on_hover_text(format!("{} (you)", c.me.name));
+                        let spot = if c.me.spotlight { "Stop spotlight" } else { "Spotlight me" };
+                        let mut act = None;
+                        egui::Popup::menu(&me).style(crate::chrome::menu_style).show(|ui| {
+                            if ui.button(spot).clicked() {
+                                act = Some(true);
+                            }
+                            if ui.button("Session settings…").clicked() {
+                                act = Some(false);
+                            }
+                        });
+                        match act {
+                            Some(true) => self.toggle_spotlight(),
+                            Some(false) => self.show_collab = true,
+                            None => {}
+                        }
+                        if let Some(id) = follow {
+                            self.toggle_follow(id);
                         }
                     }
                     if icon_button(ui, Icon::Play, false, 24.0, "Present (⌥⌘↵)").clicked() {
@@ -1387,25 +2117,25 @@ impl App {
                             self.view.zoom_at(c, pct / 100.0 / self.view.zoom);
                         }
                         ui.separator();
-                        if ui.add(egui::Button::new("Zoom in").shortcut_text("⌘+")).clicked() {
+                        if ui.add(egui::Button::new("Zoom in").shortcut_text(crate::chrome::keys("⌘+"))).clicked() {
                             self.zoom_step(&ctx, 2.0);
                         }
-                        if ui.add(egui::Button::new("Zoom out").shortcut_text("⌘-")).clicked() {
+                        if ui.add(egui::Button::new("Zoom out").shortcut_text(crate::chrome::keys("⌘-"))).clicked() {
                             self.zoom_step(&ctx, 0.5);
                         }
-                        if ui.add(egui::Button::new("Zoom to fit").shortcut_text("⇧1")).clicked() {
+                        if ui.add(egui::Button::new("Zoom to fit").shortcut_text(crate::chrome::keys("⇧1"))).clicked() {
                             self.zoom_to(&ctx, None, false);
                         }
-                        if ui.add_enabled(!self.sel.is_empty(), egui::Button::new("Zoom to selection").shortcut_text("⇧2")).clicked() {
+                        if ui.add_enabled(!self.sel.is_empty(), egui::Button::new("Zoom to selection").shortcut_text(crate::chrome::keys("⇧2"))).clicked() {
                             self.zoom_to(&ctx, Some(self.sel.clone()), false);
                         }
-                        if ui.add(egui::Button::new("Zoom to 100%").shortcut_text("⇧0")).clicked() {
+                        if ui.add(egui::Button::new("Zoom to 100%").shortcut_text(crate::chrome::keys("⇧0"))).clicked() {
                             self.zoom_to(&ctx, None, true);
                         }
                         ui.separator();
                         // View options with checks, as in Figma's zoom menu.
                         for (on, label, short, which) in [(self.show_grids, "Layout guides", "⌃G", 0), (self.rulers, "Rulers", "⇧R", 1), (self.outline_mode, "Outlines", "⌘Y", 2), (self.show_comments, "Comments", "⇧C", 3)] {
-                            if ui.add(egui::Button::new(format!("{}{label}", if on { "✓  " } else { "     " })).shortcut_text(short)).clicked() {
+                            if ui.add(egui::Button::new(format!("{}{label}", if on { "✓  " } else { "     " })).shortcut_text(crate::chrome::keys(short))).clicked() {
                                 match which {
                                     0 => self.show_grids = !self.show_grids,
                                     1 => self.rulers = !self.rulers,
@@ -1479,27 +2209,62 @@ impl App {
                 if icon_button(ui, Icon::Minus, false, 22.0, "Delete style").clicked() {
                     *delete = Some(st.id);
                 }
-                if let crate::doc::StyleValue::Paint(ps) = &st.value {
-                    let edit = icon_button(ui, Icon::Styles, false, 22.0, "Edit style");
-                    crate::chrome::popover(&edit, ui.id().with(("local-style", st.id)), "Edit style", 240.0, |ui| {
-                        let mut ps = ps.clone();
-                        let mut edited = false;
-                        for (i, p) in ps.iter_mut().enumerate().rev() {
-                            if !matches!(paint_row(ui, ui.id().with(("ls-paint", st.id, i)), p, "Fill"), PaintEvent::None) {
-                                edited = true;
-                            }
-                        }
-                        if edited {
-                            self.begin_edit();
-                            if let Some(x) = self.doc.styles.iter_mut().find(|x| x.id == st.id) {
-                                x.value = crate::doc::StyleValue::Paint(ps);
-                            }
-                            self.doc.reflow();
-                        }
-                    });
-                }
+                let edit = icon_button(ui, Icon::Styles, false, 22.0, "Edit style");
+                crate::chrome::popover(&edit, ui.id().with(("local-style", st.id)), "Edit style", 260.0, |ui| self.style_editor(ui, st));
             });
         });
+    }
+
+    /// Figma's style editor: the full name (slashes make folders) and the style's value. Every
+    /// layer using the style follows.
+    fn style_editor(&mut self, ui: &mut Ui, st: &crate::doc::Style) {
+        use crate::doc::StyleValue;
+        let mut name = st.name.clone();
+        let mut value = st.value.clone();
+        ui.add(egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY)).on_hover_text("Slashes put the style in folders, such as Brand / Primary");
+        ui.separator();
+        let id = ui.id().with(("style-edit", st.id));
+        match &mut value {
+            StyleValue::Paint(ps) => {
+                for (i, p) in ps.iter_mut().enumerate().rev() {
+                    paint_row(ui, id.with(i), p, "Fill");
+                }
+            }
+            StyleValue::Text(t) => text_style_editor(ui, id, t),
+            StyleValue::Effect(es) => {
+                let mut remove = None;
+                for (i, s) in es.iter_mut().enumerate().rev() {
+                    if shadow_row(ui, id.with(i), s).1 {
+                        remove = Some(i);
+                    }
+                }
+                if let Some(i) = remove {
+                    es.remove(i);
+                }
+                if ui.button("Add effect").clicked() {
+                    es.push(Shadow::default());
+                }
+            }
+            StyleValue::Grid(gs) => {
+                for (i, g) in gs.iter_mut().enumerate() {
+                    if i > 0 {
+                        ui.separator();
+                    }
+                    grid_editor(ui, id.with(i), g);
+                }
+                if ui.button("Add layout guide").clicked() {
+                    gs.push(crate::doc::LayoutGrid::default());
+                }
+            }
+        }
+        if name != st.name || value != st.value {
+            self.begin_edit();
+            if let Some(x) = self.doc.styles.iter_mut().find(|x| x.id == st.id) {
+                x.name = name;
+                x.value = value;
+            }
+            self.doc.reflow();
+        }
     }
 
     /// The Frame tool's sidebar: click a preset to add a frame that size.
@@ -1551,10 +2316,36 @@ impl App {
     }
 
     fn prototype_props(&mut self, ui: &mut Ui) {
-        use crate::doc::{Action, Direction, Reaction, TransitionKind, Trigger};
-        use crate::prototype::{describe, frames_on_page, top_frame};
+        use crate::doc::{Action, Device, Direction, Easing, Overflow, OverlayPos, Reaction, ScrollPos, TransitionKind, Trigger, VarValue};
+        use crate::prototype::{describe, frames_on_page, key_label, sibling_variants, top_frame, trigger_label};
+        use std::mem::discriminant;
         let frames = frames_on_page(&self.doc, self.page);
         let Some(&id) = self.sel.first() else {
+            heading(ui, "Prototype settings");
+            let mut ps = self.doc.pages[self.page].prototype;
+            egui::Grid::new("proto-settings").num_columns(2).min_col_width(72.0).show(ui, |ui| {
+                ui.label("Device");
+                dropdown(ui, ps.device.label(), |ui| {
+                    for d in Device::ALL {
+                        ui.selectable_value(&mut ps.device, d, d.label());
+                    }
+                });
+                ui.end_row();
+                ui.label("Background");
+                ui.horizontal(|ui| {
+                    let mut c = [ps.background.0[0], ps.background.0[1], ps.background.0[2]];
+                    if egui::color_picker::color_edit_button_srgb(ui, &mut c).changed() {
+                        ps.background = Rgba::rgb(c[0], c[1], c[2]);
+                    }
+                    hex_field(ui, ui.id().with("proto-bg"), &mut ps.background, 56.0);
+                });
+                ui.end_row();
+            });
+            if ps != self.doc.pages[self.page].prototype {
+                self.begin_edit();
+                self.doc.pages[self.page].prototype = ps;
+            }
+            ui.separator();
             heading(ui, "Flow starting points");
             let flows = self.doc.pages[self.page].flows.clone();
             if flows.is_empty() {
@@ -1608,58 +2399,140 @@ impl App {
             changed = true;
         }
         let name = |doc: &crate::doc::Document, f: NodeId| doc.nodes.get(&f).map_or("Missing".to_string(), |n| n.name.clone());
+        // Change to: the variants of the set this layer is in.
+        let variants = sibling_variants(&self.doc, id);
+        // Scroll to: layers inside a scrolling frame of this one.
+        let scrollable: Vec<NodeId> = self.doc.descendants(top).into_iter().filter(|&d| self.doc.ancestors(d).iter().any(|a| self.doc.node(*a).overflow != Overflow::None)).collect();
         let mut remove = None;
         for (i, r) in reactions.iter_mut().enumerate() {
             let pid = ui.id().with(("reaction", id, i));
             ui.horizontal(|ui| {
                 let open = ui.add(egui::Button::new(describe(&self.doc, r)).frame(false).truncate());
-                crate::chrome::popover(&open, pid, "Interaction", 240.0, |ui| {
+                crate::chrome::popover(&open, pid, "Interaction", 260.0, |ui| {
                     let before = r.clone();
                     egui::Grid::new(pid.with("grid")).num_columns(2).show(ui, |ui| {
                         ui.label("Trigger");
-                        let t_label = |t: &Trigger| match t {
-                            Trigger::OnClick => "On click".into(),
-                            Trigger::OnHover => "On hover".into(),
-                            Trigger::WhilePressed => "While pressing".into(),
-                            Trigger::AfterDelay(ms) => format!("After delay {ms}ms"),
-                        };
-                        dropdown(ui, t_label(&r.trigger), |ui| {
-                            for t in [Trigger::OnClick, Trigger::OnHover, Trigger::WhilePressed, Trigger::AfterDelay(800)] {
-                                let label = t_label(&t);
-                                ui.selectable_value(&mut r.trigger, t, label);
+                        let kinds = [
+                            (Trigger::OnClick, "On click"),
+                            (Trigger::OnDrag, "On drag"),
+                            (Trigger::OnHover, "While hovering"),
+                            (Trigger::WhilePressed, "While pressing"),
+                            (Trigger::Key(egui::Key::Space, egui::Modifiers::NONE), "Key/Gamepad"),
+                            (Trigger::MouseEnter, "Mouse enter"),
+                            (Trigger::MouseLeave, "Mouse leave"),
+                            (Trigger::AfterDelay(800), "After delay"),
+                        ];
+                        dropdown(ui, trigger_label(&r.trigger), |ui| {
+                            for (t, label) in kinds {
+                                let on = discriminant(&r.trigger) == discriminant(&t);
+                                if ui.selectable_label(on, label).clicked() && !on {
+                                    r.trigger = t;
+                                }
                             }
                         });
                         ui.end_row();
-                        if let Trigger::AfterDelay(ms) = &mut r.trigger {
-                            ui.label("Delay");
-                            ui.add(DragValue::new(ms).range(0..=60000).suffix("ms").speed(10.0));
-                            ui.end_row();
+                        match &mut r.trigger {
+                            Trigger::AfterDelay(ms) => {
+                                ui.label("Delay");
+                                ui.add(DragValue::new(ms).range(0..=60000).suffix("ms").speed(10.0));
+                                ui.end_row();
+                            }
+                            Trigger::Key(k, m) => {
+                                // Press the key to set it, as in Figma.
+                                ui.label("Key");
+                                let rec = egui::Id::new(crate::prototype::RECORDING_KEY);
+                                let recording = ui.data(|d| d.get_temp::<egui::Id>(rec)) == Some(pid);
+                                let b = ui.add(egui::Button::new(if recording { "Press a key...".to_string() } else { key_label(*k, *m) }).selected(recording));
+                                if recording {
+                                    let filter = egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true };
+                                    ui.memory_mut(|mem| {
+                                        mem.request_focus(b.id);
+                                        mem.set_focus_lock_filter(b.id, filter);
+                                    });
+                                    let pressed = ui.input(|i| {
+                                        i.events.iter().find_map(|e| match e {
+                                            egui::Event::Key { key, pressed: true, modifiers, .. } => Some((*key, *modifiers)),
+                                            _ => None,
+                                        })
+                                    });
+                                    if let Some((key, mods)) = pressed {
+                                        (*k, *m) = (key, egui::Modifiers { alt: mods.alt, shift: mods.shift, command: mods.command, ..Default::default() });
+                                        ui.data_mut(|d| d.remove::<egui::Id>(rec));
+                                        ui.memory_mut(|mem| mem.surrender_focus(b.id));
+                                    }
+                                } else if b.clicked() {
+                                    ui.data_mut(|d| d.insert_temp(rec, pid));
+                                }
+                                ui.end_row();
+                            }
+                            _ => {}
                         }
                         ui.label("Action");
                         let a_label = match &r.action {
                             Action::None => "None",
                             Action::Navigate(_) => "Navigate to",
+                            Action::ChangeTo(_) => "Change to",
                             Action::Back => "Back",
+                            Action::ScrollTo(_) => "Scroll to",
                             Action::OpenOverlay(_) => "Open overlay",
+                            Action::SwapOverlay(_) => "Swap overlay",
                             Action::CloseOverlay => "Close overlay",
                             Action::OpenUrl(_) => "Open link",
+                            Action::SetVariable(..) => "Set variable",
                         };
                         let first = frames.iter().copied().find(|f| *f != top).unwrap_or(top);
+                        let mut acts = vec![(Action::Navigate(first), "Navigate to")];
+                        // Change to only makes sense inside a variant; it defaults to another variant.
+                        if let Some(&v) = variants.iter().find(|&&v| v != id && !self.doc.is_ancestor(v, id)).or(variants.first()) {
+                            acts.push((Action::ChangeTo(v), "Change to"));
+                        }
+                        acts.push((Action::Back, "Back"));
+                        if let Some(&l) = scrollable.first() {
+                            acts.push((Action::ScrollTo(l), "Scroll to"));
+                        }
+                        acts.extend([
+                            (Action::OpenUrl("https://".into()), "Open link"),
+                            (Action::OpenOverlay(first), "Open overlay"),
+                            (Action::SwapOverlay(first), "Swap overlay"),
+                            (Action::CloseOverlay, "Close overlay"),
+                        ]);
+                        if let Some(v) = self.doc.variables.first() {
+                            acts.push((Action::SetVariable(v.id, v.values.first().cloned().unwrap_or(VarValue::Bool(true))), "Set variable"));
+                        }
+                        acts.push((Action::None, "None"));
                         dropdown(ui, a_label, |ui| {
-                            ui.selectable_value(&mut r.action, Action::Navigate(first), "Navigate to");
-                            ui.selectable_value(&mut r.action, Action::Back, "Back");
-                            ui.selectable_value(&mut r.action, Action::OpenOverlay(first), "Open overlay");
-                            ui.selectable_value(&mut r.action, Action::CloseOverlay, "Close overlay");
-                            ui.selectable_value(&mut r.action, Action::OpenUrl("https://".into()), "Open link");
-                            ui.selectable_value(&mut r.action, Action::None, "None");
+                            for (a, label) in acts {
+                                let on = discriminant(&r.action) == discriminant(&a);
+                                if ui.selectable_label(on, label).clicked() && !on {
+                                    r.action = a;
+                                }
+                            }
                         });
                         ui.end_row();
                         match &mut r.action {
-                            Action::Navigate(dest) | Action::OpenOverlay(dest) => {
+                            Action::Navigate(dest) | Action::OpenOverlay(dest) | Action::SwapOverlay(dest) => {
                                 ui.label("Destination");
                                 dropdown(ui, name(&self.doc, *dest), |ui| {
                                     for &f in &frames {
                                         ui.selectable_value(dest, f, name(&self.doc, f));
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                            Action::ChangeTo(dest) => {
+                                ui.label("Variant");
+                                dropdown(ui, name(&self.doc, *dest), |ui| {
+                                    for &v in &variants {
+                                        ui.selectable_value(dest, v, name(&self.doc, v));
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                            Action::ScrollTo(dest) => {
+                                ui.label("Layer");
+                                dropdown(ui, name(&self.doc, *dest), |ui| {
+                                    for &l in &scrollable {
+                                        ui.selectable_value(dest, l, name(&self.doc, l));
                                     }
                                 });
                                 ui.end_row();
@@ -1669,9 +2542,93 @@ impl App {
                                 ui.text_edit_singleline(url);
                                 ui.end_row();
                             }
+                            Action::SetVariable(var, val) => {
+                                ui.label("Variable");
+                                let vname = self.doc.variable(*var).map_or("Missing".to_string(), |v| v.name.clone());
+                                dropdown(ui, vname, |ui| {
+                                    for v in &self.doc.variables {
+                                        if ui.selectable_label(v.id == *var, &v.name).clicked() && v.id != *var {
+                                            *var = v.id;
+                                            *val = v.values.first().cloned().unwrap_or(VarValue::Bool(true));
+                                        }
+                                    }
+                                });
+                                ui.end_row();
+                                ui.label("Value");
+                                match val {
+                                    VarValue::Color(c) => {
+                                        ui.horizontal(|ui| {
+                                            let mut rgb = [c.0[0], c.0[1], c.0[2]];
+                                            if egui::color_picker::color_edit_button_srgb(ui, &mut rgb).changed() {
+                                                *c = Rgba([rgb[0], rgb[1], rgb[2], c.0[3]]);
+                                            }
+                                            hex_field(ui, pid.with("var-hex"), c, 56.0);
+                                        });
+                                    }
+                                    VarValue::Number(n) => {
+                                        ui.add(DragValue::new(n).speed(1.0));
+                                    }
+                                    VarValue::Text(t) => {
+                                        ui.text_edit_singleline(t);
+                                    }
+                                    VarValue::Bool(b) => {
+                                        ui.checkbox(b, "");
+                                    }
+                                    VarValue::Alias(_) => {
+                                        ui.label("Alias");
+                                    }
+                                }
+                                ui.end_row();
+                            }
                             _ => {}
                         }
-                        if matches!(r.action, Action::Navigate(_) | Action::Back) {
+                        if matches!(r.action, Action::OpenOverlay(_) | Action::SwapOverlay(_)) {
+                            let o = &mut r.overlay;
+                            ui.label("Position");
+                            let positions = [
+                                (OverlayPos::Center, "Center"),
+                                (OverlayPos::TopLeft, "Top left"),
+                                (OverlayPos::TopCenter, "Top center"),
+                                (OverlayPos::TopRight, "Top right"),
+                                (OverlayPos::BottomLeft, "Bottom left"),
+                                (OverlayPos::BottomCenter, "Bottom center"),
+                                (OverlayPos::BottomRight, "Bottom right"),
+                                (OverlayPos::Manual, "Manual"),
+                            ];
+                            dropdown(ui, positions.iter().find(|p| p.0 == o.position).map_or("", |p| p.1), |ui| {
+                                for (p, label) in positions {
+                                    ui.selectable_value(&mut o.position, p, label);
+                                }
+                            });
+                            ui.end_row();
+                            if o.position == OverlayPos::Manual {
+                                // From the trigger layer's top-left.
+                                ui.label("Offset");
+                                ui.horizontal(|ui| {
+                                    ui.add(DragValue::new(&mut o.offset.x).prefix("X "));
+                                    ui.add(DragValue::new(&mut o.offset.y).prefix("Y "));
+                                });
+                                ui.end_row();
+                            }
+                            ui.label("");
+                            ui.checkbox(&mut o.close_outside, "Close when clicking outside");
+                            ui.end_row();
+                            ui.label("");
+                            ui.horizontal(|ui| {
+                                let mut on = o.background.is_some();
+                                if ui.checkbox(&mut on, "Add background behind overlay").changed() {
+                                    o.background = on.then_some(Rgba([0, 0, 0, 64]));
+                                }
+                                if let Some(bg) = &mut o.background {
+                                    let mut c = bg.to32();
+                                    if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::OnlyBlend).changed() {
+                                        *bg = Rgba(c.to_srgba_unmultiplied());
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                        }
+                        if matches!(r.action, Action::Navigate(_) | Action::Back | Action::ScrollTo(_)) {
                             ui.label("Animation");
                             let k_label = |k: TransitionKind| match k {
                                 TransitionKind::Instant => "Instant",
@@ -1681,8 +2638,14 @@ impl App {
                                 TransitionKind::Push => "Push",
                                 TransitionKind::SlideIn => "Slide in",
                             };
+                            // Scrolling either jumps or animates.
+                            let kinds: &[TransitionKind] = if matches!(r.action, Action::ScrollTo(_)) {
+                                &[TransitionKind::Instant, TransitionKind::SmartAnimate]
+                            } else {
+                                &[TransitionKind::Instant, TransitionKind::Dissolve, TransitionKind::SmartAnimate, TransitionKind::MoveIn, TransitionKind::Push, TransitionKind::SlideIn]
+                            };
                             dropdown(ui, k_label(r.transition.kind), |ui| {
-                                for k in [TransitionKind::Instant, TransitionKind::Dissolve, TransitionKind::SmartAnimate, TransitionKind::MoveIn, TransitionKind::Push, TransitionKind::SlideIn] {
+                                for &k in kinds {
                                     ui.selectable_value(&mut r.transition.kind, k, k_label(k));
                                 }
                             });
@@ -1697,12 +2660,43 @@ impl App {
                                 ui.end_row();
                             }
                             if r.transition.kind != TransitionKind::Instant {
-                                ui.label("Duration");
-                                let mut ms = (r.transition.duration * 1000.0).round();
-                                if ui.add(DragValue::new(&mut ms).range(0.0..=10000.0).suffix("ms").speed(10.0)).changed() {
-                                    r.transition.duration = ms / 1000.0;
-                                }
+                                let e = &mut r.transition.easing;
+                                ui.label("Easing");
+                                ui.horizontal(|ui| {
+                                    dropdown(ui, e.label(), |ui| {
+                                        for x in Easing::ALL {
+                                            ui.horizontal(|ui| {
+                                                easing_curve(ui, x, vec2(24.0, 16.0));
+                                                let on = discriminant(e) == discriminant(&x);
+                                                if ui.selectable_label(on, x.label()).clicked() && !on {
+                                                    *e = x;
+                                                }
+                                            });
+                                        }
+                                    });
+                                    easing_curve(ui, *e, vec2(40.0, 24.0));
+                                });
                                 ui.end_row();
+                                if let Easing::Custom(c) = e {
+                                    ui.label("Bezier");
+                                    ui.horizontal(|ui| {
+                                        for (i, v) in c.iter_mut().enumerate() {
+                                            // x stays inside 0..1 so time only runs forward.
+                                            let range = if i % 2 == 0 { 0.0..=1.0 } else { -2.0..=3.0 };
+                                            ui.add(DragValue::new(v).range(range).speed(0.01).max_decimals(2));
+                                        }
+                                    });
+                                    ui.end_row();
+                                }
+                                // Springs settle in their own time.
+                                if !e.is_spring() {
+                                    ui.label("Duration");
+                                    let mut ms = (r.transition.duration * 1000.0).round();
+                                    if ui.add(DragValue::new(&mut ms).range(0.0..=10000.0).suffix("ms").speed(10.0)).changed() {
+                                        r.transition.duration = ms / 1000.0;
+                                    }
+                                    ui.end_row();
+                                }
                             }
                         }
                     });
@@ -1722,6 +2716,41 @@ impl App {
         if changed {
             self.begin_edit();
             self.doc.node_mut(id).reactions = reactions;
+        }
+        // Scroll behavior: how frames scroll and how their children move with them.
+        let n = self.doc.node(id);
+        let (is_frame, in_frame) = (n.kind.is_frame() && n.kind != Kind::Section, n.parent.is_some_and(|p| self.doc.node(p).kind.is_frame()));
+        if is_frame || in_frame {
+            ui.separator();
+            heading(ui, "Scroll behavior");
+            let (mut overflow, mut pos) = (n.overflow, n.scroll_pos);
+            egui::Grid::new("scroll-behavior").num_columns(2).min_col_width(72.0).show(ui, |ui| {
+                if in_frame {
+                    let all = [(ScrollPos::Scroll, "Scroll with parent"), (ScrollPos::Fixed, "Fixed"), (ScrollPos::Sticky, "Sticky")];
+                    ui.label("Position");
+                    dropdown(ui, all.iter().find(|x| x.0 == pos).map_or("", |x| x.1), |ui| {
+                        for (p, label) in all {
+                            ui.selectable_value(&mut pos, p, label);
+                        }
+                    });
+                    ui.end_row();
+                }
+                if is_frame {
+                    let all = [(Overflow::None, "No scrolling"), (Overflow::Horizontal, "Horizontal"), (Overflow::Vertical, "Vertical"), (Overflow::Both, "Both directions")];
+                    ui.label("Overflow");
+                    dropdown(ui, all.iter().find(|x| x.0 == overflow).map_or("", |x| x.1), |ui| {
+                        for (o, label) in all {
+                            ui.selectable_value(&mut overflow, o, label);
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+            if (overflow, pos) != (n.overflow, n.scroll_pos) {
+                self.checkpoint();
+                let n = self.doc.node_mut(id);
+                (n.overflow, n.scroll_pos) = (overflow, pos);
+            }
         }
     }
 
@@ -1758,13 +2787,34 @@ impl App {
         let n = self.doc.node(id).clone();
         ui.label(RichText::new(&n.name).strong().size(14.0));
         ui.label(RichText::new(format!("{}  ·  {} × {}", n.kind.label(), num(n.rect.width()), num(n.rect.height()))).color(theme::muted(ui.ctx())));
+        // A component's (or an instance's main's) description, as Dev Mode shows it.
+        let main = match n.kind {
+            Kind::Component | Kind::ComponentSet => Some(id),
+            Kind::Instance => n.component.filter(|c| self.doc.nodes.contains_key(c)),
+            _ => None,
+        };
+        if let Some(desc) = main.map(|c| self.doc.description_of(c).to_string()).filter(|d| !d.is_empty()) {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.label(RichText::new(desc).color(theme::muted(ui.ctx())));
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+        }
+        if n.kind.is_frame() && n.kind != Kind::Instance {
+            let green = Color32::from_rgb(0x14, 0xAE, 0x5C);
+            let (label, fill) = if n.ready { ("Ready for dev", green) } else { ("Mark as ready for dev", theme::subtle(ui.ctx())) };
+            let text = if n.ready { RichText::new(label).color(Color32::WHITE) } else { RichText::new(label) };
+            if ui.add_sized([ui.available_width(), 24.0], egui::Button::new(text).fill(fill)).on_hover_text(if n.ready { "Click to mark as changed" } else { "" }).clicked() {
+                self.toggle_ready_for_dev();
+            }
+        }
         ui.separator();
         ui.horizontal(|ui| {
             ui.label(RichText::new("Code").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                for (lang, label) in [(Lang::Compose, "Compose"), (Lang::SwiftUi, "SwiftUI"), (Lang::Css, "CSS")] {
-                    ui.selectable_value(&mut self.code_lang, lang, label);
-                }
+                egui::ComboBox::from_id_salt("code-lang").selected_text(self.code_lang.label()).width(90.0).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+                    for lang in Lang::ALL {
+                        ui.selectable_value(&mut self.code_lang, lang, lang.label());
+                    }
+                });
             });
         });
         let code = generate(&self.doc, id, self.code_lang);
@@ -1789,7 +2839,7 @@ impl App {
                 }
             }
             if dn.kind == Kind::Text {
-                let t = format!("{} {} · {}px", dn.font_family, crate::text::weight_name(dn.font_weight), num(dn.font_size));
+                let t = format!("{} {} · {}px", dn.font_family, crate::text::style_name(dn.font_weight, dn.italic), num(dn.font_size));
                 if !type_styles.contains(&t) {
                     type_styles.push(t);
                 }
@@ -1818,21 +2868,66 @@ impl App {
                 ui.label(t);
             }
         }
+        // Text links, clickable.
+        let links: Vec<(String, String)> = ids
+            .iter()
+            .flat_map(|&d| {
+                let dn = self.doc.node(d);
+                let chars: Vec<char> = dn.text.chars().collect();
+                dn.spans.iter().filter_map(move |sp| Some((chars[sp.start.min(chars.len())..sp.end.min(chars.len())].iter().collect(), sp.style.link.clone()?))).collect::<Vec<_>>()
+            })
+            .collect();
+        if !links.is_empty() {
+            ui.separator();
+            heading(ui, "Links");
+            for (text, url) in links {
+                ui.add(egui::Hyperlink::from_label_and_url(text, &url).open_in_new_tab(true)).on_hover_text(url);
+            }
+        }
+        self.annotations_section(ui, id);
         ui.separator();
         self.export_props(ui);
+    }
+
+    /// Dev Mode annotations on a layer: notes that label it on the canvas.
+    fn annotations_section(&mut self, ui: &mut Ui, id: NodeId) {
+        ui.separator();
+        let mut notes = self.doc.node(id).annotations.clone();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Annotations").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icon_button(ui, Icon::Plus, false, 22.0, "Add annotation").clicked() {
+                    notes.push("Note".into());
+                }
+            });
+        });
+        let mut remove = None;
+        for (i, note) in notes.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::multiline(note).desired_rows(1).desired_width(ui.available_width() - 28.0));
+                if icon_button(ui, Icon::Minus, false, 22.0, "Remove annotation").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            notes.remove(i);
+        }
+        if notes != self.doc.node(id).annotations {
+            self.begin_edit();
+            self.doc.node_mut(id).annotations = notes;
+        }
     }
 
     fn page_props(&mut self, ui: &mut Ui) {
         heading(ui, "Page");
         let mut bg = self.doc.pages[self.page].background;
         ui.horizontal(|ui| {
-            let mut c = [bg.0[0], bg.0[1], bg.0[2]];
-            let mut changed = egui::color_picker::color_edit_button_srgb(ui, &mut c).changed();
-            bg = Rgba::rgb(c[0], c[1], c[2]);
+            let mut changed = crate::paint_ui::color_swatch(ui, ui.id().with("page-bg-swatch"), &mut bg);
             changed |= hex_field(ui, ui.id().with("page-bg"), &mut bg, 56.0);
             if changed {
                 self.begin_edit();
-                self.doc.pages[self.page].background = bg;
+                self.doc.pages[self.page].background = bg.with_alpha(255);
             }
         });
         self.local_styles(ui);
@@ -1855,8 +2950,9 @@ impl App {
             ("Color styles", (|v: &StyleValue| matches!(v, StyleValue::Paint(_))) as fn(&StyleValue) -> bool),
             ("Text styles", |v: &StyleValue| matches!(v, StyleValue::Text(_))),
             ("Effect styles", |v: &StyleValue| matches!(v, StyleValue::Effect(_))),
+            ("Grid styles", |v: &StyleValue| matches!(v, StyleValue::Grid(_))),
         ] {
-            let list: Vec<crate::doc::Style> = self.doc.styles.iter().filter(|s| is(&s.value)).cloned().collect();
+            let list: Vec<crate::doc::Style> = self.doc.styles.iter().filter(|s| s.remote.is_none() && is(&s.value)).cloned().collect();
             if list.is_empty() {
                 continue;
             }
@@ -1882,11 +2978,27 @@ impl App {
                         }
                     }
                     Some(name) => {
-                        egui::CollapsingHeader::new(name).id_salt(("style-folder", label, name)).default_open(true).show(ui, |ui| {
-                            for st in items {
-                                self.local_style_row(ui, &st, &mut delete);
+                        // A collapsible folder whose name edits in place, renaming every style in it.
+                        let state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.id().with(("style-folder", label, name)), true);
+                        let mut rename = None;
+                        state
+                            .show_header(ui, |ui| {
+                                rename = commit_field(ui, ui.id().with(("folder-name", label, name)), name, 150.0, false);
+                            })
+                            .body(|ui| {
+                                for st in &items {
+                                    self.local_style_row(ui, st, &mut delete);
+                                }
+                            });
+                        if let Some(rename) = rename.map(|r| r.trim().trim_matches('/').trim().to_string()) {
+                            self.begin_edit();
+                            for st in &items {
+                                if let Some(x) = self.doc.styles.iter_mut().find(|x| x.id == st.id) {
+                                    let leaf = x.name.rsplit_once('/').map_or(x.name.as_str(), |(_, l)| l).trim().to_string();
+                                    x.name = if rename.is_empty() { leaf } else { format!("{rename} / {leaf}") };
+                                }
                             }
-                        });
+                        }
                     }
                 }
             }
@@ -1895,6 +3007,30 @@ impl App {
             self.checkpoint();
             self.doc.styles.retain(|s| s.id != id);
             self.doc.reflow();
+        }
+        // Library styles this file uses; "Move to this file" makes one local, as in Figma.
+        let remote: Vec<crate::doc::Style> = self.doc.styles.iter().filter(|s| s.remote.is_some()).cloned().collect();
+        if remote.is_empty() {
+            return;
+        }
+        ui.label(RichText::new("Library styles").color(theme::muted(ui.ctx())).small());
+        let mut localize = None;
+        for st in remote {
+            ui.horizontal(|ui| {
+                crate::paint_ui::style_preview(ui, &st.value);
+                ui.label(&st.name);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Move to this file").clicked() {
+                        localize = Some(st.id);
+                    }
+                });
+            });
+        }
+        if let Some(id) = localize {
+            self.checkpoint();
+            if let Some(s) = self.doc.styles.iter_mut().find(|s| s.id == id) {
+                s.remote = None;
+            }
         }
     }
 
@@ -1944,7 +3080,7 @@ impl App {
             let mut changed = false;
             ui.horizontal(|ui| {
                 ui.label("Arc");
-                changed |= ui.add(DragValue::new(&mut start).speed(1.0).suffix("°")).on_hover_text("Start").changed();
+                changed |= ui.add(DragValue::new(&mut start).range(-360.0..=360.0).speed(1.0).suffix("°")).on_hover_text("Start").changed();
                 changed |= ui.add(DragValue::new(&mut sweep_pct).range(-100.0..=100.0).speed(0.5).suffix("%")).on_hover_text("Sweep").changed();
                 changed |= ui.add(DragValue::new(&mut ratio_pct).range(0.0..=99.0).speed(0.5).suffix("%")).on_hover_text("Ratio").changed();
             });
@@ -2097,6 +3233,117 @@ impl App {
         false
     }
 
+    /// An instance's variant pickers and component property values. Edits apply to every
+    /// selected instance of the same component, or just this one when it is a nested instance.
+    fn instance_props(&mut self, ui: &mut Ui, i: NodeId, c: NodeId, nested: bool) {
+        use crate::doc::PropValue;
+        let pool: Vec<NodeId> = if nested { vec![i] } else { self.sel.clone() };
+        if let Some(set) = self.doc.node(c).parent.filter(|p| self.doc.node(*p).kind == Kind::ComponentSet) {
+            let current = crate::doc::variant_pairs(&self.doc.node(c).name);
+            for (prop, values) in self.doc.variant_props(set) {
+                let cur = current.iter().find(|(k, _)| *k == prop).map(|(_, v)| v.clone()).unwrap_or_default();
+                let mut pick = cur.clone();
+                ui.horizontal(|ui| {
+                    ui.label(&prop);
+                    egui::ComboBox::from_id_salt(("variant", i, &prop)).selected_text(&pick).width(110.0).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+                        for v in &values {
+                            ui.selectable_value(&mut pick, v.clone(), v);
+                        }
+                    });
+                });
+                if pick != cur {
+                    // Every selected instance of this set switches, each keeping its other properties.
+                    self.checkpoint();
+                    let targets: Vec<NodeId> = pool.iter().copied().filter(|&s| self.doc.node(s).component.and_then(|c| self.doc.nodes.get(&c)).and_then(|c| c.parent) == Some(set)).collect();
+                    for t in targets {
+                        let Some(tc) = self.doc.node(t).component else { continue };
+                        let mut want = crate::doc::variant_pairs(&self.doc.node(tc).name);
+                        want.retain(|(k, _)| *k != prop);
+                        want.push((prop.clone(), pick.clone()));
+                        if let Some(v) = self.doc.find_variant(set, &want) {
+                            self.doc.swap_component(t, v);
+                        }
+                    }
+                    self.doc.reflow();
+                }
+            }
+        }
+        // Component property values.
+        let props = self.doc.props_of(c);
+        let mut values = self.doc.node(i).prop_values.clone();
+        let mut changed = false;
+        for p in &props {
+            let cur = values.iter().find(|(k, _)| *k == p.name).map(|(_, v)| v.clone()).unwrap_or(p.default.clone());
+            let mut next = cur.clone();
+            ui.horizontal(|ui| {
+                ui.label(&p.name);
+                match &mut next {
+                    PropValue::Bool(b) => {
+                        ui.checkbox(b, "");
+                    }
+                    PropValue::Text(t) => {
+                        ui.text_edit_singleline(t);
+                    }
+                    PropValue::Swap(target) => {
+                        // Preferred values, when the property has them, are what the picker offers (as in Figma).
+                        let live: Vec<NodeId> = p.preferred.iter().copied().filter(|c| self.doc.nodes.contains_key(c)).collect();
+                        let mut comps: Vec<NodeId> = if live.is_empty() { self.doc.nodes.values().filter(|n| n.kind == Kind::Component).map(|n| n.id).collect() } else { live };
+                        comps.sort_by_key(|c| self.doc.node(*c).name.to_lowercase());
+                        egui::ComboBox::from_id_salt(("swap", i, &p.name)).selected_text(self.doc.nodes.get(target).map_or("Missing".into(), |n| n.name.clone())).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+                            for cid in comps {
+                                let name = self.doc.node(cid).name.clone();
+                                ui.selectable_value(target, cid, name);
+                            }
+                        });
+                    }
+                }
+            });
+            if next != cur {
+                values.retain(|(k, _)| *k != p.name);
+                values.push((p.name.clone(), next));
+                changed = true;
+            }
+        }
+        if changed {
+            self.begin_edit();
+            // Selected instances of the same component take the same values.
+            let targets: Vec<NodeId> = pool.iter().copied().filter(|&s| s == i || self.doc.node(s).component == Some(c)).collect();
+            for t in targets {
+                self.doc.node_mut(t).prop_values = values.clone();
+            }
+            self.doc.reflow();
+        }
+    }
+
+    /// Instance actions shared by the Design panel and the canvas menu: push overrides to the
+    /// main component, reset everything or one kind of override.
+    pub fn instance_menu(&mut self, ui: &mut Ui, inst: NodeId) {
+        let overrides = self.doc.instance_overrides(inst);
+        // A library component is read-only here; it can be moved into this file instead.
+        let remote = self.main_is_remote(inst);
+        if ui.add_enabled(!overrides.is_empty() && !remote, egui::Button::new("Push changes to main component")).clicked() {
+            self.checkpoint();
+            self.doc.push_to_main(inst);
+            ui.close();
+        }
+        if remote && ui.button("Move main component to this file").clicked() {
+            self.localize_main(inst);
+            ui.close();
+        }
+        if ui.button("Reset all changes").clicked() {
+            self.checkpoint();
+            self.doc.reset_instance(inst);
+            ui.close();
+        }
+        for o in overrides {
+            if ui.button(o.label()).clicked() {
+                self.checkpoint();
+                self.doc.reset_override(inst, o);
+                ui.close();
+            }
+        }
+    }
+
     fn component_section(&mut self, ui: &mut Ui, id: NodeId) {
         use crate::doc::{CompProp, PropTarget, PropValue};
         let n = self.doc.node(id).clone();
@@ -2138,81 +3385,24 @@ impl App {
             let comp = self.doc.node(i).component.filter(|c| self.doc.nodes.contains_key(c));
             // Variant pickers when the main lives in a component set.
             if let Some(c) = comp {
-                if let Some(set) = self.doc.node(c).parent.filter(|p| self.doc.node(*p).kind == Kind::ComponentSet) {
-                    let current = crate::doc::variant_pairs(&self.doc.node(c).name);
-                    for (prop, values) in self.doc.variant_props(set) {
-                        let cur = current.iter().find(|(k, _)| *k == prop).map(|(_, v)| v.clone()).unwrap_or_default();
-                        let mut pick = cur.clone();
-                        ui.horizontal(|ui| {
-                            ui.label(&prop);
-                            egui::ComboBox::from_id_salt(("variant", i, &prop)).selected_text(&pick).width(110.0).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
-                                for v in &values {
-                                    ui.selectable_value(&mut pick, v.clone(), v);
-                                }
-                            });
-                        });
-                        if pick != cur {
-                            // Every selected instance of this set switches, each keeping its other properties.
-                            self.checkpoint();
-                            let targets: Vec<NodeId> = self.sel.iter().copied().filter(|&s| self.doc.node(s).component.and_then(|c| self.doc.nodes.get(&c)).and_then(|c| c.parent) == Some(set)).collect();
-                            for t in targets {
-                                let Some(tc) = self.doc.node(t).component else { continue };
-                                let mut want = crate::doc::variant_pairs(&self.doc.node(tc).name);
-                                want.retain(|(k, _)| *k != prop);
-                                want.push((prop.clone(), pick.clone()));
-                                if let Some(v) = self.doc.find_variant(set, &want) {
-                                    self.doc.swap_component(t, v);
-                                }
-                            }
-                            self.doc.reflow();
-                        }
-                    }
+                let desc = self.doc.description_of(c);
+                if !desc.is_empty() {
+                    ui.label(RichText::new(desc).small().color(theme::muted(ui.ctx())));
                 }
-                // Component property values.
-                let props = self.doc.props_of(c);
-                let mut values = self.doc.node(i).prop_values.clone();
-                let mut changed = false;
-                for p in &props {
-                    let cur = values.iter().find(|(k, _)| *k == p.name).map(|(_, v)| v.clone()).unwrap_or(p.default.clone());
-                    let mut next = cur.clone();
-                    ui.horizontal(|ui| {
-                        ui.label(&p.name);
-                        match &mut next {
-                            PropValue::Bool(b) => {
-                                ui.checkbox(b, "");
-                            }
-                            PropValue::Text(t) => {
-                                ui.text_edit_singleline(t);
-                            }
-                            PropValue::Swap(target) => {
-                                let comps: Vec<NodeId> = self.doc.nodes.values().filter(|n| n.kind == Kind::Component).map(|n| n.id).collect();
-                                egui::ComboBox::from_id_salt(("swap", i, &p.name)).selected_text(self.doc.nodes.get(target).map_or("Missing".into(), |n| n.name.clone())).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
-                                    for cid in comps {
-                                        let name = self.doc.node(cid).name.clone();
-                                        ui.selectable_value(target, cid, name);
-                                    }
-                                });
-                            }
-                        }
-                    });
-                    if next != cur {
-                        values.retain(|(k, _)| *k != p.name);
-                        values.push((p.name.clone(), next));
-                        changed = true;
-                    }
-                }
-                if changed {
-                    self.begin_edit();
-                    // Selected instances of the same component take the same values.
-                    let targets: Vec<NodeId> = self.sel.iter().copied().filter(|&s| s == i || self.doc.node(s).component == Some(c)).collect();
-                    for t in targets {
-                        self.doc.node_mut(t).prop_values = values.clone();
-                    }
-                    self.doc.reflow();
+                self.instance_props(ui, i, c, false);
+                // Nested instances the main component exposes show their properties here too.
+                let nested: Vec<NodeId> = self.doc.descendants(i).into_iter().filter(|&d| {
+                    let n = self.doc.node(d);
+                    n.kind == Kind::Instance && n.exposed && n.component.is_some_and(|c| self.doc.nodes.contains_key(&c))
+                }).collect();
+                for d in nested {
+                    ui.label(RichText::new(format!("↳ {}", self.doc.node(d).name)).small().color(theme::muted(ui.ctx())));
+                    let dc = self.doc.node(d).component.unwrap();
+                    self.instance_props(ui, d, dc, true);
                 }
             }
             ui.horizontal(|ui| {
-                if ui.button("Go to main").clicked() {
+                if ui.button(if self.main_is_remote(i) { "Open library file" } else { "Go to main" }).clicked() {
                     self.go_to_main(i);
                 }
                 if ui.button("Reset").clicked() {
@@ -2223,6 +3413,8 @@ impl App {
                     self.checkpoint();
                     self.doc.detach_instance(i);
                 }
+                let more = icon_button(ui, Icon::Menu, false, 22.0, "More instance options");
+                egui::Popup::menu(&more).id(ui.id().with(("inst-more", i))).style(crate::chrome::menu_style).show(|ui| self.instance_menu(ui, i));
             });
         } else if let Some(o) = owner.filter(|_| inst.is_none()) {
             let on = self.doc.node(o).clone();
@@ -2250,7 +3442,7 @@ impl App {
                                 ui.close();
                             }
                             if ui.button("Boolean").clicked() {
-                                props.push(CompProp { name: fresh(&props, "Show"), default: PropValue::Bool(true) });
+                                props.push(CompProp { name: fresh(&props, "Show"), default: PropValue::Bool(true), preferred: vec![] });
                                 changed = true;
                                 ui.close();
                             }
@@ -2270,12 +3462,12 @@ impl App {
                                 } else {
                                     "Text".into()
                                 };
-                                props.push(CompProp { name, default: PropValue::Text(default) });
+                                props.push(CompProp { name, default: PropValue::Text(default), preferred: vec![] });
                                 changed = true;
                                 ui.close();
                             }
                             if ui.button("Instance swap").clicked() {
-                                props.push(CompProp { name: fresh(&props, "Icon"), default: PropValue::Swap(o) });
+                                props.push(CompProp { name: fresh(&props, "Icon"), default: PropValue::Swap(o), preferred: vec![] });
                                 changed = true;
                                 ui.close();
                             }
@@ -2290,7 +3482,22 @@ impl App {
                             PropValue::Bool(b) => changed |= ui.checkbox(b, "").changed(),
                             PropValue::Text(t) => changed |= ui.add(egui::TextEdit::singleline(t).desired_width(70.0)).changed(),
                             PropValue::Swap(_) => {
-                                ui.label("Instance");
+                                // Figma's "Preferred values": the components this swap offers.
+                                let label = if p.preferred.is_empty() { "Preferred".to_string() } else { format!("Preferred ({})", p.preferred.len()) };
+                                crate::chrome::menu_button(ui, label, |ui| {
+                                    let mut comps: Vec<(NodeId, String)> = self.doc.nodes.values().filter(|n| n.kind == Kind::Component).map(|n| (n.id, n.name.clone())).collect();
+                                    comps.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+                                    for (cid, name) in comps {
+                                        let mut on = p.preferred.contains(&cid);
+                                        if ui.checkbox(&mut on, name).changed() {
+                                            p.preferred.retain(|x| *x != cid);
+                                            if on {
+                                                p.preferred.push(cid);
+                                            }
+                                            changed = true;
+                                        }
+                                    }
+                                });
                             }
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2303,6 +3510,12 @@ impl App {
                 if let Some(k) = remove {
                     props.remove(k);
                     changed = true;
+                }
+                // Figma's component description, shown in Assets and Dev Mode.
+                let mut desc = self.doc.node(def).description.clone();
+                if ui.add(egui::TextEdit::multiline(&mut desc).hint_text("Description").desired_rows(2).desired_width(f32::INFINITY)).changed() {
+                    self.begin_edit();
+                    self.doc.node_mut(def).description = desc;
                 }
                 if changed {
                     self.begin_edit();
@@ -2378,6 +3591,15 @@ impl App {
                     self.checkpoint();
                     self.doc.node_mut(id).prop_bind = bind;
                     self.doc.reflow();
+                }
+                // A nested instance can show its own properties on instances of this component.
+                if n.kind == Kind::Instance {
+                    let mut on = n.exposed;
+                    if ui.checkbox(&mut on, "Expose properties").on_hover_text("Show this nested instance's properties on instances of the component").changed() {
+                        self.checkpoint();
+                        self.doc.node_mut(id).exposed = on;
+                        self.doc.reflow();
+                    }
                 }
             }
         }
@@ -2556,6 +3778,25 @@ impl App {
                 self.doc.reflow();
             }
         }
+        // Grid children span columns and rows.
+        if parent_al && roots.len() == 1 && n.parent.is_some_and(|p| self.doc.node(p).layout.mode == LayoutMode::Grid) {
+            let mut span = n.grid_span;
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                for (i, label) in [(0, "Col span"), (1, "Row span")] {
+                    let mut v = span[i].max(1) as f32;
+                    if num_field(ui, &mut v, label, 1.0, half(ui) - 4.0) {
+                        span[i] = v.round().clamp(1.0, 100.0) as u32;
+                        changed = true;
+                    }
+                }
+            });
+            if changed {
+                self.begin_edit();
+                self.doc.node_mut(first).grid_span = span;
+                self.doc.reflow();
+            }
+        }
         if n.kind.is_frame() {
             let mut clip = n.clip;
             if ui.checkbox(&mut clip, "Clip content").changed() {
@@ -2572,30 +3813,85 @@ impl App {
     fn auto_layout_controls(&mut self, ui: &mut Ui, f: NodeId) {
         let mut l = self.doc.node(f).layout;
         let before = l;
+        let kids = self.doc.node(f).children.len().max(1) as f32;
         ui.horizontal(|ui| {
             for (m, wrap, icon, tip) in [
                 (LayoutMode::Vertical, false, Icon::ArrowDown, "Vertical layout"),
                 (LayoutMode::Horizontal, false, Icon::ArrowRight, "Horizontal layout"),
                 (LayoutMode::Horizontal, true, Icon::Wrap, "Wrap"),
+                (LayoutMode::Grid, false, Icon::Grid, "Grid"),
             ] {
-                let on = l.mode == m && (m == LayoutMode::Vertical || l.wrap == wrap);
+                let on = l.mode == m && (m != LayoutMode::Horizontal || l.wrap == wrap);
                 if icon_button(ui, icon, on, 26.0, tip).clicked() {
                     l.mode = m;
                     l.wrap = wrap;
+                    // A new grid starts about square around the children it already has.
+                    if m == LayoutMode::Grid && l.grid[0] == 0 {
+                        let cols = kids.sqrt().ceil();
+                        l.grid = [cols as u32, (kids / cols).ceil() as u32];
+                    }
                 }
             }
         });
+        let grid = l.mode == LayoutMode::Grid;
+        if grid {
+            ui.horizontal(|ui| {
+                for (i, label) in [(0, "Columns"), (1, "Rows")] {
+                    let mut v = l.grid[i].max(1) as f32;
+                    if num_field(ui, &mut v, label, 1.0, half(ui) - 4.0) {
+                        l.grid[i] = v.round().clamp(1.0, 100.0) as u32;
+                    }
+                }
+            });
+            // Track sizing: every column (row) shares the space (Fill) or has one fixed size.
+            ui.horizontal(|ui| {
+                for (i, what) in [(0, "Col"), (1, "Row")] {
+                    let shown = if l.tracks[i].is_some() { format!("{what} Fixed") } else { format!("{what} Fill") };
+                    dropdown(ui, shown, |ui| {
+                        if ui.selectable_label(l.tracks[i].is_none(), "Fill").clicked() {
+                            l.tracks[i] = None;
+                        }
+                        if ui.selectable_label(l.tracks[i].is_some(), "Fixed").clicked() && l.tracks[i].is_none() {
+                            l.tracks[i] = Some(100.0);
+                        }
+                    });
+                    if let Some(t) = &mut l.tracks[i] {
+                        num_field(ui, t, "", 0.0, 44.0);
+                    }
+                }
+            });
+        }
         ui.horizontal(|ui| {
             align_grid(ui, &mut l);
             ui.vertical(|ui| {
-                ui.add_enabled_ui(!l.space_between, |ui| {
-                    num_field(ui, &mut l.gap, if l.mode == LayoutMode::Horizontal { "@gaph" } else { "@gapv" }, 0.0, (ui.available_width()).min(110.0));
+                ui.add_enabled_ui(!l.space_between || grid, |ui| {
+                    num_field(ui, &mut l.gap, if l.mode == LayoutMode::Vertical { "@gapv" } else { "@gaph" }, 0.0, (ui.available_width()).min(110.0));
                 });
-                if l.wrap && l.mode == LayoutMode::Horizontal {
+                if (l.wrap && l.mode == LayoutMode::Horizontal) || grid {
                     num_field(ui, &mut l.cross_gap, "@gapv", 0.0, (ui.available_width()).min(110.0));
                 }
-                ui.checkbox(&mut l.space_between, "Auto gap");
+                if !grid {
+                    ui.checkbox(&mut l.space_between, "Auto gap");
+                }
                 ui.checkbox(&mut l.strokes_included, "Include strokes").on_hover_text("Strokes take up space in the layout");
+            });
+        });
+        // Advanced settings: text baselines (horizontal flows) and canvas stacking.
+        ui.horizontal(|ui| {
+            if l.mode == LayoutMode::Horizontal {
+                let mut base = l.cross == AxisAlign::Baseline;
+                if ui.checkbox(&mut base, "Text baseline").on_hover_text("Align the first lines of text along the row").changed() {
+                    l.cross = if base { AxisAlign::Baseline } else { AxisAlign::Min };
+                }
+            }
+            dropdown(ui, if l.reverse_z { "First on top" } else { "Last on top" }, |ui| {
+                ui.label(RichText::new("Canvas stacking").small());
+                if ui.selectable_label(!l.reverse_z, "Last on top").clicked() {
+                    l.reverse_z = false;
+                }
+                if ui.selectable_label(l.reverse_z, "First on top").clicked() {
+                    l.reverse_z = true;
+                }
             });
         });
         let [t, r, b, lft] = &mut l.padding;
@@ -2739,15 +4035,15 @@ impl App {
 
     fn typography_section(&mut self, ui: &mut Ui, n: &crate::doc::Node) {
         use crate::doc::{Decoration, LineHeight, TextAlign, TextCase, TextSizing, VAlign};
-        use crate::text::{families, weight_name, weights_for};
+        use crate::text::{families, style_name, styles_for};
         let mut pick = None;
         ui.horizontal(|ui| {
             ui.label(RichText::new("Typography").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                pick = crate::paint_ui::style_menu(ui, ui.id().with("text-styles"), &self.doc.styles, |v| matches!(v, crate::doc::StyleValue::Text(_)));
+                pick = self.style_picker(ui, ui.id().with("text-styles"), |v| matches!(v, crate::doc::StyleValue::Text(_)));
             });
         });
-        match pick {
+        match self.local_style_pick(pick) {
             Some(crate::paint_ui::StylePick::Apply(sid)) => {
                 self.checkpoint();
                 for &id in &self.sel.clone() {
@@ -2765,7 +4061,7 @@ impl App {
                 self.doc.reflow();
                 return;
             }
-            None => {}
+            _ => {}
         }
         if let Some(style) = n.text_style.and_then(|sid| self.doc.style(sid)).cloned() {
             ui.horizontal(|ui| {
@@ -2784,7 +4080,20 @@ impl App {
         let mut t = n.clone();
         // Font family picker with search.
         let fam_id = ui.id().with("font-search");
-        let resp = ui.add_sized([ui.available_width(), 24.0], egui::Button::new(&t.font_family));
+        // A missing font reads struck through in italics, with a way to replace it (Figma).
+        let missing = std::iter::once(&n.font_family).chain(n.spans.iter().filter_map(|sp| sp.style.font_family.as_ref())).any(|f| !crate::text::installed(f));
+        let label = if crate::text::installed(&t.font_family) { RichText::new(&t.font_family) } else { RichText::new(&t.font_family).italics().strikethrough() };
+        let resp = ui.add_sized([ui.available_width(), 24.0], egui::Button::new(label));
+        if missing {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Missing fonts").small().color(Color32::from_rgb(0xF2, 0x48, 0x22)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Replace fonts…").clicked() {
+                        self.open_replace_fonts();
+                    }
+                });
+            });
+        }
         // Each opening starts with an empty, focused search, as in Figma.
         if resp.clicked() {
             ui.data_mut(|d| d.insert_temp(fam_id, String::new()));
@@ -2803,9 +4112,12 @@ impl App {
                     let current = *f == t.font_family;
                     if ui.add(egui::Button::new(format!("{}{f}", if current { "✓  " } else { "     " })).frame(false)).clicked() {
                         t.font_family = f.clone();
-                        let ws = weights_for(f);
-                        if !ws.contains(&t.font_weight) {
-                            t.font_weight = *ws.iter().min_by_key(|w| (**w as i32 - 400).abs()).unwrap_or(&400);
+                        // Keep the style if the new family has it, else its nearest, upright if need be.
+                        let ss = styles_for(f);
+                        if !ss.contains(&(t.font_weight, t.italic)) {
+                            let italic = t.italic && ss.iter().any(|s| s.1);
+                            let near = ss.iter().filter(|s| s.1 == italic).min_by_key(|s| (s.0 as i32 - t.font_weight as i32).abs());
+                            (t.font_weight, t.italic) = near.copied().unwrap_or((400, false));
                         }
                         ui.close();
                     }
@@ -2813,9 +4125,12 @@ impl App {
             });
         });
         ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("weight").width(half(ui) - 12.0).selected_text(weight_name(t.font_weight)).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
-                for w in weights_for(&t.font_family) {
-                    ui.selectable_value(&mut t.font_weight, w, weight_name(w));
+            // Font styles as Figma lists them: each weight, then its italic.
+            egui::ComboBox::from_id_salt("weight").width(half(ui) - 12.0).selected_text(style_name(t.font_weight, t.italic)).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+                for (w, i) in styles_for(&t.font_family) {
+                    if ui.selectable_label((t.font_weight, t.italic) == (w, i), style_name(w, i)).clicked() {
+                        (t.font_weight, t.italic) = (w, i);
+                    }
                 }
             });
             num_field(ui, &mut t.font_size, "", 1.0, half(ui));
@@ -2837,11 +4152,13 @@ impl App {
             }
             if r.lost_focus() {
                 let v = buf.trim();
+                // "inf", "NaN" and negatives parse as floats but aren't line heights.
+                let ok = |x: &f32| x.is_finite() && *x >= 0.0;
                 t.line_height = if v.eq_ignore_ascii_case("auto") || v.is_empty() {
                     LineHeight::Auto
-                } else if let Some(p) = v.strip_suffix('%').and_then(|p| p.trim().parse().ok()) {
+                } else if let Some(p) = v.strip_suffix('%').and_then(|p| p.trim().parse().ok()).filter(ok) {
                     LineHeight::Percent(p)
-                } else if let Ok(px) = v.parse() {
+                } else if let Some(px) = v.parse().ok().filter(ok) {
                     LineHeight::Px(px)
                 } else {
                     t.line_height
@@ -2849,14 +4166,19 @@ impl App {
             }
             r.on_hover_text("Line height: Auto, pixels, or percent");
             let mut ls = t.letter_spacing;
-            if ui.add_sized([half(ui), 22.0], DragValue::new(&mut ls).speed(0.1).suffix("%").prefix("|A|  ").custom_formatter(|v, _| num(v as f32))).changed() {
+            if ui.add_sized([half(ui), 22.0], DragValue::new(&mut ls).range(-100.0..=1000.0).speed(0.1).suffix("%").prefix("|A|  ").custom_formatter(|v, _| num(v as f32))).changed() {
                 t.letter_spacing = ls;
             }
         });
         // Alignment and resizing.
         ui.horizontal(|ui| {
-            for (a, icon) in [(TextAlign::Left, Icon::Align(Align::Left)), (TextAlign::Center, Icon::Align(Align::HCenter)), (TextAlign::Right, Icon::Align(Align::Right))] {
-                if icon_button(ui, icon, t.text_align == a, 24.0, &format!("Align {a:?}")).clicked() {
+            for (a, icon, tip) in [
+                (TextAlign::Left, Icon::Align(Align::Left), "Align left  ⌥⌘L"),
+                (TextAlign::Center, Icon::Align(Align::HCenter), "Align center  ⌥⌘T"),
+                (TextAlign::Right, Icon::Align(Align::Right), "Align right  ⌥⌘R"),
+                (TextAlign::Justify, Icon::Menu, "Justify  ⌥⌘J"),
+            ] {
+                if icon_button(ui, icon, t.text_align == a, 24.0, tip).clicked() {
                     t.text_align = a;
                 }
             }
@@ -2895,28 +4217,44 @@ impl App {
             });
         });
         ui.horizontal(|ui| {
-            if ui.selectable_label(false, RichText::new(" I ").italics()).on_hover_text("Italic (selected characters)").clicked() {
-                let on = self
-                    .text_selection(ui.ctx())
-                    .and_then(|(a, _)| n.spans.iter().find(|sp| sp.start <= a && sp.end > a))
-                    .and_then(|sp| sp.style.italic)
-                    .unwrap_or(false);
-                self.style_selection(ui.ctx(), crate::doc::SpanStyle { italic: Some(!on), ..Default::default() });
+            if ui.selectable_label(n.italic, RichText::new(" I ").italics()).on_hover_text(crate::chrome::keys("Italic  ⌘I")).clicked() {
+                self.format_text(ui.ctx(), crate::canvas::TextFmt::Italic);
+                return;
             }
-            for (d, label) in [(Decoration::Underline, RichText::new(" U ").underline()), (Decoration::Strikethrough, RichText::new(" S ").strikethrough())] {
+            for (d, label, tip) in [(Decoration::Underline, RichText::new(" U ").underline(), "Underline  ⌘U"), (Decoration::Strikethrough, RichText::new(" S ").strikethrough(), "Strikethrough  ⇧⌘X")] {
                 let on = t.decoration == d;
-                if ui.selectable_label(on, label).on_hover_text(format!("{d:?}")).clicked() {
+                if ui.selectable_label(on, label).on_hover_text(crate::chrome::keys(tip)).clicked() {
                     t.decoration = if on { Decoration::None } else { d };
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Figma's type details: the paragraph settings that don't fit the main rows.
+                let more = ui.button("···").on_hover_text("Type details");
+                crate::chrome::popover(&more, ui.id().with("type-details"), "Type details", 220.0, |ui| {
+                    let row = |ui: &mut Ui, label: &str, add: &mut dyn FnMut(&mut Ui)| {
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| add(ui));
+                        });
+                    };
+                    row(ui, "Paragraph indent", &mut |ui| {
+                        num_field(ui, &mut t.paragraph_indent, "", 0.0, 64.0);
+                    });
+                    row(ui, "Vertical trim", &mut |ui| {
+                        let shown = if t.vertical_trim { "Cap height to baseline" } else { "Standard" };
+                        dropdown(ui, shown, |ui| {
+                            ui.selectable_value(&mut t.vertical_trim, false, "Standard");
+                            ui.selectable_value(&mut t.vertical_trim, true, "Cap height to baseline");
+                        });
+                    });
+                });
                 num_field(ui, &mut t.paragraph_spacing, "¶", 0.0, 64.0);
             });
         });
         ui.horizontal(|ui| {
             for (kind, label, tip) in [(crate::doc::ListKind::Bullet, " • ", "Bulleted list (⇧⌘8)"), (crate::doc::ListKind::Number, " 1. ", "Numbered list (⇧⌘7)")] {
                 let on = !n.lists.is_empty() && n.lists.iter().all(|l| l.kind == kind);
-                if ui.selectable_label(on, label).on_hover_text(tip).clicked() {
+                if ui.selectable_label(on, label).on_hover_text(crate::chrome::keys(tip)).clicked() {
                     self.toggle_list(ui.ctx(), kind);
                     return;
                 }
@@ -2930,6 +4268,7 @@ impl App {
         });
         let changed = t.font_family != n.font_family
             || t.font_weight != n.font_weight
+            || t.italic != n.italic
             || t.font_size != n.font_size
             || t.line_height != n.line_height
             || t.letter_spacing != n.letter_spacing
@@ -2940,12 +4279,15 @@ impl App {
             || t.text_case != n.text_case
             || t.truncate != n.truncate
             || t.paragraph_spacing != n.paragraph_spacing
+            || t.paragraph_indent != n.paragraph_indent
+            || t.vertical_trim != n.vertical_trim
             || t.max_lines != n.max_lines;
         // With characters selected in the editor, changes style just that range (rich text).
         if changed && self.text_selection(ui.ctx()).is_some() {
             let patch = crate::doc::SpanStyle {
                 font_family: (t.font_family != n.font_family).then(|| t.font_family.clone()),
                 font_weight: (t.font_weight != n.font_weight).then_some(t.font_weight),
+                italic: (t.italic != n.italic).then_some(t.italic),
                 font_size: (t.font_size != n.font_size).then_some(t.font_size),
                 decoration: (t.decoration != n.decoration).then_some(t.decoration),
                 ..Default::default()
@@ -2963,6 +4305,7 @@ impl App {
                 d.text_style = None;
                 d.font_family = t.font_family.clone();
                 d.font_weight = t.font_weight;
+                d.italic = t.italic;
                 d.font_size = t.font_size;
                 d.line_height = t.line_height;
                 d.letter_spacing = t.letter_spacing;
@@ -2973,6 +4316,8 @@ impl App {
                 d.text_case = t.text_case;
                 d.truncate = t.truncate;
                 d.paragraph_spacing = t.paragraph_spacing.max(0.0);
+                d.paragraph_indent = t.paragraph_indent.max(0.0);
+                d.vertical_trim = t.vertical_trim;
                 d.max_lines = t.max_lines;
             }
         }
@@ -2980,21 +4325,54 @@ impl App {
 
     fn paints_section(&mut self, ui: &mut Ui, stroke: bool) {
         use crate::doc::StyleValue;
-        use crate::paint_ui::{StylePick, style_menu, style_preview};
+        use crate::paint_ui::{StylePick, style_preview};
         let first = self.sel[0];
         let n = self.doc.node(first).clone();
         let mut paints = if stroke { n.strokes.clone() } else { n.fills.clone() };
         let mut changed = false;
         let link = if stroke { n.stroke_style } else { n.fill_style };
+        let prop = if stroke { crate::doc::Bindable::Stroke } else { crate::doc::Bindable::Fill };
         let mut add = false;
         let mut pick = None;
+        let mut var_pick = None;
         ui.horizontal(|ui| {
             ui.label(RichText::new(if stroke { "Stroke" } else { "Fill" }).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 add = icon_button(ui, Icon::Plus, false, 22.0, "").clicked();
-                pick = style_menu(ui, ui.id().with(("paint-styles", stroke)), &self.doc.styles, |v| matches!(v, StyleValue::Paint(_)));
+                pick = self.style_picker(ui, ui.id().with(("paint-styles", stroke)), |v| matches!(v, StyleValue::Paint(_)));
+                // Figma's hexagon: apply a color variable to the paint.
+                if self.has_variables() {
+                    let vb = icon_button(ui, Icon::Variable, false, 22.0, "Apply variable");
+                    egui::Popup::menu(&vb).id(ui.id().with(("paint-var", stroke))).style(crate::chrome::menu_style).show(|ui| {
+                        var_pick = self.variable_menu(ui, prop);
+                    });
+                }
             });
         });
+        if let Some(v) = self.local_var(var_pick) {
+            self.bind_selection(prop, v);
+            return;
+        }
+        // A bound paint shows the variable's name in place of its value, with detach.
+        let bound = n.bindings.iter().find(|(b, _)| *b == prop).map(|(_, v)| *v);
+        if let Some(var) = bound {
+            let name = self.doc.variable(var).map_or("Missing variable".into(), |v| v.name.clone());
+            ui.horizontal(|ui| {
+                if let Some(p) = paints.last() {
+                    let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+                    ui.painter().rect_filled(r.shrink(2.0), 3.0, p.color.to32());
+                }
+                ui.label(RichText::new(name).color(BLUE));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, Icon::Detach, false, 22.0, "Detach variable").clicked() {
+                        self.checkpoint();
+                        for &s in &self.sel.clone() {
+                            self.doc.node_mut(s).bindings.retain(|(b, _)| *b != prop);
+                        }
+                    }
+                });
+            });
+        }
         let set_link = |app: &mut App, v: Option<crate::doc::StyleId>| {
             for &id in &app.sel.clone() {
                 let t = app.doc.node_mut(id);
@@ -3002,7 +4380,7 @@ impl App {
             }
             app.doc.reflow();
         };
-        match pick {
+        match self.local_style_pick(pick) {
             Some(StylePick::Apply(sid)) => {
                 self.checkpoint();
                 set_link(self, Some(sid));
@@ -3012,7 +4390,7 @@ impl App {
                 let sid = self.doc.add_style(name, StyleValue::Paint(paints.clone()));
                 set_link(self, Some(sid));
             }
-            None => {}
+            _ => {}
         }
         // A linked style shows as one row; editing it edits the style for everyone.
         if let Some(style) = link.and_then(|sid| self.doc.style(sid)).cloned() {
@@ -3020,7 +4398,10 @@ impl App {
                 style_preview(ui, &style.value);
                 let open = ui.add(egui::Button::new(&style.name).frame(false));
                 crate::chrome::popover(&open, ui.id().with(("edit-style", style.id)), &format!("Edit {}", style.name), 240.0, |ui| {
-                    if let StyleValue::Paint(mut ps) = style.value.clone() {
+                    // A library's style is edited in the library.
+                    if style.remote.is_some() {
+                        ui.label(RichText::new("From a library: edit it in its file.").color(theme::muted(ui.ctx())));
+                    } else if let StyleValue::Paint(mut ps) = style.value.clone() {
                         let mut edited = false;
                         for (i, p) in ps.iter_mut().enumerate().rev() {
                             if !matches!(paint_row(ui, ui.id().with(("style-paint", style.id, i)), p, "Fill"), PaintEvent::None) {
@@ -3059,10 +4440,22 @@ impl App {
             }
         }
         let mut remove = None;
-        // Topmost paint first, as in Figma.
-        for i in (0..paints.len()).rev() {
+        // Topmost paint first, as in Figma. Each row drags by its grip to reorder.
+        let (mut rows, mut dragging, mut dropped) = (vec![], None, None);
+        for i in (0..paints.len()).rev().filter(|_| bound.is_none()) {
             let id = ui.id().with((stroke, i, first));
-            match paint_row(ui, id, &mut paints[i], if stroke { "Stroke" } else { "Fill" }) {
+            let row = ui.horizontal(|ui| {
+                let grip = crate::paint_ui::grip(ui);
+                if grip.dragged() {
+                    dragging = Some(i);
+                }
+                if grip.drag_stopped() {
+                    dropped = Some(i);
+                }
+                paint_row(ui, id, &mut paints[i], if stroke { "Stroke" } else { "Fill" })
+            });
+            rows.push((i, row.response.rect));
+            match row.inner {
                 PaintEvent::None => {}
                 PaintEvent::Changed => changed = true,
                 PaintEvent::Remove => remove = Some(i),
@@ -3070,6 +4463,24 @@ impl App {
                     paints[i].image = self.add_image(bytes);
                     changed = true;
                 }
+            }
+            // An open gradient editor puts its handles on the canvas (one layer at a time, as in Figma).
+            if self.sel.len() == 1 && paints[i].kind.is_gradient() && egui::Popup::is_id_open(ui.ctx(), id.with("popup")) {
+                let stop = ui.data(|d| d.get_temp(id.with("stop"))).unwrap_or(0);
+                self.gradient_edit = Some(crate::app::GradientEdit { stroke, index: i, ui: id, stop });
+            }
+        }
+        if let (Some(src), Some(y)) = (dragging.or(dropped), ui.ctx().pointer_interact_pos().map(|p| p.y)) {
+            // Where it lands: below every other row whose middle is above the pointer.
+            let others: Vec<Rect> = rows.iter().filter(|(j, _)| *j != src).map(|r| r.1).collect();
+            let above = others.iter().filter(|r| r.center().y < y).count();
+            if dropped.is_some() {
+                let p = paints.remove(src);
+                let dst = paints.len() - above;
+                paints.insert(dst, p);
+                changed |= dst != src;
+            } else if let Some(line) = if above == 0 { others.first().map(|r| r.min.y) } else { others.get(above - 1).map(|r| r.max.y) } {
+                ui.painter().hline(ui.max_rect().x_range(), line, Stroke::new(2.0, BLUE));
             }
         }
         if let Some(i) = remove {
@@ -3129,7 +4540,7 @@ impl App {
                         ui.data_mut(|d| d.remove::<String>(dash_id));
                     }
                     if r.lost_focus() {
-                        style.0 = buf.split([',', ' ']).filter_map(|t| t.trim().parse::<f32>().ok()).filter(|v| *v >= 0.0).collect();
+                        style.0 = buf.split([',', ' ']).filter_map(|t| t.trim().parse::<f32>().ok()).filter(|v| v.is_finite() && *v >= 0.0).collect();
                     }
                     ui.horizontal(|ui| {
                         ui.label("Caps");
@@ -3218,10 +4629,56 @@ impl App {
     }
 
     fn layout_guides(&mut self, ui: &mut Ui, id: NodeId) {
-        use crate::doc::{GridAlign, GridKind, LayoutGrid};
+        use crate::doc::{GridKind, LayoutGrid};
+        use crate::doc::StyleValue;
+        use crate::paint_ui::{StylePick, style_preview};
         let mut grids = self.doc.node(id).grids.clone();
         let before = grids.clone();
-        if section_title(ui, "Layout guide") {
+        let (mut add, mut pick) = (false, None);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Layout guide").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                add = icon_button(ui, Icon::Plus, false, 22.0, "").clicked();
+                pick = self.style_picker(ui, ui.id().with("grid-styles"), |v| matches!(v, StyleValue::Grid(_)));
+            });
+        });
+        let set_link = |app: &mut App, v: Option<crate::doc::StyleId>| {
+            for &s in &app.sel.clone() {
+                if app.doc.node(s).kind.is_frame() {
+                    app.doc.node_mut(s).grid_style = v;
+                }
+            }
+            app.doc.reflow();
+        };
+        match self.local_style_pick(pick) {
+            Some(StylePick::Apply(sid)) => {
+                self.checkpoint();
+                set_link(self, Some(sid));
+                return;
+            }
+            Some(StylePick::Create(name)) => {
+                self.checkpoint();
+                let sid = self.doc.add_style(name, StyleValue::Grid(grids));
+                set_link(self, Some(sid));
+                return;
+            }
+            _ => {}
+        }
+        // A linked grid style shows as one row, with detach, as in Figma.
+        if let Some(style) = self.doc.node(id).grid_style.and_then(|sid| self.doc.style(sid)).cloned() {
+            ui.horizontal(|ui| {
+                style_preview(ui, &style.value);
+                ui.label(&style.name);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, Icon::Detach, false, 22.0, "Detach style").clicked() {
+                        self.checkpoint();
+                        set_link(self, None);
+                    }
+                });
+            });
+            return;
+        }
+        if add {
             grids.push(LayoutGrid::default());
         }
         let mut remove = None;
@@ -3233,46 +4690,7 @@ impl App {
                     GridKind::Rows => format!("{} rows", g.count),
                 };
                 let open = ui.add(egui::Button::new(label).frame(false));
-                crate::chrome::popover(&open, ui.id().with(("grid", id, i)), "Layout guide", 240.0, |ui| {
-                    ui.horizontal(|ui| {
-                        for k in [GridKind::Grid, GridKind::Columns, GridKind::Rows] {
-                            ui.selectable_value(&mut g.kind, k, format!("{k:?}"));
-                        }
-                    });
-                    egui::Grid::new(ui.id().with(("grid-fields", id, i))).num_columns(2).show(ui, |ui| {
-                        if g.kind == GridKind::Grid {
-                            ui.label("Size");
-                            ui.add(DragValue::new(&mut g.size).range(1.0..=1000.0));
-                            ui.end_row();
-                        } else {
-                            ui.label("Count");
-                            ui.add(DragValue::new(&mut g.count).range(1..=100));
-                            ui.end_row();
-                            ui.label("Type");
-                            dropdown(ui, format!("{:?}", g.align), |ui| {
-                                for a in [GridAlign::Stretch, GridAlign::Min, GridAlign::Center, GridAlign::Max] {
-                                    ui.selectable_value(&mut g.align, a, format!("{a:?}"));
-                                }
-                            });
-                            ui.end_row();
-                            if g.align != GridAlign::Stretch {
-                                ui.label("Width");
-                                ui.add(DragValue::new(&mut g.size).range(1.0..=10000.0));
-                                ui.end_row();
-                            }
-                            ui.label("Gutter");
-                            ui.add(DragValue::new(&mut g.gutter).range(0.0..=1000.0));
-                            ui.end_row();
-                            ui.label(if g.align == GridAlign::Stretch { "Margin" } else { "Offset" });
-                            ui.add(DragValue::new(&mut g.margin).range(-1000.0..=1000.0));
-                            ui.end_row();
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        hex_field(ui, ui.id().with(("grid-color", id, i)), &mut g.color, 56.0);
-                        crate::paint_ui::alpha_field(ui, &mut g.color);
-                    });
-                });
+                crate::chrome::popover(&open, ui.id().with(("grid", id, i)), "Layout guide", 240.0, |ui| grid_editor(ui, ui.id().with(("grid-fields", id, i)), g));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if icon_button(ui, Icon::Minus, false, 22.0, "Remove").clicked() {
                         remove = Some(i);
@@ -3294,7 +4712,7 @@ impl App {
 
     fn effects_section(&mut self, ui: &mut Ui) {
         use crate::doc::StyleValue;
-        use crate::paint_ui::{StylePick, style_menu, style_preview};
+        use crate::paint_ui::{StylePick, style_preview};
         let first = self.sel[0];
         let mut shadows = self.doc.node(first).shadows.clone();
         let mut changed = false;
@@ -3305,7 +4723,7 @@ impl App {
             ui.label(RichText::new("Effects").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 add = icon_button(ui, Icon::Plus, false, 22.0, "").clicked();
-                pick = style_menu(ui, ui.id().with("effect-styles"), &self.doc.styles, |v| matches!(v, StyleValue::Effect(_)));
+                pick = self.style_picker(ui, ui.id().with("effect-styles"), |v| matches!(v, StyleValue::Effect(_)));
             });
         });
         let set_link = |app: &mut App, v: Option<crate::doc::StyleId>| {
@@ -3314,7 +4732,7 @@ impl App {
             }
             app.doc.reflow();
         };
-        match pick {
+        match self.local_style_pick(pick) {
             Some(StylePick::Apply(sid)) => {
                 self.checkpoint();
                 set_link(self, Some(sid));
@@ -3324,7 +4742,7 @@ impl App {
                 let sid = self.doc.add_style(name, StyleValue::Effect(shadows.clone()));
                 set_link(self, Some(sid));
             }
-            None => {}
+            _ => {}
         }
         if let Some(style) = link.and_then(|sid| self.doc.style(sid)).cloned() {
             ui.horizontal(|ui| {
@@ -3346,11 +4764,42 @@ impl App {
             egui::Popup::open_id(ui.ctx(), ui.id().with(("shadow", shadows.len() - 1, first)).with("popup"));
         }
         let mut remove = None;
+        // Topmost first; each row drags by its grip to reorder, like paints.
+        let (mut rows, mut dragging, mut dropped) = (vec![], None, None);
         for i in (0..shadows.len()).rev() {
-            let (c, r) = shadow_row(ui, ui.id().with(("shadow", i, first)), &mut shadows[i]);
+            let row = ui.horizontal(|ui| {
+                let grip = crate::paint_ui::grip(ui);
+                if grip.dragged() {
+                    dragging = Some(i);
+                }
+                if grip.drag_stopped() {
+                    dropped = Some(i);
+                }
+                shadow_row(ui, ui.id().with(("shadow", i, first)), &mut shadows[i])
+            });
+            rows.push((i, row.response.rect));
+            let (c, r) = row.inner;
             changed |= c;
             if r {
                 remove = Some(i);
+            }
+        }
+        if let (Some(src), Some(y)) = (dragging.or(dropped), ui.ctx().pointer_interact_pos().map(|p| p.y)) {
+            let others: Vec<Rect> = rows.iter().filter(|(j, _)| *j != src).map(|r| r.1).collect();
+            let above = others.iter().filter(|r| r.center().y < y).count();
+            if dropped.is_some() {
+                let dst = shadows.len() - 1 - above;
+                if dst != src {
+                    // A reorder is one step of its own.
+                    self.checkpoint();
+                    let s = shadows.remove(src);
+                    shadows.insert(dst, s);
+                    for &id in &self.sel.clone() {
+                        self.doc.node_mut(id).shadows = shadows.clone();
+                    }
+                }
+            } else if let Some(line) = if above == 0 { others.first().map(|r| r.min.y) } else { others.get(above - 1).map(|r| r.max.y) } {
+                ui.painter().hline(ui.max_rect().x_range(), line, Stroke::new(2.0, BLUE));
             }
         }
         if let Some(i) = remove {
@@ -3365,76 +4814,57 @@ impl App {
         }
     }
 
+    /// The Export section. With several layers selected it edits all their presets at once
+    /// (mixed presets can be replaced with +), and exports each of them.
     fn export_props(&mut self, ui: &mut Ui) {
-        use crate::doc::{ExportFormat, ExportSetting};
+        use crate::doc::ExportSetting;
         let roots = self.sel_roots();
-        let single = (roots.len() == 1).then(|| roots[0]);
+        let lists: Vec<Vec<ExportSetting>> = roots.iter().map(|&id| self.doc.node(id).exports.clone()).collect();
+        let mixed = lists.windows(2).any(|w| w[0] != w[1]);
+        let presets = if mixed { vec![] } else { lists.first().cloned().unwrap_or_default() };
         ui.horizontal(|ui| {
             ui.label(RichText::new("Export").strong());
-            if let Some(id) = single {
+            if !roots.is_empty() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if icon_button(ui, Icon::Plus, false, 22.0, "Add export setting").clicked() {
                         self.checkpoint();
-                        let n = self.doc.node_mut(id);
-                        // Figma adds the next common scale.
-                        let next = match n.exports.last().map(|e| e.scale) {
+                        // Figma adds the next common scale; mixed presets are replaced.
+                        let next = match presets.last().map(|e| e.scale) {
                             None => 1.0,
                             Some(s) if s < 2.0 => 2.0,
                             Some(s) => s + 1.0,
                         };
-                        n.exports.push(ExportSetting { scale: next, ..Default::default() });
+                        let mut list = presets.clone();
+                        list.push(ExportSetting { scale: next, ..Default::default() });
+                        for &id in &roots {
+                            self.doc.node_mut(id).exports = list.clone();
+                        }
                     }
                 });
             }
         });
-        let fmt_combo = |ui: &mut Ui, id: egui::Id, f: &mut ExportFormat| {
-            let mut changed = false;
-            egui::ComboBox::from_id_salt(id).width(56.0).selected_text(f.ext().to_uppercase()).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
-                for k in [ExportFormat::Png, ExportFormat::Jpg, ExportFormat::Svg, ExportFormat::Pdf] {
-                    changed |= ui.selectable_value(f, k, k.ext().to_uppercase()).changed();
-                }
-            });
-            changed
-        };
-        let scale_combo = |ui: &mut Ui, id: egui::Id, s: &mut f32| {
-            let mut changed = false;
-            egui::ComboBox::from_id_salt(id).width(48.0).selected_text(format!("{}x", num(*s))).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
-                for v in [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0] {
-                    changed |= ui.selectable_value(s, v, format!("{}x", num(v))).changed();
-                }
-            });
-            changed
-        };
-        let presets = single.map(|id| self.doc.node(id).exports.clone()).unwrap_or_default();
-        if presets.is_empty() {
-            ui.horizontal(|ui| {
-                scale_combo(ui, ui.id().with("export-scale"), &mut self.export_scale);
-                let mut f = if self.export_svg { ExportFormat::Svg } else { ExportFormat::Png };
-                if fmt_combo(ui, ui.id().with("export-format"), &mut f) {
-                    self.export_svg = f == ExportFormat::Svg;
-                }
-            });
-        } else if let Some(id) = single {
+        if mixed {
+            ui.label(RichText::new("Mixed export settings. Click + to replace them.").small().color(theme::muted(ui.ctx())));
+        } else if presets.is_empty() {
+            let mut p = self.export_default.clone();
+            export_row(ui, ui.id().with("export-default"), &mut p, false);
+            self.export_default = p;
+        } else {
             let mut list = presets.clone();
             let mut remove = None;
             for (i, p) in list.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    scale_combo(ui, ui.id().with(("ex-scale", id, i)), &mut p.scale);
-                    ui.add(egui::TextEdit::singleline(&mut p.suffix).hint_text("Suffix").desired_width(60.0));
-                    fmt_combo(ui, ui.id().with(("ex-fmt", id, i)), &mut p.format);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if icon_button(ui, Icon::Minus, false, 20.0, "Remove").clicked() {
-                            remove = Some(i);
-                        }
-                    });
-                });
+                if export_row(ui, ui.id().with(("ex", i)), p, true) {
+                    remove = Some(i);
+                }
             }
             if let Some(i) = remove {
                 list.remove(i);
             }
             if list != presets {
                 self.begin_edit();
-                self.doc.node_mut(id).exports = list;
+                for &id in &roots {
+                    self.doc.node_mut(id).exports = list.clone();
+                }
             }
         }
         let label = match roots.as_slice() {
@@ -3444,6 +4874,68 @@ impl App {
         };
         if ui.add_sized([ui.available_width(), 26.0], egui::Button::new(label)).clicked() {
             self.export(&ui.ctx().clone());
+        }
+    }
+
+    /// Shift Cmd E: every layer on the page with export presets, ticked to export, with a
+    /// preview of each, as in Figma's Export dialog.
+    pub fn export_window(&mut self, ctx: &egui::Context) {
+        let Some(mut off) = self.export_dialog.take() else { return };
+        let ids: Vec<NodeId> = self.doc.pages[self.page]
+            .children
+            .iter()
+            .flat_map(|&r| std::iter::once(r).chain(self.doc.descendants(r)))
+            .filter(|&id| !self.doc.node(id).exports.is_empty())
+            .collect();
+        let (mut open, mut go) = (true, false);
+        let mut budget = 4;
+        crate::chrome::window(ctx, "Export", &mut open, 340.0, |ui| {
+            let muted = theme::muted(ui.ctx());
+            if ids.is_empty() {
+                ui.label(RichText::new("No layers on this page have export settings. Add them in the Design panel's Export section.").color(muted));
+                return;
+            }
+            egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+                for &id in &ids {
+                    let tex = self.asset_thumb(ui.ctx(), id, &mut budget);
+                    let n = self.doc.node(id);
+                    ui.horizontal(|ui| {
+                        let mut on = !off.contains(&id);
+                        if ui.checkbox(&mut on, "").on_hover_text(&n.name).changed() {
+                            if on { off.remove(&id) } else { off.insert(id) };
+                        }
+                        let (rect, _) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::hover());
+                        ui.painter().rect_filled(rect, 4.0, theme::subtle(ui.ctx()));
+                        if let Some(tex) = &tex {
+                            let s = tex.size_vec2();
+                            let fit = (32.0 / s.x).min(32.0 / s.y);
+                            ui.painter().image(tex.id(), Rect::from_center_size(rect.center(), s * fit), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+                        }
+                        ui.vertical(|ui| {
+                            ui.add(egui::Label::new(&n.name).truncate());
+                            let what: Vec<String> = n.exports.iter().map(|p| format!("{} {}", if p.format.raster() { p.size_label() } else { String::new() }, p.format.ext().to_uppercase()).trim().to_string()).collect();
+                            ui.label(RichText::new(what.join(", ")).small().color(muted));
+                        });
+                    });
+                }
+            });
+            let files: usize = ids.iter().filter(|id| !off.contains(id)).map(|&id| self.doc.node(id).exports.len()).sum();
+            ui.add_space(6.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), 26.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let label = if files == 1 { "Export 1 file".to_string() } else { format!("Export {files} files") };
+                go = ui.add_enabled(files > 0, egui::Button::new(RichText::new(label).color(Color32::WHITE)).fill(BLUE).corner_radius(6)).clicked();
+            });
+        });
+        if budget == 0 {
+            ctx.request_repaint();
+        }
+        if go {
+            let chosen: Vec<NodeId> = ids.into_iter().filter(|id| !off.contains(id)).collect();
+            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                self.export_layers_to(ctx, &chosen, &dir);
+            }
+        } else if open {
+            self.export_dialog = Some(off);
         }
     }
 
@@ -3486,7 +4978,7 @@ impl App {
                                                 // The menu's own text color (menus are dark in both themes).
                                                 paint_icon(ui.painter(), r, icon, ui.visuals().text_color());
                                                 let (name, key) = label.split_once("  ").unwrap_or((label, ""));
-                                                if ui.add(egui::Button::new(name).shortcut_text(key).frame(false).min_size(vec2(140.0, 0.0))).clicked() {
+                                                if ui.add(egui::Button::new(name).shortcut_text(crate::chrome::keys(key)).frame(false).min_size(vec2(140.0, 0.0))).clicked() {
                                                     self.set_tool(t);
                                                     ui.close();
                                                 }

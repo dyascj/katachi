@@ -117,7 +117,7 @@ fn paints(list: &[Value]) -> Vec<Paint> {
             "SOLID" => Paint::solid(rgba(p.get("color"), opacity)),
             "GRADIENT_LINEAR" | "GRADIENT_RADIAL" | "GRADIENT_ANGULAR" | "GRADIENT_DIAMOND" => {
                 let mut g = Paint::solid(Rgba::WHITE.with_alpha((opacity * 255.0) as u8));
-                g.kind = if kind == "GRADIENT_LINEAR" { PaintKind::Linear } else { PaintKind::Radial };
+                g.kind = crate::doc::gradient_kind(kind);
                 g.stops = p.arr("stops").iter().map(|st| (st.f("position").unwrap_or(0.0), rgba(st.get("color"), 1.0))).collect();
                 // Figma's gradient transform maps the layer's unit square into gradient space,
                 // where the gradient runs along x at y = 0.5.
@@ -128,6 +128,7 @@ fn paints(list: &[Value]) -> Vec<Paint> {
                 } else {
                     g.from = inv.apply(pos2(0.5, 0.5));
                     g.to = inv.apply(pos2(1.0, 0.5));
+                    g.width_to = crate::doc::explicit_width(&g, inv.apply(pos2(0.5, 1.0)));
                 }
                 g
             }
@@ -159,6 +160,7 @@ fn paints(list: &[Value]) -> Vec<Paint> {
             _ => continue,
         };
         paint.visible = visible;
+        paint.blend = crate::doc::BlendMode::from_figma(p.s("blendMode"));
         out.push(paint);
     }
     out
@@ -172,7 +174,7 @@ fn blob_paths(blob: &[u8], to_world: Affine) -> Vec<SubPath> {
     let f = |at: &mut usize| -> Option<f32> {
         let v = f32::from_le_bytes(blob.get(*at..*at + 4)?.try_into().ok()?);
         *at += 4;
-        Some(v)
+        Some(if v.is_finite() { v } else { 0.0 })
     };
     let finish = |cur: &mut Vec<PathPoint>, out: &mut Vec<SubPath>, closed: bool| {
         if closed && cur.len() > 1 && cur[0].p.distance(cur[cur.len() - 1].p) < 0.01 {
@@ -243,6 +245,7 @@ fn align(s: Option<&str>) -> AxisAlign {
     match s {
         Some("CENTER") => AxisAlign::Center,
         Some("MAX") => AxisAlign::Max,
+        Some("BASELINE") => AxisAlign::Baseline,
         _ => AxisAlign::Min,
     }
 }
@@ -285,14 +288,14 @@ pub fn to_document(fig: &FigFile) -> Result<Document, String> {
         // Figma keeps component masters for instances on a hidden canvas; bring it in as a page.
         let name = if pg.b("internalOnly") == Some(true) { "Internal components".to_string() } else { pg.s("name").unwrap_or("Page").to_string() };
         let bg = pg.get("backgroundColor").map(|c| rgba(Some(c), 1.0).with_alpha(255)).unwrap_or(crate::doc::PAGE_BG);
-        doc.pages.push(Page { name, children: vec![], background: bg, flows: vec![], view: None });
+        doc.pages.push(Page { name, children: vec![], background: bg, flows: vec![], view: None, guides: vec![], prototype: Default::default() });
         let page = doc.pages.len() - 1;
         for (_, child) in kids.get(&page_guid).cloned().unwrap_or_default() {
             import_node(&mut doc, &by_guid, &kids, &blobs, child, page, None, Affine::ID, &mut ids, &mut instances);
         }
     }
     if doc.pages.is_empty() {
-        doc.pages.push(Page { name: "Page 1".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None });
+        doc.pages.push(Page { name: "Page 1".into(), children: vec![], background: crate::doc::PAGE_BG, flows: vec![], view: None, guides: vec![], prototype: Default::default() });
     }
     // Instances point at their main components once everything exists; sync builds their layers.
     for (inst, sym) in instances {
@@ -318,7 +321,7 @@ pub fn to_document(fig: &FigFile) -> Result<Document, String> {
         for d in v.arr("componentPropDefs") {
             let ty = d.s("type").unwrap_or("BOOL");
             if let Some(default) = props.value(d.get("initialValue"), ty) {
-                n.comp_props.push(CompProp { name: d.s("name").unwrap_or("").to_string(), default });
+                n.comp_props.push(CompProp { name: d.s("name").unwrap_or("").to_string(), default, preferred: vec![] });
             }
         }
         n.prop_bind = v.arr("componentPropRefs").iter().filter(|r| r.b("isDeleted") != Some(true)).filter_map(|r| {
@@ -423,6 +426,19 @@ fn import_variables(doc: &mut Document, changes: &[Value], by_guid: &HashMap<Gui
                 *v = value;
             }
         }
+        // "Show in" scopes and code syntax (WEB, ANDROID, iOS), as the plugin API names them.
+        let var = doc.variables.last_mut().unwrap();
+        var.scopes = n.arr("variableScopes").iter().filter_map(|s| match s { crate::kiwi::Value::Str(v) | crate::kiwi::Value::Enum(v) => Some(v.as_str()), _ => None }).flat_map(Bindable::from_scope).collect();
+        var.scopes.dedup();
+        for e in n.get("codeSyntax").map(|c| c.arr("entries")).unwrap_or_default() {
+            let slot = match e.s("platform") {
+                Some("WEB") => 0,
+                Some("iOS") => 1,
+                Some("ANDROID") => 2,
+                _ => continue,
+            };
+            var.code_syntax[slot] = e.s("value").unwrap_or_default().to_string();
+        }
         for r in refs(n) {
             vars.insert(r, id);
         }
@@ -458,6 +474,15 @@ fn import_variables(doc: &mut Document, changes: &[Value], by_guid: &HashMap<Gui
                 "FONT_SIZE" => Bindable::FontSize,
                 "TEXT_DATA" => Bindable::Text,
                 "VISIBLE" => Bindable::Visible,
+                "LINE_HEIGHT" => Bindable::LineHeight,
+                "LETTER_SPACING" => Bindable::LetterSpacing,
+                "PARAGRAPH_SPACING" => Bindable::ParagraphSpacing,
+                "FONT_FAMILY" => Bindable::FontFamily,
+                "FONT_WEIGHT" | "FONT_STYLE" => Bindable::FontWeight,
+                "MIN_WIDTH" => Bindable::MinWidth,
+                "MAX_WIDTH" => Bindable::MaxWidth,
+                "MIN_HEIGHT" => Bindable::MinHeight,
+                "MAX_HEIGHT" => Bindable::MaxHeight,
                 _ => continue,
             };
             if let Some(var) = bound(e.get("variableData")) {
@@ -706,6 +731,7 @@ fn import_node(
     n.layout.mode = match v.s("stackMode") {
         Some("HORIZONTAL") => LayoutMode::Horizontal,
         Some("VERTICAL") => LayoutMode::Vertical,
+        Some("GRID") => LayoutMode::Grid,
         _ => LayoutMode::None,
     };
     if n.layout.mode != LayoutMode::None {
@@ -723,14 +749,34 @@ fn import_node(
             wrap: v.s("stackWrap") == Some("WRAP"),
             strokes_included: v.b("bordersTakeSpace") == Some(true),
             cross_gap: v.f("stackCounterSpacing").filter(|g| g.is_finite()).or(v.f("stackSpacing")).unwrap_or(0.0),
+            reverse_z: v.b("stackReverseZIndex") == Some(true),
+            grid: [v.f("gridColumnCount").unwrap_or(0.0) as u32, v.f("gridRowCount").unwrap_or(0.0) as u32],
+            tracks: [None; 2],
         };
+        if n.layout.mode == LayoutMode::Grid {
+            n.layout.gap = v.f("gridColumnGap").unwrap_or(n.layout.gap);
+            n.layout.cross_gap = v.f("gridRowGap").unwrap_or(n.layout.cross_gap);
+        }
     }
+    n.grid_span = [v.f("gridColumnSpan").unwrap_or(1.0).max(1.0) as u32, v.f("gridRowSpan").unwrap_or(1.0).max(1.0) as u32];
     // Unset bounds are stored as 0 (min) and infinity (max).
     let bound = |k: &str, axis: &str| v.get(k).and_then(|s| s.get("value")).and_then(|s| s.f(axis)).filter(|x| x.is_finite() && *x > 0.0);
     n.min_size = [bound("minSize", "x"), bound("minSize", "y")];
     n.max_size = [bound("maxSize", "x"), bound("maxSize", "y")];
     n.absolute = v.s("stackPositioning") == Some("ABSOLUTE");
     n.constraints = [constraint(v.s("horizontalConstraint")), constraint(v.s("verticalConstraint"))];
+    // Prototype scrolling.
+    n.overflow = match v.s("scrollDirection") {
+        Some("VERTICAL") => crate::doc::Overflow::Vertical,
+        Some("HORIZONTAL") => crate::doc::Overflow::Horizontal,
+        Some("BOTH") => crate::doc::Overflow::Both,
+        _ => crate::doc::Overflow::None,
+    };
+    n.scroll_pos = match v.s("scrollBehavior") {
+        Some("FIXED_WHEN_CHILD_OF_SCROLLING_FRAME") => crate::doc::ScrollPos::Fixed,
+        Some("STICKY_SCROLLS") => crate::doc::ScrollPos::Sticky,
+        _ => crate::doc::ScrollPos::Scroll,
+    };
     // Layers start collapsed, as in Figma.
     n.expanded = false;
     finish_common(&mut n, v);
@@ -779,6 +825,7 @@ fn text_props(n: &mut Node, v: &Value) {
     if let Some(f) = v.get("fontName") {
         n.font_family = f.s("family").unwrap_or("Inter").to_string();
         n.font_weight = weight_of(f.s("style").unwrap_or("Regular"));
+        n.italic = f.s("style").unwrap_or("").to_lowercase().contains("italic");
     }
     if let Some(sz) = v.f("fontSize") {
         n.font_size = sz;
@@ -786,6 +833,10 @@ fn text_props(n: &mut Node, v: &Value) {
     if let Some(ps) = v.f("paragraphSpacing") {
         n.paragraph_spacing = ps;
     }
+    if let Some(pi) = v.f("paragraphIndent") {
+        n.paragraph_indent = pi;
+    }
+    n.vertical_trim = v.s("leadingTrim") == Some("CAP_HEIGHT");
     if let Some(lh) = v.get("lineHeight") {
         let val = lh.f("value").unwrap_or(100.0);
         n.line_height = match lh.s("units") {
@@ -847,11 +898,10 @@ fn text_props(n: &mut Node, v: &Value) {
 /// Properties every layer type shares.
 fn finish_common(n: &mut Node, v: &Value) {
     n.visible = v.b("visible").unwrap_or(true);
+    n.description = v.s("description").unwrap_or_default().to_string();
+    n.exposed = v.b("isExposedInstance") == Some(true);
     n.opacity = v.f("opacity").unwrap_or(1.0);
-    n.blend = crate::doc::BlendMode::ALL
-        .into_iter()
-        .find(|b| Some(b.css().replace('-', "_").to_uppercase().as_str()) == v.s("blendMode"))
-        .unwrap_or_default();
+    n.blend = crate::doc::BlendMode::from_figma(v.s("blendMode"));
     n.is_mask = v.b("mask") == Some(true);
     n.cap = match v.s("strokeCap") {
         Some("ROUND") => Cap::Round,
@@ -865,6 +915,28 @@ fn finish_common(n: &mut Node, v: &Value) {
     };
     n.dash = v.arr("dashPattern").iter().filter_map(|d| if let Value::Float(f) = d { Some(*f) } else { None }).collect();
     n.shadows = effects(v);
+    n.exports = v
+        .arr("exportSettings")
+        .iter()
+        .map(|e| {
+            use crate::doc::{ExportFormat, ExportSetting, ExportSize};
+            let mut out = ExportSetting { suffix: e.s("suffix").unwrap_or("").to_string(), ..Default::default() };
+            out.format = match e.s("imageType") {
+                Some("JPEG") => ExportFormat::Jpg,
+                Some("SVG") => ExportFormat::Svg,
+                Some("PDF") => ExportFormat::Pdf,
+                _ => ExportFormat::Png,
+            };
+            let c = e.get("constraint");
+            let value = c.and_then(|c| c.f("value")).filter(|v| *v > 0.0).unwrap_or(1.0);
+            match c.and_then(|c| c.s("type")) {
+                Some("CONTENT_WIDTH") => out.size = ExportSize::Width(value),
+                Some("CONTENT_HEIGHT") => out.size = ExportSize::Height(value),
+                _ => out.scale = value,
+            }
+            out
+        })
+        .collect();
 }
 
 fn effects(v: &Value) -> Vec<Shadow> {
@@ -880,7 +952,16 @@ fn effects(v: &Value) -> Vec<Shadow> {
                 _ => return None,
             };
             let off = e.get("offset").map_or(Vec2::ZERO, |o| vec2(o.f("x").unwrap_or(0.0), o.f("y").unwrap_or(0.0)));
-            Some(Shadow { kind, color: rgba(e.get("color"), 1.0), offset: off, blur: e.f("radius").unwrap_or(0.0), spread: e.f("spread").unwrap_or(0.0), visible: e.b("visible").unwrap_or(true) })
+            Some(Shadow {
+                kind,
+                color: rgba(e.get("color"), 1.0),
+                offset: off,
+                blur: e.f("radius").unwrap_or(0.0),
+                spread: e.f("spread").unwrap_or(0.0),
+                visible: e.b("visible").unwrap_or(true),
+                show_behind: e.b("showShadowBehindNode").unwrap_or(false),
+                ..Default::default()
+            })
         })
         .collect()
 }
@@ -965,6 +1046,24 @@ mod tests {
         doc.node_mut(frame).modes.clear();
         doc.reflow();
         assert_eq!(doc.node(rect).fills[0].color, Rgba::rgb(255, 0, 0), "switching back to the default mode");
+    }
+
+    #[test]
+    fn scroll_behavior_imports() {
+        use serde_json::json;
+        let g = |l: u64| json!({ "sessionID": 1, "localID": l });
+        let at = |l: u64, pos: &str| json!({ "guid": g(l), "position": pos });
+        let xf = json!({ "m00": 1.0, "m01": 0.0, "m02": 0.0, "m10": 0.0, "m11": 1.0, "m12": 0.0 });
+        let msg = json!({ "nodeChanges": [
+            { "guid": g(0), "type": "DOCUMENT" },
+            { "guid": g(1), "type": "CANVAS", "name": "Page", "parentIndex": at(0, "a") },
+            { "guid": g(2), "type": "FRAME", "name": "List", "parentIndex": at(1, "a"), "size": { "x": 100, "y": 100 }, "transform": xf, "scrollDirection": "VERTICAL" },
+            { "guid": g(3), "type": "RECTANGLE", "name": "Header", "parentIndex": at(2, "a"), "size": { "x": 10, "y": 10 }, "transform": xf, "scrollBehavior": "STICKY_SCROLLS" },
+        ] });
+        let doc = to_document(&FigFile { message: kv(msg), images: HashMap::new() }).unwrap();
+        let frame = doc.nodes.values().find(|n| n.kind == Kind::Frame).unwrap();
+        assert_eq!(frame.overflow, crate::doc::Overflow::Vertical);
+        assert_eq!(doc.node(frame.children[0]).scroll_pos, crate::doc::ScrollPos::Sticky);
     }
 
     /// Import a real file and report what came through.

@@ -1,7 +1,7 @@
 //! Quick actions (Cmd / or Cmd K), as in Figma: type to find any command, tool, plugin or layer,
 //! arrow to pick, Enter to run.
 
-use crate::app::{App, Tool};
+use crate::app::{App, Same, Tool};
 use crate::doc::{BoolOp, NodeId};
 use egui::{Key, RichText};
 
@@ -20,6 +20,9 @@ const COMMANDS: &[(&str, &str, Run)] = &[
     ("Text tool", "T", |a, _| a.set_tool(Tool::Text)),
     ("Comment tool", "C", |a, _| a.set_tool(Tool::Comment)),
     ("Hand tool", "H", |a, _| a.set_tool(Tool::Hand)),
+    ("Zoom tool", "Z", |a, _| a.set_tool(Tool::Zoom)),
+    ("Zoom to next frame", "N", |a, c| a.zoom_frame(c, 1)),
+    ("Zoom to previous frame", "⇧N", |a, c| a.zoom_frame(c, -1)),
     ("Zoom to fit", "⇧1", |a, c| a.zoom_to(c, None, false)),
     ("Zoom to 100%", "⇧0", |a, c| a.zoom_to(c, None, true)),
     ("Zoom to selection", "⇧2", |a, c| {
@@ -38,6 +41,8 @@ const COMMANDS: &[(&str, &str, Run)] = &[
         }
     }),
     ("Detach instance", "⌥⌘B", |a, _| a.detach_selection()),
+    ("Push changes to main component", "", |a, _| a.push_selection_to_main()),
+    ("Reset all changes", "", |a, _| a.reset_selection_instances()),
     ("Group selection", "⌘G", |a, _| a.group_selection(false)),
     ("Frame selection", "⌥⌘G", |a, _| a.group_selection(true)),
     ("Ungroup", "⇧⌘G", |a, _| a.ungroup_selection()),
@@ -47,21 +52,58 @@ const COMMANDS: &[(&str, &str, Run)] = &[
     ("Exclude selection", "⌥⇧E", |a, _| a.boolean_selection(BoolOp::Exclude)),
     ("Flatten", "⌘E", |a, _| a.flatten_selection()),
     ("Outline stroke", "⌥⌘O", |a, _| a.outline_stroke_selection()),
+    ("Join selection (vector points)", "⌘J", |a, _| a.vector_join()),
+    ("Cut tool (vector edit)", "Y", |a, _| {
+        if let Some(ve) = a.vector_edit.as_mut() {
+            ve.tool = crate::vector_edit::VTool::Cut;
+        }
+    }),
     ("Use as mask", "⌃⌘M", |a, _| a.toggle_mask()),
+    ("Resize to fit", "⌥⇧⌘R", |a, _| a.resize_to_fit()),
+    ("Remove fill", "", |a, _| a.remove_fills()),
+    ("Paste over selection", "⇧⌘V", |a, c| a.paste_from_menu(c, true)),
+    ("Paste to replace", "⇧⌘R", |a, _| a.paste_to_replace()),
+    ("Lock all", "", |a, _| a.lock_all(true)),
+    ("Unlock all", "", |a, _| a.lock_all(false)),
     ("Duplicate", "⌘D", |a, _| a.duplicate_selection()),
+    ("Swap fill and stroke", "⇧X", |a, _| a.swap_fill_stroke()),
+    ("Pick color", "I", |a, _| {
+        if !a.sel.is_empty() {
+            a.start_eyedrop(crate::paint_ui::EyeTarget::Fill)
+        }
+    }),
     ("Delete", "⌫", |a, _| a.delete_selection()),
     ("Select all", "⌘A", |a, _| a.select_all()),
+    ("Select inverse", "⇧⌘A", |a, _| a.select_inverse()),
     ("Select matching layers", "⌥⌘A", |a, _| a.select_matching()),
+    ("Select all with same fill", "", |a, _| a.select_same(Same::Fill)),
+    ("Select all with same stroke", "", |a, _| a.select_same(Same::Stroke)),
+    ("Select all with same effect", "", |a, _| a.select_same(Same::Effect)),
+    ("Select all with same font", "", |a, _| a.select_same(Same::Font)),
+    ("Select all with same instance", "", |a, _| a.select_same(Same::Instance)),
+    ("Rename selection", "⌘R", |a, _| a.rename_selection()),
     ("Show/Hide selection", "⇧⌘H", |a, _| a.toggle_visible()),
     ("Lock/Unlock selection", "⇧⌘L", |a, _| a.toggle_locked()),
     ("Rulers", "⇧R", |a, _| a.rulers = !a.rulers),
+    ("Remove all guides", "", |a, _| a.remove_all_guides()),
+    ("Pixel grid", "⇧'", |a, _| a.toggle_pref(|p| &mut p.pixel_grid)),
+    ("Snap to pixel grid", "⇧⌘'", |a, _| a.toggle_pref(|p| &mut p.snap_to_pixels)),
     ("Outline mode", "⌘Y", |a, _| a.outline_mode = !a.outline_mode),
     ("Layout guides", "⌃G", |a, _| a.show_grids = !a.show_grids),
     ("Hide UI", "⌘\\", |a, _| a.ui_hidden = !a.ui_hidden),
     ("Dev Mode", "⇧D", |a, _| a.dev_mode = !a.dev_mode),
+    ("Mark as ready for dev", "", |a, _| a.toggle_ready_for_dev()),
     ("Present", "⌥⌘↵", |a, c| a.present(c.input(|i| i.time))),
     ("Comments", "⇧C", |a, _| a.show_comments = !a.show_comments),
+    ("Cursor chat", "/", |a, c| a.open_chat(c)),
+    ("Spotlight me", "", |a, _| a.toggle_spotlight()),
+    ("Multiplayer session", "", |a, _| a.show_collab = true),
     ("Local variables", "", |a, _| a.show_variables = true),
+    ("Libraries", "", |a, _| a.show_libraries = true),
+    ("Publish library", "", |a, _| a.publish_library()),
+    ("Review library updates", "", |a, _| a.review_updates = true),
+    ("Replace fonts", "", |a, _| a.open_replace_fonts()),
+    ("Create link", "⌘K", |a, c| a.create_link(c)),
     ("Find and replace", "⌘F", |a, _| {
         a.find.0 = true;
         a.find.3 = true;
@@ -72,7 +114,12 @@ const COMMANDS: &[(&str, &str, Run)] = &[
     ("Keyboard shortcuts", "", |a, _| a.open_settings(crate::settings::Tab::Shortcuts)),
     ("Manage plugins", "", |a, _| a.open_settings(crate::settings::Tab::Plugins)),
     ("Run script (plugin console)", "", |a, _| a.show_console = true),
-    ("Export selection", "⇧⌘E", |a, c| a.export(c)),
+    ("Export…", "⇧⌘E", |a, _| a.export_dialog = Some(Default::default())),
+    ("Export selection", "", |a, c| a.export(c)),
+    ("Copy as PNG", "⇧⌘C", |a, c| a.copy_as(c, "png")),
+    ("Copy as SVG", "", |a, c| a.copy_as(c, "svg")),
+    ("Copy as CSS", "", |a, c| a.copy_as(c, "css")),
+    ("Copy as code", "", |a, c| a.copy_as(c, "code")),
     ("Place image", "⇧⌘K", |a, _| a.import_dialog()),
     ("Save", "⌘S", |a, _| {
         a.save(false);
@@ -89,6 +136,7 @@ const COMMANDS: &[(&str, &str, Run)] = &[
 #[derive(Clone)]
 enum Hit {
     Command(usize),
+    Text(crate::canvas::TextFmt),
     Plugin(crate::plugins::Installed),
     Layer(NodeId, usize),
 }
@@ -114,7 +162,12 @@ impl App {
         if tab == 0 {
             for (i, (label, short, _)) in COMMANDS.iter().enumerate() {
                 if matches(label, &q) {
-                    hits.push((Hit::Command(i), label.to_string(), short.to_string()));
+                    hits.push((Hit::Command(i), label.to_string(), crate::chrome::keys(short)));
+                }
+            }
+            for &(f, label, short) in crate::canvas::TEXT_MENU.iter().copied().flatten() {
+                if matches(label, &q) {
+                    hits.push((Hit::Text(f), label.to_string(), crate::chrome::keys(short)));
                 }
             }
         }
@@ -202,6 +255,9 @@ impl App {
         }
         match run {
             Some(Hit::Command(i)) => (COMMANDS[i].2)(self, ctx),
+            Some(Hit::Text(f)) => {
+                self.format_text(ctx, f);
+            }
             Some(Hit::Plugin(p)) => match crate::plugins::load(&p) {
                 Ok((code, html, id)) => self.run_plugin(&p.name, Some(&id), &code, html.as_deref()),
                 Err(e) => self.toast(format!("Couldn't run {}: {e}", p.name)),

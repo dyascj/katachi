@@ -1,6 +1,6 @@
 //! SVG export from the model; PNG export rasterizes that SVG with resvg so both always match.
 
-use crate::doc::{BlendMode, Cap, Decoration, Document, EffectKind, Join, Kind, Node, NodeId, Paint, PaintKind, Rgba, Shadow, StrokeAlign, TextAlign};
+use crate::doc::{BlendMode, Cap, Decoration, Document, EffectKind, Join, Kind, Node, NodeId, NoiseType, Paint, PaintKind, Rgba, Shadow, StrokeAlign, TextAlign};
 use egui::{Pos2, Rect, Vec2};
 use std::fmt::Write;
 
@@ -141,8 +141,8 @@ fn stroke_style(n: &Node) -> String {
 fn shadow_reach(n: &Node) -> f32 {
     n.shadows
         .iter()
-        .filter(|s| s.visible && s.kind != EffectKind::BackgroundBlur)
-        .map(|s| s.blur * 2.0 + s.spread.max(0.0) + s.offset.x.abs().max(s.offset.y.abs()))
+        .filter(|s| s.visible && !s.kind.is_backdrop())
+        .map(|s| s.max_blur() * 2.0 + s.spread.max(0.0) + s.offset.x.abs().max(s.offset.y.abs()))
         .fold(0.0, f32::max)
 }
 
@@ -152,6 +152,9 @@ struct Svg<'a> {
     out: String,
     defs: String,
     next: usize,
+    /// Bake background blurs and glass into images of what's behind them (export only; the
+    /// canvas draws those itself).
+    backdrops: bool,
 }
 
 impl Svg<'_> {
@@ -162,6 +165,11 @@ impl Svg<'_> {
 
     /// `fill="..."`-style attributes for a paint, adding gradient/pattern defs as needed.
     fn paint(&mut self, name: &str, p: &Paint, n: &Node) -> String {
+        let attrs = self.paint_source(name, p, n);
+        if p.blend == BlendMode::Normal { attrs } else { format!(r#"{attrs} style="mix-blend-mode:{}""#, p.blend.css()) }
+    }
+
+    fn paint_source(&mut self, name: &str, p: &Paint, n: &Node) -> String {
         let r = n.rect.translate(-self.o);
         match p.kind {
             PaintKind::Solid => {
@@ -170,19 +178,45 @@ impl Svg<'_> {
             }
             PaintKind::Linear | PaintKind::Radial => {
                 let id = self.id("paint");
-                // Defined in the layer's unit square, mapped onto it.
-                let m = format!("matrix({} 0 0 {} {} {})", r.width().max(1e-3), r.height().max(1e-3), r.min.x, r.min.y);
+                let (sx, sy) = (r.width().max(1e-3), r.height().max(1e-3));
+                // Defined in the layer's unit square, mapped onto it. A radial is a unit circle
+                // mapped onto its two handle axes, which makes it an ellipse when they differ.
                 let geo = if p.kind == PaintKind::Linear {
-                    format!(r#"<linearGradient id="{id}" x1="{}" y1="{}" x2="{}" y2="{}""#, p.from.x, p.from.y, p.to.x, p.to.y)
+                    let m = format!("matrix({sx} 0 0 {sy} {} {})", r.min.x, r.min.y);
+                    format!(r#"<linearGradient id="{id}" x1="{}" y1="{}" x2="{}" y2="{}" gradientUnits="userSpaceOnUse" gradientTransform="{m}">"#, p.from.x, p.from.y, p.to.x, p.to.y)
                 } else {
-                    format!(r#"<radialGradient id="{id}" cx="{}" cy="{}" r="{}""#, p.from.x, p.from.y, (p.to - p.from).length())
+                    let (d, w) = (p.to - p.from, p.width_point() - p.from);
+                    let m = format!("matrix({} {} {} {} {} {})", sx * d.x, sy * d.y, sx * w.x, sy * w.y, r.min.x + sx * p.from.x, r.min.y + sy * p.from.y);
+                    format!(r#"<radialGradient id="{id}" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="{m}">"#)
                 };
-                let _ = write!(self.defs, r#"{geo} gradientUnits="userSpaceOnUse" gradientTransform="{m}">"#);
+                self.defs.push_str(&geo);
                 for (t, c) in &p.stops {
                     let (c, a) = color_parts(*c);
                     let _ = write!(self.defs, r#"<stop offset="{t}" stop-color="{c}" stop-opacity="{a:.3}"/>"#);
                 }
                 self.defs.push_str(if p.kind == PaintKind::Linear { "</linearGradient>" } else { "</radialGradient>" });
+                format!(r#"{name}="url(#{id})" {name}-opacity="{:.3}""#, p.alpha())
+            }
+            PaintKind::Angular | PaintKind::Diamond => {
+                // SVG has neither: bake the gradient into an image pattern over the layer.
+                // ponytail: 2 px per unit up to 1024 px a side; bump the density if big exports band
+                let px = |len: f32| (len * 2.0).ceil().clamp(16.0, 1024.0) as u32;
+                let (w, h) = (px(r.width()), px(r.height()));
+                let img = image::RgbaImage::from_fn(w, h, |x, y| {
+                    image::Rgba(p.sample(p.gradient_t(egui::pos2((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32))).0)
+                });
+                let mut png = std::io::Cursor::new(vec![]);
+                if img.write_to(&mut png, image::ImageFormat::Png).is_err() {
+                    return format!(r#"{name}="none""#);
+                }
+                use base64::Engine;
+                let data = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+                let id = self.id("paint");
+                let (x, y, w, h) = (r.min.x, r.min.y, r.width(), r.height());
+                let _ = write!(
+                    self.defs,
+                    r#"<pattern id="{id}" patternUnits="userSpaceOnUse" x="{x}" y="{y}" width="{w}" height="{h}"><image href="data:image/png;base64,{data}" x="0" y="0" width="{w}" height="{h}" preserveAspectRatio="none"/></pattern>"#
+                );
                 format!(r#"{name}="url(#{id})" {name}-opacity="{:.3}""#, p.alpha())
             }
             PaintKind::Image => {
@@ -261,9 +295,9 @@ impl Svg<'_> {
         }
     }
 
-    /// Opens a filter group for the layer's own drop and inner shadows. Returns whether it did.
+    /// Opens a filter group for the layer's own shadows, noise and texture. Returns whether it did.
     fn open_shadows(&mut self, n: &Node) -> bool {
-        let fx: Vec<Shadow> = n.shadows.iter().filter(|s| s.visible && s.kind.is_shadow()).copied().collect();
+        let fx: Vec<Shadow> = n.shadows.iter().filter(|s| s.visible && (s.kind.is_shadow() || matches!(s.kind, EffectKind::Noise | EffectKind::Texture))).copied().collect();
         if fx.is_empty() {
             return false;
         }
@@ -277,23 +311,84 @@ impl Svg<'_> {
             reg.width(),
             reg.height()
         );
+        // Grain is seeded by the layer so it stays put from frame to frame.
+        let seed = n.id % 100_000;
+        // Texture distorts the layer first; shadows and noise follow the distorted shape.
+        let (mut sg, mut sa) = ("SourceGraphic".to_string(), "SourceAlpha".to_string());
+        for (i, s) in fx.iter().enumerate().filter(|(_, s)| s.kind == EffectKind::Texture) {
+            let _ = write!(
+                self.defs,
+                // Made opaque first: the map is read premultiplied, which would bias it to one side.
+                r#"<feTurbulence type="fractalNoise" baseFrequency="{}" numOctaves="2" seed="{}"/><feColorMatrix type="matrix" values="1 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 0 1"/><feDisplacementMap in="{sg}" scale="{}" xChannelSelector="R" yChannelSelector="G""#,
+                grain(s.size),
+                seed + i as u64,
+                s.blur * 2.0
+            );
+            if s.clip {
+                let _ = write!(self.defs, r#"/><feComposite in2="SourceAlpha" operator="in""#);
+            }
+            let _ = write!(self.defs, r#" result="tex{i}"/><feColorMatrix in="tex{i}" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0" result="texa{i}"/>"#);
+            (sg, sa) = (format!("tex{i}"), format!("texa{i}"));
+        }
+        let knock = n.knocks_out_shadow();
+        if knock {
+            // Anything the layer covers at all hides the shadow behind it.
+            let _ = write!(self.defs, r#"<feComponentTransfer in="{sa}" result="knock"><feFuncA type="linear" slope="255"/></feComponentTransfer>"#);
+        }
         for (i, s) in fx.iter().enumerate() {
             let (c, a) = color_parts(s.color);
-            if s.kind == EffectKind::DropShadow {
-                let _ = write!(self.defs, r#"<feFlood flood-color="{c}" flood-opacity="{a:.3}"/><feComposite in2="SourceAlpha" operator="in""#);
-                if s.spread > 0.0 {
-                    let _ = write!(self.defs, r#"/><feMorphology operator="dilate" radius="{}""#, s.spread);
+            match s.kind {
+                EffectKind::DropShadow => {
+                    let _ = write!(self.defs, r#"<feFlood flood-color="{c}" flood-opacity="{a:.3}"/><feComposite in2="{sa}" operator="in""#);
+                    if s.spread > 0.0 {
+                        let _ = write!(self.defs, r#"/><feMorphology operator="dilate" radius="{}""#, s.spread);
+                    }
+                    let _ = write!(self.defs, r#"/><feGaussianBlur stdDeviation="{}"/><feOffset dx="{}" dy="{}""#, s.blur / 2.0, s.offset.x, s.offset.y);
+                    if knock && !s.show_behind {
+                        self.defs.push_str(r#"/><feComposite in2="knock" operator="out""#);
+                    }
+                    let _ = write!(self.defs, r#" result="e{i}"/>"#);
                 }
-                let _ = write!(self.defs, r#"/><feGaussianBlur stdDeviation="{}"/><feOffset dx="{}" dy="{}" result="e{i}"/>"#, s.blur / 2.0, s.offset.x, s.offset.y);
-            } else {
-                // Inner shadow: the shape's inverse, shifted and blurred, kept only inside the shape.
-                let _ = write!(
-                    self.defs,
-                    r#"<feComponentTransfer in="SourceAlpha"><feFuncA type="table" tableValues="1 0"/></feComponentTransfer><feOffset dx="{}" dy="{}"/><feGaussianBlur stdDeviation="{}" result="inv{i}"/><feFlood flood-color="{c}" flood-opacity="{a:.3}"/><feComposite in2="inv{i}" operator="in"/><feComposite in2="SourceAlpha" operator="in" result="e{i}"/>"#,
-                    s.offset.x,
-                    s.offset.y,
-                    s.blur / 2.0
-                );
+                EffectKind::InnerShadow => {
+                    // The shape's inverse, shifted and blurred, kept only inside the shape.
+                    let _ = write!(
+                        self.defs,
+                        r#"<feComponentTransfer in="{sa}"><feFuncA type="table" tableValues="1 0"/></feComponentTransfer><feOffset dx="{}" dy="{}"/><feGaussianBlur stdDeviation="{}" result="inv{i}"/><feFlood flood-color="{c}" flood-opacity="{a:.3}"/><feComposite in2="inv{i}" operator="in"/><feComposite in2="{sa}" operator="in" result="e{i}"/>"#,
+                        s.offset.x,
+                        s.offset.y,
+                        s.blur / 2.0
+                    );
+                }
+                EffectKind::Noise => {
+                    // Grains are where the noise's alpha clears a threshold set by the density.
+                    let _ = write!(
+                        self.defs,
+                        r#"<feTurbulence type="fractalNoise" baseFrequency="{}" numOctaves="2" seed="{}" result="n{i}"/><feComponentTransfer in="n{i}"><feFuncA type="discrete" tableValues="{}"/></feComponentTransfer><feComposite in2="{sa}" operator="in" result="g{i}"/>"#,
+                        grain(s.size),
+                        seed + 7 + i as u64,
+                        noise_table(s.density)
+                    );
+                    match s.noise {
+                        NoiseType::Mono => {
+                            let _ = write!(self.defs, r#"<feFlood flood-color="{c}" flood-opacity="{a:.3}"/><feComposite in2="g{i}" operator="in" result="e{i}"/>"#);
+                        }
+                        NoiseType::Duo => {
+                            let (c2, a2) = color_parts(s.color2);
+                            let _ = write!(
+                                self.defs,
+                                r#"<feFlood flood-color="{c2}" flood-opacity="{a2:.3}"/><feComposite in2="{sa}" operator="in"/><feComposite in2="g{i}" operator="out" result="d{i}"/><feFlood flood-color="{c}" flood-opacity="{a:.3}"/><feComposite in2="g{i}" operator="in"/><feComposite in2="d{i}" operator="over" result="e{i}"/>"#
+                            );
+                        }
+                        NoiseType::Multi => {
+                            // The noise's own color channels, pushed to saturated tones.
+                            let _ = write!(
+                                self.defs,
+                                r#"<feColorMatrix in="n{i}" type="matrix" values="4 0 0 0 -1.5 0 4 0 0 -1.5 0 0 4 0 -1.5 0 0 0 0 1"/><feComposite in2="g{i}" operator="in"/><feComponentTransfer result="e{i}"><feFuncA type="linear" slope="{a:.3}"/></feComponentTransfer>"#
+                            );
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         self.defs.push_str("<feMerge>");
@@ -302,10 +397,12 @@ impl Svg<'_> {
                 let _ = write!(self.defs, r#"<feMergeNode in="e{i}"/>"#);
             }
         }
-        self.defs.push_str(r#"<feMergeNode in="SourceGraphic"/>"#);
-        for (i, s) in fx.iter().enumerate() {
-            if s.kind == EffectKind::InnerShadow {
-                let _ = write!(self.defs, r#"<feMergeNode in="e{i}"/>"#);
+        let _ = write!(self.defs, r#"<feMergeNode in="{sg}"/>"#);
+        for kind in [EffectKind::InnerShadow, EffectKind::Noise] {
+            for (i, s) in fx.iter().enumerate() {
+                if s.kind == kind {
+                    let _ = write!(self.defs, r#"<feMergeNode in="e{i}"/>"#);
+                }
             }
         }
         self.defs.push_str("</feMerge></filter>");
@@ -313,11 +410,17 @@ impl Svg<'_> {
         true
     }
 
-    /// Opens a layer-blur group around the whole layer (children included).
+    /// Opens a uniform layer-blur group around the whole layer (children included).
     fn open_blur(&mut self, n: &Node) -> bool {
-        let Some(b) = n.shadows.iter().find(|s| s.visible && s.kind == EffectKind::LayerBlur) else { return false };
+        let Some(b) = n.shadows.iter().find(|s| s.visible && s.kind == EffectKind::LayerBlur && s.progressive.is_none()) else { return false };
+        let id = self.blur_filter(n, b.blur);
+        let _ = write!(self.out, r#"<g filter="url(#{id})">"#);
+        true
+    }
+
+    fn blur_filter(&mut self, n: &Node, blur: f32) -> String {
         let id = self.id("blur");
-        let reg = n.aabb().translate(-self.o).expand(b.blur * 2.0);
+        let reg = n.aabb().translate(-self.o).expand(blur * 2.0);
         let _ = write!(
             self.defs,
             r#"<filter id="{id}" filterUnits="userSpaceOnUse" x="{}" y="{}" width="{}" height="{}"><feGaussianBlur stdDeviation="{}"/></filter>"#,
@@ -325,10 +428,53 @@ impl Svg<'_> {
             reg.min.y,
             reg.width(),
             reg.height(),
-            b.blur / 2.0
+            blur / 2.0
         );
-        let _ = write!(self.out, r#"<g filter="url(#{id})">"#);
-        true
+        id
+    }
+
+    /// A progressive layer blur: the layer as written since `mark`, repeated at a few blur
+    /// levels, each faded in along the ramp over the one before. SVG has no variable blur.
+    fn progressive_blur(&mut self, n: &Node, mark: usize) {
+        let Some(s) = n.shadows.iter().find(|s| s.visible && s.kind == EffectKind::LayerBlur && s.progressive.is_some()) else { return };
+        let p = s.progressive.unwrap_or_default();
+        let body = self.out.split_off(mark);
+        // ponytail: 6 fixed levels; add levels by blur range if long ramps band
+        const LEVELS: usize = 6;
+        let r = n.rect.translate(-self.o);
+        let at = |q: Pos2| r.min + q.to_vec2() * r.size();
+        let (a, b, c) = (at(p.start), at(p.end), r.center());
+        let reg = n.aabb().translate(-self.o).expand(s.max_blur() * 2.0);
+        for k in 0..=LEVELS {
+            let t = k as f32 / LEVELS as f32;
+            if k > 0 {
+                let (gid, mid) = (self.id("ramp"), self.id("mask"));
+                let (x, y, w, h) = (reg.min.x, reg.min.y, reg.width(), reg.height());
+                let _ = write!(
+                    self.defs,
+                    r##"<linearGradient id="{gid}" gradientUnits="userSpaceOnUse" x1="{}" y1="{}" x2="{}" y2="{}" gradientTransform="rotate({} {} {})"><stop offset="{}" stop-color="#FFFFFF" stop-opacity="0"/><stop offset="{t}" stop-color="#FFFFFF"/></linearGradient><mask id="{mid}" maskUnits="userSpaceOnUse" x="{x}" y="{y}" width="{w}" height="{h}"><rect x="{x}" y="{y}" width="{w}" height="{h}" fill="url(#{gid})"/></mask>"##,
+                    a.x,
+                    a.y,
+                    b.x,
+                    b.y,
+                    -n.rotation,
+                    c.x,
+                    c.y,
+                    (k - 1) as f32 / LEVELS as f32,
+                );
+                let _ = write!(self.out, r#"<g mask="url(#{mid})">"#);
+            }
+            let blur = s.blur_at(t);
+            if blur > 0.0 {
+                let id = self.blur_filter(n, blur);
+                let _ = write!(self.out, r#"<g filter="url(#{id})">{body}</g>"#);
+            } else {
+                self.out.push_str(&body);
+            }
+            if k > 0 {
+                self.out.push_str("</g>");
+            }
+        }
     }
 
     fn node(&mut self, id: NodeId) {
@@ -349,6 +495,9 @@ impl Svg<'_> {
             return;
         }
         let o = self.o;
+        if self.backdrops && n.shadows.iter().any(|s| s.visible && s.kind.is_backdrop()) {
+            self.backdrop_image(id);
+        }
         let blended = n.blend != BlendMode::Normal;
         if blended {
             let _ = write!(self.out, r#"<g style="mix-blend-mode:{}">"#, n.blend.css());
@@ -363,6 +512,7 @@ impl Svg<'_> {
         } else {
             String::new()
         };
+        let mark = self.out.len();
         let blurred = self.open_blur(n);
         // Groups cast their children's shadow; everything else shadows its own shape.
         let group_shadow = n.kind == Kind::Group && self.open_shadows(n);
@@ -388,6 +538,9 @@ impl Svg<'_> {
                         n.font_size,
                         n.font_weight
                     );
+                    if n.italic {
+                        attrs.push_str(r#" font-style="italic""#);
+                    }
                     if n.letter_spacing != 0.0 {
                         let _ = write!(attrs, r#" letter-spacing="{}""#, n.letter_spacing / 100.0 * n.font_size);
                     }
@@ -410,7 +563,9 @@ impl Svg<'_> {
                     for (i, line) in lines.iter().enumerate() {
                         let y = top + n.font_size * crate::text::ASCENT + pitch * i as f32 + n.paragraph_spacing * para as f32;
                         let indent = crate::text::list_indent(n, para);
-                        let lx = if anchor == "start" { x + indent } else { x };
+                        // Paragraph indent: the first line starts further in (its row is that much wider when centered).
+                        let pin = if first { n.paragraph_indent * if anchor == "start" { 1.0 } else if anchor == "middle" { 0.5 } else { 0.0 } } else { 0.0 };
+                        let lx = if anchor == "start" { x + indent + pin } else { x + pin };
                         if first && let Some(m) = markers.get(para).filter(|m| !m.is_empty()) {
                             let _ = write!(self.out, r#"<tspan x="{}" y="{y}">{}</tspan>"#, r.min.x + indent - n.font_size * 1.2, esc(m));
                         }
@@ -430,10 +585,18 @@ impl Svg<'_> {
                         }
                         cuts.sort();
                         cuts.dedup();
+                        // Justified lines (all but a paragraph's last) stretch their spaces to the box.
+                        // ponytail: only lines in one style run; mixed runs stay ragged in export.
+                        let justify = n.text_align == TextAlign::Justify && n.text_sizing != crate::doc::TextSizing::AutoWidth && !first && i + 1 < lines.len() && cuts.len() == 2;
                         for (k, w) in cuts.windows(2).enumerate() {
-                            let text: String = body[w[0]..w[1]].iter().collect();
+                            let mut text: String = body[w[0]..w[1]].iter().collect();
                             let (a, b) = (offset + w[0], offset + w[1]);
                             let mut style = String::new();
+                            let mut href = None;
+                            if justify {
+                                text.truncate(text.trim_end().len());
+                                let _ = write!(style, r#" textLength="{}" lengthAdjust="spacing""#, r.width() - indent - pin);
+                            }
                             if let Some(sp) = n.spans.iter().find(|sp| sp.start <= a && sp.end >= b) {
                                 let st = &sp.style;
                                 if let Some(w) = st.font_weight {
@@ -448,18 +611,33 @@ impl Svg<'_> {
                                 if let Some(c) = st.color {
                                     let (c, a) = color_parts(c);
                                     let _ = write!(style, r#" fill="{c}" fill-opacity="{a:.3}""#);
+                                } else if st.link.is_some() {
+                                    let l = crate::text::LINK;
+                                    let (c, _) = color_parts(Rgba::rgb(l.r(), l.g(), l.b()));
+                                    let _ = write!(style, r#" fill="{c}""#);
                                 }
-                                if st.italic == Some(true) {
-                                    style.push_str(r#" font-style="italic""#);
+                                href = st.link.clone();
+                                match st.italic {
+                                    Some(true) => style.push_str(r#" font-style="italic""#),
+                                    Some(false) if n.italic => style.push_str(r#" font-style="normal""#),
+                                    _ => {}
                                 }
-                                match st.decoration {
-                                    Some(Decoration::Underline) => style.push_str(r#" text-decoration="underline""#),
-                                    Some(Decoration::Strikethrough) => style.push_str(r#" text-decoration="line-through""#),
+                                // Links are underlined, as on the canvas.
+                                match (st.decoration, href.is_some()) {
+                                    (Some(Decoration::Strikethrough), true) => style.push_str(r#" text-decoration="underline line-through""#),
+                                    (Some(Decoration::Underline), _) | (_, true) => style.push_str(r#" text-decoration="underline""#),
+                                    (Some(Decoration::Strikethrough), false) => style.push_str(r#" text-decoration="line-through""#),
                                     _ => {}
                                 }
                             }
                             let pos = if k == 0 { format!(r#" x="{lx}" y="{y}""#) } else { String::new() };
-                            let _ = write!(self.out, r#"<tspan{pos}{style}>{}</tspan>"#, esc(&text));
+                            let run = format!(r#"<tspan{pos}{style}>{}</tspan>"#, esc(&text));
+                            match href {
+                                Some(url) => {
+                                    let _ = write!(self.out, r#"<a href="{}">{run}</a>"#, esc(&url));
+                                }
+                                None => self.out.push_str(&run),
+                            }
                         }
                         offset += line.chars().count();
                     }
@@ -523,7 +701,7 @@ impl Svg<'_> {
             }
             // A mask layer clips everything above it in this parent (alpha mask, like Figma).
             let mut masks_open = 0;
-            for &c in &n.children {
+            for c in n.paint_order() {
                 let cn = doc.node(c);
                 if cn.is_mask && cn.visible {
                     let mid = self.id("mask");
@@ -558,6 +736,7 @@ impl Svg<'_> {
         if blurred {
             self.out.push_str("</g>");
         }
+        self.progressive_blur(n, mark);
         if wrap {
             self.out.push_str("</g>");
         }
@@ -570,7 +749,7 @@ impl Svg<'_> {
     fn node_like_full(&mut self, n: &Node, id: NodeId) {
         let mut d = self.doc.clone();
         *d.node_mut(id) = n.clone();
-        let mut sub = Svg { doc: &d, o: self.o, out: String::new(), defs: String::new(), next: self.next + 1000 };
+        let mut sub = Svg { doc: &d, o: self.o, out: String::new(), defs: String::new(), next: self.next + 1000, backdrops: self.backdrops };
         sub.node(id);
         self.next = sub.next;
         self.defs.push_str(&sub.defs);
@@ -586,7 +765,8 @@ pub fn export_bounds(doc: &Document, ids: &[NodeId]) -> Rect {
         for s in n.shadows.iter().filter(|s| s.visible) {
             match s.kind {
                 EffectKind::DropShadow => b = b.union(n.aabb().translate(s.offset).expand(s.blur + s.spread)),
-                EffectKind::LayerBlur => b = b.union(n.aabb().expand(s.blur)),
+                EffectKind::LayerBlur => b = b.union(n.aabb().expand(s.max_blur())),
+                EffectKind::Texture => b = b.union(n.aabb().expand(s.blur)),
                 _ => {}
             }
         }
@@ -596,9 +776,14 @@ pub fn export_bounds(doc: &Document, ids: &[NodeId]) -> Rect {
 }
 
 pub fn to_svg(doc: &Document, ids: &[NodeId]) -> String {
+    svg_of(doc, ids, true)
+}
+
+/// Export SVG, optionally without baked backdrops (the canvas draws its own).
+pub fn svg_of(doc: &Document, ids: &[NodeId], backdrops: bool) -> String {
     let ids = doc.sort_by_z(ids);
     let r = export_bounds(doc, &ids);
-    let mut svg = Svg { doc, o: r.min.to_vec2(), out: String::new(), defs: String::new(), next: 0 };
+    let mut svg = Svg { doc, o: r.min.to_vec2(), out: String::new(), defs: String::new(), next: 0, backdrops };
     for &id in &ids {
         svg.node(id);
     }
@@ -610,13 +795,15 @@ pub fn to_svg(doc: &Document, ids: &[NodeId]) -> String {
     )
 }
 
-/// What's beneath a background-blurred layer (canvas only; SVG can't express backdrop blur):
-/// an unblurred backdrop and a mask of the layer's shape, both over `region` (padded by the
-/// blur so edges blur against real content), plus the blur radius.
-pub fn backdrop_parts(doc: &Document, id: NodeId) -> Option<(String, String, Rect, f32)> {
+/// What's beneath a background-blurred or glass layer (SVG can't express either): an
+/// unblurred backdrop and a mask of the layer's shape, both over `region` (padded so edges blur
+/// and refract real content). The canvas shows the whole page beneath; an export only what's
+/// beneath in the layer's top-level frame, as Figma exports don't include the page around them.
+pub fn backdrop_parts(doc: &Document, id: NodeId, export: bool) -> Option<(String, String, Rect)> {
     let n = doc.node(id);
-    let blur = n.shadows.iter().find(|s| s.visible && s.kind == EffectKind::BackgroundBlur)?.blur;
+    let s = n.shadows.iter().find(|s| s.visible && s.kind.is_backdrop())?;
     let page = doc.page_of(id);
+    let top = doc.ancestors(id).last().copied().unwrap_or(id);
     // Everything painted before this layer: at each level of its ancestry, drop the
     // layer (or ancestor's later siblings) and whatever sits above it.
     let mut tmp = doc.clone();
@@ -635,12 +822,21 @@ pub fn backdrop_parts(doc: &Document, id: NodeId) -> Option<(String, String, Rec
             None => break,
         }
     }
-    let region = n.aabb().expand(blur);
-    let mut svg = Svg { doc: &tmp, o: region.min.to_vec2(), out: String::new(), defs: String::new(), next: 0 };
-    let bg = doc.pages[page].background;
-    let _ = write!(svg.out, r##"<rect x="0" y="0" width="{}" height="{}" fill="#{}"/>"##, region.width(), region.height(), bg.hex());
-    for r in tmp.pages[page].children.clone() {
-        svg.node(r);
+    // Glass also reaches past its edge for what it bends inward.
+    let pad = s.max_blur() + if s.kind == EffectKind::Glass { s.glass.depth * s.glass.refraction } else { 0.0 };
+    let region = n.aabb().expand(pad.max(1.0));
+    // ponytail: backdrops leave out other backdrop effects beneath (glass over glass); render them nested if it matters
+    let mut svg = Svg { doc: &tmp, o: region.min.to_vec2(), out: String::new(), defs: String::new(), next: 0, backdrops: false };
+    if export {
+        if top != id {
+            svg.node(top);
+        }
+    } else {
+        let bg = doc.pages[page].background;
+        let _ = write!(svg.out, r##"<rect x="0" y="0" width="{}" height="{}" fill="#{}"/>"##, region.width(), region.height(), bg.hex());
+        for r in tmp.pages[page].children.clone() {
+            svg.node(r);
+        }
     }
     let (w, h) = (region.width().max(1.0), region.height().max(1.0));
     let head = format!(r#"<svg width="{w}" height="{h}" viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg">"#);
@@ -652,7 +848,86 @@ pub fn backdrop_parts(doc: &Document, id: NodeId) -> Option<(String, String, Rec
         String::new()
     };
     let mask = format!(r##"{head}{}</svg>"##, shape(n, svg.o, 0.0, &format!(r##"fill="#FFFFFF" {turn}"##)));
-    Some((content, mask, region, blur))
+    Some((content, mask, region))
+}
+
+/// The backdrop from `backdrop_parts` at `scale`, run through the layer's background blur or
+/// glass and masked to its shape (premultiplied RGBA).
+pub fn backdrop_pixels(n: &Node, (content, mask, region): &(String, String, Rect), scale: f32) -> Option<(Vec<u8>, [usize; 2])> {
+    let s = n.shadows.iter().find(|s| s.visible && s.kind.is_backdrop())?;
+    let (mut px, size) = rasterize(content, scale)?;
+    let (m, msize) = rasterize(mask, scale)?;
+    if msize != size {
+        return None;
+    }
+    let [w, h] = size;
+    if s.kind == EffectKind::Glass {
+        crate::render::glass(&mut px, &m, w, h, s, scale);
+    } else if let Some(p) = s.progressive {
+        // How far along the ramp each pixel is, measured in the layer's own (unrotated) frame.
+        let r = n.rect;
+        let at = |q: Pos2| r.min + q.to_vec2() * r.size();
+        let (a, d) = (at(p.start), at(p.end) - at(p.start));
+        crate::render::blur_ramp(&mut px, w, h, p.start_blur / 2.0 * scale, s.blur / 2.0 * scale, |x, y| {
+            let world = region.min + egui::vec2(x as f32 + 0.5, y as f32 + 0.5) / scale;
+            (crate::doc::rotate(world, r.center(), -n.rotation) - a).dot(d) / d.length_sq().max(1e-6)
+        });
+    } else {
+        crate::render::blur_rgba(&mut px, w, h, s.blur / 2.0 * scale);
+    }
+    for (p, a) in px.chunks_exact_mut(4).zip(m.chunks_exact(4).map(|c| c[3] as u32)) {
+        for c in p.iter_mut() {
+            *c = (*c as u32 * a / 255) as u8;
+        }
+    }
+    Some((px, size))
+}
+
+impl Svg<'_> {
+    /// A background blur or glass, baked into an image of what's behind the layer.
+    fn backdrop_image(&mut self, id: NodeId) {
+        let Some(parts) = backdrop_parts(self.doc, id, true) else { return };
+        // ponytail: baked at 2x; scale with the export if large exports look soft
+        let Some((mut px, [w, h])) = backdrop_pixels(self.doc.node(id), &parts, 2.0) else { return };
+        for p in px.chunks_exact_mut(4).filter(|p| p[3] > 0) {
+            let a = p[3] as u32;
+            for c in &mut p[..3] {
+                *c = (*c as u32 * 255 / a).min(255) as u8;
+            }
+        }
+        let mut png = std::io::Cursor::new(vec![]);
+        let Some(img) = image::RgbaImage::from_raw(w as u32, h as u32, px) else { return };
+        if img.write_to(&mut png, image::ImageFormat::Png).is_err() {
+            return;
+        }
+        use base64::Engine;
+        let data = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+        let r = parts.2.translate(-self.o);
+        let _ = write!(
+            self.out,
+            r#"<image href="data:image/png;base64,{data}" x="{}" y="{}" width="{}" height="{}" preserveAspectRatio="none"/>"#,
+            r.min.x,
+            r.min.y,
+            r.width(),
+            r.height()
+        );
+    }
+}
+
+/// Noise frequency for grains `size` px across. Kept off whole numbers: Perlin noise is flat on
+/// its integer lattice, which pixel centers would hit.
+fn grain(size: f32) -> f32 {
+    0.537 / size.max(0.1)
+}
+
+/// Noise threshold table: `feFuncA` steps to 1 where the noise is above the level that lets
+/// `density` of it through. Fractal noise is roughly normal around 0.5 (sd 0.12): the cut is
+/// its inverse CDF, in the logistic approximation.
+fn noise_table(density: f32) -> String {
+    const STEPS: usize = 64;
+    let d = density.clamp(0.0, 1.0);
+    let cut = 0.5 + 0.12 / 1.702 * ((1.0 - d) / d).ln();
+    (0..STEPS).map(|i| if (i as f32 + 0.5) / STEPS as f32 >= cut { "1" } else { "0" }).collect::<Vec<_>>().join(" ")
 }
 
 /// Rasterize SVG text at `scale` (premultiplied RGBA pixels and size).
@@ -671,7 +946,7 @@ pub fn rasterize(svg: &str, scale: f32) -> Option<(Vec<u8>, [usize; 2])> {
 
 /// Everything on `page` inside `region` (a slice), clipped to it.
 pub fn region_svg(doc: &Document, page: usize, region: Rect, skip: NodeId) -> String {
-    let mut svg = Svg { doc, o: region.min.to_vec2(), out: String::new(), defs: String::new(), next: 0 };
+    let mut svg = Svg { doc, o: region.min.to_vec2(), out: String::new(), defs: String::new(), next: 0, backdrops: true };
     for &r in &doc.pages[page].children {
         if r != skip && doc.node(r).aabb().intersects(region) {
             svg.node(r);
@@ -689,12 +964,28 @@ pub fn to_png(doc: &Document, ids: &[NodeId], scale: f32) -> Result<Vec<u8>, Str
     svg_to_png(doc, &to_svg(doc, ids), scale)
 }
 
-/// Encode export SVG in a format: SVG as-is, PNG/JPG rasterized at `scale`, PDF as vectors.
+/// Encode export SVG in a format: SVG as-is, PNG/JPG/WebP rasterized at `scale`, PDF as vectors.
 pub fn encode(doc: &Document, svg: &str, format: crate::doc::ExportFormat, scale: f32) -> Result<Vec<u8>, String> {
+    encode_with(doc, svg, format, scale, 92)
+}
+
+/// Encode export SVG of content `size` big with an export preset: its format, size, and JPG quality.
+pub fn encode_preset(doc: &Document, svg: &str, p: &crate::doc::ExportSetting, size: egui::Vec2) -> Result<Vec<u8>, String> {
+    encode_with(doc, svg, p.format, p.scale_for(size), p.quality)
+}
+
+fn encode_with(doc: &Document, svg: &str, format: crate::doc::ExportFormat, scale: f32, quality: u8) -> Result<Vec<u8>, String> {
     use crate::doc::ExportFormat;
     match format {
         ExportFormat::Svg => Ok(svg.as_bytes().to_vec()),
         ExportFormat::Png => svg_to_png(doc, svg, scale),
+        ExportFormat::Webp => {
+            let png = svg_to_png(doc, svg, scale)?;
+            let img = image::load_from_memory(&png).map_err(|e| e.to_string())?.to_rgba8();
+            let mut out = std::io::Cursor::new(vec![]);
+            image::codecs::webp::WebPEncoder::new_lossless(&mut out).encode(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::Rgba8).map_err(|e| e.to_string())?;
+            Ok(out.into_inner())
+        }
         ExportFormat::Jpg => {
             // JPEG has no alpha: flatten onto white.
             let png = svg_to_png(doc, svg, scale)?;
@@ -706,12 +997,12 @@ pub fn encode(doc: &Document, svg: &str, format: crate::doc::ExportFormat, scale
                 rgb.put_pixel(x, y, image::Rgb([c(p.0[0]), c(p.0[1]), c(p.0[2])]));
             }
             let mut out = std::io::Cursor::new(vec![]);
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 92).encode_image(&rgb).map_err(|e| e.to_string())?;
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality.clamp(1, 100)).encode_image(&rgb).map_err(|e| e.to_string())?;
             Ok(out.into_inner())
         }
         ExportFormat::Pdf => {
             let mut opt = svg2pdf::usvg::Options::default();
-            if doc.nodes.values().any(|n| n.kind == Kind::Text && n.font_family != "Inter") {
+            if needs_system_fonts(doc) {
                 opt.fontdb_mut().load_system_fonts();
             }
             for f in FONTS {
@@ -723,11 +1014,19 @@ pub fn encode(doc: &Document, svg: &str, format: crate::doc::ExportFormat, scale
     }
 }
 
+/// System fonts only when text uses one (or an italic, which Inter isn't bundled in); Inter is
+/// always bundled. usvg then picks the same faces the canvas does: both query fontdb by family,
+/// weight and style.
+/// ponytail: a family without an italic face exports upright, where the canvas slants it.
+fn needs_system_fonts(doc: &Document) -> bool {
+    doc.nodes.values().any(|n| {
+        n.kind == Kind::Text && (n.font_family != "Inter" || n.italic || n.spans.iter().any(|s| s.style.font_family.is_some() || s.style.italic == Some(true)))
+    })
+}
+
 pub fn svg_to_png(doc: &Document, svg: &str, scale: f32) -> Result<Vec<u8>, String> {
     let mut opt = resvg::usvg::Options::default();
-    // System fonts only when a layer uses one; Inter is always bundled.
-    let needs_system = doc.nodes.values().any(|n| n.kind == Kind::Text && n.font_family != "Inter");
-    if needs_system {
+    if needs_system_fonts(doc) {
         opt.fontdb = std::sync::Arc::new(crate::text::system_fonts().clone());
     }
     for f in FONTS {
@@ -741,11 +1040,44 @@ pub fn svg_to_png(doc: &Document, svg: &str, scale: f32) -> Result<Vec<u8>, Stri
     pix.encode_png().map_err(|e| e.to_string())
 }
 
+/// A layer name as a file name: slashes become "-", characters Windows forbids go, and so do
+/// leading dots (hidden files, or ".." climbing out of the export folder).
+pub fn safe_name(name: &str) -> String {
+    let s: String = name.chars().filter(|c| !r#":*?"<>|"#.contains(*c) && !c.is_control()).map(|c| if c == '/' || c == '\\' { '-' } else { c }).collect();
+    let s = s.trim().trim_start_matches('.').trim_start();
+    if s.is_empty() { "Untitled".into() } else { s.to_string() }
+}
+
+/// File names made distinct with " 2", " 3" before the extension (ignoring case, as macOS and
+/// Windows do), so exporting same-named layers doesn't overwrite one with another.
+pub fn unique_names(names: Vec<String>) -> Vec<String> {
+    let mut taken = std::collections::HashSet::new();
+    names
+        .into_iter()
+        .map(|name| {
+            let (stem, ext) = name.rsplit_once('.').map_or((name.as_str(), String::new()), |(s, e)| (s, format!(".{e}")));
+            let out = (1..).map(|i| if i == 1 { name.clone() } else { format!("{stem} {i}{ext}") }).find(|n| !taken.contains(&n.to_lowercase())).unwrap_or_default();
+            taken.insert(out.to_lowercase());
+            out
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::doc::{Node, PathPoint};
     use egui::{pos2, vec2};
+
+    #[test]
+    fn export_file_names_are_safe_and_distinct() {
+        assert_eq!(safe_name("../../.ssh/Icons/Home"), "-..-.ssh-Icons-Home");
+        assert_eq!(safe_name("..\\evil"), "-evil");
+        assert_eq!(safe_name("..."), "Untitled");
+        assert_eq!(safe_name("a:b*c?d\"e<f>g|h"), "abcdefgh");
+        let names = unique_names(vec!["Icon.png".into(), "icon.png".into(), "Icon.png".into(), "Icon@2x.png".into()]);
+        assert_eq!(names, ["Icon.png", "icon 2.png", "Icon 3.png", "Icon@2x.png"]);
+    }
 
     #[test]
     fn svg_and_png_roundtrip() {
@@ -811,6 +1143,51 @@ mod tests {
         let img = image::load_from_memory(&png).unwrap().to_rgba8();
         assert!(img.get_pixel(5, 20).0[0] > 200, "left half red");
         assert!(img.get_pixel(35, 20).0[2] > 200, "right half blue");
+    }
+
+    #[test]
+    fn angular_diamond_and_elliptical_radial_export() {
+        let mut d = Document::default();
+        let px = |d: &Document, id, x, y| image::load_from_memory(&to_png(d, &[id], 1.0).unwrap()).unwrap().to_rgba8().get_pixel(x, y).0;
+        let mut add = |kind| {
+            let mut g = Paint::solid(Rgba::rgb(255, 0, 0));
+            g.convert(kind);
+            g.stops = vec![(0.0, Rgba::rgb(255, 0, 0)), (1.0, Rgba::rgb(0, 0, 255))];
+            let mut n = Node::new(Kind::Rectangle, Rect::from_min_size(pos2(0., 0.), vec2(100., 100.)));
+            n.fills = vec![g];
+            d.insert(0, None, None, n)
+        };
+        let (ang, dia, rad) = (add(PaintKind::Angular), add(PaintKind::Diamond), add(PaintKind::Radial));
+        // Angular: red just below the start ray (right of center), blue just above it, purple halfway round.
+        assert!(px(&d, ang, 90, 52)[0] > 200 && px(&d, ang, 90, 47)[2] > 200);
+        let left = px(&d, ang, 10, 50);
+        assert!(left[0] > 90 && left[2] > 90, "{left:?}");
+        // Diamond: the edge midpoint is the corner of the last ring; the box corner is past it.
+        assert!(px(&d, dia, 50, 50)[0] > 240);
+        assert!(px(&d, dia, 99, 99)[2] > 240 && px(&d, dia, 75, 75)[2] > 240);
+        // An elliptical radial (half as tall): blue already at 75% of the way down.
+        d.node_mut(rad).fills[0].width_to = Some(pos2(0.5, 0.75));
+        let svg = to_svg(&d, &[rad]);
+        assert!(svg.contains(r#"<radialGradient id="paint1" cx="0" cy="0" r="1""#), "{svg}");
+        assert!(px(&d, rad, 50, 76)[2] > 240 && px(&d, rad, 76, 50)[0] > 60);
+    }
+
+    #[test]
+    fn per_paint_blend_modes_export() {
+        let mut d = Document::default();
+        let mut n = Node::new(Kind::Rectangle, Rect::from_min_size(pos2(0., 0.), vec2(20., 20.)));
+        let mut top = Paint::solid(Rgba::rgb(255, 128, 0));
+        top.blend = BlendMode::Multiply;
+        n.fills = vec![Paint::solid(Rgba::rgb(128, 255, 255)), top];
+        let a = d.insert(0, None, None, n);
+        let svg = to_svg(&d, &[a]);
+        assert!(svg.contains(r##"fill="#FF8000" style="mix-blend-mode:multiply""##), "{svg}");
+        let px = image::load_from_memory(&to_png(&d, &[a], 1.0).unwrap()).unwrap().to_rgba8().get_pixel(10, 10).0;
+        // Multiply: (128, 255, 255) x (255, 128, 0) = (128, 128, 0).
+        assert!(px[0].abs_diff(128) < 3 && px[1].abs_diff(128) < 3 && px[2] < 3, "{px:?}");
+        let back: Paint = serde_json::from_str(&serde_json::to_string(&d.node(a).fills[1]).unwrap()).unwrap();
+        assert_eq!(back.blend, BlendMode::Multiply);
+        assert!(!serde_json::to_string(&d.node(a).fills[0]).unwrap().contains("blend"), "Normal stays out of files");
     }
 
     #[test]
@@ -894,6 +1271,36 @@ mod tests {
     }
 
     #[test]
+    fn presets_size_by_scale_width_or_height_and_encode_webp() {
+        use crate::doc::{ExportFormat, ExportSetting, ExportSize};
+        let mut p = ExportSetting::default();
+        assert!(p.set_size("2.5x") && p.size == ExportSize::Scale && p.scale == 2.5);
+        assert_eq!(p.size_label(), "2.5x");
+        assert!(p.set_size("3") && p.scale == 3.0);
+        assert!(p.set_size("512 W") && p.size == ExportSize::Width(512.0));
+        assert_eq!(p.size_label(), "512w");
+        assert!(!p.set_size("big") && !p.set_size("-2x"), "nonsense leaves it alone");
+        assert_eq!(p.size, ExportSize::Width(512.0));
+        let mut d = Document::default();
+        let a = d.insert(0, None, None, Node::new(Kind::Ellipse, Rect::from_min_size(pos2(0., 0.), vec2(40., 20.))));
+        let svg = to_svg(&d, &[a]);
+        let dims = |p: &ExportSetting| image::load_from_memory(&encode_preset(&d, &svg, p, vec2(40., 20.)).unwrap()).unwrap().to_rgba8().dimensions();
+        assert_eq!(dims(&p), (512, 256));
+        p.set_size("100h");
+        assert_eq!(dims(&p), (200, 100));
+        p.format = ExportFormat::Webp;
+        p.set_size("1x");
+        let webp = encode_preset(&d, &svg, &p, vec2(40., 20.)).unwrap();
+        assert_eq!(&webp[8..12], b"WEBP");
+        assert_eq!(image::load_from_memory(&webp).unwrap().to_rgba8().dimensions(), (40, 20));
+        // JPG quality changes the bytes.
+        p.format = ExportFormat::Jpg;
+        let hi = encode_preset(&d, &svg, &p, vec2(40., 20.)).unwrap();
+        p.quality = 10;
+        assert!(encode_preset(&d, &svg, &p, vec2(40., 20.)).unwrap().len() < hi.len());
+    }
+
+    #[test]
     fn rich_text_exports_styled_runs() {
         use crate::doc::{SpanStyle, TextSpan};
         let mut d = Document::default();
@@ -914,5 +1321,198 @@ mod tests {
         let svg = to_svg(&d, &[a]);
         assert!(svg.contains(r#"width="10" height="100""#), "{svg}");
         assert!(svg.contains(r#"transform="rotate(-90 5 50)""#), "{svg}");
+    }
+
+    fn pixels(d: &Document, id: NodeId) -> image::RgbaImage {
+        image::load_from_memory(&to_png(d, &[id], 1.0).unwrap()).unwrap().to_rgba8()
+    }
+
+    /// A square of black and white vertical stripes, 4 px each.
+    fn stripes(d: &mut Document, parent: Option<NodeId>, at: Pos2, size: f32) -> NodeId {
+        let mut bg = Node::new(Kind::Rectangle, Rect::from_min_size(at, vec2(size, size)));
+        bg.fills = vec![Paint::solid(Rgba::WHITE)];
+        let g = d.insert(0, parent, None, bg);
+        for i in 0..(size / 8.0) as usize {
+            let mut s = Node::new(Kind::Rectangle, Rect::from_min_size(at + vec2(i as f32 * 8.0, 0.0), vec2(4.0, size)));
+            s.fills = vec![Paint::solid(Rgba::BLACK)];
+            d.insert(0, parent, None, s);
+        }
+        g
+    }
+
+    /// How much a row of pixels varies: sharp stripes vary a lot, blurred ones little.
+    fn contrast(img: &image::RgbaImage, y: u32, xs: std::ops::Range<u32>) -> i32 {
+        let v: Vec<i32> = xs.map(|x| img.get_pixel(x, y).0[0] as i32).collect();
+        v.iter().max().unwrap() - v.iter().min().unwrap()
+    }
+
+    #[test]
+    fn noise_is_seeded_clipped_and_as_dense_as_set() {
+        use crate::doc::NoiseType;
+        let mut d = Document::default();
+        let mut n = Node::new(Kind::Ellipse, Rect::from_min_size(pos2(0., 0.), vec2(200., 200.)));
+        n.fills = vec![Paint::solid(Rgba::WHITE)];
+        n.shadows = vec![Shadow { color: Rgba::BLACK, density: 0.25, ..Shadow::of(EffectKind::Noise) }];
+        let a = d.insert(0, None, None, n.clone());
+        let img = pixels(&d, a);
+        // Grain covers about a quarter of the middle square, and nothing outside the circle.
+        let dark = (60..140).flat_map(|y| (60..140).map(move |x| (x, y))).filter(|&(x, y)| img.get_pixel(x, y).0[0] < 128).count();
+        assert!((1300..1900).contains(&dark), "{dark} of 6400");
+        assert_eq!(img.get_pixel(5, 5).0[3], 0);
+        assert_eq!(img, pixels(&d, a), "the same grain every time");
+        let b = d.insert(0, None, None, n);
+        assert_ne!(img, pixels(&d, b), "another layer, another grain");
+        // Duo paints its second color between grains; Multitone grains are colored.
+        d.node_mut(a).shadows[0].noise = NoiseType::Duo;
+        d.node_mut(a).shadows[0].color2 = Rgba::rgb(255, 0, 0);
+        let duo = pixels(&d, a);
+        assert!(duo.pixels().any(|p| p.0 == [255, 0, 0, 255]) && duo.pixels().any(|p| p.0 == [0, 0, 0, 255]));
+        d.node_mut(a).shadows[0].noise = NoiseType::Multi;
+        let multi = pixels(&d, a);
+        assert!(multi.pixels().any(|p| p.0[0].abs_diff(p.0[1]) > 60 || p.0[1].abs_diff(p.0[2]) > 60), "colored grains");
+    }
+
+    #[test]
+    fn texture_roughens_edges_unless_clipped() {
+        let mut d = Document::default();
+        let mut n = Node::new(Kind::Rectangle, Rect::from_min_size(pos2(0., 0.), vec2(100., 100.)));
+        n.fills = vec![Paint::solid(Rgba::BLACK)];
+        n.shadows = vec![Shadow { clip: false, blur: 6.0, ..Shadow::of(EffectKind::Texture) }];
+        let a = d.insert(0, None, None, n);
+        let img = pixels(&d, a);
+        // Export bounds grow by the radius: the square starts at 6, 6.
+        assert_eq!(img.dimensions(), (112, 112));
+        let outside = (0..112).filter(|&y| img.get_pixel(3, y).0[3] > 128).count();
+        let edge_holes = (0..112).filter(|&y| (12..100).contains(&y) && img.get_pixel(8, y).0[3] < 128).count();
+        assert!(outside > 3 && edge_holes > 3, "{outside} spill out, {edge_holes} holes");
+        assert!(img.get_pixel(56, 56).0[3] == 255, "the middle stays solid");
+        d.node_mut(a).shadows[0].clip = true;
+        let img = pixels(&d, a);
+        assert!((0..112).all(|y| img.get_pixel(3, y).0[3] == 0), "clipped to the shape");
+    }
+
+    #[test]
+    fn progressive_layer_blur_ramps_from_start_to_end() {
+        let mut d = Document::default();
+        let f = d.insert(0, None, None, Node::new(Kind::Frame, Rect::from_min_size(pos2(0., 0.), vec2(160., 160.))));
+        stripes(&mut d, Some(f), pos2(0., 0.), 160.);
+        d.node_mut(f).shadows = vec![Shadow { blur: 16.0, progressive: Some(crate::doc::Progressive::default()), ..Shadow::of(EffectKind::LayerBlur) }];
+        let img = pixels(&d, f);
+        // Bounds grow by the strongest blur.
+        assert_eq!(img.dimensions(), (192, 192));
+        let (top, mid, bottom) = (contrast(&img, 18, 60..130), contrast(&img, 36, 60..130), contrast(&img, 172, 60..130));
+        assert!(top > 200 && top > mid && bottom < 20, "{top} {mid} {bottom}");
+    }
+
+    #[test]
+    fn drop_shadows_hide_behind_see_through_layers() {
+        let mut d = Document::default();
+        let mut n = Node::new(Kind::Rectangle, Rect::from_min_size(pos2(0., 0.), vec2(60., 60.)));
+        n.fills = vec![Paint::solid(Rgba([255, 255, 255, 51]))];
+        n.shadows = vec![Shadow { color: Rgba::BLACK, offset: vec2(0., 0.), blur: 4.0, ..Default::default() }];
+        let a = d.insert(0, None, None, n);
+        let alpha = |d: &Document| pixels(d, a).get_pixel(34, 34).0[3];
+        let off = alpha(&d);
+        assert!(off.abs_diff(51) < 3, "just the fill: {off}");
+        d.node_mut(a).shadows[0].show_behind = true;
+        assert!(alpha(&d) > off + 30, "shadow under the fill: {}", alpha(&d));
+        // An opaque fill hides it anyway, and isn't knocked out (no seams on its edges).
+        d.node_mut(a).shadows[0].show_behind = false;
+        d.node_mut(a).fills = vec![Paint::solid(Rgba::WHITE)];
+        assert!(!to_svg(&d, &[a]).contains("knock"));
+    }
+
+    #[test]
+    fn glass_and_background_blurs_bake_their_backdrop() {
+        let mut d = Document::default();
+        let f = d.insert(0, None, None, Node::new(Kind::Frame, Rect::from_min_size(pos2(0., 0.), vec2(160., 160.))));
+        stripes(&mut d, Some(f), pos2(0., 0.), 160.);
+        let mut g = Node::new(Kind::Rectangle, Rect::from_min_size(pos2(20., 20.), vec2(120., 120.)));
+        g.radius = 24.;
+        g.fills = vec![];
+        g.shadows = vec![Shadow { blur: 16.0, ..Shadow::of(EffectKind::BackgroundBlur) }];
+        let g = d.insert(0, Some(f), None, g);
+        let svg = to_svg(&d, &[f]);
+        assert!(svg.contains(r#"<image href="data:image/png;base64,"#), "{}", &svg[..300.min(svg.len())]);
+        let img = pixels(&d, f);
+        assert!(contrast(&img, 80, 40..120) < 40 && contrast(&img, 10, 40..120) > 200, "blurred inside, sharp outside");
+        // Progressive: sharp at the top of the layer, blurred at the bottom.
+        d.node_mut(g).shadows[0].progressive = Some(crate::doc::Progressive::default());
+        let img = pixels(&d, f);
+        let (top, bottom) = (contrast(&img, 22, 40..120), contrast(&img, 134, 40..120));
+        assert!(top > 150 && bottom < 40, "{top} {bottom}");
+        // Glass: frosted in the middle, lit on the top-left rim, bent near the edges.
+        d.node_mut(g).shadows = vec![Shadow { blur: 16.0, ..Shadow::of(EffectKind::Glass) }];
+        let img = pixels(&d, f);
+        assert!(contrast(&img, 80, 60..100) < 40, "frosted");
+        let (lit, far) = (img.get_pixel(21, 80).0[0], img.get_pixel(138, 80).0[0]);
+        assert!(lit > far + 40, "lit from the top left: {lit} vs {far}");
+        assert!(contrast(&img, 10, 40..120) > 200, "untouched outside");
+        // A top-level layer exports without the page behind it.
+        let lone = d.insert(0, None, None, Node { rect: Rect::from_min_size(pos2(0., 0.), vec2(50., 50.)), fills: vec![], ..d.node(g).clone() });
+        assert_eq!(pixels(&d, lone).get_pixel(25, 25).0[3], 0);
+    }
+
+    #[test]
+    fn effects_load_from_old_files_and_roundtrip() {
+        let old: Shadow = serde_json::from_str(r#"{"kind":"DropShadow","color":[0,0,0,64],"offset":[0,4],"blur":4,"spread":0,"visible":true}"#).unwrap();
+        assert_eq!(old, Shadow::default());
+        assert!(!serde_json::to_string(&old).unwrap().contains("glass"), "unused settings stay out of files");
+        for k in crate::doc::EffectKind::ALL {
+            let mut s = Shadow::of(k);
+            if k.is_blur() {
+                s.progressive = Some(crate::doc::Progressive { start: pos2(0.2, 0.1), end: pos2(0.9, 1.0), start_blur: 2.0 });
+            }
+            let back: Shadow = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+            assert_eq!(back, s, "{k:?} through a file");
+            let v = crate::plugin_doc::effect_json(&s);
+            assert_eq!(crate::plugin_doc::effect_from(&v), Some(s), "{k:?} through plugins: {v}");
+        }
+    }
+
+    /// Renders every new effect over light and dark content for a look by eye.
+    #[test]
+    #[ignore]
+    fn effects_look() {
+        use crate::doc::{NoiseType, Progressive};
+        let mut d = Document::default();
+        for (row, bg) in [Rgba::rgb(245, 245, 245), Rgba::rgb(24, 24, 28)].into_iter().enumerate() {
+            let y = row as f32 * 260.0;
+            let mut f = Node::new(Kind::Frame, Rect::from_min_size(pos2(0., y), vec2(1500., 240.)));
+            f.fills = vec![Paint::solid(bg)];
+            let f = d.insert(0, None, None, f);
+            // Colorful things to look through.
+            for i in 0..14 {
+                let mut c = Node::new(Kind::Ellipse, Rect::from_min_size(pos2(20. + i as f32 * 105., y + 40. + (i % 3) as f32 * 30.), vec2(90., 90.)));
+                c.fills = vec![Paint::solid([Rgba::rgb(13, 153, 255), Rgba::rgb(255, 199, 0), Rgba::rgb(242, 72, 34), Rgba::rgb(20, 174, 92)][i % 4])];
+                d.insert(0, Some(f), None, c);
+            }
+            let mut t = Node::new(Kind::Text, Rect::from_min_size(pos2(20., y + 100.), vec2(1460., 40.)));
+            t.text = "Katachi glass, noise, texture and progressive blur".into();
+            t.font_size = 36.;
+            t.fills = vec![Paint::solid(if row == 0 { Rgba::BLACK } else { Rgba::WHITE })];
+            d.insert(0, Some(f), None, t);
+            let fx = [
+                Shadow::of(EffectKind::Glass),
+                Shadow { glass: crate::doc::Glass { refraction: 1.0, depth: 40., dispersion: 1.0, angle: 45., light: 1.0 }, blur: 0.0, ..Shadow::of(EffectKind::Glass) },
+                Shadow { progressive: Some(Progressive::default()), blur: 24., ..Shadow::of(EffectKind::BackgroundBlur) },
+                Shadow { color: Rgba([0, 0, 0, 160]), ..Shadow::of(EffectKind::Noise) },
+                Shadow { noise: NoiseType::Duo, color: Rgba([255, 255, 255, 200]), color2: Rgba([0, 0, 0, 90]), size: 2.0, ..Shadow::of(EffectKind::Noise) },
+                Shadow { noise: NoiseType::Multi, color: Rgba([0, 0, 0, 200]), density: 0.8, ..Shadow::of(EffectKind::Noise) },
+                Shadow::of(EffectKind::Texture),
+            ];
+            for (i, s) in fx.into_iter().enumerate() {
+                let mut n = Node::new(Kind::Rectangle, Rect::from_min_size(pos2(20. + i as f32 * 210., y + 30.), vec2(190., 180.)));
+                n.radius = 32.;
+                n.fills = match s.kind {
+                    EffectKind::Glass | EffectKind::BackgroundBlur => vec![Paint::solid(Rgba([255, 255, 255, 25]))],
+                    _ => vec![Paint::solid(Rgba::rgb(142, 114, 255))],
+                };
+                n.shadows = vec![s];
+                d.insert(0, Some(f), None, n);
+            }
+        }
+        let roots = d.pages[0].children.clone();
+        std::fs::write("target/look-effects.png", to_png(&d, &roots, 1.0).unwrap()).unwrap();
     }
 }

@@ -89,14 +89,18 @@ fn paint(p: &usvg::Paint, opacity: f32, ts: Transform, bounds: Rect) -> Paint {
             to: unit(g.x2(), g.y2(), g.transform()),
             ..Paint::solid(Rgba::WHITE)
         },
-        usvg::Paint::RadialGradient(g) => Paint {
-            kind: PaintKind::Radial,
-            color: alpha,
-            stops: stops(g.stops()),
-            from: unit(g.cx(), g.cy(), g.transform()),
-            to: unit(g.cx() + g.r().get(), g.cy(), g.transform()),
-            ..Paint::solid(Rgba::WHITE)
-        },
+        usvg::Paint::RadialGradient(g) => {
+            let mut p = Paint {
+                kind: PaintKind::Radial,
+                color: alpha,
+                stops: stops(g.stops()),
+                from: unit(g.cx(), g.cy(), g.transform()),
+                to: unit(g.cx() + g.r().get(), g.cy(), g.transform()),
+                ..Paint::solid(Rgba::WHITE)
+            };
+            p.width_to = crate::doc::explicit_width(&p, unit(g.cx(), g.cy() + g.r().get(), g.transform()));
+            p
+        }
         usvg::Paint::Pattern(_) => Paint::solid(Rgba([0xD9, 0xD9, 0xD9, (opacity * 255.0) as u8])),
     }
 }
