@@ -74,7 +74,10 @@ jobs:
           [ "$(printf '%s\nGLIBC_2.28\n' "$need" | sort -V | tail -1)" = GLIBC_2.28 ] || { echo "::error::binary needs $need"; exit 1; }
       - name: Runs on old and new distributions
         run: |
-          for img in debian:11 ubuntu:20.04 rockylinux:8 fedora:latest archlinux:latest; do
+          imgs="debian:11 ubuntu:20.04 rockylinux:8 fedora:latest opensuse/leap:15.6"
+          # Arch publishes x86_64 images only.
+          [ "${{ matrix.arch }}" = x86_64 ] && imgs="$imgs archlinux:latest"
+          for img in $imgs; do
             docker run --rm -v "$PWD/target/release:/k:ro" "$img" /k/katachi --version
           done
       - name: Starts and draws a window

@@ -110,6 +110,7 @@ package instead. Set `KATACHI_NO_UPDATE=1` to turn the check off.
 - Variables with collections, modes (for example Light and Dark), aliases, groups, scopes, and code syntax for web, iOS, and Android
 - Bind variables to colors, sizes, spacing, radius, text, typography (font, weight, line height, letter spacing), min and max sizes, effects, and visibility, with Figma's "Apply variable" button on fills and strokes
 - Assets panel with component previews, grouped by page; click or drag to place
+- Libraries: use components, styles, and variables from other `.katachi` files, review updates when a library changes, and publish your own
 
 **Vectors**
 - Multi-contour paths with even-odd or non-zero fill
@@ -123,7 +124,7 @@ package instead. Set `KATACHI_NO_UPDATE=1` to turn the check off.
 - Figma's color picker: Hex, RGB, CSS, HSL, and HSB, colors on this page, color styles, and an eyedropper (I) with a loupe
 - Several fills and strokes per layer, reordered by dragging, each with its own blend mode; Shift X swaps fill and stroke; number keys set opacity (5 = 50%, 4 then 5 = 45%)
 - Strokes with inside / center / outside alignment, individual side weights, dashes, caps, joins, and arrow markers
-- Drop shadow, inner shadow, layer blur, background blur, blend modes, masks, independent corner radii
+- Drop shadow, inner shadow, layer and background blur (uniform or progressive), noise, texture, and glass, reordered by dragging; blend modes, masks, independent corner radii
 - Selection colors: every color in a selection, editable in one place
 
 **Text**
@@ -141,8 +142,10 @@ package instead. Set `KATACHI_NO_UPDATE=1` to turn the check off.
 
 **Collaboration**
 - Real-time multiplayer: host a session from the app (Main menu > Collaborate) or run `katachi serve file.katachi`, and others join by address
-- Live cursors, selections, and avatars; undo only reverts your own changes
-- Comments pinned to frames, with replies and resolve
+- Sessions are protected by a code in the shared address; dropped connections reconnect on their own
+- Live cursors, selections with name tags, text carets, and avatars; undo only reverts your own changes
+- Cursor chat (/), follow a collaborator by clicking their avatar, and Spotlight me
+- Comments pinned to frames, with replies, resolve, @mentions, filters, and unread markers
 
 **Handoff**
 - Dev Mode (Shift D) with CSS, Tailwind, SwiftUI, and Jetpack Compose code that uses your variable and style names, colors, type, and auto layout spacing on hover

@@ -5,6 +5,18 @@ on:
   pull_request:
 
 jobs:
+  # macOS and Windows: the release builds there too, and every platform must build for signing.
+  other:
+    strategy:
+      matrix:
+        os: [macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
   test:
     runs-on: ubuntu-latest
     steps:
