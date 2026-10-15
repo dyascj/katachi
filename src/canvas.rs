@@ -152,7 +152,11 @@ impl App {
                 self.checkpoint();
                 let w = self.view.to_world(p);
                 let size = self.doc.node(drop.0).rect.size();
-                let parent = self.frame_at(w, &[]);
+                let mut parent = self.frame_at(w, &[]);
+                // Never into an instance (its layers come from its main) or the component itself.
+                while let Some(p) = parent.filter(|&p| self.owning_instance(p).is_some() || p == drop.0 || self.doc.is_ancestor(drop.0, p)) {
+                    parent = self.doc.node(p).parent;
+                }
                 let i = self.doc.instantiate(drop.0, self.page, parent, None, self.px(w - size / 2.0));
                 self.sel = vec![i];
             }
@@ -1950,11 +1954,7 @@ impl App {
                     ui.close();
                 }
             });
-            if item(ui, "Reset instance", "", true) {
-                self.checkpoint();
-                self.doc.reset_instance(inst);
-                ui.close();
-            }
+            self.instance_menu(ui, inst);
             if item(ui, "Detach instance", "⌥⌘B", true) {
                 self.checkpoint();
                 self.doc.detach_instance(inst);

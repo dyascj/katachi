@@ -2728,3 +2728,122 @@ fn plugin_variables_carry_scopes_and_code_syntax() {
     assert_eq!(out["variables"][0]["scopes"], serde_json::json!(["CORNER_RADIUS"]));
     assert_eq!(out["variables"][0]["codeSyntax"]["WEB"], "var(--radius-md)");
 }
+
+/// A "Card" component with a "Bg" rectangle and a "Title" text, and two instances of it.
+fn card_doc() -> crate::doc::Document {
+    let mut doc = crate::doc::Document::default();
+    crate::plugins::run(&mut doc, 0, &[], r##"
+        const c = figma.createComponent(); c.name = "Card"; c.resize(100, 60);
+        const bg = figma.createRectangle(); bg.name = "Bg"; bg.resize(100, 60); c.appendChild(bg);
+        bg.fills = [figma.util.solidPaint("#FF0000")];
+        const t = figma.createText(); t.name = "Title"; t.characters = "Hello"; c.appendChild(t);
+        c.createInstance().x = 200;
+        c.createInstance().x = 400;
+    "##).unwrap();
+    doc.reflow();
+    doc
+}
+
+#[test]
+fn instance_overrides_reset_one_at_a_time_and_push_to_main() {
+    use crate::doc::{Override, Rgba};
+    let mut doc = card_doc();
+    let insts: Vec<NodeId> = doc.pages[0].children.iter().copied().filter(|&i| doc.node(i).kind == Kind::Instance).collect();
+    let layer = |doc: &crate::doc::Document, inst: NodeId, name: &str| doc.descendants(inst).into_iter().find(|&d| doc.node(d).name == name).unwrap();
+    let (bg, title) = (layer(&doc, insts[0], "Bg"), layer(&doc, insts[0], "Title"));
+    doc.node_mut(bg).fills[0].color = Rgba::rgb(0, 0, 255);
+    doc.node_mut(title).text = "Changed".into();
+    doc.reflow();
+    assert_eq!(doc.instance_overrides(insts[0]), vec![Override::Fill, Override::Text]);
+    doc.reset_override(insts[0], Override::Fill);
+    let bg = layer(&doc, insts[0], "Bg");
+    assert_eq!(doc.node(bg).fills[0].color, Rgba::rgb(255, 0, 0), "fill back to the main's");
+    assert_eq!(doc.node(layer(&doc, insts[0], "Title")).text, "Changed", "the text override stays");
+    // Push the text to the main component: the other instance follows, and it is no longer an override.
+    doc.push_to_main(insts[0]);
+    assert_eq!(doc.node(layer(&doc, insts[1], "Title")).text, "Changed");
+    assert!(doc.instance_overrides(insts[0]).is_empty());
+}
+
+#[test]
+fn instance_menu_resets_a_property_and_assets_click_places_an_instance() {
+    let mut h = harness();
+    h.state_mut().doc = card_doc();
+    h.run_steps(2);
+    let inst = h.state().doc.pages[0].children.iter().copied().find(|&i| h.state().doc.node(i).kind == Kind::Instance).unwrap();
+    let bg = h.state().doc.descendants(inst).into_iter().find(|&d| h.state().doc.node(d).name == "Bg").unwrap();
+    h.state_mut().doc.node_mut(bg).opacity = 0.5;
+    h.state_mut().sel = vec![inst];
+    h.run_steps(2);
+    h.get_by_label("More instance options").click();
+    h.run_steps(2);
+    h.get_by_label("Reset opacity").click();
+    h.run_steps(2);
+    assert_eq!(h.state().doc.node(bg).opacity, 1.0);
+    // Assets: a click places an instance mid-screen, and the description shows on hover.
+    let comp = h.state().doc.nodes.values().find(|n| n.kind == Kind::Component).unwrap().id;
+    h.state_mut().doc.node_mut(comp).description = "A content card".into();
+    h.state_mut().sel.clear();
+    h.state_mut().left_tab_assets = true;
+    h.run_steps(3);
+    let before = h.state().doc.nodes.values().filter(|n| n.kind == Kind::Instance).count();
+    h.get_all_by_label("Card").max_by(|a, b| a.rect().height().total_cmp(&b.rect().height())).unwrap().click();
+    h.run_steps(2);
+    assert_eq!(h.state().doc.nodes.values().filter(|n| n.kind == Kind::Instance).count(), before + 1);
+    assert_eq!(h.state().doc.node(h.state().sel[0]).component, Some(comp));
+    // Dragging the tile onto the canvas still drops an instance there.
+    let tile = h.get_all_by_label("Card").max_by(|a, b| a.rect().height().total_cmp(&b.rect().height())).unwrap().rect().center();
+    // It lands over the instance placed above, so goes beside it rather than inside.
+    drag(&mut h, tile, pos2(800.0, 450.0), Modifiers::NONE);
+    assert_eq!(h.state().doc.nodes.values().filter(|n| n.kind == Kind::Instance).count(), before + 2);
+}
+
+#[test]
+fn exposed_nested_instance_props_show_on_the_outer_instance() {
+    let mut h = harness();
+    let mut doc = crate::doc::Document::default();
+    crate::plugins::run(&mut doc, 0, &[], r##"
+        const icon = figma.createComponent(); icon.name = "Icon"; icon.resize(20, 20);
+        const g = figma.createText(); g.name = "Glyph"; g.characters = "A"; icon.appendChild(g);
+        icon.addComponentProperty("Glyph", "TEXT", "A");
+        g.componentPropertyReferences = { characters: "Glyph" };
+        const b = figma.createComponent(); b.name = "Button"; b.resize(100, 40); b.y = 100;
+        const nested = icon.createInstance(); b.appendChild(nested);
+        nested.isExposedInstance = true;
+        b.description = "Primary action";
+        b.createInstance().x = 300;
+    "##).unwrap();
+    doc.reflow();
+    let button = doc.nodes.values().find(|n| n.name == "Button" && n.kind == Kind::Component).unwrap().id;
+    assert_eq!(doc.description_of(button), "Primary action");
+    let outer = doc.nodes.values().find(|n| n.kind == Kind::Instance && n.component == Some(button)).unwrap().id;
+    let nested = doc.descendants(outer).into_iter().find(|&d| doc.node(d).kind == Kind::Instance).unwrap();
+    assert!(doc.node(nested).exposed, "the copy carries the main's expose flag");
+    h.state_mut().doc = doc;
+    h.state_mut().sel = vec![outer];
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("↳ Icon").is_some(), "the nested instance's properties are listed");
+    assert!(h.query_by_label("Primary action").is_some(), "the description shows");
+    // Its property drives the nested layers, from the outer instance's panel.
+    h.state_mut().doc.node_mut(nested).prop_values = vec![("Glyph".into(), crate::doc::PropValue::Text("B".into()))];
+    h.state_mut().doc.reflow();
+    let glyph = h.state().doc.descendants(nested).into_iter().find(|&d| h.state().doc.node(d).kind == Kind::Text).unwrap();
+    assert_eq!(h.state().doc.node(glyph).text, "B");
+}
+
+#[test]
+fn plugin_preferred_swap_values_round_trip() {
+    let mut doc = crate::doc::Document::default();
+    crate::plugins::run(&mut doc, 0, &[], r##"
+        const a = figma.createComponent(); a.name = "Star";
+        const b = figma.createComponent(); b.name = "Heart";
+        const card = figma.createComponent(); card.name = "Card";
+        card.addComponentProperty("Icon", "INSTANCE_SWAP", a.id, { preferredValues: [{ type: "COMPONENT", key: b.id }] });
+    "##).unwrap();
+    let id = |n: &str| doc.nodes.values().find(|x| x.name == n).unwrap().id;
+    let card = doc.node(id("Card"));
+    assert_eq!(card.comp_props[0].preferred, vec![id("Heart")]);
+    let out = crate::plugin_doc::snapshot(&doc, 0, &[], false);
+    let c = out["pages"][0]["children"].as_array().unwrap().iter().find(|n| n["name"] == "Card").unwrap().clone();
+    assert_eq!(c["componentPropertyDefinitions"]["Icon"]["preferredValues"][0]["key"], id("Heart").to_string());
+}

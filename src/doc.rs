@@ -371,6 +371,86 @@ pub enum PropValue {
 pub struct CompProp {
     pub name: String,
     pub default: PropValue,
+    /// Instance swap: Figma's "Preferred values", the components the swap picker offers first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preferred: Vec<NodeId>,
+}
+
+/// Instance overrides that can be reset one at a time (Figma's "Reset fill", "Reset text"...).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Override {
+    Name,
+    Visibility,
+    Opacity,
+    Fill,
+    Stroke,
+    Effects,
+    CornerRadius,
+    Text,
+    TextStyle,
+}
+
+impl Override {
+    pub const ALL: [Override; 9] = [
+        Override::Name,
+        Override::Visibility,
+        Override::Opacity,
+        Override::Fill,
+        Override::Stroke,
+        Override::Effects,
+        Override::CornerRadius,
+        Override::Text,
+        Override::TextStyle,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Override::Name => "Reset name",
+            Override::Visibility => "Reset visibility",
+            Override::Opacity => "Reset opacity",
+            Override::Fill => "Reset fill",
+            Override::Stroke => "Reset stroke",
+            Override::Effects => "Reset effects",
+            Override::CornerRadius => "Reset corner radius",
+            Override::Text => "Reset text",
+            Override::TextStyle => "Reset text style",
+        }
+    }
+
+    /// Whether layer `n` overrides this against `snap`, what it last copied from the main.
+    pub fn differs(self, n: &Node, snap: &Node) -> bool {
+        match self {
+            Override::Name => n.name != snap.name,
+            Override::Visibility => n.visible != snap.visible,
+            Override::Opacity => n.opacity != snap.opacity,
+            Override::Fill => n.fills != snap.fills || n.fill_style != snap.fill_style,
+            Override::Stroke => n.strokes != snap.strokes || n.stroke_style != snap.stroke_style || n.stroke_width != snap.stroke_width,
+            Override::Effects => n.shadows != snap.shadows || n.effect_style != snap.effect_style,
+            Override::CornerRadius => n.radius != snap.radius || n.corner_radii != snap.corner_radii,
+            Override::Text => n.text != snap.text || n.spans != snap.spans,
+            Override::TextStyle => {
+                n.font_family != snap.font_family || n.font_size != snap.font_size || n.font_weight != snap.font_weight || n.line_height != snap.line_height || n.letter_spacing != snap.letter_spacing || n.text_style != snap.text_style
+            }
+        }
+    }
+
+    /// Copy this property group from `from` onto `to`.
+    pub fn copy(self, from: &Node, to: &mut Node) {
+        match self {
+            Override::Name => to.name = from.name.clone(),
+            Override::Visibility => to.visible = from.visible,
+            Override::Opacity => to.opacity = from.opacity,
+            Override::Fill => (to.fills, to.fill_style) = (from.fills.clone(), from.fill_style),
+            Override::Stroke => (to.strokes, to.stroke_style, to.stroke_width) = (from.strokes.clone(), from.stroke_style, from.stroke_width),
+            Override::Effects => (to.shadows, to.effect_style) = (from.shadows.clone(), from.effect_style),
+            Override::CornerRadius => (to.radius, to.corner_radii) = (from.radius, from.corner_radii),
+            Override::Text => (to.text, to.spans) = (from.text.clone(), from.spans.clone()),
+            Override::TextStyle => {
+                to.font_family = from.font_family.clone();
+                (to.font_size, to.font_weight, to.line_height, to.letter_spacing, to.text_style) = (from.font_size, from.font_weight, from.line_height, from.letter_spacing, from.text_style);
+            }
+        }
+    }
 }
 
 /// Which property of a layer a component property drives.
@@ -1525,6 +1605,19 @@ pub struct Node {
     pub lines: Vec<String>,
     #[serde(skip_serializing_if = "dflt::expanded")]
     pub expanded: bool,
+    /// Components and sets: the description shown in Assets and Dev Mode.
+    #[serde(skip_serializing_if = "dflt::description")]
+    pub description: String,
+    /// A nested instance inside a component whose properties show on the component's instances
+    /// (Figma's "Expose properties from nested instances").
+    #[serde(skip_serializing_if = "dflt::exposed")]
+    pub exposed: bool,
+    /// Frames and sections: Dev Mode's "Ready for dev" status.
+    #[serde(skip_serializing_if = "dflt::ready")]
+    pub ready: bool,
+    /// Dev Mode annotations: notes pinned to the layer, labeled on the canvas.
+    #[serde(skip_serializing_if = "dflt::annotations")]
+    pub annotations: Vec<String>,
 }
 
 /// Serialization leaves out fields at `Node::default()`'s values; `#[serde(default)]` fills
@@ -1608,6 +1701,10 @@ mod dflt {
         spans: Vec<TextSpan>,
         lists: Vec<ListLine>,
         expanded: bool,
+        description: String,
+        exposed: bool,
+        ready: bool,
+        annotations: Vec<String>,
     );
 }
 
@@ -1694,6 +1791,10 @@ impl Default for Node {
             lists: vec![],
             lines: vec![],
             expanded: true,
+            description: String::new(),
+            exposed: false,
+            ready: false,
+            annotations: vec![],
         }
     }
 }
@@ -2561,6 +2662,51 @@ impl Document {
         self.reflow();
     }
 
+    /// The instance's own layers (itself and its descendants outside nested instances).
+    fn own_layers(&self, inst: NodeId) -> Vec<NodeId> {
+        std::iter::once(inst)
+            .chain(self.descendants(inst).into_iter().filter(|&d| !self.ancestors(d).iter().take_while(|a| **a != inst).any(|a| self.nodes[a].kind == Kind::Instance)))
+            .collect()
+    }
+
+    /// Which property groups an instance overrides anywhere in its layers.
+    pub fn instance_overrides(&self, inst: NodeId) -> Vec<Override> {
+        let layers: Vec<NodeId> = std::iter::once(inst).chain(self.descendants(inst)).collect();
+        Override::ALL
+            .into_iter()
+            .filter(|o| layers.iter().any(|d| self.nodes[d].synced.as_deref().is_some_and(|s| o.differs(&self.nodes[d], s))))
+            .collect()
+    }
+
+    /// Drop one kind of override across an instance (Figma's "Reset fill" and the like).
+    pub fn reset_override(&mut self, inst: NodeId, o: Override) {
+        for d in std::iter::once(inst).chain(self.descendants(inst)) {
+            let Some(snap) = self.nodes[&d].synced.as_deref().filter(|s| o.differs(&self.nodes[&d], s)).cloned() else { continue };
+            o.copy(&snap, self.node_mut(d));
+        }
+        self.sync_instance(inst);
+        self.reflow();
+    }
+
+    /// Figma's "Push changes to main component": the instance's overrides become the main
+    /// component's values, so every other instance picks them up too.
+    pub fn push_to_main(&mut self, inst: NodeId) {
+        if self.nodes[&inst].component.is_none_or(|c| !self.nodes.contains_key(&c)) {
+            return;
+        }
+        for d in self.own_layers(inst) {
+            let n = self.nodes[&d].clone();
+            let (Some(snap), Some(src)) = (n.synced.as_deref(), n.source.filter(|s| self.nodes.contains_key(s))) else { continue };
+            for o in Override::ALL.into_iter().filter(|o| o.differs(&n, snap) && !(d == inst && *o == Override::Name)) {
+                o.copy(&n, self.node_mut(src));
+            }
+            if n.layout != snap.layout {
+                self.node_mut(src).layout = n.layout;
+            }
+        }
+        self.reflow();
+    }
+
     /// Bring an instance in line with its main component, keeping overrides.
     pub fn sync_instance(&mut self, inst: NodeId) {
         let Some(comp) = self.nodes[&inst].component.filter(|c| self.nodes.contains_key(c)) else { return };
@@ -2721,6 +2867,15 @@ impl Document {
     fn mark_synced(&self, inst: NodeId, revs: &mut HashMap<NodeId, u64>) {
         if let Some(key) = self.inst_key(inst, revs) {
             self.cache.0.lock().unwrap().insts.insert(inst, key);
+        }
+    }
+
+    /// A component's description: its own, or its component set's.
+    pub fn description_of(&self, comp: NodeId) -> &str {
+        let c = &self.nodes[&comp];
+        match c.parent.map(|p| &self.nodes[&p]) {
+            Some(set) if set.kind == Kind::ComponentSet && c.description.is_empty() => &set.description,
+            _ => &c.description,
         }
     }
 
@@ -3381,7 +3536,7 @@ fn merge_from(e: &mut Node, src: &Node) {
         name, visible, opacity, fills, strokes, stroke_width, stroke_sides, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, min_size, max_size, constraints, absolute,
         paths, even_odd, text, font_size, font_weight, font_family, text_sizing, text_align, text_valign, line_height, letter_spacing,
         decoration, text_case, paragraph_spacing, truncate, max_lines, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, overflow, scroll_pos, fill_style,
-        stroke_style, text_style, effect_style, prop_bind, is_mask, blend, bindings, modes, spans, lists
+        stroke_style, text_style, effect_style, prop_bind, is_mask, blend, bindings, modes, spans, lists, exposed
     );
     e.synced = Some(Box::new(Node { children: vec![], synced: None, ..src.clone() }));
 }
@@ -3972,8 +4127,8 @@ mod tests {
         assert_eq!(d.node(i).name, d.node(set).name, "named after the set");
         // Boolean and text properties drive bound layers.
         d.node_mut(set).comp_props = vec![
-            CompProp { name: "Show label".into(), default: PropValue::Bool(true) },
-            CompProp { name: "Label".into(), default: PropValue::Text("Go".into()) },
+            CompProp { name: "Show label".into(), default: PropValue::Bool(true), preferred: vec![] },
+            CompProp { name: "Label".into(), default: PropValue::Text("Go".into()), preferred: vec![] },
         ];
         for c in [a, b] {
             let lbl = d.node(c).children[1];

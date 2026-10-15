@@ -580,6 +580,13 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
         }
     }
     v["boundVariables"] = Value::Object(bv);
+    v["annotations"] = json!(n.annotations.iter().map(|a| json!({ "label": a })).collect::<Vec<_>>());
+    if n.kind.is_frame() {
+        v["devStatus"] = if n.ready { json!({ "type": "READY_FOR_DEV" }) } else { Value::Null };
+    }
+    if n.kind == Kind::Instance {
+        v["isExposedInstance"] = json!(n.exposed);
+    }
     v["reactions"] = json!(n.reactions.iter().map(reaction_json).collect::<Vec<_>>());
     if n.kind.is_frame() {
         v["overflowDirection"] = json!(match n.overflow { Overflow::None => "NONE", Overflow::Vertical => "VERTICAL", Overflow::Horizontal => "HORIZONTAL", Overflow::Both => "BOTH" });
@@ -670,8 +677,13 @@ pub fn node_json(doc: &Document, id: NodeId) -> Value {
         let mut defs = serde_json::Map::new();
         for p in &n.comp_props {
             let (t, d) = prop_json(&p.default);
-            defs.insert(p.name.clone(), json!({ "type": t, "defaultValue": d }));
+            let mut def = json!({ "type": t, "defaultValue": d });
+            if !p.preferred.is_empty() {
+                def["preferredValues"] = json!(p.preferred.iter().map(|c| json!({ "type": "COMPONENT", "key": c.to_string() })).collect::<Vec<_>>());
+            }
+            defs.insert(p.name.clone(), def);
         }
+        v["description"] = json!(n.description);
         if n.kind == Kind::ComponentSet {
             for (k, opts) in doc.variant_props(id) {
                 defs.insert(k, json!({ "type": "VARIANT", "defaultValue": opts.first(), "variantOptions": opts }));
@@ -1001,6 +1013,18 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
     }
     if changed("locked") {
         n.locked = v["locked"].as_bool().unwrap_or(false);
+    }
+    if changed("description") {
+        n.description = s("description").to_string();
+    }
+    if changed("isExposedInstance") {
+        n.exposed = v["isExposedInstance"].as_bool().unwrap_or(false);
+    }
+    if changed("devStatus") {
+        n.ready = v["devStatus"]["type"].as_str() == Some("READY_FOR_DEV");
+    }
+    if changed("annotations") {
+        n.annotations = v["annotations"].as_array().into_iter().flatten().filter_map(|a| a["label"].as_str().or(a["labelMarkdown"].as_str()).map(String::from)).collect();
     }
     if changed("isMask") {
         n.is_mask = v["isMask"].as_bool().unwrap_or(false);
@@ -1343,7 +1367,8 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
                     _ => return None,
                 };
                 // Figma suffixes names with "#id"; Katachi binds by plain name.
-                Some(CompProp { name: name.split('#').next().unwrap_or(name).to_string(), default })
+                let preferred = d["preferredValues"].as_array().into_iter().flatten().filter_map(|p| refs.node(p["key"].as_str()?)).collect();
+                Some(CompProp { name: name.split('#').next().unwrap_or(name).to_string(), default, preferred })
             })
             .collect();
     }

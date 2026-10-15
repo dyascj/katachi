@@ -318,7 +318,7 @@ pub fn to_document(fig: &FigFile) -> Result<Document, String> {
         for d in v.arr("componentPropDefs") {
             let ty = d.s("type").unwrap_or("BOOL");
             if let Some(default) = props.value(d.get("initialValue"), ty) {
-                n.comp_props.push(CompProp { name: d.s("name").unwrap_or("").to_string(), default });
+                n.comp_props.push(CompProp { name: d.s("name").unwrap_or("").to_string(), default, preferred: vec![] });
             }
         }
         n.prop_bind = v.arr("componentPropRefs").iter().filter(|r| r.b("isDeleted") != Some(true)).filter_map(|r| {
@@ -881,6 +881,8 @@ fn text_props(n: &mut Node, v: &Value) {
 /// Properties every layer type shares.
 fn finish_common(n: &mut Node, v: &Value) {
     n.visible = v.b("visible").unwrap_or(true);
+    n.description = v.s("description").unwrap_or_default().to_string();
+    n.exposed = v.b("isExposedInstance") == Some(true);
     n.opacity = v.f("opacity").unwrap_or(1.0);
     n.blend = crate::doc::BlendMode::ALL
         .into_iter()

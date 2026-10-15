@@ -159,9 +159,9 @@ const __NodeProto = {
     for (const k of Object.keys(props)) cp[k] = Object.assign({}, cp[k] || {}, { value: props[k] });
     this.componentProperties = cp;
   },
-  addComponentProperty(name, type, value) {
+  addComponentProperty(name, type, value, options) {
     this.componentPropertyDefinitions = this.componentPropertyDefinitions || {};
-    this.componentPropertyDefinitions[name] = { type, defaultValue: value };
+    this.componentPropertyDefinitions[name] = Object.assign({ type, defaultValue: value }, options && options.preferredValues ? { preferredValues: options.preferredValues } : {});
     return name;
   },
   editComponentProperty(name, def) {
@@ -171,6 +171,8 @@ const __NodeProto = {
     const next = def.name || name;
     delete d[name];
     d[next] = { type: old.type, defaultValue: def.defaultValue !== undefined ? def.defaultValue : old.defaultValue };
+    const preferred = def.preferredValues || old.preferredValues;
+    if (preferred) d[next].preferredValues = preferred;
     return next;
   },
   deleteComponentProperty(name) { delete (this.componentPropertyDefinitions || {})[name]; },

@@ -41,6 +41,8 @@ const COMMANDS: &[(&str, &str, Run)] = &[
         }
     }),
     ("Detach instance", "⌥⌘B", |a, _| a.detach_selection()),
+    ("Push changes to main component", "", |a, _| a.push_selection_to_main()),
+    ("Reset all changes", "", |a, _| a.reset_selection_instances()),
     ("Group selection", "⌘G", |a, _| a.group_selection(false)),
     ("Frame selection", "⌥⌘G", |a, _| a.group_selection(true)),
     ("Ungroup", "⇧⌘G", |a, _| a.ungroup_selection()),

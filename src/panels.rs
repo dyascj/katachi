@@ -697,32 +697,47 @@ impl App {
         }
     }
 
-    /// One component in the Assets grid: a preview over its name. Drag onto the canvas, or
-    /// double-click to place it mid-screen.
+    /// One component in the Assets grid: a preview over its name, with its description on hover.
+    /// Drag onto the canvas, or click to place an instance mid-screen, as in Figma.
     fn asset_tile(&mut self, ui: &mut Ui, id: NodeId, name: &str, size: f32, budget: &mut usize) {
         let tex = self.asset_thumb(ui.ctx(), id, budget);
-        let r = ui.dnd_drag_source(ui.id().with(("asset", id)), AssetDrag(id), |ui| {
-            ui.vertical(|ui| {
+        let desc = self.doc.description_of(id).to_string();
+        // Click and drag on one widget: egui's drag source starts dragging on press, which
+        // would swallow the click.
+        let clicked = ui
+            .vertical(|ui| {
                 ui.set_width(size);
-                let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
-                let p = ui.painter();
-                p.rect_filled(rect, 6.0, theme::subtle(ui.ctx()));
+                let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click_and_drag());
+                let thumb = |p: &Painter, rect: Rect| {
+                    p.rect_filled(rect, 6.0, theme::subtle(ui.ctx()));
+                    if let Some(tex) = &tex {
+                        let s = tex.size_vec2();
+                        let fit = ((size - 12.0) / s.x).min((size - 12.0) / s.y);
+                        p.image(tex.id(), Rect::from_center_size(rect.center(), s * fit), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+                    } else {
+                        paint_icon(p, Rect::from_center_size(rect.center(), vec2(18.0, 18.0)), Icon::Component, crate::canvas::PURPLE);
+                    }
+                };
+                thumb(ui.painter(), rect);
                 if resp.hovered() {
-                    p.rect_stroke(rect, 6.0, Stroke::new(1.0, BLUE), egui::StrokeKind::Inside);
+                    ui.painter().rect_stroke(rect, 6.0, Stroke::new(1.0, BLUE), egui::StrokeKind::Inside);
                 }
-                if let Some(tex) = &tex {
-                    let s = tex.size_vec2();
-                    let fit = ((size - 12.0) / s.x).min((size - 12.0) / s.y);
-                    p.image(tex.id(), Rect::from_center_size(rect.center(), s * fit), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
-                } else {
-                    paint_icon(p, Rect::from_center_size(rect.center(), vec2(18.0, 18.0)), Icon::Component, crate::canvas::PURPLE);
+                if resp.drag_started() {
+                    egui::DragAndDrop::set_payload(ui.ctx(), AssetDrag(id));
+                }
+                // The tile follows the pointer while dragging.
+                if resp.dragged()
+                    && let Some(p) = ui.ctx().pointer_interact_pos()
+                {
+                    thumb(&ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, ui.id().with(("asset-ghost", id)))), Rect::from_center_size(p, vec2(size, size)));
                 }
                 ui.add(egui::Label::new(RichText::new(name).small()).truncate());
                 resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
-            });
-        });
-        let r = r.response.on_hover_text(name);
-        if r.double_clicked() {
+                let tip = if desc.is_empty() { name.to_string() } else { format!("{name}\n{desc}") };
+                resp.on_hover_cursor(egui::CursorIcon::Grab).on_hover_text(tip).clicked()
+            })
+            .inner;
+        if clicked {
             let at = self.view_center_world();
             self.checkpoint();
             let size = self.doc.node(id).rect.size();
@@ -1004,6 +1019,15 @@ impl App {
             }
             if enabled(ui, has, "Detach instance", "⌥⌘B") {
                 self.detach_selection();
+                ui.close();
+            }
+            let inst = self.sel.iter().any(|&s| self.owning_instance(s).is_some());
+            if enabled(ui, inst, "Push changes to main component", "") {
+                self.push_selection_to_main();
+                ui.close();
+            }
+            if enabled(ui, inst, "Reset all changes", "") {
+                self.reset_selection_instances();
                 ui.close();
             }
             ui.separator();
@@ -2665,6 +2689,111 @@ impl App {
         false
     }
 
+    /// An instance's variant pickers and component property values. Edits apply to every
+    /// selected instance of the same component, or just this one when it is a nested instance.
+    fn instance_props(&mut self, ui: &mut Ui, i: NodeId, c: NodeId, nested: bool) {
+        use crate::doc::PropValue;
+        let pool: Vec<NodeId> = if nested { vec![i] } else { self.sel.clone() };
+        if let Some(set) = self.doc.node(c).parent.filter(|p| self.doc.node(*p).kind == Kind::ComponentSet) {
+            let current = crate::doc::variant_pairs(&self.doc.node(c).name);
+            for (prop, values) in self.doc.variant_props(set) {
+                let cur = current.iter().find(|(k, _)| *k == prop).map(|(_, v)| v.clone()).unwrap_or_default();
+                let mut pick = cur.clone();
+                ui.horizontal(|ui| {
+                    ui.label(&prop);
+                    egui::ComboBox::from_id_salt(("variant", i, &prop)).selected_text(&pick).width(110.0).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+                        for v in &values {
+                            ui.selectable_value(&mut pick, v.clone(), v);
+                        }
+                    });
+                });
+                if pick != cur {
+                    // Every selected instance of this set switches, each keeping its other properties.
+                    self.checkpoint();
+                    let targets: Vec<NodeId> = pool.iter().copied().filter(|&s| self.doc.node(s).component.and_then(|c| self.doc.nodes.get(&c)).and_then(|c| c.parent) == Some(set)).collect();
+                    for t in targets {
+                        let Some(tc) = self.doc.node(t).component else { continue };
+                        let mut want = crate::doc::variant_pairs(&self.doc.node(tc).name);
+                        want.retain(|(k, _)| *k != prop);
+                        want.push((prop.clone(), pick.clone()));
+                        if let Some(v) = self.doc.find_variant(set, &want) {
+                            self.doc.swap_component(t, v);
+                        }
+                    }
+                    self.doc.reflow();
+                }
+            }
+        }
+        // Component property values.
+        let props = self.doc.props_of(c);
+        let mut values = self.doc.node(i).prop_values.clone();
+        let mut changed = false;
+        for p in &props {
+            let cur = values.iter().find(|(k, _)| *k == p.name).map(|(_, v)| v.clone()).unwrap_or(p.default.clone());
+            let mut next = cur.clone();
+            ui.horizontal(|ui| {
+                ui.label(&p.name);
+                match &mut next {
+                    PropValue::Bool(b) => {
+                        ui.checkbox(b, "");
+                    }
+                    PropValue::Text(t) => {
+                        ui.text_edit_singleline(t);
+                    }
+                    PropValue::Swap(target) => {
+                        // Preferred values, when the property has them, are what the picker offers (as in Figma).
+                        let live: Vec<NodeId> = p.preferred.iter().copied().filter(|c| self.doc.nodes.contains_key(c)).collect();
+                        let mut comps: Vec<NodeId> = if live.is_empty() { self.doc.nodes.values().filter(|n| n.kind == Kind::Component).map(|n| n.id).collect() } else { live };
+                        comps.sort_by_key(|c| self.doc.node(*c).name.to_lowercase());
+                        egui::ComboBox::from_id_salt(("swap", i, &p.name)).selected_text(self.doc.nodes.get(target).map_or("Missing".into(), |n| n.name.clone())).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+                            for cid in comps {
+                                let name = self.doc.node(cid).name.clone();
+                                ui.selectable_value(target, cid, name);
+                            }
+                        });
+                    }
+                }
+            });
+            if next != cur {
+                values.retain(|(k, _)| *k != p.name);
+                values.push((p.name.clone(), next));
+                changed = true;
+            }
+        }
+        if changed {
+            self.begin_edit();
+            // Selected instances of the same component take the same values.
+            let targets: Vec<NodeId> = pool.iter().copied().filter(|&s| s == i || self.doc.node(s).component == Some(c)).collect();
+            for t in targets {
+                self.doc.node_mut(t).prop_values = values.clone();
+            }
+            self.doc.reflow();
+        }
+    }
+
+    /// Instance actions shared by the Design panel and the canvas menu: push overrides to the
+    /// main component, reset everything or one kind of override.
+    pub fn instance_menu(&mut self, ui: &mut Ui, inst: NodeId) {
+        let overrides = self.doc.instance_overrides(inst);
+        if ui.add_enabled(!overrides.is_empty(), egui::Button::new("Push changes to main component")).clicked() {
+            self.checkpoint();
+            self.doc.push_to_main(inst);
+            ui.close();
+        }
+        if ui.button("Reset all changes").clicked() {
+            self.checkpoint();
+            self.doc.reset_instance(inst);
+            ui.close();
+        }
+        for o in overrides {
+            if ui.button(o.label()).clicked() {
+                self.checkpoint();
+                self.doc.reset_override(inst, o);
+                ui.close();
+            }
+        }
+    }
+
     fn component_section(&mut self, ui: &mut Ui, id: NodeId) {
         use crate::doc::{CompProp, PropTarget, PropValue};
         let n = self.doc.node(id).clone();
@@ -2706,77 +2835,20 @@ impl App {
             let comp = self.doc.node(i).component.filter(|c| self.doc.nodes.contains_key(c));
             // Variant pickers when the main lives in a component set.
             if let Some(c) = comp {
-                if let Some(set) = self.doc.node(c).parent.filter(|p| self.doc.node(*p).kind == Kind::ComponentSet) {
-                    let current = crate::doc::variant_pairs(&self.doc.node(c).name);
-                    for (prop, values) in self.doc.variant_props(set) {
-                        let cur = current.iter().find(|(k, _)| *k == prop).map(|(_, v)| v.clone()).unwrap_or_default();
-                        let mut pick = cur.clone();
-                        ui.horizontal(|ui| {
-                            ui.label(&prop);
-                            egui::ComboBox::from_id_salt(("variant", i, &prop)).selected_text(&pick).width(110.0).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
-                                for v in &values {
-                                    ui.selectable_value(&mut pick, v.clone(), v);
-                                }
-                            });
-                        });
-                        if pick != cur {
-                            // Every selected instance of this set switches, each keeping its other properties.
-                            self.checkpoint();
-                            let targets: Vec<NodeId> = self.sel.iter().copied().filter(|&s| self.doc.node(s).component.and_then(|c| self.doc.nodes.get(&c)).and_then(|c| c.parent) == Some(set)).collect();
-                            for t in targets {
-                                let Some(tc) = self.doc.node(t).component else { continue };
-                                let mut want = crate::doc::variant_pairs(&self.doc.node(tc).name);
-                                want.retain(|(k, _)| *k != prop);
-                                want.push((prop.clone(), pick.clone()));
-                                if let Some(v) = self.doc.find_variant(set, &want) {
-                                    self.doc.swap_component(t, v);
-                                }
-                            }
-                            self.doc.reflow();
-                        }
-                    }
+                let desc = self.doc.description_of(c);
+                if !desc.is_empty() {
+                    ui.label(RichText::new(desc).small().color(theme::muted(ui.ctx())));
                 }
-                // Component property values.
-                let props = self.doc.props_of(c);
-                let mut values = self.doc.node(i).prop_values.clone();
-                let mut changed = false;
-                for p in &props {
-                    let cur = values.iter().find(|(k, _)| *k == p.name).map(|(_, v)| v.clone()).unwrap_or(p.default.clone());
-                    let mut next = cur.clone();
-                    ui.horizontal(|ui| {
-                        ui.label(&p.name);
-                        match &mut next {
-                            PropValue::Bool(b) => {
-                                ui.checkbox(b, "");
-                            }
-                            PropValue::Text(t) => {
-                                ui.text_edit_singleline(t);
-                            }
-                            PropValue::Swap(target) => {
-                                let comps: Vec<NodeId> = self.doc.nodes.values().filter(|n| n.kind == Kind::Component).map(|n| n.id).collect();
-                                egui::ComboBox::from_id_salt(("swap", i, &p.name)).selected_text(self.doc.nodes.get(target).map_or("Missing".into(), |n| n.name.clone())).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
-                                    for cid in comps {
-                                        let name = self.doc.node(cid).name.clone();
-                                        ui.selectable_value(target, cid, name);
-                                    }
-                                });
-                            }
-                        }
-                    });
-                    if next != cur {
-                        values.retain(|(k, _)| *k != p.name);
-                        values.push((p.name.clone(), next));
-                        changed = true;
-                    }
-                }
-                if changed {
-                    self.begin_edit();
-                    // Selected instances of the same component take the same values.
-                    let targets: Vec<NodeId> = self.sel.iter().copied().filter(|&s| s == i || self.doc.node(s).component == Some(c)).collect();
-                    for t in targets {
-                        self.doc.node_mut(t).prop_values = values.clone();
-                    }
-                    self.doc.reflow();
+                self.instance_props(ui, i, c, false);
+                // Nested instances the main component exposes show their properties here too.
+                let nested: Vec<NodeId> = self.doc.descendants(i).into_iter().filter(|&d| {
+                    let n = self.doc.node(d);
+                    n.kind == Kind::Instance && n.exposed && n.component.is_some_and(|c| self.doc.nodes.contains_key(&c))
+                }).collect();
+                for d in nested {
+                    ui.label(RichText::new(format!("↳ {}", self.doc.node(d).name)).small().color(theme::muted(ui.ctx())));
+                    let dc = self.doc.node(d).component.unwrap();
+                    self.instance_props(ui, d, dc, true);
                 }
             }
             ui.horizontal(|ui| {
@@ -2791,6 +2863,8 @@ impl App {
                     self.checkpoint();
                     self.doc.detach_instance(i);
                 }
+                let more = icon_button(ui, Icon::Menu, false, 22.0, "More instance options");
+                egui::Popup::menu(&more).id(ui.id().with(("inst-more", i))).style(crate::chrome::menu_style).show(|ui| self.instance_menu(ui, i));
             });
         } else if let Some(o) = owner.filter(|_| inst.is_none()) {
             let on = self.doc.node(o).clone();
@@ -2818,7 +2892,7 @@ impl App {
                                 ui.close();
                             }
                             if ui.button("Boolean").clicked() {
-                                props.push(CompProp { name: fresh(&props, "Show"), default: PropValue::Bool(true) });
+                                props.push(CompProp { name: fresh(&props, "Show"), default: PropValue::Bool(true), preferred: vec![] });
                                 changed = true;
                                 ui.close();
                             }
@@ -2838,12 +2912,12 @@ impl App {
                                 } else {
                                     "Text".into()
                                 };
-                                props.push(CompProp { name, default: PropValue::Text(default) });
+                                props.push(CompProp { name, default: PropValue::Text(default), preferred: vec![] });
                                 changed = true;
                                 ui.close();
                             }
                             if ui.button("Instance swap").clicked() {
-                                props.push(CompProp { name: fresh(&props, "Icon"), default: PropValue::Swap(o) });
+                                props.push(CompProp { name: fresh(&props, "Icon"), default: PropValue::Swap(o), preferred: vec![] });
                                 changed = true;
                                 ui.close();
                             }
@@ -2858,7 +2932,22 @@ impl App {
                             PropValue::Bool(b) => changed |= ui.checkbox(b, "").changed(),
                             PropValue::Text(t) => changed |= ui.add(egui::TextEdit::singleline(t).desired_width(70.0)).changed(),
                             PropValue::Swap(_) => {
-                                ui.label("Instance");
+                                // Figma's "Preferred values": the components this swap offers.
+                                let label = if p.preferred.is_empty() { "Preferred".to_string() } else { format!("Preferred ({})", p.preferred.len()) };
+                                crate::chrome::menu_button(ui, label, |ui| {
+                                    let mut comps: Vec<(NodeId, String)> = self.doc.nodes.values().filter(|n| n.kind == Kind::Component).map(|n| (n.id, n.name.clone())).collect();
+                                    comps.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+                                    for (cid, name) in comps {
+                                        let mut on = p.preferred.contains(&cid);
+                                        if ui.checkbox(&mut on, name).changed() {
+                                            p.preferred.retain(|x| *x != cid);
+                                            if on {
+                                                p.preferred.push(cid);
+                                            }
+                                            changed = true;
+                                        }
+                                    }
+                                });
                             }
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2871,6 +2960,12 @@ impl App {
                 if let Some(k) = remove {
                     props.remove(k);
                     changed = true;
+                }
+                // Figma's component description, shown in Assets and Dev Mode.
+                let mut desc = self.doc.node(def).description.clone();
+                if ui.add(egui::TextEdit::multiline(&mut desc).hint_text("Description").desired_rows(2).desired_width(f32::INFINITY)).changed() {
+                    self.begin_edit();
+                    self.doc.node_mut(def).description = desc;
                 }
                 if changed {
                     self.begin_edit();
@@ -2946,6 +3041,15 @@ impl App {
                     self.checkpoint();
                     self.doc.node_mut(id).prop_bind = bind;
                     self.doc.reflow();
+                }
+                // A nested instance can show its own properties on instances of this component.
+                if n.kind == Kind::Instance {
+                    let mut on = n.exposed;
+                    if ui.checkbox(&mut on, "Expose properties").on_hover_text("Show this nested instance's properties on instances of the component").changed() {
+                        self.checkpoint();
+                        self.doc.node_mut(id).exposed = on;
+                        self.doc.reflow();
+                    }
                 }
             }
         }

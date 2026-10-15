@@ -1315,6 +1315,37 @@ impl App {
         }
     }
 
+    /// Selected instances (or the instances selected layers sit in), each once.
+    fn selected_instances(&self) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = self.sel.iter().filter_map(|&s| self.owning_instance(s)).collect();
+        out.dedup();
+        out
+    }
+
+    /// "Push changes to main component" for every selected instance, as one undo step.
+    pub fn push_selection_to_main(&mut self) {
+        let insts = self.selected_instances();
+        if insts.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for i in insts {
+            self.doc.push_to_main(i);
+        }
+    }
+
+    /// "Reset all changes" on every selected instance.
+    pub fn reset_selection_instances(&mut self) {
+        let insts = self.selected_instances();
+        if insts.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for i in insts {
+            self.doc.reset_instance(i);
+        }
+    }
+
     /// The instance a layer belongs to (itself or nearest instance ancestor).
     pub fn owning_instance(&self, id: NodeId) -> Option<NodeId> {
         std::iter::once(id).chain(self.doc.ancestors(id)).find(|a| self.doc.node(*a).kind == Kind::Instance)
