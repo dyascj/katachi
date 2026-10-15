@@ -41,6 +41,9 @@ Good to know on Linux:
   Alt Shift H / V / T.
 - Tabs sit in the title bar with Katachi's own window buttons. Settings > Appearance > "Use the
   system title bar" switches to your desktop's.
+- Many desktops take Ctrl Alt L (lock screen) and Ctrl Alt T (terminal), which Figma uses to align
+  text left and center. Use the Text menu or quick actions for those, or free the keys in your
+  desktop's keyboard settings.
 - Alt-drag duplicates layers. If your desktop moves windows with Alt-drag (XFCE, MATE, Cinnamon,
   older Plasma), set its window-move key to Super.
 - Glass needs a compositor and takes effect after a restart.
