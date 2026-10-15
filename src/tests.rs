@@ -3974,11 +3974,11 @@ fn others_see_my_selection_and_text_caret() {
     a.run_steps(3);
     a.event(Event::Text("!".into()));
     a.run_steps(2);
-    let caret = a.state().caret;
-    assert!(caret.is_some(), "the editor reports its caret");
-    settle(&mut a, &mut b, &|_, b| peer(b, ada).is_some_and(|p| p.caret == Some((id, caret.unwrap())) && p.selection == [id]));
+    assert!(a.state().caret.is_some(), "the editor reports its caret");
+    // The caret can still move a frame later (the typed text lands), so compare with Ada's latest.
+    settle(&mut a, &mut b, &|a, b| peer(b, ada).is_some_and(|p| a.caret.is_some_and(|c| p.caret == Some((id, c))) && p.selection == [id]));
     let p = peer(b.state(), ada).unwrap();
-    assert_eq!(p.caret, Some((id, caret.unwrap())), "Bo sees where Ada types");
+    assert_eq!(p.caret, Some((id, a.state().caret.unwrap())), "Bo sees where Ada types");
     assert_eq!(p.selection, vec![id]);
     // Bo's canvas draws them (name tag and caret) without trouble.
     b.run_steps(2);
