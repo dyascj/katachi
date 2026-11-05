@@ -1320,8 +1320,8 @@ fn autosave_and_recovery_roundtrip() {
     // Once the process that wrote it is gone, a new session can recover it as unsaved work.
     let p = mine.with_file_name(mine.file_name().unwrap().to_string_lossy().replacen(&own, "4000000000-", 1));
     std::fs::rename(&mine, &p).unwrap();
+    assert!(crate::files::orphaned_recoveries(std::path::Path::new("none")).contains(&p));
     let mut b = App::new(None);
-    assert!(b.recoverable.contains(&p));
     b.recover(&p);
     assert_eq!(b.doc.nodes.len(), 1);
     assert!(b.dirty);

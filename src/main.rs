@@ -57,7 +57,8 @@ fn main() -> eframe::Result {
         serve_headless(&args[2..]);
         return Ok(());
     }
-    let path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+    // Every file named (a file manager opening several at once passes them all).
+    let paths = std::env::args_os().skip(1).map(std::path::PathBuf::from).collect();
     macos_open::install();
     let transparent = !cfg!(target_os = "linux") || appearance::load().glass;
     appearance::TRANSPARENT_WINDOW.store(transparent, std::sync::atomic::Ordering::Relaxed);
@@ -89,7 +90,8 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             setup_style(&cc.egui_ctx);
-            Ok(Box::new(shell::Shell::new(path)))
+            macos_open::set_context(&cc.egui_ctx);
+            Ok(Box::new(shell::Shell::new(paths)))
         }),
     )
 }

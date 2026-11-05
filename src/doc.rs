@@ -753,10 +753,11 @@ pub fn link_at(spans: &[TextSpan], c: usize) -> Option<(usize, usize, String)> {
     let url = sp.style.link.clone()?;
     let same = |s: &TextSpan| s.style.link.as_ref() == Some(&url);
     let (mut a, mut b) = (sp.start, sp.end);
-    while let Some(s) = spans.iter().find(|s| s.end == a && same(s)) {
+    // Each step must move outward: empty or reversed spans would loop forever.
+    while let Some(s) = spans.iter().find(|s| s.end == a && s.start < a && same(s)) {
         a = s.start;
     }
-    while let Some(s) = spans.iter().find(|s| s.start == b && same(s)) {
+    while let Some(s) = spans.iter().find(|s| s.start == b && s.end > b && same(s)) {
         b = s.end;
     }
     Some((a, b, url))
@@ -1191,8 +1192,9 @@ impl ExportSetting {
         };
         let Some(v) = num.parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0) else { return false };
         match unit {
-            'w' => self.size = ExportSize::Width(v),
-            'h' => self.size = ExportSize::Height(v),
+            // The largest PNG export allows (see `export::svg_to_png`).
+            'w' => self.size = ExportSize::Width(v.min(16384.0)),
+            'h' => self.size = ExportSize::Height(v.min(16384.0)),
             _ => (self.size, self.scale) = (ExportSize::Scale, v.min(64.0)),
         }
         true
@@ -2508,6 +2510,19 @@ struct FileJson {
 /// Read a .katachi file's text.
 pub fn parse_file(text: &str) -> Result<Document, String> {
     let mut doc = from_json::<FileJson>(text)?.document;
+    // New layers take ids counting up from the largest: one at the very top leaves no room.
+    if doc.next_id == NodeId::MAX || doc.nodes.contains_key(&NodeId::MAX) {
+        return Err("layer ids out of range".into());
+    }
+    // Hand-edited or foreign files: layout looks layers up by their own `id`, so it must be the
+    // key, and a span with no characters (or reversed) means nothing.
+    for (k, n) in doc.nodes.iter_mut() {
+        if n.id != *k || n.spans.iter().any(|s| s.end <= s.start) {
+            let n = std::sync::Arc::make_mut(n);
+            n.id = *k;
+            n.spans.retain(|s| s.start < s.end);
+        }
+    }
     crate::collab::repair(&mut doc);
     doc.next_id = doc.nodes.keys().map(|k| k + 1).fold(doc.next_id, u64::max);
     Ok(doc)
@@ -4428,6 +4443,27 @@ mod tests {
         assert_eq!(d.hit(0, pos2(7., 7.), 0.), Some(b), "topmost wins");
         d.reorder(b, Order::Back);
         assert_eq!(d.hit(0, pos2(7., 7.), 0.), Some(a));
+    }
+
+    #[test]
+    fn malformed_files_open_without_crashing() {
+        let mut d = Document::default();
+        let g = d.insert(0, None, None, Node::new(Kind::Group, r(0., 0., 10., 10.)));
+        let t = d.insert(0, Some(g), None, Node::new(Kind::Text, r(0., 0., 10., 10.)));
+        let link = SpanStyle { link: Some("https://example.com".into()), ..Default::default() };
+        d.node_mut(t).text = "hello world".into();
+        d.node_mut(t).spans = vec![TextSpan { start: 4, end: 8, style: link.clone() }, TextSpan { start: 4, end: 4, style: link.clone() }, TextSpan { start: 8, end: 4, style: link }];
+        d.node_mut(g).id = 999;
+        let mut opened = parse_file(&file_json(&d)).unwrap();
+        assert_eq!(opened.node(g).id, g, "a layer's id is its key");
+        assert_eq!(opened.node(t).spans.len(), 1, "empty and reversed spans are dropped");
+        opened.reflow();
+        // Spans that arrive another way (plugins) still can't hang the caret or a click.
+        assert_eq!(link_at(&d.node(t).spans, 5), Some((4, 8, "https://example.com".into())));
+        let mut top = Document::default();
+        top.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 0., 1., 1.)));
+        let json = file_json(&top).replace(r#""next_id":2"#, &format!(r#""next_id":{}"#, u64::MAX));
+        assert!(parse_file(&json).is_err(), "ids at the top of the range are refused");
     }
 
     #[test]
