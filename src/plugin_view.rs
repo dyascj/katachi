@@ -22,15 +22,16 @@ const SHIM: &str = r#"(() => {
 })();"#;
 
 /// The same, for a browser tab: sends are POSTs, and plugin messages arrive by long polling.
+/// URLs are relative, so they keep the page's secret path prefix.
 const BROWSER_SHIM: &str = r#"<script>(() => {
-  const send = (m) => fetch("/send", { method: "POST", body: JSON.stringify(m && m.pluginMessage !== undefined ? m.pluginMessage : null) });
+  const send = (m) => fetch("send", { method: "POST", body: JSON.stringify(m && m.pluginMessage !== undefined ? m.pluginMessage : null) });
   const host = { postMessage: send };
   try { Object.defineProperty(window, "parent", { get: () => host, configurable: true }); } catch (e) { try { window.parent = host; } catch (_) {} }
-  window.addEventListener("load", () => fetch("/send", { method: "POST", body: "__katachi_ready__" }));
+  window.addEventListener("load", () => fetch("send", { method: "POST", body: "__katachi_ready__" }));
   (async () => {
     for (;;) {
       try {
-        const r = await fetch("/poll");
+        const r = await fetch("poll");
         if (r.status === 410) { document.title = "Plugin closed"; return; }
         for (const m of await r.json()) window.dispatchEvent(new MessageEvent("message", { data: { pluginMessage: m, pluginId: "katachi" } }));
       } catch (e) { await new Promise(r => setTimeout(r, 1000)); }
@@ -133,31 +134,49 @@ pub fn open_url(url: &str) {
 /// A plugin UI served to a browser tab from 127.0.0.1.
 pub struct Browser {
     pub url: String,
-    outbox: Arc<(Mutex<Vec<String>>, Condvar)>,
-    stop: Arc<AtomicBool>,
+    port: u16,
+    shared: Arc<Shared>,
+}
+
+/// What every connection to a browser-tab UI needs.
+struct Shared {
+    page: String,
+    /// The secret first path segment: other web pages and local processes can't guess it.
+    token: String,
+    /// `127.0.0.1:<port>`, the only Host (and Origin) accepted, which also defeats DNS rebinding.
+    host: String,
+    inbox: Arc<Mutex<Vec<String>>>,
+    outbox: (Mutex<Vec<String>>, Condvar),
+    stop: AtomicBool,
+    ctx: egui::Context,
 }
 
 impl Browser {
     pub fn start(html: &str, inbox: Arc<Mutex<Vec<String>>>, ctx: egui::Context) -> Result<Self, String> {
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
-        let url = format!("http://127.0.0.1:{}/", listener.local_addr().map_err(|e| e.to_string())?.port());
-        let page = Arc::new(format!("{BROWSER_SHIM}{html}"));
-        let outbox: Arc<(Mutex<Vec<String>>, Condvar)> = Arc::default();
-        let stop = Arc::new(AtomicBool::new(false));
-        let (o, s) = (outbox.clone(), stop.clone());
+        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+        let host = format!("127.0.0.1:{port}");
+        let token = crate::collab::session_token();
+        let url = format!("http://{host}/{token}/");
+        let shared = Arc::new(Shared { page: with_shim(html), token, host, inbox, outbox: Default::default(), stop: AtomicBool::new(false), ctx });
+        let sh = shared.clone();
         std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let (page, inbox, o, s, ctx) = (page.clone(), inbox.clone(), o.clone(), s.clone(), ctx.clone());
+            for stream in listener.incoming() {
+                if sh.stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(stream) = stream else { continue };
+                let sh = sh.clone();
                 std::thread::spawn(move || {
-                    let _ = serve(stream, &page, &inbox, &o, &s, &ctx);
+                    let _ = serve(stream, &sh);
                 });
             }
         });
-        Ok(Self { url, outbox, stop })
+        Ok(Self { url, port, shared })
     }
 
     pub fn post(&self, json: &str) {
-        let (lock, cv) = &*self.outbox;
+        let (lock, cv) = &self.shared.outbox;
         lock.lock().unwrap().push(json.to_string());
         cv.notify_all();
     }
@@ -165,22 +184,35 @@ impl Browser {
 
 impl Drop for Browser {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        self.outbox.1.notify_all();
+        self.shared.stop.store(true, Ordering::Relaxed);
+        self.shared.outbox.1.notify_all();
+        // Wake the accept loop so it sees the flag and closes the port.
+        let _ = TcpStream::connect_timeout(&(std::net::Ipv4Addr::LOCALHOST, self.port).into(), Duration::from_secs(1));
     }
+}
+
+/// The plugin's HTML with the shim in front, but after any doctype: a script before the
+/// doctype would put the page in quirks mode.
+fn with_shim(html: &str) -> String {
+    let t = html.trim_start();
+    let at = match t.get(..9).filter(|s| s.eq_ignore_ascii_case("<!doctype")) {
+        Some(_) => html.len() - t.len() + t.find('>').map_or(0, |i| i + 1),
+        None => 0,
+    };
+    format!("{}{BROWSER_SHIM}{}", &html[..at], &html[at..])
 }
 
 fn respond(mut s: TcpStream, status: &str, ctype: &str, body: &str) -> std::io::Result<()> {
     write!(s, "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
 }
 
-fn serve(stream: TcpStream, page: &str, inbox: &Mutex<Vec<String>>, outbox: &(Mutex<Vec<String>>, Condvar), stop: &AtomicBool, ctx: &egui::Context) -> std::io::Result<()> {
+fn serve(stream: TcpStream, sh: &Shared) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let mut parts = line.split_whitespace();
     let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-    let mut len = 0;
+    let (mut len, mut host, mut origin) = (0, String::new(), None);
     loop {
         let mut h = String::new();
         reader.read_line(&mut h)?;
@@ -188,28 +220,37 @@ fn serve(stream: TcpStream, page: &str, inbox: &Mutex<Vec<String>>, outbox: &(Mu
         if h.is_empty() {
             break;
         }
-        if let Some((k, v)) = h.split_once(':')
-            && k.eq_ignore_ascii_case("content-length")
-        {
-            len = v.trim().parse().unwrap_or(0);
+        if let Some((k, v)) = h.split_once(':') {
+            let v = v.trim();
+            if k.eq_ignore_ascii_case("content-length") {
+                len = v.parse().unwrap_or(0);
+            } else if k.eq_ignore_ascii_case("host") {
+                host = v.to_string();
+            } else if k.eq_ignore_ascii_case("origin") {
+                origin = Some(v.to_string());
+            }
         }
     }
+    let ours = host == sh.host && origin.is_none_or(|o| o.strip_prefix("http://") == Some(sh.host.as_str()));
+    let Some(path) = path.strip_prefix('/').and_then(|p| p.strip_prefix(sh.token.as_str())).filter(|_| ours) else {
+        return respond(stream, "403 Forbidden", "text/plain", "");
+    };
     let mut body = vec![0; len.min(16 << 20)];
     reader.read_exact(&mut body)?;
     match (method, path) {
-        ("GET", "/") => respond(stream, "200 OK", "text/html; charset=utf-8", page),
+        ("GET", "/") => respond(stream, "200 OK", "text/html; charset=utf-8", &sh.page),
         ("POST", "/send") => {
-            inbox.lock().unwrap().push(String::from_utf8_lossy(&body).into_owned());
-            ctx.request_repaint();
+            sh.inbox.lock().unwrap().push(String::from_utf8_lossy(&body).into_owned());
+            sh.ctx.request_repaint();
             respond(stream, "204 No Content", "text/plain", "")
         }
         ("GET", "/poll") => {
-            let (lock, cv) = outbox;
+            let (lock, cv) = &sh.outbox;
             let mut q = lock.lock().unwrap();
-            if q.is_empty() && !stop.load(Ordering::Relaxed) {
+            if q.is_empty() && !sh.stop.load(Ordering::Relaxed) {
                 q = cv.wait_timeout(q, Duration::from_secs(20)).unwrap().0;
             }
-            if stop.load(Ordering::Relaxed) {
+            if sh.stop.load(Ordering::Relaxed) {
                 return respond(stream, "410 Gone", "text/plain", "");
             }
             let msgs: Vec<String> = q.drain(..).collect();
@@ -224,28 +265,67 @@ fn serve(stream: TcpStream, page: &str, inbox: &Mutex<Vec<String>>, outbox: &(Mu
 mod tests {
     use super::*;
 
-    fn http(url: &str, method: &str, path: &str, body: &str) -> String {
-        let addr = url.trim_start_matches("http://").trim_end_matches('/');
+    /// A request to `url` + `rel` with extra header lines.
+    fn http_with(url: &str, method: &str, rel: &str, headers: &str, body: &str) -> String {
+        let (addr, path) = url.trim_start_matches("http://").split_once('/').unwrap();
         let mut s = TcpStream::connect(addr).unwrap();
-        write!(s, "{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        write!(s, "{method} /{path}{rel} HTTP/1.1\r\n{headers}Content-Length: {}\r\n\r\n{body}", body.len()).unwrap();
         let mut out = String::new();
         s.read_to_string(&mut out).unwrap();
         out
+    }
+
+    fn http(url: &str, method: &str, rel: &str, body: &str) -> String {
+        let host = url.trim_start_matches("http://").split('/').next().unwrap();
+        http_with(url, method, rel, &format!("Host: {host}\r\n"), body)
     }
 
     #[test]
     fn browser_bridge_carries_messages_both_ways() {
         let inbox: Arc<Mutex<Vec<String>>> = Arc::default();
         let b = Browser::start("<p>Hello</p>", inbox.clone(), egui::Context::default()).unwrap();
-        let page = http(&b.url, "GET", "/", "");
+        let page = http(&b.url, "GET", "", "");
         assert!(page.contains("parent") && page.ends_with("<p>Hello</p>"), "shim before the plugin's HTML");
-        http(&b.url, "POST", "/send", r#"{"type":"create"}"#);
+        http(&b.url, "POST", "send", r#"{"type":"create"}"#);
         assert_eq!(*inbox.lock().unwrap(), vec![r#"{"type":"create"}"#.to_string()]);
         b.post(r#"{"type":"made"}"#);
         b.post("2");
-        assert!(http(&b.url, "GET", "/poll", "").ends_with(r#"[{"type":"made"},2]"#));
+        assert!(http(&b.url, "GET", "poll", "").ends_with(r#"[{"type":"made"},2]"#));
         let url = b.url.clone();
+        let poll = std::thread::spawn(move || http(&url, "GET", "poll", ""));
+        std::thread::sleep(Duration::from_millis(200));
+        let addr = b.url.trim_start_matches("http://").split('/').next().unwrap().to_string();
         drop(b);
-        assert!(http(&url, "GET", "/poll", "").starts_with("HTTP/1.1 410"), "closing the plugin ends the tab's polling");
+        assert!(poll.join().unwrap().starts_with("HTTP/1.1 410"), "closing the plugin ends the tab's polling");
+        // The accept loop exits and the port closes.
+        let closed = (0..50).any(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            TcpStream::connect(&addr).is_err()
+        });
+        assert!(closed, "the port is released");
+    }
+
+    #[test]
+    fn browser_bridge_refuses_other_pages() {
+        let inbox: Arc<Mutex<Vec<String>>> = Arc::default();
+        let b = Browser::start("<p>Hello</p>", inbox.clone(), egui::Context::default()).unwrap();
+        let host = b.url.trim_start_matches("http://").split('/').next().unwrap();
+        let forbidden = |r: String| r.starts_with("HTTP/1.1 403");
+        let base = format!("http://{host}/");
+        assert!(forbidden(http(&base, "GET", "", "")), "no token");
+        assert!(forbidden(http(&base, "POST", "send", "1")), "no token");
+        assert!(forbidden(http_with(&b.url, "GET", "", "Host: evil.example\r\n", "")), "rebound host");
+        let evil = format!("Host: {host}\r\nOrigin: http://evil.example\r\n");
+        assert!(forbidden(http_with(&b.url, "POST", "send", &evil, "1")), "foreign origin");
+        let own = format!("Host: {host}\r\nOrigin: http://{host}\r\n");
+        assert!(http_with(&b.url, "POST", "send", &own, "1").starts_with("HTTP/1.1 204"));
+        assert_eq!(*inbox.lock().unwrap(), vec!["1".to_string()], "only the page's own message got through");
+    }
+
+    #[test]
+    fn shim_goes_after_the_doctype() {
+        let html = with_shim("  <!DOCTYPE html><html></html>");
+        assert!(html.starts_with("  <!DOCTYPE html><script>"), "{html}");
+        assert!(with_shim("<p>x</p>").starts_with("<script>"));
     }
 }
