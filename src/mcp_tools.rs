@@ -6,7 +6,7 @@ use crate::mcp::{fail, image, text};
 use serde_json::{Value, json};
 use std::fmt::Write;
 
-fn kind_tag(k: Kind) -> &'static str {
+pub fn kind_tag(k: Kind) -> &'static str {
     match k {
         Kind::Frame => "frame",
         Kind::Group => "group",
@@ -106,10 +106,16 @@ impl App {
     }
 
     pub fn mcp_tool(&mut self, ctx: &egui::Context, name: &str, args: &Value) -> Value {
-        match self.mcp_tool_inner(ctx, name, args) {
+        // What an agent changes glows on the canvas for a moment.
+        let before = matches!(name, "execute_code" | "import_svg" | "place_image" | "undo").then(|| self.doc.nodes.clone());
+        let out = match self.mcp_tool_inner(ctx, name, args) {
             Ok(v) => v,
             Err(e) => fail(e),
+        };
+        if let Some(before) = before {
+            self.mark_agent_changes(&before, ctx.input(|i| i.time));
         }
+        out
     }
 
     fn mcp_tool_inner(&mut self, ctx: &egui::Context, name: &str, args: &Value) -> Result<Value, String> {
@@ -148,6 +154,8 @@ impl App {
                     Some("swiftui") => crate::codegen::Lang::SwiftUi,
                     Some("compose") => crate::codegen::Lang::Compose,
                     Some("tailwind") => crate::codegen::Lang::Tailwind,
+                    Some("react") => crate::codegen::Lang::React,
+                    Some("react-tailwind") => crate::codegen::Lang::ReactTailwind,
                     _ => crate::codegen::Lang::Css,
                 };
                 let mut out = String::new();
@@ -306,15 +314,131 @@ impl App {
                     return Err("there are unsaved changes; save first".into());
                 }
                 let path = args["path"].as_str().ok_or("missing path")?;
-                self.open_path(path.into());
+                if !self.open_path(path.into()) {
+                    return Err(format!("couldn't open {path}"));
+                }
                 text(format!("Opened {path}: {} pages", self.doc.pages.len()))
             }
             "undo" => {
+                if self.undo_len() == 0 || self.drag.is_some() {
+                    return Err("nothing to undo".into());
+                }
                 self.undo();
                 text("Undone")
             }
+            "find_nodes" => {
+                let roots = match args["node_id"].as_str() {
+                    Some(_) => self.mcp_targets(args)?,
+                    None => self.doc.pages[self.page].children.clone(),
+                };
+                let (name, txt, kind) = (args["name"].as_str(), args["text"].as_str(), args["type"].as_str());
+                if name.is_none() && txt.is_none() && kind.is_none() {
+                    return Err("give a name, text, or type to look for".into());
+                }
+                let limit = args["limit"].as_u64().unwrap_or(100) as usize;
+                let d = &self.doc;
+                let found: Vec<Value> = roots
+                    .iter()
+                    .flat_map(|&r| std::iter::once(r).chain(d.descendants(r)))
+                    .map(|id| d.node(id))
+                    .filter(|n| name.is_none_or(|p| glob(p, &n.name)) && txt.is_none_or(|p| n.kind == Kind::Text && glob(p, &n.text)) && kind.is_none_or(|k| k.eq_ignore_ascii_case(kind_tag(n.kind))))
+                    .take(limit)
+                    .map(|n| {
+                        let mut v = json!({ "id": n.id.to_string(), "type": kind_tag(n.kind), "name": n.name, "x": n.rect.min.x, "y": n.rect.min.y, "width": n.rect.width(), "height": n.rect.height() });
+                        if n.kind == Kind::Text {
+                            v["text"] = n.text.chars().take(120).collect::<String>().into();
+                        }
+                        v
+                    })
+                    .collect();
+                text(Value::Array(found).to_string())
+            }
+            "export" => {
+                let dir = std::path::PathBuf::from(args["dir"].as_str().ok_or("missing dir")?);
+                std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                let ids: Vec<NodeId> = match args["node_ids"].as_array() {
+                    Some(list) => list.iter().map(|v| v.as_str().and_then(|s| s.parse().ok()).filter(|id| self.doc.nodes.contains_key(id)).ok_or(format!("no layer {v}"))).collect::<Result<_, _>>()?,
+                    None => self.sel_roots(),
+                };
+                self.fit_all_texts(ctx);
+                let mut jobs = if ids.is_empty() {
+                    let page = &self.doc.pages[self.page];
+                    vec![(page.children.clone(), page.name.clone(), self.export_default.clone())]
+                } else {
+                    self.export_jobs(&ids)
+                };
+                // A format or size given here replaces the layers' own settings.
+                if args["format"].is_string() || args["size"].is_string() {
+                    let mut preset = crate::doc::ExportSetting::default();
+                    if let Some(f) = args["format"].as_str() {
+                        preset.format = crate::doc::ExportFormat::ALL.into_iter().find(|x| x.ext() == f).ok_or(format!("unknown format {f}"))?;
+                    }
+                    if let Some(sz) = args["size"].as_str()
+                        && !preset.set_size(sz)
+                    {
+                        return Err(format!("bad size {sz}; use 2x, 512w, or 512h"));
+                    }
+                    jobs.dedup_by(|a, b| a.0 == b.0);
+                    jobs.iter_mut().for_each(|j| j.2 = preset.clone());
+                }
+                let names = crate::export::unique_names(jobs.iter().map(|(_, name, p)| crate::app::export_file_name(name, p)).collect());
+                let targets: Vec<std::path::PathBuf> = names.into_iter().map(|f| dir.join(f)).collect();
+                self.render_exports(&jobs, &targets)?;
+                text(json!({ "files": targets.iter().map(|p| p.display().to_string()).collect::<Vec<_>>() }).to_string())
+            }
+            "get_comments" => {
+                let (all, resolved) = (args["all_pages"].as_bool().unwrap_or(false), args["include_resolved"].as_bool().unwrap_or(false));
+                let threads: Vec<Value> = self
+                    .doc
+                    .comments
+                    .iter()
+                    .filter(|c| (all || c.page == self.page) && (resolved || !c.resolved))
+                    .map(|c| {
+                        let anchor = c.anchor.filter(|a| self.doc.nodes.contains_key(a)).map(|a| json!({ "id": a.to_string(), "name": self.doc.node(a).name }));
+                        json!({
+                            "id": c.id.to_string(), "page": self.doc.pages.get(c.page).map(|p| p.name.as_str()), "resolved": c.resolved, "layer": anchor,
+                            "messages": c.messages.iter().map(|(who, what, _)| json!({ "author": who, "text": what })).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                text(Value::Array(threads).to_string())
+            }
+            "reply_to_comment" => {
+                let id: u64 = args["comment_id"].as_str().and_then(|s| s.parse().ok()).ok_or("bad comment_id")?;
+                let reply = args["text"].as_str().map(str::trim).filter(|t| !t.is_empty());
+                let resolve = args["resolve"].as_bool().unwrap_or(false);
+                let i = self.doc.comments.iter().position(|c| c.id == id).ok_or(format!("no comment {id}"))?;
+                if reply.is_none() && !resolve {
+                    return Err("give text, or resolve: true".into());
+                }
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                let c = &mut self.doc.comments[i];
+                if let Some(t) = reply {
+                    c.messages.push(("Agent".into(), t.to_string(), now));
+                }
+                c.resolved |= resolve;
+                self.dirty = true;
+                text(if resolve { "Replied and resolved" } else { "Replied" })
+            }
             other => return Err(format!("unknown tool {other}")),
         })
+    }
+
+    /// Export jobs written to their targets; an error stops at the first failure.
+    pub fn render_exports(&self, jobs: &[crate::app::ExportJob], targets: &[std::path::PathBuf]) -> Result<(), String> {
+        for ((ids, _, p), path) in jobs.iter().zip(targets) {
+            // A slice exports whatever lies inside it.
+            let (svg, size) = match ids.as_slice() {
+                [one] if self.doc.node(*one).kind == Kind::Slice => {
+                    let n = self.doc.node(*one);
+                    (crate::export::region_svg(&self.doc, self.page, n.aabb(), n.id), n.aabb().size())
+                }
+                _ => (crate::export::to_svg(&self.doc, ids), crate::export::export_bounds(&self.doc, ids).size()),
+            };
+            let data = crate::export::encode_preset(&self.doc, &svg, p, size)?;
+            std::fs::write(path, data).map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+        Ok(())
     }
 
     /// Move a new layer into `parent_id` (keeping its position relative to that parent).
@@ -331,6 +455,27 @@ impl App {
         self.doc.reflow();
         Ok(())
     }
+}
+
+/// Case-insensitive match: `*` is a wildcard; without one, the pattern may appear anywhere.
+fn glob(pattern: &str, s: &str) -> bool {
+    let (p, s) = (pattern.to_lowercase(), s.to_lowercase());
+    if !p.contains('*') {
+        return s.contains(&p);
+    }
+    let parts: Vec<&str> = p.split('*').collect();
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if !s.starts_with(first) || s.len() < first.len() + last.len() || !s.ends_with(last) {
+        return false;
+    }
+    let mut rest = &s[first.len()..s.len() - last.len()];
+    for mid in &parts[1..parts.len() - 1] {
+        match rest.find(mid) {
+            Some(i) => rest = &rest[i + mid.len()..],
+            None => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -373,5 +518,58 @@ mod tests {
         let page = app.mcp_tool(&ctx, "set_page", &json!({ "page": "Screens", "create": true }));
         assert!(page["content"][0]["text"].as_str().unwrap().contains("Screens"));
         assert_eq!(app.page, 1);
+    }
+
+    fn reply(v: &serde_json::Value) -> &str {
+        v["content"][0]["text"].as_str().unwrap()
+    }
+
+    #[test]
+    fn find_export_comments_and_marks() {
+        crate::tests::isolate_data();
+        let mut app = App::new(None);
+        let ctx = egui::Context::default();
+        ctx.begin_pass(Default::default());
+        let _ = ctx.end_pass();
+        app.mcp_tool(&ctx, "execute_code", &json!({ "code": r#"
+            const card = figma.createFrame(); card.name = "Pricing card"; card.resize(120, 80);
+            const t = figma.createText(); t.characters = "Pro plan"; card.appendChild(t);
+            const r = figma.createRectangle(); r.name = "Badge"; r.x = 300;
+        "# }));
+        // Only the outermost new layers glow: the card and the badge, not the text inside the card.
+        let marked: Vec<String> = app.agent_marked().into_iter().map(|id| app.doc.node(id).name.clone()).collect();
+        assert_eq!(marked.len(), 2, "{marked:?}");
+        assert!(marked.contains(&"Pricing card".to_string()) && marked.contains(&"Badge".to_string()));
+
+        let found: serde_json::Value = serde_json::from_str(reply(&app.mcp_tool(&ctx, "find_nodes", &json!({ "name": "pricing*" })))).unwrap();
+        assert_eq!(found.as_array().unwrap().len(), 1);
+        let found: serde_json::Value = serde_json::from_str(reply(&app.mcp_tool(&ctx, "find_nodes", &json!({ "text": "pro" })))).unwrap();
+        assert_eq!(found[0]["text"], "Pro plan");
+        assert_eq!(app.mcp_tool(&ctx, "find_nodes", &json!({}))["isError"], true);
+
+        let dir = std::env::temp_dir().join(format!("katachi-mcp-export-{}", std::process::id()));
+        let card = found[0]["id"].as_str().map(|_| app.doc.pages[0].children[0].to_string()).unwrap();
+        let out: serde_json::Value = serde_json::from_str(reply(&app.mcp_tool(&ctx, "export", &json!({ "node_ids": [card], "format": "png", "size": "2x", "dir": dir })))).unwrap();
+        let file = std::path::PathBuf::from(out["files"][0].as_str().unwrap());
+        assert!(file.ends_with("Pricing card@2x.png"), "{file:?}");
+        let png = image::load_from_memory(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!((png.width(), png.height()), (240, 160));
+        assert_eq!(app.mcp_tool(&ctx, "export", &json!({ "dir": dir, "size": "huge" }))["isError"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        app.doc.comments.push(crate::doc::Comment { id: 7, page: 0, at: egui::Pos2::ZERO, anchor: None, messages: vec![("Ana".into(), "Make the badge red".into(), 0)], resolved: false });
+        let threads: serde_json::Value = serde_json::from_str(reply(&app.mcp_tool(&ctx, "get_comments", &json!({})))).unwrap();
+        assert_eq!(threads[0]["messages"][0]["text"], "Make the badge red");
+        app.mcp_tool(&ctx, "reply_to_comment", &json!({ "comment_id": "7", "text": "Done", "resolve": true }));
+        assert!(app.doc.comments[0].resolved && app.doc.comments[0].messages.len() == 2);
+        let open: serde_json::Value = serde_json::from_str(reply(&app.mcp_tool(&ctx, "get_comments", &json!({})))).unwrap();
+        assert!(open.as_array().unwrap().is_empty(), "resolved threads are hidden by default");
+    }
+
+    #[test]
+    fn globs() {
+        use super::glob;
+        assert!(glob("card", "Pricing Card") && glob("pri*card", "Pricing card") && glob("*", "") && glob("a*b*c", "aXbYc"));
+        assert!(!glob("pri*card", "Pricing cards") && !glob("x*", "ax") && !glob("ab*ba", "aba"));
     }
 }

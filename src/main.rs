@@ -1,6 +1,8 @@
 // Release builds on Windows are GUI programs, so double-clicking one opens no console window.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod agent;
+mod agent_ui;
 mod app;
 mod appearance;
 mod boolean;

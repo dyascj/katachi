@@ -1855,6 +1855,7 @@ impl App {
         if let Some(h) = self.hover.filter(|h| !self.sel.contains(h) && self.prefs.highlight_on_hover) {
             self.outline(painter, h, 2.0);
         }
+        self.draw_agent_marks(painter);
         if self.vector_edit.is_some() {
             self.draw_vector_edit(painter, ptr);
             if let (Some(Drag::PointMarquee { start, .. }), Some(p)) = (&self.drag, ptr) {

@@ -162,7 +162,7 @@ package instead. Set `KATACHI_NO_UPDATE=1` to turn the check off.
 - Comments pinned to frames, with replies, resolve, @mentions, filters, and unread markers
 
 **Handoff**
-- Dev Mode (Shift D) with CSS, Tailwind, SwiftUI, and Jetpack Compose code that uses your variable and style names, colors, type, and auto layout spacing on hover
+- Dev Mode (Shift D) with CSS, Tailwind, React (inline styles or Tailwind), SwiftUI, and Jetpack Compose code that uses your variable and style names, colors, type, and auto layout spacing on hover
 - Ready for dev status on frames, and annotations pinned to layers
 - Copy as PNG, SVG, CSS, or code
 
@@ -175,9 +175,16 @@ package instead. Set `KATACHI_NO_UPDATE=1` to turn the check off.
 - Light, dark, or system theme (Main menu > Appearance). Pages left at the default canvas color follow the theme
 - Glass: translucent, tinted side panels and toolbars over a blurred desktop, with adjustable opacity, blur (macOS), and tint; the canvas stays solid. On Windows and Linux glass is translucency without the blur
 
+**Agents, in the app**
+- The Agent panel (Cmd L, or the spark in the toolbar) runs the coding agents already installed on your computer: Claude Code, Codex, Gemini CLI, OpenCode, or Cursor. They use your own sign-in and models; Katachi has no account or API key of its own
+- Ask for a screen, a component, a cleanup, or a dark version, and watch the agent build it on the canvas. Layers it changes glow for a moment, the tab shows a spinner while it works, and Stop ends it at once
+- It knows the file, the page, and your selection. Each reply's changes undo in one step (Undo these changes), and every tab keeps its own conversation; an agent keeps working on its file when you switch tabs
+- Settings > Agents lists the agents Katachi found and adds Katachi to Claude Code, Codex, or Gemini CLI with one click, for using it from a terminal too
+
 **MCP server (for AI agents)**
 - The app serves MCP at `http://127.0.0.1:3855/mcp` while it's open, like Figma's Dev Mode MCP server, but agents can also edit: `claude mcp add --transport http katachi http://127.0.0.1:3855/mcp` (or Main menu > MCP server to copy the command). Stdio clients use `katachi mcp`
-- Tools: `get_metadata` (XML outline), `get_screenshot`, `get_code` (CSS, SwiftUI, Compose), `get_variable_defs`, `get_components`, `get_selection`, `execute_code` (Figma plugin-API JavaScript, one undo step per call), `list_pages`, `set_page`, `select`, `import_svg`, `place_image`, `save`, `open_file`, `undo`
+- Tools: `get_metadata` (XML outline), `get_screenshot`, `get_code` (CSS, Tailwind, React, SwiftUI, Compose), `get_variable_defs`, `get_components`, `get_selection`, `find_nodes`, `execute_code` (Figma plugin-API JavaScript, one undo step per call), `list_pages`, `set_page`, `select`, `import_svg`, `place_image`, `export` (PNG, JPG, WebP, SVG, PDF at 2x, 512w, ...), `get_comments`, `reply_to_comment`, `save`, `open_file`, `undo`
+- Only native clients can connect: requests from web pages (anything sending an Origin header) are refused
 
 **Plugins**
 - Run Figma plugins: Main menu > Plugins > Development > Import plugin from manifest. Plugins use the core of Figma's plugin API (`figma.currentPage`, selection, `findAll`, `create*`, fills, text, `notify`, `clientStorage`, `figma.on("selectionchange")`, async), and plugin UIs (`figma.showUI`) open in a panel with Figma's `postMessage` messaging (on Linux they open in your browser, connected the same way). Each change a plugin makes is one undo step
@@ -229,6 +236,7 @@ Cmd is Ctrl on Windows and Linux, and menus there show every shortcut with Ctrl,
 | Dev Mode, present | Shift D, Alt Cmd Enter |
 | Save, open, place image, export | Cmd S, Cmd O, Shift Cmd K, Shift Cmd E |
 | Quick actions, find and replace | Cmd / or Cmd K, Cmd F |
+| Agent panel | Cmd L |
 | Next and previous tab, close tab, quit | Ctrl Tab, Ctrl Shift Tab, Cmd W, Cmd Q |
 
 ## Roadmap
@@ -255,6 +263,8 @@ Code map:
 | `src/prototype.rs` | Present mode, interactions, transitions |
 | `src/codegen.rs` | Dev Mode code generation |
 | `src/collab.rs` | Multiplayer relay, diff sync, presence |
+| `src/agent.rs`, `src/agent_ui.rs` | Finding and running installed coding agents; the Agent panel |
+| `src/mcp.rs`, `src/mcp_tools.rs` | MCP server and its tools |
 | `src/kiwi.rs`, `src/fig_import.rs` | Kiwi binary decoder and Figma `.fig` import |
 | `src/text.rs` | Shared text layout and system fonts |
 | `src/boolean.rs`, `src/vector_edit.rs`, `src/svg_import.rs` | Vector features |

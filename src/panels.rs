@@ -58,6 +58,8 @@ pub enum Icon {
     Eyedropper,
     /// Figma's hexagon "Apply variable".
     Variable,
+    /// The Agent panel: a four-pointed spark.
+    Spark,
 }
 
 use crate::appearance as theme;
@@ -353,6 +355,12 @@ pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
         Icon::Close => {
             p.line_segment([at(-4., -4.), at(4., 4.)], s);
             p.line_segment([at(4., -4.), at(-4., 4.)], s);
+        }
+        Icon::Spark => {
+            // Two thin diamonds, each convex, crossed.
+            let (r, w) = (7.0, 2.2);
+            p.add(Shape::convex_polygon(vec![at(0., -r), at(w, 0.), at(0., r), at(-w, 0.)], color, Stroke::NONE));
+            p.add(Shape::convex_polygon(vec![at(-r, 0.), at(0., -w), at(r, 0.), at(0., w)], color, Stroke::NONE));
         }
         Icon::Comment => {
             let r = Rect::from_center_size(c, vec2(12., 11.));
@@ -5099,6 +5107,10 @@ impl App {
                                     });
                                 }
                                 ui.add_space(4.0);
+                            }
+                            ui.add(egui::Separator::default().vertical().spacing(8.0));
+                            if icon_button(ui, Icon::Spark, self.agent.open, 32.0, "Agent  ⌘L").clicked() {
+                                self.toggle_agent();
                             }
                         });
                     });

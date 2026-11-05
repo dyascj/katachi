@@ -296,9 +296,15 @@ pub struct App {
     glass_applied: Option<(bool, u8)>,
     /// The plugin that's running with a UI, if any.
     pub plugin: Option<PluginRun>,
-    /// MCP tool calls from agents, once the server is listening.
-    mcp: Option<std::sync::mpsc::Receiver<crate::mcp::Call>>,
+    /// MCP tool calls from agents, once the server is listening (and its port).
+    mcp: Option<(u16, std::sync::mpsc::Receiver<crate::mcp::Call>)>,
     mcp_tried: bool,
+    /// Tool calls for other tabs, which the shell hands on.
+    pub mcp_elsewhere: Vec<crate::mcp::Call>,
+    /// This tab's id, for agents working on it (`/mcp/<tab_id>`).
+    pub tab_id: u64,
+    /// The Agent panel's conversation.
+    pub agent: crate::agent_ui::Chat,
     /// `KATACHI_PLUGIN=path/manifest.json`: run a plugin at startup (development).
     debug_plugin: Option<PathBuf>,
     /// The last layers copied here, for Paste to replace.
@@ -454,6 +460,12 @@ impl App {
             glass_applied: None,
             mcp: None,
             mcp_tried: cfg!(test),
+            mcp_elsewhere: Vec::new(),
+            tab_id: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
+            agent: Default::default(),
             debug_plugin: std::env::var_os("KATACHI_PLUGIN").map(PathBuf::from),
             show_console: false,
             quick: None,
@@ -606,9 +618,11 @@ impl App {
         self.clear_recovery();
         let screenshot = self.screenshot.take();
         let recoverable = std::mem::take(&mut self.recoverable);
-        // The MCP server and the window's appearance belong to the session, not the document.
+        // The MCP server and the window's appearance belong to the session, not the document; the
+        // tab keeps its id and agent conversation (an agent may have opened this file).
         let (mcp, mcp_tried, appearance, glass_applied) = (self.mcp.take(), self.mcp_tried, self.appearance.clone(), self.glass_applied);
-        *self = App { screenshot, recoverable, mcp, mcp_tried, appearance, glass_applied, ..fresh };
+        let (tab_id, agent) = (self.tab_id, std::mem::take(&mut self.agent));
+        *self = App { screenshot, recoverable, mcp, mcp_tried, appearance, glass_applied, tab_id, agent, ..fresh };
     }
 
     // ---------- undo ----------
@@ -1769,7 +1783,8 @@ impl App {
 
     // ---------- files ----------
 
-    pub fn open_path(&mut self, p: PathBuf) {
+    /// Open a file into this app; false (after a toast) if it couldn't be read.
+    pub fn open_path(&mut self, p: PathBuf) -> bool {
         if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("fig")) {
             return self.import_fig(&p);
         }
@@ -1784,13 +1799,17 @@ impl App {
                 crate::files::add_recent(&p);
                 self.path = Some(p);
                 self.refresh_libraries();
+                true
             }
-            Err(e) => self.toast(format!("Couldn't open {}: {e}", p.file_name().unwrap_or(p.as_os_str()).to_string_lossy())),
+            Err(e) => {
+                self.toast(format!("Couldn't open {}: {e}", p.file_name().unwrap_or(p.as_os_str()).to_string_lossy()));
+                false
+            }
         }
     }
 
     /// Open a Figma `.fig` as a new, unsaved document (the original is never written to).
-    pub fn import_fig(&mut self, p: &std::path::Path) {
+    pub fn import_fig(&mut self, p: &std::path::Path) -> bool {
         let result = std::fs::read(p).map_err(|e| e.to_string()).and_then(|b| crate::fig_import::import(&b));
         match result {
             Ok(doc) => {
@@ -1800,8 +1819,12 @@ impl App {
                 let name = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 self.draft_name = Some(name.clone());
                 self.toast(format!("Imported {name}: {} layers. Save to keep it as a .katachi file.", self.doc.nodes.len()));
+                true
             }
-            Err(e) => self.toast(format!("Couldn't import: {e}")),
+            Err(e) => {
+                self.toast(format!("Couldn't import: {e}"));
+                false
+            }
         }
     }
 
@@ -1894,25 +1917,14 @@ impl App {
 
     /// Render each job and write it to its path; a toast says how it went.
     fn write_exports(&mut self, jobs: &[ExportJob], targets: &[PathBuf]) {
-        let mut done = 0;
-        for ((ids, _, p), path) in jobs.iter().zip(targets) {
-            // A slice exports whatever lies inside it.
-            let (svg, size) = match ids.as_slice() {
-                [one] if self.doc.node(*one).kind == Kind::Slice => {
-                    let n = self.doc.node(*one);
-                    (crate::export::region_svg(&self.doc, self.page, n.aabb(), n.id), n.aabb().size())
-                }
-                _ => (crate::export::to_svg(&self.doc, ids), crate::export::export_bounds(&self.doc, ids).size()),
-            };
-            match crate::export::encode_preset(&self.doc, &svg, p, size).and_then(|d| std::fs::write(path, d).map_err(|e| e.to_string())) {
-                Ok(()) => done += 1,
-                Err(e) => return self.toast(format!("Export failed: {e}")),
-            }
-        }
-        self.toast(match targets {
-            [one] if done == 1 => format!("Exported {}", one.file_name().unwrap_or_default().to_string_lossy()),
-            _ => format!("Exported {done} files"),
-        });
+        let msg = match self.render_exports(jobs, targets) {
+            Err(e) => format!("Export failed: {e}"),
+            Ok(()) => match targets {
+                [one] => format!("Exported {}", one.file_name().unwrap_or_default().to_string_lossy()),
+                _ => format!("Exported {} files", targets.len()),
+            },
+        };
+        self.toast(msg);
     }
 
     /// New and Open make tabs.
@@ -2102,18 +2114,41 @@ impl App {
     fn mcp_frame(&mut self, ctx: &egui::Context) {
         if !self.mcp_tried {
             self.mcp_tried = true;
-            self.mcp = crate::mcp::start(ctx.clone());
+            self.mcp = crate::mcp::start(ctx.clone(), crate::mcp::port());
         }
-        let calls: Vec<crate::mcp::Call> = self.mcp.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
+        // A drag rebuilds the document from its starting copy each frame, which would throw an
+        // agent's edit away: calls wait until it ends.
+        if self.drag.is_some() {
+            return;
+        }
+        let calls: Vec<crate::mcp::Call> = self.mcp.as_ref().map(|(_, rx)| rx.try_iter().collect()).unwrap_or_default();
         for c in calls {
+            if std::time::Instant::now() > c.deadline {
+                continue;
+            }
+            if c.tab.is_some_and(|t| t != self.tab_id) {
+                self.mcp_elsewhere.push(c);
+                continue;
+            }
             let result = self.mcp_tool(ctx, &c.name, &c.args);
             let _ = c.reply.send(result);
             ctx.request_repaint();
         }
     }
 
-    pub fn mcp_listening(&self) -> bool {
-        self.mcp.is_some()
+    /// Tests: an MCP server on a free port, for the Agent panel.
+    #[cfg(test)]
+    pub fn listen_for_agents(&mut self, ctx: &egui::Context) {
+        self.mcp = crate::mcp::start(ctx.clone(), 0);
+    }
+
+    /// The port the MCP server listens on.
+    pub fn mcp_port(&self) -> Option<u16> {
+        self.mcp.as_ref().map(|(p, _)| *p)
+    }
+
+    pub fn undo_len(&self) -> usize {
+        self.undo.len()
     }
 
     /// A running plugin with a UI: pass messages both ways, report selection changes, draw its panel.
@@ -2911,6 +2946,7 @@ impl App {
             (true, true, false, Key::C) => self.copy_as(ctx, "png"),
             (true, false, false, Key::R) => self.rename_selection(),
             (true, false, false, Key::Backslash) => self.ui_hidden = !self.ui_hidden,
+            (true, false, false, Key::L) => self.toggle_agent(),
             (false, true, false, Key::R) => self.rulers = !self.rulers,
             (false, true, false, Key::D) => self.dev_mode = !self.dev_mode,
             (false, false, true, Key::L) => {
@@ -3153,6 +3189,9 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         if self.presenting.is_some() {
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.presentation_ui(ui));
+            // Agents keep working while you present.
+            self.mcp_frame(&ctx);
+            self.agent_poll(ctx.input(|i| i.time));
             return;
         }
         self.eyedropper(&ctx);
@@ -3163,6 +3202,7 @@ impl eframe::App for App {
         self.offer_swatches(&ctx);
         if !self.ui_hidden {
             self.left_panel(ui);
+            self.agent_panel(ui);
             self.right_panel(ui);
         }
         self.canvas_panel(ui);
@@ -3191,6 +3231,7 @@ impl eframe::App for App {
         self.libraries_window(&ctx);
         self.library_updates(&ctx);
         self.autosave(ctx.input(|i| i.time));
+        self.agent_poll(ctx.input(|i| i.time));
         self.debug_screenshot(&ctx);
 
         // A gesture (and its single undo step) ends when the pointer is up and no field is focused.
