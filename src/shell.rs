@@ -412,11 +412,10 @@ impl Shell {
                 }
                 resp.on_hover_text("New design file");
             }
-            if own_frame() {
-                if let Some(a) = window_buttons(ui, Rect::from_min_max(pos2(end, r.min.y), r.max)) {
+            if own_frame()
+                && let Some(a) = window_buttons(ui, Rect::from_min_max(pos2(end, r.min.y), r.max)) {
                     action = Some(a);
                 }
-            }
             // The line under everything except the tab on screen, which runs into the content.
             let under = r.max.y - 0.5;
             let gap = match self.active {

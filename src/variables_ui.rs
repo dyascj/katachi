@@ -282,10 +282,9 @@ impl App {
                 };
             }
         });
-        for m in 0..modes {
+        for (m, alias) in aliases.into_iter().enumerate().take(modes) {
             let id = ui.id().with(("var", vid, m));
             if let Some(v) = self.doc.variables[vi].values.get_mut(m) {
-                let alias = aliases[m].clone();
                 ui.horizontal(|ui| value_editor(ui, id, v, &targets, alias));
             }
         }

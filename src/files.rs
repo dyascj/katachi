@@ -141,17 +141,20 @@ pub fn forget_recent(p: &Path) {
 
 /// Where Home keeps a file's thumbnail.
 pub fn thumb_path(file: &Path) -> PathBuf {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    file.hash(&mut h);
-    data_dir().join("thumbs").join(format!("{:016x}.png", h.finish()))
+    data_dir().join("thumbs").join(format!("{}.png", path_key(file)))
 }
 
-/// The file's version folder, named by an FNV-1a hash of its path (stable across Rust releases).
+/// A name for per-file folders: an FNV-1a hash of the path, stable across Rust releases
+/// (unlike `DefaultHasher`).
+fn path_key(file: &Path) -> String {
+    let fnv = file.as_os_str().as_encoded_bytes().iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x0100_0000_01b3));
+    format!("{fnv:016x}")
+}
+
+/// The file's version folder.
 fn history_dir(file: &Path) -> PathBuf {
     use std::hash::{Hash, Hasher};
-    let fnv = file.as_os_str().as_encoded_bytes().iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x0100_0000_01b3));
-    let dir = data_dir().join("history").join(format!("{fnv:016x}"));
+    let dir = data_dir().join("history").join(path_key(file));
     // Earlier versions used DefaultHasher, whose output may change between Rust releases: move that folder over.
     let mut h = std::hash::DefaultHasher::new();
     file.hash(&mut h);

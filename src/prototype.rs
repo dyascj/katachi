@@ -552,6 +552,7 @@ impl App {
     }
 
     /// While hovering / pressing: act now, undo when the hover or press ends.
+    #[allow(clippy::too_many_arguments)]
     fn hold(&mut self, doc: &Document, id: NodeId, r: &Reaction, spot: Rect, press: bool, ctx: &egui::Context, now: f64) {
         let Some(frame) = self.presenting.as_ref().map(|p| p.frame) else { return };
         let undo = match r.action {

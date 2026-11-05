@@ -341,9 +341,9 @@ pub fn glass(px: &mut [u8], mask: &[u8], w: usize, h: usize, s: &crate::doc::Sha
             let light = g.light * rim * (facing.max(0.0).powi(2) + 0.35 * (-facing).max(0.0).powi(2));
             let shade = 1.0 - 0.25 * g.light * rim * (-facing).max(0.0);
             let a = px[i + 3] as f32;
-            for c in i..i + 3 {
-                let v = px[c] as f32 * shade;
-                px[c] = (v + light * (a - v)).round().clamp(0.0, a) as u8;
+            for c in &mut px[i..i + 3] {
+                let v = *c as f32 * shade;
+                *c = (v + light * (a - v)).round().clamp(0.0, a) as u8;
             }
         }
     }
@@ -357,7 +357,7 @@ pub fn dashed(path: &Path, pattern: &[f32]) -> Path {
     let total: f32 = pattern.iter().sum();
     let mut b = Path::builder();
     // Dashes under a pixel look solid anyway, and millions of them would freeze the canvas.
-    if !(total >= 1.0) || pattern.iter().any(|d| !d.is_finite() || *d < 0.0) {
+    if total.is_nan() || total < 1.0 || pattern.iter().any(|d| !d.is_finite() || *d < 0.0) {
         return path.clone();
     }
     const MAX_DASHES: usize = 20_000;
@@ -405,12 +405,11 @@ pub fn dashed(path: &Path, pattern: &[f32]) -> Path {
                     open = false;
                 }
             }
-            Event::End { .. } => {
-                if open {
+            Event::End { .. }
+                if open => {
                     b.end(false);
                     open = false;
                 }
-            }
             _ => {}
         }
     }

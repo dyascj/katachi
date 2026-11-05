@@ -49,11 +49,10 @@ fn shape_contours(n: &Node) -> Contours {
         match ev {
             Event::Begin { at } => cur = vec![[at.x as f64, at.y as f64]],
             Event::Line { to, .. } => cur.push([to.x as f64, to.y as f64]),
-            Event::End { .. } => {
-                if cur.len() >= 3 {
+            Event::End { .. }
+                if cur.len() >= 3 => {
                     out.push(std::mem::take(&mut cur));
                 }
-            }
             _ => {}
         }
     }
@@ -137,11 +136,10 @@ pub fn stroke_outline(n: &Node) -> Vec<SubPath> {
         match ev {
             Event::Begin { at } => cur = vec![[at.x as f64, at.y as f64]],
             Event::Line { to, .. } => cur.push([to.x as f64, to.y as f64]),
-            Event::End { close, .. } => {
-                if cur.len() >= 2 {
+            Event::End { close, .. }
+                if cur.len() >= 2 => {
                     contours.push((std::mem::take(&mut cur), close));
                 }
-            }
             _ => {}
         }
     }

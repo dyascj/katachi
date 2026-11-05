@@ -1570,7 +1570,7 @@ fn prototype_scroll_to_fixed_layers_and_wheel() {
     }
     h.run_steps(20);
     let y = offset(&h).y;
-    assert!(y < 400. && y >= 0., "{y}");
+    assert!((0. ..400.).contains(&y), "{y}");
 }
 
 #[test]
@@ -1775,7 +1775,7 @@ fn render_svgs() {
             let img = image::RgbaImage::from_fn(size[0] as u32, size[1] as u32, |x, y| {
                 let i = (y as usize * size[0] + x as usize) * 4;
                 let a = px[i + 3] as u32;
-                let un = |c: u8| if a == 0 { 0 } else { ((c as u32 * 255) / a).min(255) as u8 };
+                let un = |c: u8| (c as u32 * 255).checked_div(a).map_or(0, |v| v.min(255) as u8);
                 image::Rgba([un(px[i]), un(px[i + 1]), un(px[i + 2]), px[i + 3]])
             });
             img.save(p.with_extension("png")).unwrap();
