@@ -2938,12 +2938,19 @@ impl Document {
     /// Rotate a subtree by `deg` (counter-clockwise) around `pivot`.
     /// Groups stay axis-aligned and re-hug their rotated children.
     pub fn rotate(&mut self, id: NodeId, deg: f32, pivot: Pos2) {
-        for n in std::iter::once(id).chain(self.descendants(id)) {
-            let node = self.node_mut(n);
-            let c = rotate(node.rect.center(), pivot, deg);
-            node.rect = Rect::from_center_size(c, node.rect.size());
-            if node.kind != Kind::Group {
-                node.rotation = normalize_deg(node.rotation + deg);
+        self.rotate_all(&[id], deg, pivot);
+    }
+
+    /// Rotate several subtrees, with one reflow for all of them.
+    pub fn rotate_all(&mut self, ids: &[NodeId], deg: f32, pivot: Pos2) {
+        for &id in ids {
+            for n in std::iter::once(id).chain(self.descendants(id)) {
+                let node = self.node_mut(n);
+                let c = rotate(node.rect.center(), pivot, deg);
+                node.rect = Rect::from_center_size(c, node.rect.size());
+                if node.kind != Kind::Group {
+                    node.rotation = normalize_deg(node.rotation + deg);
+                }
             }
         }
         self.reflow();
@@ -3120,6 +3127,14 @@ impl Document {
         }
         // Only layers whose values change are written (and so copied away from undo snapshots).
         for (id, prop, val) in writes {
+            if let (Bindable::Width | Bindable::Height, VarValue::Number(v)) = (prop, &val) {
+                // Resized like any other way, so vector paths and group contents scale and frame
+                // children follow their constraints.
+                let r = self.nodes[&id].rect;
+                let size = if prop == Bindable::Width { vec2(v.max(0.0), r.height()) } else { vec2(r.width(), v.max(0.0)) };
+                self.set_rect(id, Rect::from_min_size(r.min, size));
+                continue;
+            }
             let n = self.node_mut(id);
             match (prop, val) {
                 (Bindable::Fill, VarValue::Color(c)) => match n.fills.last_mut() {
@@ -3132,8 +3147,6 @@ impl Document {
                 },
                 (Bindable::Opacity, VarValue::Number(v)) => n.opacity = (v / 100.0).clamp(0.0, 1.0),
                 (Bindable::Radius, VarValue::Number(v)) => n.radius = v.max(0.0),
-                (Bindable::Width, VarValue::Number(v)) => n.rect = Rect::from_min_size(n.rect.min, vec2(v.max(0.0), n.rect.height())),
-                (Bindable::Height, VarValue::Number(v)) => n.rect = Rect::from_min_size(n.rect.min, vec2(n.rect.width(), v.max(0.0))),
                 (Bindable::Gap, VarValue::Number(v)) => n.layout.gap = v,
                 (Bindable::Padding, VarValue::Number(v)) => n.layout.padding = [v; 4],
                 (Bindable::StrokeWidth, VarValue::Number(v)) => n.stroke_width = v.max(0.0),
@@ -4133,6 +4146,21 @@ impl Document {
                 Rect::from_min_size(pos2(r.min.x, 2.0 * axis - r.max.y), r.size())
             };
             node.rotation = normalize_deg(-node.rotation);
+            // Polygons and stars are mirror-symmetric left to right, so upside down is a half turn.
+            if !horizontal && matches!(node.kind, Kind::Polygon | Kind::Star) {
+                node.rotation = normalize_deg(node.rotation + 180.0);
+            }
+            // Arc angles run clockwise from 3 o'clock.
+            if let Some([start, sweep, _]) = &mut node.arc {
+                *start = (if horizontal { 180.0 - *start - *sweep } else { -*start - *sweep }).rem_euclid(360.0);
+            }
+            // Corners are top-left, top-right, bottom-right, bottom-left; sides top, right, bottom, left.
+            if let Some([tl, tr, br, bl]) = node.corner_radii {
+                node.corner_radii = Some(if horizontal { [tr, tl, bl, br] } else { [bl, br, tr, tl] });
+            }
+            if let Some([t, rt, b, l]) = node.stroke_sides {
+                node.stroke_sides = Some(if horizontal { [t, l, b, rt] } else { [b, rt, t, l] });
+            }
             let (w, h) = (r.width(), r.height());
             for pt in node.paths.iter_mut().flat_map(|sp| sp.points.iter_mut()) {
                 if horizontal {
@@ -4146,11 +4174,13 @@ impl Document {
                 }
             }
             for p in node.fills.iter_mut().chain(node.strokes.iter_mut()) {
-                if horizontal {
-                    (p.from.x, p.to.x) = (1.0 - p.from.x, 1.0 - p.to.x);
-                } else {
-                    (p.from.y, p.to.y) = (1.0 - p.from.y, 1.0 - p.to.y);
+                let mirror = |q: Pos2| if horizontal { pos2(1.0 - q.x, q.y) } else { pos2(q.x, 1.0 - q.y) };
+                // A derived width handle would come back perpendicular on the wrong side,
+                // reversing angular sweeps; pin it where the mirror puts it.
+                if matches!(p.kind, PaintKind::Radial | PaintKind::Angular | PaintKind::Diamond) {
+                    p.width_to = Some(mirror(p.width_point()));
                 }
+                (p.from, p.to) = (mirror(p.from), mirror(p.to));
             }
         }
     }
@@ -5126,6 +5156,54 @@ mod tests {
         d.distribute(&[c, a, b], true);
         assert_eq!(d.node(b).rect.min.x, 45.0);
         assert_eq!(d.node(c).rect.min.x, 90.0);
+    }
+
+    #[test]
+    fn flip_mirrors_orientation_dependent_properties() {
+        let mut d = Document::default();
+        let tri = d.insert(0, None, None, Node::new(Kind::Polygon, r(0., 0., 10., 10.)));
+        d.flip(tri, false, 5.0);
+        assert_eq!(d.node(tri).rotation, 180.0, "a triangle flipped vertically points down");
+        let mut n = Node::new(Kind::Rectangle, r(0., 0., 10., 10.));
+        (n.corner_radii, n.stroke_sides) = (Some([1., 2., 3., 4.]), Some([1., 2., 3., 4.]));
+        let mut g = Paint::solid(Rgba::BLACK);
+        (g.kind, g.from, g.to, g.width_to) = (PaintKind::Angular, pos2(0.5, 0.5), pos2(1.0, 0.5), Some(pos2(0.5, 0.8)));
+        n.fills = vec![g];
+        let rect = d.insert(0, None, None, n);
+        d.flip(rect, true, 5.0);
+        let n = d.node(rect);
+        assert_eq!(n.corner_radii, Some([2., 1., 4., 3.]), "the rounded top-left corner moves top-right");
+        assert_eq!(n.stroke_sides, Some([1., 4., 3., 2.]), "left and right weights swap");
+        assert_eq!((n.fills[0].to, n.fills[0].width_to), (pos2(0.0, 0.5), Some(pos2(0.5, 0.8))));
+        d.flip(rect, false, 5.0);
+        assert_eq!(d.node(rect).corner_radii, Some([3., 4., 1., 2.]));
+        let mut e = Node::new(Kind::Ellipse, r(0., 0., 10., 10.));
+        e.arc = Some([0., 90., 0.]);
+        let e = d.insert(0, None, None, e);
+        d.flip(e, true, 5.0);
+        assert_eq!(d.node(e).arc, Some([90., 90., 0.]), "the lower-right quarter becomes the lower-left");
+        d.flip(e, false, 5.0);
+        assert_eq!(d.node(e).arc, Some([180., 90., 0.]));
+    }
+
+    #[test]
+    fn size_bindings_resize_like_dragging() {
+        let mut d = Document::default();
+        let c = d.add_collection("Device".into());
+        let width = d.add_variable(c, "width".into(), VarValue::Number(100.0));
+        let f = d.insert(0, None, None, Node::new(Kind::Frame, r(0., 0., 100., 100.)));
+        let pinned = d.insert(0, Some(f), None, Node::new(Kind::Rectangle, r(80., 0., 20., 20.)));
+        d.node_mut(pinned).constraints[0] = Constraint::Max;
+        let pts = [PathPoint { p: pos2(0., 0.), ..Default::default() }, PathPoint { p: pos2(100., 50.), ..Default::default() }];
+        let v = d.insert(0, None, None, Node::vector(&pts, false));
+        d.node_mut(f).bindings = vec![(Bindable::Width, width)];
+        d.node_mut(v).bindings = vec![(Bindable::Width, width)];
+        d.reflow();
+        d.variables[0].values[0] = VarValue::Number(200.0);
+        d.reflow();
+        assert_eq!(d.node(f).rect.width(), 200.0);
+        assert_eq!(d.node(pinned).rect.min.x, 180.0, "a right-pinned child follows the edge");
+        assert_eq!(d.node(v).paths[0].points[1].p, pos2(200., 50.), "the path stretches with its box");
     }
 
     #[test]

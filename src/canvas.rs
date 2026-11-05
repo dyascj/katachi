@@ -52,6 +52,9 @@ impl App {
             && (self.sel != [ve.id] || !self.doc.nodes.contains_key(&ve.id) || self.tool != Tool::Move) {
                 self.vector_edit = None;
             }
+        if let Some(ve) = &mut self.vector_edit {
+            ve.drop_stale(&self.doc.node(ve.id).paths);
+        }
         let prof = std::env::var_os("KATACHI_PROFILE").is_some();
         let t0 = std::time::Instant::now();
         self.fit_texts(&painter);
@@ -314,7 +317,17 @@ impl App {
 
     fn layout_frame_labels(&mut self, painter: &Painter) {
         self.frame_labels.clear();
-        for &id in &self.doc.pages[self.page].children {
+        // Top-level frames and sections, and the frames inside sections (topmost first).
+        let mut ids = vec![];
+        let mut stack = self.doc.pages[self.page].children.clone();
+        while let Some(id) = stack.pop() {
+            let n = self.doc.node(id);
+            if n.kind == Kind::Section && n.visible {
+                stack.extend(&n.children);
+            }
+            ids.push(id);
+        }
+        for id in ids {
             let n = self.doc.node(id);
             if !n.kind.is_frame() || !n.visible {
                 continue;
@@ -787,9 +800,8 @@ impl App {
                     d = ((*start_rot + d) / 15.0).round() * 15.0 - *start_rot;
                 }
                 *deg = crate::doc::normalize_deg(*start_rot + d);
-                for id in self.sel_roots() {
-                    self.doc.rotate(id, d, *center);
-                }
+                let roots = self.sel_roots();
+                self.doc.rotate_all(&roots, d, *center);
             }
             Drag::Resize { base, handle, bounds, rot } => {
                 self.doc = base.clone();
@@ -838,18 +850,27 @@ impl App {
                     if hy == 1 { nb.min.y = 2.0 * c.y - nb.max.y }
                 }
                 let nb = Rect::from_two_pos(self.px(nb.min), self.px(nb.max));
-                if rot != 0.0 {
-                    // Keep the fixed side planted: move the new center back into world space.
-                    let c = rotate(nb.center(), b.center(), rot);
-                    self.doc.set_rect_with(roots[0], Rect::from_center_size(c, nb.size()), !mods.command);
-                    self.drag = Some(drag);
-                    return;
-                }
                 let sx = if b.width() > 0.0 { nb.width() / b.width() } else { 1.0 };
                 let sy = if b.height() > 0.0 { nb.height() / b.height() } else { 1.0 };
+                // A layer's new box: its center mapped from `b` to `nb` in the selection's own
+                // axes (rotated layers keep their fixed side planted), its size scaled.
                 let map = |p: Pos2| pos2(nb.min.x + (p.x - b.min.x) * sx, nb.min.y + (p.y - b.min.y) * sy);
-                if self.tool == Tool::Scale {
-                    // K: strokes, radii, effects, and type scale along with the box.
+                let resized = |r: Rect| {
+                    if rot == 0.0 {
+                        return Rect::from_two_pos(map(r.min), map(r.max));
+                    }
+                    let c = map(rotate(r.center(), b.center(), -rot));
+                    Rect::from_center_size(rotate(c, b.center(), rot), vec2(r.width() * sx, r.height() * sy))
+                };
+                // K scales whole subtrees: every layer's box, and strokes, radii, effects, and type.
+                // Otherwise only the selection is resized and frame children follow constraints.
+                let scale = self.tool == Tool::Scale;
+                let targets: Vec<(NodeId, Rect)> = roots
+                    .iter()
+                    .flat_map(|&id| std::iter::once(id).chain(if scale { self.doc.descendants(id) } else { vec![] }))
+                    .map(|id| (id, resized(self.doc.node(id).rect)))
+                    .collect();
+                if scale {
                     // A flat box (a line) scales by its one real axis.
                     let k = match (b.width() > 0.0, b.height() > 0.0) {
                         (true, true) => (sx.abs() * sy.abs()).sqrt(),
@@ -857,14 +878,11 @@ impl App {
                         _ => sy.abs(),
                     }
                     .max(0.001);
-                    for &id in &roots {
-                        for d in std::iter::once(id).chain(self.doc.descendants(id)) {
-                            scale_props(self.doc.node_mut(d), k);
-                        }
+                    for &(id, _) in &targets {
+                        scale_props(self.doc.node_mut(id), k);
                     }
                 }
-                for id in roots {
-                    let r = self.doc.node(id).rect;
+                for &id in &roots {
                     // Dragging a size by hand pins it, as in Figma.
                     let n = self.doc.node_mut(id);
                     if hx != 0 {
@@ -882,7 +900,11 @@ impl App {
                             n.text_sizing = TextSizing::AutoHeight;
                         }
                     }
-                    self.doc.set_rect_with(id, Rect::from_two_pos(map(r.min), map(r.max)), !mods.command);
+                }
+                // Parents come before their children, so a child's box is set after its group
+                // or frame has moved it.
+                for (id, r) in targets {
+                    self.doc.set_rect_with(id, r, !mods.command && !scale);
                 }
                 self.doc.reflow();
             }
@@ -1356,7 +1378,8 @@ impl App {
         if !self.show_grids {
             return;
         }
-        for n in self.doc.nodes.values().filter(|n| !n.grids.is_empty() && n.visible && self.doc.page_of(n.id) == self.page) {
+        let shown = |n: &Node| n.visible && self.doc.ancestors(n.id).iter().all(|a| self.doc.node(*a).visible);
+        for n in self.doc.nodes.values().filter(|n| !n.grids.is_empty() && shown(n) && self.doc.page_of(n.id) == self.page) {
             let r = n.rect;
             let clip = painter.with_clip_rect(painter.clip_rect().intersect(self.view.rect_to_screen(r)));
             for g in n.grids.iter().filter(|g| g.visible) {
@@ -2183,6 +2206,22 @@ impl App {
     // ---------- text editing ----------
 
     fn text_editor(&mut self, ui: &mut Ui, painter: &Painter) {
+        // One editor serves every text layer: each edit starts with fresh state, or the caret
+        // and undo history (Cmd Z) would carry over from the last layer edited.
+        let owner = egui::Id::new(TEXT_EDIT_ID).with("owner");
+        if ui.ctx().data(|d| d.get_temp::<NodeId>(owner)) != self.editing_text {
+            ui.ctx().data_mut(|d| {
+                d.remove::<egui::text_edit::TextEditState>(egui::Id::new(TEXT_EDIT_ID));
+                match self.editing_text {
+                    Some(id) => {
+                        d.insert_temp(owner, id);
+                    }
+                    None => {
+                        d.remove::<NodeId>(owner);
+                    }
+                }
+            });
+        }
         let Some(id) = self.editing_text else { return };
         let Some(n) = self.doc.nodes.get(&id).cloned() else {
             self.editing_text = None;

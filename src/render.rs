@@ -758,8 +758,12 @@ fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
     let needs_compositing = n.children.iter().any(|c| sc.doc.node(*c).is_mask)
         || (n.parent.is_none()
             && (paint_blend(n) || sc.doc.descendants(id).iter().any(|d| sc.doc.node(*d).blend != crate::doc::BlendMode::Normal || paint_blend(sc.doc.node(*d)))));
-    // So do effects egui can't draw: blurs, inner shadows, grain, and shadows knocked out behind see-through layers.
-    let raster_fx = n.knocks_out_shadow() || n.shadows.iter().any(|s| s.visible && matches!(s.kind, EffectKind::InnerShadow | EffectKind::LayerBlur | EffectKind::Noise | EffectKind::Texture));
+    // So do effects egui can't draw: blurs, inner shadows, grain, shadows knocked out behind
+    // see-through layers, and drop shadows cast by glyphs or by a group's contents.
+    let raster_fx = n.knocks_out_shadow()
+        || n.shadows.iter().any(|s| {
+            s.visible && (matches!(s.kind, EffectKind::InnerShadow | EffectKind::LayerBlur | EffectKind::Noise | EffectKind::Texture) || (s.kind == EffectKind::DropShadow && matches!(n.kind, Kind::Text | Kind::Group)))
+        });
     if Some(id) != sc.hide && (needs_compositing || raster_fx) {
         if !on_screen {
             return;
@@ -788,7 +792,7 @@ fn draw_node(painter: &Painter, sc: &mut Scene, id: NodeId, alpha: f32) {
     if n.kind == Kind::Boolean {
         // Operands aren't drawn themselves; the result carries the paint.
         if let Some(r) = crate::boolean::as_vector(sc.doc, id) {
-            draw_shadows(painter, &r, &v, alpha);
+            draw_shadows(painter, &r, &v, a);
             draw_content(painter, sc, &r, a);
         }
         return;

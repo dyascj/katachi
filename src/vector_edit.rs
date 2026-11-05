@@ -41,6 +41,14 @@ pub struct VectorEdit {
     pub drawing: Option<usize>,
 }
 
+impl VectorEdit {
+    /// Forget points that no longer exist: a collaborator can edit the path underneath.
+    pub fn drop_stale(&mut self, paths: &[SubPath]) {
+        self.selected.retain(|&(si, pi)| paths.get(si).is_some_and(|sp| pi < sp.points.len()));
+        self.drawing = self.drawing.filter(|&si| paths.get(si).is_some_and(|sp| !sp.points.is_empty()));
+    }
+}
+
 /// Reverse a contour's direction: handles swap sides.
 fn reverse(pts: &mut [PathPoint]) {
     pts.reverse();
@@ -482,7 +490,7 @@ impl App {
     fn toggle_smooth_at(&mut self, (si, pi): PointRef) {
         let id = self.vector_edit.as_ref().unwrap().id;
         let n = self.doc.node_mut(id);
-        let sp = &mut n.paths[si];
+        let Some(sp) = n.paths.get_mut(si).filter(|sp| pi < sp.points.len()) else { return };
         let k = sp.points.len();
         let pt = sp.points[pi];
         if pt.h_in != Vec2::ZERO || pt.h_out != Vec2::ZERO {
@@ -603,5 +611,21 @@ impl App {
                 painter.rect_stroke(r, 1.0, Stroke::new(1.0, BLUE), StrokeKind::Middle);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_point_references_are_dropped() {
+        let sp = |n: usize| SubPath { points: vec![PathPoint::default(); n], closed: false };
+        let mut ve = VectorEdit { id: 1, selected: vec![(0, 1), (1, 0), (1, 3)], tool: Default::default(), drawing: Some(1) };
+        // A collaborator deleted points from the second contour, then the whole contour.
+        ve.drop_stale(&[sp(2), sp(2)]);
+        assert_eq!((ve.selected.clone(), ve.drawing), (vec![(0, 1), (1, 0)], Some(1)));
+        ve.drop_stale(&[sp(2)]);
+        assert_eq!((ve.selected, ve.drawing), (vec![(0, 1)], None));
     }
 }

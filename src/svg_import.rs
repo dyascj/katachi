@@ -233,8 +233,17 @@ pub fn outline(doc: &Document, ids: &[NodeId]) -> Option<Node> {
         p.p += origin;
     }
     let mut n = Node::vector_paths(subs);
-    if let Some(s) = style {
-        // Gradient handles were relative to the first path; keep paints but re-anchor solids only.
+    if let Some(mut s) = style {
+        // Paints come from the first path, its gradient handles relative to that path's box:
+        // move them into the merged box so the gradient stays where it was.
+        let (first, all) = (s.rect.translate(origin), n.rect);
+        let map = |p: Pos2| ((first.min + p.to_vec2() * first.size() - all.min) / all.size().max(Vec2::splat(1e-6))).to_pos2();
+        for p in s.fills.iter_mut().chain(s.strokes.iter_mut()).filter(|p| p.kind.is_gradient()) {
+            if p.kind != PaintKind::Linear {
+                p.width_to = Some(map(p.width_point()));
+            }
+            (p.from, p.to) = (map(p.from), map(p.to));
+        }
         n.fills = s.fills;
         n.strokes = s.strokes;
         n.stroke_width = s.stroke_width;
@@ -246,6 +255,22 @@ pub fn outline(doc: &Document, ids: &[NodeId]) -> Option<Node> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flatten_keeps_gradients_where_they_were() {
+        let mut d = Document::default();
+        let mut a = Node::new(Kind::Rectangle, Rect::from_min_size(pos2(0., 0.), vec2(100., 100.)));
+        let mut g = Paint::solid(Rgba::BLACK);
+        (g.kind, g.stops, g.from, g.to) = (PaintKind::Linear, vec![(0.0, Rgba::BLACK), (1.0, Rgba::WHITE)], pos2(0., 0.5), pos2(1., 0.5));
+        a.fills = vec![g];
+        let a = d.insert(0, None, None, a);
+        let b = d.insert(0, None, None, Node::new(Kind::Rectangle, Rect::from_min_size(pos2(300., 0.), vec2(100., 100.))));
+        let n = outline(&d, &[a, b]).unwrap();
+        assert_eq!(n.rect, Rect::from_min_size(pos2(0., 0.), vec2(400., 100.)));
+        // The gradient still spans only the first rectangle: a quarter of the merged box.
+        let f = &n.fills[0];
+        assert!((f.from - pos2(0., 0.5)).length() < 0.01 && (f.to - pos2(0.25, 0.5)).length() < 0.01, "{:?} {:?}", f.from, f.to);
+    }
 
     #[test]
     fn imports_paths_groups_gradients_and_holes() {

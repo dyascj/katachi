@@ -219,13 +219,19 @@ pub fn font_family(ctx: &egui::Context, family: &str, weight: u16, italic: bool)
 }
 
 pub fn apply_case(text: &str, case: TextCase) -> String {
+    case_piece(text, case, true)
+}
+
+/// `apply_case` for part of a text; `word_start` says whether it begins a word, so a styled
+/// run that starts mid-word isn't capitalized by Title case.
+fn case_piece(text: &str, case: TextCase, word_start: bool) -> String {
     match case {
         TextCase::Original => text.to_string(),
         TextCase::Upper => text.to_uppercase(),
         TextCase::Lower => text.to_lowercase(),
         TextCase::Title => {
             let mut out = String::with_capacity(text.len());
-            let mut start = true;
+            let mut start = word_start;
             for c in text.chars() {
                 if start && c.is_alphabetic() {
                     out.extend(c.to_uppercase());
@@ -292,7 +298,8 @@ pub fn job(ctx: &egui::Context, n: &Node, text: &str, zoom: f32, color: Color32)
             let piece: String = chars[w[0]..w[1]].iter().collect();
             let st = n.spans.iter().find(|sp| sp.start <= w[0] && sp.end >= w[1]).map(|sp| sp.style.clone()).unwrap_or_default();
             let lead = if w[0] == 0 || chars[w[0] - 1] == '\n' { indent } else { 0.0 };
-            job.append(&apply_case(&piece, n.text_case), lead, format(&st));
+            let word_start = w[0] == 0 || chars[w[0] - 1].is_whitespace();
+            job.append(&case_piece(&piece, n.text_case, word_start), lead, format(&st));
         }
     }
     // Justified rows stretch to the box, except each paragraph's last (Figma, and egui's justify).
@@ -511,4 +518,18 @@ pub fn layout(painter: &egui::Painter, n: &Node, zoom: f32, color: Color32) -> (
     let (top, bottom) = trim(n);
     let size = vec2(width, (line_pitch(n) * rows.max(1) as f32).max(laid_out) + n.paragraph_spacing * n.text.matches('\n').count() as f32 - top - bottom);
     (align_rows(galley, n, zoom), size, lines)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn title_case_ignores_style_runs_inside_words() {
+        let mut n = Node::new(crate::doc::Kind::Text, egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(200., 20.)));
+        (n.text, n.text_case) = ("hello world".into(), TextCase::Title);
+        n.spans = vec![crate::doc::TextSpan { start: 2, end: 5, style: crate::doc::SpanStyle { font_weight: Some(700), ..Default::default() } }];
+        let j = job(&egui::Context::default(), &n, &n.text, 1.0, Color32::BLACK);
+        assert_eq!(j.text, "Hello World");
+    }
 }
