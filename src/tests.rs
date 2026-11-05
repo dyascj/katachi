@@ -153,6 +153,8 @@ fn deleting_an_earlier_page_stays_on_the_current_one() {
         h.state_mut().doc.pages.push(p);
     }
     h.state_mut().page = 2;
+    // One comment per page; the deleted page's goes, the rest follow their pages.
+    h.state_mut().doc.comments = (0..4).map(|p| crate::doc::Comment { id: p as u64 + 1, page: p, at: pos2(0., 0.), anchor: None, messages: vec![], resolved: false }).collect();
     h.run_steps(2);
     h.get_by_label("Page 1").click_secondary();
     h.run_steps(2);
@@ -160,6 +162,29 @@ fn deleting_an_earlier_page_stays_on_the_current_one() {
     h.run_steps(2);
     let st = h.state();
     assert_eq!((st.doc.pages.len(), st.doc.pages[st.page].name.as_str()), (3, "Page 3"));
+    assert_eq!(st.doc.comments.iter().map(|c| (c.id, c.page)).collect::<Vec<_>>(), vec![(2, 0), (3, 1), (4, 2)]);
+}
+
+#[test]
+fn undoing_a_variable_delete_restores_its_bindings() {
+    use crate::doc::{Bindable, Rgba, VarValue};
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    let st = h.state_mut();
+    let coll = st.doc.add_collection("Tokens".into());
+    let var = st.doc.add_variable(coll, "brand".into(), VarValue::Color(Rgba::rgb(255, 0, 0)));
+    st.doc.node_mut(id).bindings = vec![(Bindable::Fill, var)];
+    st.show_variables = true;
+    h.run_steps(3);
+    h.get_by_label("Delete variable").click();
+    h.run_steps(2);
+    assert!(h.state().doc.variables.is_empty() && h.state().doc.node(id).bindings.is_empty());
+    h.state_mut().show_variables = false;
+    h.run_steps(1);
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    let st = h.state();
+    assert_eq!(st.doc.variables.len(), 1);
+    assert_eq!(st.doc.node(id).bindings, vec![(Bindable::Fill, var)], "the layer is bound again");
 }
 
 #[test]

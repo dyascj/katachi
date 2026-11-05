@@ -665,8 +665,8 @@ fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEve
             // selection and a drag in progress stay on their stop when it passes a neighbor.
             let keys_id = id.with("stop-keys");
             let mut keys: Vec<u64> = ui.data(|d| d.get_temp(keys_id)).filter(|k: &Vec<u64>| k.len() == paint.stops.len()).unwrap_or_else(|| (0..paint.stops.len() as u64).collect());
-            for i in 0..paint.stops.len() {
-                ui.push_id(keys[i], |ui| ui.horizontal(|ui| {
+            for (i, &key) in keys.iter().enumerate() {
+                ui.push_id(key, |ui| ui.horizontal(|ui| {
                     let (t, c) = &mut paint.stops[i];
                     let mut pct = (*t * 100.0).round();
                     if ui.radio(sel == i, "").clicked() {
@@ -676,7 +676,7 @@ fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEve
                         *t = pct / 100.0;
                         ev = Some(PaintEvent::Changed);
                     }
-                    if hex_field(ui, id.with(("stop-hex", keys[i])), c, 56.0) {
+                    if hex_field(ui, id.with(("stop-hex", key)), c, 56.0) {
                         ev = Some(PaintEvent::Changed);
                     }
                     if alpha_field(ui, c) {

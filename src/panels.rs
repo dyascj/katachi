@@ -4484,14 +4484,14 @@ impl App {
                     // A library's style is edited in the library.
                     if style.remote.is_some() {
                         ui.label(RichText::new("From a library: edit it in its file.").color(theme::muted(ui.ctx())));
-                    } else if let StyleValue::Paint(mut ps) = style.value.clone() {
-                        if self.edit_paint_style(ui, ui.id().with(("style-paint", style.id)), &mut ps) {
-                            self.begin_edit();
-                            if let Some(st) = self.doc.styles.iter_mut().find(|s| s.id == style.id) {
-                                st.value = StyleValue::Paint(ps);
-                            }
-                            self.doc.reflow();
+                    } else if let StyleValue::Paint(mut ps) = style.value.clone()
+                        && self.edit_paint_style(ui, ui.id().with(("style-paint", style.id)), &mut ps)
+                    {
+                        self.begin_edit();
+                        if let Some(st) = self.doc.styles.iter_mut().find(|s| s.id == style.id) {
+                            st.value = StyleValue::Paint(ps);
                         }
+                        self.doc.reflow();
                     }
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
