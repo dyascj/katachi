@@ -7,6 +7,8 @@ use i_overlay::core::fill_rule::FillRule;
 use i_overlay::core::overlay_rule::OverlayRule;
 use i_overlay::float::single::SingleFloatOverlay;
 use lyon::path::iterator::PathIterator;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 type Contours = Vec<Vec<[f64; 2]>>;
 
@@ -31,7 +33,8 @@ fn operand(doc: &Document, id: NodeId) -> Contours {
             }
             acc
         }
-        Kind::Text => vec![],
+        // Text takes part through its glyph outlines, as in Figma.
+        Kind::Text => crate::svg_import::outline(doc, &[id]).map_or(vec![], |v| shape_contours(&v)),
         _ => shape_contours(n),
     }
 }
@@ -71,8 +74,33 @@ fn union(a: &Contours, b: &Contours) -> Contours {
     op(a, b, OverlayRule::Union)
 }
 
+/// Boolean results by boolean id, with the operands they were computed from. Drawing, hit
+/// testing, and reflow all ask for the result many times a second; it only changes with them.
+/// Entries are checked against the operands, so another document's boolean with the same id
+/// just recomputes.
+type ResultCache = HashMap<NodeId, (BoolOp, Vec<Node>, Contours)>;
+
 fn result_contours(doc: &Document, id: NodeId) -> Contours {
+    static CACHE: Mutex<Option<ResultCache>> = Mutex::new(None);
     let n = doc.node(id);
+    let operands: Vec<&Node> = doc.descendants(id).into_iter().map(|d| doc.node(d)).collect();
+    let fresh = |(o, nodes, _): &(BoolOp, Vec<Node>, Contours)| *o == n.bool_op && nodes.len() == operands.len() && nodes.iter().zip(&operands).all(|(a, b)| a == *b);
+    if let Some((.., c)) = CACHE.lock().unwrap().get_or_insert_default().get(&id).filter(|e| fresh(e)) {
+        return c.clone();
+    }
+    // Not under the lock: nested booleans come back through here.
+    let c = compute(doc, n);
+    let mut cache = CACHE.lock().unwrap();
+    let cache = cache.get_or_insert_default();
+    // ponytail: dropped wholesale when it fills up (deleted booleans linger until then)
+    if cache.len() >= 1024 {
+        cache.clear();
+    }
+    cache.insert(id, (n.bool_op, operands.into_iter().cloned().collect(), c.clone()));
+    c
+}
+
+fn compute(doc: &Document, n: &Node) -> Contours {
     let mut kids = n.children.iter().map(|&c| operand(doc, c)).filter(|c| !c.is_empty());
     let Some(first) = kids.next() else { return vec![] };
     // Subtract removes the upper layers from the bottom one, like Figma.
@@ -224,5 +252,21 @@ mod tests {
         assert_eq!(d.hit(0, pos2(7., 7.), 0.), None);
         assert_eq!(d.hit(0, pos2(2., 2.), 0.), Some(a), "click reaches the operand under the result");
         assert!(contains(&d, g, pos2(2., 2.)));
+        // Results are cached, and recomputed when an operand changes.
+        d.node_mut(g).bool_op = BoolOp::Intersect;
+        d.node_mut(b).rect = Rect::from_min_size(pos2(8., 8.), vec2(10., 10.));
+        assert!((area(&result(&d, g)) - 4.).abs() < 0.5, "{}", area(&result(&d, g)));
+    }
+
+    #[test]
+    fn text_cuts_through_its_glyphs() {
+        let mut d = Document::default();
+        let a = sq(&mut d, None, 0., 0., 100.);
+        let mut t = Node::new(Kind::Text, Rect::from_min_size(pos2(10., 10.), vec2(80., 60.)));
+        (t.text, t.font_size) = ("O".into(), 48.0);
+        let t = d.insert(0, None, None, t);
+        let g = d.boolean(&[a, t], BoolOp::Subtract).unwrap();
+        let left = area(&result(&d, g)).abs();
+        assert!(left < 9900., "the letter is knocked out of the square: {left}");
     }
 }
