@@ -753,10 +753,11 @@ pub fn link_at(spans: &[TextSpan], c: usize) -> Option<(usize, usize, String)> {
     let url = sp.style.link.clone()?;
     let same = |s: &TextSpan| s.style.link.as_ref() == Some(&url);
     let (mut a, mut b) = (sp.start, sp.end);
-    while let Some(s) = spans.iter().find(|s| s.end == a && same(s)) {
+    // Each step must move outward: empty or reversed spans would loop forever.
+    while let Some(s) = spans.iter().find(|s| s.end == a && s.start < a && same(s)) {
         a = s.start;
     }
-    while let Some(s) = spans.iter().find(|s| s.start == b && same(s)) {
+    while let Some(s) = spans.iter().find(|s| s.start == b && s.end > b && same(s)) {
         b = s.end;
     }
     Some((a, b, url))
@@ -1085,6 +1086,11 @@ impl BlendMode {
     pub fn from_figma(name: Option<&str>) -> Self {
         BlendMode::ALL.into_iter().find(|b| Some(b.css().replace('-', "_").to_uppercase().as_str()) == name).unwrap_or_default()
     }
+    /// Figma's menu name: "Color dodge", "Soft light".
+    pub fn label(self) -> String {
+        let css = self.css().replace('-', " ");
+        css[..1].to_uppercase() + &css[1..]
+    }
     /// CSS / SVG `mix-blend-mode` keyword.
     pub fn css(self) -> &'static str {
         match self {
@@ -1191,8 +1197,9 @@ impl ExportSetting {
         };
         let Some(v) = num.parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0) else { return false };
         match unit {
-            'w' => self.size = ExportSize::Width(v),
-            'h' => self.size = ExportSize::Height(v),
+            // The largest PNG export allows (see `export::svg_to_png`).
+            'w' => self.size = ExportSize::Width(v.min(16384.0)),
+            'h' => self.size = ExportSize::Height(v.min(16384.0)),
             _ => (self.size, self.scale) = (ExportSize::Scale, v.min(64.0)),
         }
         true
@@ -1283,6 +1290,16 @@ pub enum Cap {
     Square,
 }
 
+impl Cap {
+    pub fn label(self) -> &'static str {
+        match self {
+            Cap::None => "Flat",
+            Cap::Round => "Round",
+            Cap::Square => "Square",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Join {
     #[default]
@@ -1291,11 +1308,31 @@ pub enum Join {
     Bevel,
 }
 
+impl Join {
+    pub fn label(self) -> &'static str {
+        match self {
+            Join::Miter => "Miter",
+            Join::Round => "Round",
+            Join::Bevel => "Bevel",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StrokeAlign {
     Inside,
     Center,
     Outside,
+}
+
+impl StrokeAlign {
+    pub fn label(self) -> &'static str {
+        match self {
+            StrokeAlign::Inside => "Inside",
+            StrokeAlign::Center => "Center",
+            StrokeAlign::Outside => "Outside",
+        }
+    }
 }
 
 /// A vector anchor. `p` is relative to the node's `rect.min`; handles are offsets from `p`.
@@ -1362,6 +1399,16 @@ impl PaintKind {
     pub fn is_gradient(self) -> bool {
         !matches!(self, PaintKind::Solid | PaintKind::Image)
     }
+    pub fn label(self) -> &'static str {
+        match self {
+            PaintKind::Solid => "Solid",
+            PaintKind::Linear => "Linear",
+            PaintKind::Radial => "Radial",
+            PaintKind::Image => "Image",
+            PaintKind::Angular => "Angular",
+            PaintKind::Diamond => "Diamond",
+        }
+    }
 }
 
 /// Figma's GRADIENT_* paint type names.
@@ -1392,6 +1439,18 @@ pub enum ScaleMode {
     /// Figma's Crop: like Fill, zoomed by `tile_scale` (1 = cover) and shifted by `from`
     /// (-1..1 of the room to move on each axis, 0 = centered).
     Crop,
+}
+
+impl ScaleMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            ScaleMode::Fill => "Fill",
+            ScaleMode::Fit => "Fit",
+            ScaleMode::Stretch => "Stretch",
+            ScaleMode::Tile => "Tile",
+            ScaleMode::Crop => "Crop",
+        }
+    }
 }
 
 /// An embedded image's pixel size (read from its header).
@@ -2331,7 +2390,8 @@ impl Node {
     pub fn star_points(&self) -> Vec<Pos2> {
         let r = self.rect;
         let (c, rx, ry) = (r.center(), r.width() / 2.0, r.height() / 2.0);
-        let n = self.point_count.max(3) as usize;
+        // Files and peers can carry any count; a huge one would allocate gigabytes.
+        let n = self.point_count.clamp(3, 1000) as usize;
         let star = self.kind == Kind::Star;
         let steps = if star { n * 2 } else { n };
         (0..steps)
@@ -2415,6 +2475,9 @@ pub struct Guide {
 }
 
 pub const PAGE_BG: Rgba = Rgba::rgb(0xF5, 0xF5, 0xF5);
+
+/// Upper bound on grid layout column/row counts and spans.
+pub const MAX_GRID: u32 = 1000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Document {
@@ -2504,6 +2567,19 @@ struct FileJson {
 /// Read a .katachi file's text.
 pub fn parse_file(text: &str) -> Result<Document, String> {
     let mut doc = from_json::<FileJson>(text)?.document;
+    // New layers take ids counting up from the largest: one at the very top leaves no room.
+    if doc.next_id == NodeId::MAX || doc.nodes.contains_key(&NodeId::MAX) {
+        return Err("layer ids out of range".into());
+    }
+    // Hand-edited or foreign files: layout looks layers up by their own `id`, so it must be the
+    // key, and a span with no characters (or reversed) means nothing.
+    for (k, n) in doc.nodes.iter_mut() {
+        if n.id != *k || n.spans.iter().any(|s| s.end <= s.start) {
+            let n = std::sync::Arc::make_mut(n);
+            n.id = *k;
+            n.spans.retain(|s| s.start < s.end);
+        }
+    }
     crate::collab::repair(&mut doc);
     doc.next_id = doc.nodes.keys().map(|k| k + 1).fold(doc.next_id, u64::max);
     Ok(doc)
@@ -2807,15 +2883,49 @@ impl Document {
     }
 
     /// Move `id` under `parent` at `index` (index is computed after detaching).
-    pub fn reparent(&mut self, id: NodeId, page: usize, parent: Option<NodeId>, index: Option<usize>) {
+    /// Move `id` under `parent`. Returns false (and leaves it) when that would put a layer in
+    /// itself, or an instance inside its own main component.
+    pub fn reparent(&mut self, id: NodeId, page: usize, parent: Option<NodeId>, index: Option<usize>) -> bool {
         if parent == Some(id) || parent.is_some_and(|p| self.is_ancestor(id, p)) {
-            return;
+            return false;
+        }
+        let inside_main = |doc: &Document, n: NodeId| doc.nodes[&n].kind == Kind::Instance && doc.nodes[&n].component.is_some_and(|c| doc.nests_in_own_main(c, parent));
+        if parent != self.nodes[&id].parent && std::iter::once(id).chain(self.descendants(id)).any(|n| inside_main(self, n)) {
+            return false;
         }
         self.detach(id);
         self.node_mut(id).parent = parent;
         let list = self.children_of_mut(page, parent);
         let i = index.unwrap_or(list.len()).min(list.len());
         list.insert(i, id);
+        true
+    }
+
+    /// Whether an instance of `comp` under `parent` would contain itself: `parent` is inside a
+    /// component that `comp` uses, directly or through instances of other components.
+    pub fn nests_in_own_main(&self, comp: NodeId, parent: Option<NodeId>) -> bool {
+        let Some(p) = parent.filter(|p| self.nodes.contains_key(p)) else { return false };
+        let mains: Vec<NodeId> = std::iter::once(p).chain(self.ancestors(p)).filter(|a| self.nodes[a].kind == Kind::Component).collect();
+        if mains.is_empty() {
+            return false;
+        }
+        // Walk `comp` and the mains of the instances inside it.
+        let (mut seen, mut stack) = (std::collections::HashSet::new(), vec![comp]);
+        while let Some(c) = stack.pop() {
+            if mains.contains(&c) {
+                return true;
+            }
+            if !self.nodes.contains_key(&c) || !seen.insert(c) {
+                continue;
+            }
+            for d in self.descendants(c) {
+                let n = &self.nodes[&d];
+                if n.kind == Kind::Instance && let Some(m) = n.component {
+                    stack.push(m);
+                }
+            }
+        }
+        false
     }
 
     pub fn translate(&mut self, id: NodeId, d: Vec2) {
@@ -2828,12 +2938,19 @@ impl Document {
     /// Rotate a subtree by `deg` (counter-clockwise) around `pivot`.
     /// Groups stay axis-aligned and re-hug their rotated children.
     pub fn rotate(&mut self, id: NodeId, deg: f32, pivot: Pos2) {
-        for n in std::iter::once(id).chain(self.descendants(id)) {
-            let node = self.node_mut(n);
-            let c = rotate(node.rect.center(), pivot, deg);
-            node.rect = Rect::from_center_size(c, node.rect.size());
-            if node.kind != Kind::Group {
-                node.rotation = normalize_deg(node.rotation + deg);
+        self.rotate_all(&[id], deg, pivot);
+    }
+
+    /// Rotate several subtrees, with one reflow for all of them.
+    pub fn rotate_all(&mut self, ids: &[NodeId], deg: f32, pivot: Pos2) {
+        for &id in ids {
+            for n in std::iter::once(id).chain(self.descendants(id)) {
+                let node = self.node_mut(n);
+                let c = rotate(node.rect.center(), pivot, deg);
+                node.rect = Rect::from_center_size(c, node.rect.size());
+                if node.kind != Kind::Group {
+                    node.rotation = normalize_deg(node.rotation + deg);
+                }
             }
         }
         self.reflow();
@@ -3010,6 +3127,14 @@ impl Document {
         }
         // Only layers whose values change are written (and so copied away from undo snapshots).
         for (id, prop, val) in writes {
+            if let (Bindable::Width | Bindable::Height, VarValue::Number(v)) = (prop, &val) {
+                // Resized like any other way, so vector paths and group contents scale and frame
+                // children follow their constraints.
+                let r = self.nodes[&id].rect;
+                let size = if prop == Bindable::Width { vec2(v.max(0.0), r.height()) } else { vec2(r.width(), v.max(0.0)) };
+                self.set_rect(id, Rect::from_min_size(r.min, size));
+                continue;
+            }
             let n = self.node_mut(id);
             match (prop, val) {
                 (Bindable::Fill, VarValue::Color(c)) => match n.fills.last_mut() {
@@ -3022,8 +3147,6 @@ impl Document {
                 },
                 (Bindable::Opacity, VarValue::Number(v)) => n.opacity = (v / 100.0).clamp(0.0, 1.0),
                 (Bindable::Radius, VarValue::Number(v)) => n.radius = v.max(0.0),
-                (Bindable::Width, VarValue::Number(v)) => n.rect = Rect::from_min_size(n.rect.min, vec2(v.max(0.0), n.rect.height())),
-                (Bindable::Height, VarValue::Number(v)) => n.rect = Rect::from_min_size(n.rect.min, vec2(n.rect.width(), v.max(0.0))),
                 (Bindable::Gap, VarValue::Number(v)) => n.layout.gap = v,
                 (Bindable::Padding, VarValue::Number(v)) => n.layout.padding = [v; 4],
                 (Bindable::StrokeWidth, VarValue::Number(v)) => n.stroke_width = v.max(0.0),
@@ -3294,7 +3417,9 @@ impl Document {
     /// Bring an instance in line with its main component, keeping overrides.
     pub fn sync_instance(&mut self, inst: NodeId) {
         let Some(comp) = self.nodes[&inst].component.filter(|c| self.nodes.contains_key(c)) else { return };
-        if comp == inst || self.is_ancestor(inst, comp) {
+        // Copying a component into an instance inside it (or inside a component it uses) would
+        // nest another copy on every pass.
+        if comp == inst || self.is_ancestor(inst, comp) || self.nests_in_own_main(comp, self.nodes[&inst].parent) {
             return;
         }
         // An instance nested inside another instance is a copy its outer instance keeps in step;
@@ -3860,14 +3985,15 @@ impl Document {
     /// sparse auto-placement); rows are added when the children outnumber the cells.
     fn layout_grid(&mut self, f: NodeId, n: &Node, kids: &[NodeId], [pt, pr, pb, pl]: [f32; 4], out: &dyn Fn(&Node) -> f32) {
         let l = n.layout;
-        let cols = l.grid[0].max(1) as usize;
+        // Counts and spans arrive unchecked from files, plugins, and peers; the cell map is rows x cols.
+        let cols = l.grid[0].clamp(1, MAX_GRID) as usize;
         let gaps = [l.gap, l.cross_gap];
         let mut taken: Vec<Vec<bool>> = vec![];
         let mut placed: Vec<(NodeId, [usize; 2], [usize; 2])> = vec![];
         let mut cursor = 0;
         for &c in kids {
             let span = self.nodes[&c].grid_span;
-            let (cs, rs) = ((span[0].max(1) as usize).min(cols), span[1].max(1) as usize);
+            let (cs, rs) = ((span[0].max(1) as usize).min(cols), span[1].clamp(1, MAX_GRID) as usize);
             let mut i = cursor;
             loop {
                 let (r, col) = (i / cols, i % cols);
@@ -3885,7 +4011,7 @@ impl Document {
                 i += 1;
             }
         }
-        let counts = [cols, (l.grid[1] as usize).max(taken.len()).max(1)];
+        let counts = [cols, (l.grid[1].min(MAX_GRID) as usize).max(taken.len()).max(1)];
         let pad = [pl + pr, pt + pb];
         let fills = |k: &Node, axis: usize| k.sizing[axis] == Sizing::Fill && (k.kind != Kind::Text || k.text_sizing != TextSizing::AutoWidth);
         let lsize = |k: &Node| k.aabb().size() + Vec2::splat(2.0 * out(k));
@@ -4020,6 +4146,21 @@ impl Document {
                 Rect::from_min_size(pos2(r.min.x, 2.0 * axis - r.max.y), r.size())
             };
             node.rotation = normalize_deg(-node.rotation);
+            // Polygons and stars are mirror-symmetric left to right, so upside down is a half turn.
+            if !horizontal && matches!(node.kind, Kind::Polygon | Kind::Star) {
+                node.rotation = normalize_deg(node.rotation + 180.0);
+            }
+            // Arc angles run clockwise from 3 o'clock.
+            if let Some([start, sweep, _]) = &mut node.arc {
+                *start = (if horizontal { 180.0 - *start - *sweep } else { -*start - *sweep }).rem_euclid(360.0);
+            }
+            // Corners are top-left, top-right, bottom-right, bottom-left; sides top, right, bottom, left.
+            if let Some([tl, tr, br, bl]) = node.corner_radii {
+                node.corner_radii = Some(if horizontal { [tr, tl, bl, br] } else { [bl, br, tr, tl] });
+            }
+            if let Some([t, rt, b, l]) = node.stroke_sides {
+                node.stroke_sides = Some(if horizontal { [t, l, b, rt] } else { [b, rt, t, l] });
+            }
             let (w, h) = (r.width(), r.height());
             for pt in node.paths.iter_mut().flat_map(|sp| sp.points.iter_mut()) {
                 if horizontal {
@@ -4033,11 +4174,13 @@ impl Document {
                 }
             }
             for p in node.fills.iter_mut().chain(node.strokes.iter_mut()) {
-                if horizontal {
-                    (p.from.x, p.to.x) = (1.0 - p.from.x, 1.0 - p.to.x);
-                } else {
-                    (p.from.y, p.to.y) = (1.0 - p.from.y, 1.0 - p.to.y);
+                let mirror = |q: Pos2| if horizontal { pos2(1.0 - q.x, q.y) } else { pos2(q.x, 1.0 - q.y) };
+                // A derived width handle would come back perpendicular on the wrong side,
+                // reversing angular sweeps; pin it where the mirror puts it.
+                if matches!(p.kind, PaintKind::Radial | PaintKind::Angular | PaintKind::Diamond) {
+                    p.width_to = Some(mirror(p.width_point()));
                 }
+                (p.from, p.to) = (mirror(p.from), mirror(p.to));
             }
         }
     }
@@ -4285,7 +4428,7 @@ fn merge_from(e: &mut Node, src: &Node) {
         name, visible, opacity, fills, strokes, stroke_width, stroke_sides, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, min_size, max_size, constraints, absolute,
         paths, even_odd, text, font_size, font_weight, font_family, italic, text_sizing, text_align, text_valign, line_height, letter_spacing,
         decoration, text_case, paragraph_spacing, paragraph_indent, vertical_trim, truncate, max_lines, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, overflow, scroll_pos, fill_style,
-        stroke_style, text_style, effect_style, grid_style, prop_bind, is_mask, blend, bindings, modes, spans, lists, exposed, grid_span, grids, arc, bool_op
+        stroke_style, text_style, effect_style, grid_style, prop_bind, prop_values, is_mask, blend, bindings, modes, spans, lists, exposed, grid_span, grids, arc, bool_op
     );
     e.synced = Some(Box::new(Node { children: vec![], synced: None, remote: None, ..src.clone() }));
 }
@@ -4426,6 +4569,27 @@ mod tests {
     }
 
     #[test]
+    fn malformed_files_open_without_crashing() {
+        let mut d = Document::default();
+        let g = d.insert(0, None, None, Node::new(Kind::Group, r(0., 0., 10., 10.)));
+        let t = d.insert(0, Some(g), None, Node::new(Kind::Text, r(0., 0., 10., 10.)));
+        let link = SpanStyle { link: Some("https://example.com".into()), ..Default::default() };
+        d.node_mut(t).text = "hello world".into();
+        d.node_mut(t).spans = vec![TextSpan { start: 4, end: 8, style: link.clone() }, TextSpan { start: 4, end: 4, style: link.clone() }, TextSpan { start: 8, end: 4, style: link }];
+        d.node_mut(g).id = 999;
+        let mut opened = parse_file(&file_json(&d)).unwrap();
+        assert_eq!(opened.node(g).id, g, "a layer's id is its key");
+        assert_eq!(opened.node(t).spans.len(), 1, "empty and reversed spans are dropped");
+        opened.reflow();
+        // Spans that arrive another way (plugins) still can't hang the caret or a click.
+        assert_eq!(link_at(&d.node(t).spans, 5), Some((4, 8, "https://example.com".into())));
+        let mut top = Document::default();
+        top.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 0., 1., 1.)));
+        let json = file_json(&top).replace(r#""next_id":2"#, &format!(r#""next_id":{}"#, u64::MAX));
+        assert!(parse_file(&json).is_err(), "ids at the top of the range are refused");
+    }
+
+    #[test]
     fn non_finite_numbers_save_and_old_files_with_nulls_open() {
         let mut d = Document::default();
         let a = d.insert(0, None, None, Node::new(Kind::Rectangle, r(0., 0., 10., 10.)));
@@ -4548,6 +4712,20 @@ mod tests {
         d.node_mut(f).layout.tracks = [Some(40.), None];
         d.reflow();
         assert_eq!(d.node(e).rect.min.x, 60.0);
+    }
+
+    #[test]
+    fn huge_grid_and_star_counts_are_clamped() {
+        let mut d = Document::default();
+        let mut f = Node::new(Kind::Frame, r(0., 0., 100., 100.));
+        f.layout = AutoLayout { mode: LayoutMode::Grid, grid: [u32::MAX, u32::MAX], ..Default::default() };
+        let f = d.insert(0, None, None, f);
+        let k = d.insert(0, Some(f), None, Node::new(Kind::Rectangle, r(0., 0., 10., 10.)));
+        d.node_mut(k).grid_span = [u32::MAX, u32::MAX];
+        d.reflow();
+        let mut star = Node::new(Kind::Star, r(0., 0., 10., 10.));
+        star.point_count = u32::MAX;
+        assert_eq!(star.star_points().len(), 2000);
     }
 
     #[test]
@@ -4978,6 +5156,54 @@ mod tests {
         d.distribute(&[c, a, b], true);
         assert_eq!(d.node(b).rect.min.x, 45.0);
         assert_eq!(d.node(c).rect.min.x, 90.0);
+    }
+
+    #[test]
+    fn flip_mirrors_orientation_dependent_properties() {
+        let mut d = Document::default();
+        let tri = d.insert(0, None, None, Node::new(Kind::Polygon, r(0., 0., 10., 10.)));
+        d.flip(tri, false, 5.0);
+        assert_eq!(d.node(tri).rotation, 180.0, "a triangle flipped vertically points down");
+        let mut n = Node::new(Kind::Rectangle, r(0., 0., 10., 10.));
+        (n.corner_radii, n.stroke_sides) = (Some([1., 2., 3., 4.]), Some([1., 2., 3., 4.]));
+        let mut g = Paint::solid(Rgba::BLACK);
+        (g.kind, g.from, g.to, g.width_to) = (PaintKind::Angular, pos2(0.5, 0.5), pos2(1.0, 0.5), Some(pos2(0.5, 0.8)));
+        n.fills = vec![g];
+        let rect = d.insert(0, None, None, n);
+        d.flip(rect, true, 5.0);
+        let n = d.node(rect);
+        assert_eq!(n.corner_radii, Some([2., 1., 4., 3.]), "the rounded top-left corner moves top-right");
+        assert_eq!(n.stroke_sides, Some([1., 4., 3., 2.]), "left and right weights swap");
+        assert_eq!((n.fills[0].to, n.fills[0].width_to), (pos2(0.0, 0.5), Some(pos2(0.5, 0.8))));
+        d.flip(rect, false, 5.0);
+        assert_eq!(d.node(rect).corner_radii, Some([3., 4., 1., 2.]));
+        let mut e = Node::new(Kind::Ellipse, r(0., 0., 10., 10.));
+        e.arc = Some([0., 90., 0.]);
+        let e = d.insert(0, None, None, e);
+        d.flip(e, true, 5.0);
+        assert_eq!(d.node(e).arc, Some([90., 90., 0.]), "the lower-right quarter becomes the lower-left");
+        d.flip(e, false, 5.0);
+        assert_eq!(d.node(e).arc, Some([180., 90., 0.]));
+    }
+
+    #[test]
+    fn size_bindings_resize_like_dragging() {
+        let mut d = Document::default();
+        let c = d.add_collection("Device".into());
+        let width = d.add_variable(c, "width".into(), VarValue::Number(100.0));
+        let f = d.insert(0, None, None, Node::new(Kind::Frame, r(0., 0., 100., 100.)));
+        let pinned = d.insert(0, Some(f), None, Node::new(Kind::Rectangle, r(80., 0., 20., 20.)));
+        d.node_mut(pinned).constraints[0] = Constraint::Max;
+        let pts = [PathPoint { p: pos2(0., 0.), ..Default::default() }, PathPoint { p: pos2(100., 50.), ..Default::default() }];
+        let v = d.insert(0, None, None, Node::vector(&pts, false));
+        d.node_mut(f).bindings = vec![(Bindable::Width, width)];
+        d.node_mut(v).bindings = vec![(Bindable::Width, width)];
+        d.reflow();
+        d.variables[0].values[0] = VarValue::Number(200.0);
+        d.reflow();
+        assert_eq!(d.node(f).rect.width(), 200.0);
+        assert_eq!(d.node(pinned).rect.min.x, 180.0, "a right-pinned child follows the edge");
+        assert_eq!(d.node(v).paths[0].points[1].p, pos2(200., 50.), "the path stretches with its box");
     }
 
     #[test]

@@ -234,33 +234,56 @@ pub fn repair(doc: &mut Document) {
 
 // ---------- transport ----------
 
+/// Move messages both ways until either side ends. The socket is nonblocking and polled: a
+/// receive timeout would be simpler, but Winsock leaves a socket that timed out in an undefined
+/// state where data can be lost.
 fn pump(mut ws: WebSocket<TcpStream>, outgoing: Receiver<String>, mut incoming: impl FnMut(String) -> bool) {
-    let _ = ws.get_mut().set_read_timeout(Some(Duration::from_millis(10)));
+    if ws.get_mut().set_nonblocking(true).is_err() {
+        return;
+    }
+    let blocked = |e: &tungstenite::Error| matches!(e, tungstenite::Error::Io(e) if e.kind() == std::io::ErrorKind::WouldBlock);
+    // A send that didn't fit in the socket's buffer: tungstenite keeps the rest until we flush.
+    let mut unsent = false;
     loop {
-        match ws.read() {
+        let idle = match ws.read() {
             Ok(Message::Text(t)) => {
                 if !incoming(t.as_str().to_string()) {
                     break;
                 }
+                false
             }
             Ok(Message::Close(_)) => break,
-            Ok(_) => {}
-            Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Ok(_) => false,
+            Err(e) if blocked(&e) => true,
             Err(_) => break,
-        }
+        };
         loop {
             match outgoing.try_recv() {
-                Ok(m) => {
-                    if ws.send(Message::text(m)).is_err() {
-                        return;
-                    }
-                }
+                Ok(m) => match ws.send(Message::text(m)) {
+                    Ok(()) => {}
+                    Err(e) if blocked(&e) => unsent = true,
+                    Err(_) => return,
+                },
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Finish what's queued (a kick's notice, say) and the close, as before.
+                    let _ = ws.get_mut().set_nonblocking(false);
                     let _ = ws.close(None);
+                    let _ = ws.flush();
                     return;
                 }
             }
+        }
+        if unsent {
+            match ws.flush() {
+                Ok(()) => unsent = false,
+                Err(e) if blocked(&e) => {}
+                Err(_) => return,
+            }
+        }
+        if idle {
+            // Nothing arrived: wait a moment, briefly if a big send is still draining.
+            std::thread::sleep(Duration::from_millis(if unsent { 1 } else { 10 }));
         }
     }
 }
@@ -278,7 +301,7 @@ pub struct Relay {
     /// The shared document, as merged so far.
     pub doc: Arc<Mutex<Document>>,
     /// The session code: joiners connect to `host:port/token`; anything else is refused.
-    pub token: String,
+    token: Arc<Mutex<String>>,
     port: u16,
     stop: Arc<AtomicBool>,
     state: Arc<Mutex<ServerState>>,
@@ -297,9 +320,18 @@ impl Drop for Relay {
 }
 
 impl Relay {
+    /// The current session code.
+    pub fn token(&self) -> String {
+        self.token.lock().unwrap().clone()
+    }
+
     /// Remove a participant (the host's "Remove from session"): they're told, then disconnected.
-    pub fn kick(&self, client: u32) {
+    /// The session code changes too, or they could just rejoin with the old address. Returns the new code.
+    pub fn kick(&self, client: u32) -> String {
         self.drop_client(client, true);
+        let token = session_token();
+        *self.token.lock().unwrap() = token.clone();
+        token
     }
 
     /// Close a client's connection; dropping its sender ends its pump after what's queued.
@@ -328,6 +360,7 @@ pub fn serve(listener: TcpListener, doc: Document, token: String) -> Relay {
     let snap = Arc::new(Mutex::new(state.lock().unwrap().doc.clone()));
     let stop = Arc::new(AtomicBool::new(false));
     let port = listener.local_addr().map_or(0, |a| a.port());
+    let token = Arc::new(Mutex::new(token));
     let relay = Relay { doc: snap.clone(), token: token.clone(), port, stop: stop.clone(), state: state.clone() };
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -340,7 +373,7 @@ pub fn serve(listener: TcpListener, doc: Document, token: String) -> Relay {
                 // A connection that never finishes the handshake mustn't hold a thread forever.
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                 let check = |req: &tungstenite::handshake::server::Request, resp| {
-                    if req.uri().path().trim_start_matches('/') == token {
+                    if req.uri().path().trim_start_matches('/') == *token.lock().unwrap() {
                         Ok(resp)
                     } else {
                         Err(tungstenite::http::Response::builder().status(403).body(Some("Wrong session code".to_string())).unwrap_or_default())
@@ -446,7 +479,11 @@ pub fn connect(addr: &str, ctx: Option<egui::Context>) -> Result<Link, String> {
 /// The relay's first message: this client's id and the shared document.
 fn welcome(link: &Link) -> Result<(u32, Document), String> {
     match link.rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(ToClient::Welcome { client, doc }) => Ok((client, *doc)),
+        Ok(ToClient::Welcome { client, mut doc }) => {
+            // The host could send anything; dangling ids would panic once the page draws.
+            repair(&mut doc);
+            Ok((client, *doc))
+        }
         Ok(_) => Err("Unexpected reply".into()),
         Err(_) => Err("No response from the session".into()),
     }
@@ -534,6 +571,17 @@ impl Collab {
             spotlights: vec![],
         };
         Ok((c, doc))
+    }
+
+    /// Host only: remove a participant. The session code changes, so the shared address does too.
+    pub fn kick(&mut self, client: u32) {
+        let Some(relay) = &self.relay else { return };
+        let token = relay.kick(client);
+        for addr in [&mut self.address, &mut self.dial] {
+            if let Some((host, _)) = addr.rsplit_once('/') {
+                *addr = format!("{host}/{token}");
+            }
+        }
     }
 
     /// Keep trying to get back into the session in the background, backing off, for up to
@@ -698,7 +746,7 @@ mod tests {
         let frame = seed.insert(0, None, None, Node::new(Kind::Frame, r(0., 0.)));
         let relay = serve(listener, seed, session_token());
         let shared = relay.doc.clone();
-        let addr = format!("127.0.0.1:{}/{}", relay.port, relay.token);
+        let addr = format!("127.0.0.1:{}/{}", relay.port, relay.token());
         let (mut ca, mut da) = Collab::join(connect(&addr, None).unwrap(), addr.clone(), "A".into(), true).unwrap();
         let (mut cb, mut db) = Collab::join(connect(&addr, None).unwrap(), addr.clone(), "B".into(), false).unwrap();
         assert_ne!(ca.client, cb.client);
@@ -773,7 +821,7 @@ mod tests {
     /// A relay with clients named `names`, all joined.
     fn session(names: &[&str]) -> (Relay, Vec<(Collab, Document)>) {
         let relay = serve(TcpListener::bind("127.0.0.1:0").unwrap(), Document::default(), session_token());
-        let addr = format!("127.0.0.1:{}/{}", relay.port, relay.token);
+        let addr = format!("127.0.0.1:{}/{}", relay.port, relay.token());
         let cs = names.iter().map(|n| Collab::join(connect(&addr, None).unwrap(), addr.clone(), n.to_string(), false).unwrap()).collect();
         (relay, cs)
     }
@@ -813,7 +861,7 @@ mod tests {
         assert!(p.color < PEER_COLORS.len());
         assert_eq!(cs[1].0.spotlights, vec![(a, true)], "spotlight start reported");
         // Someone joining later sees A at once, though A hasn't moved since.
-        let addr = format!("127.0.0.1:{}/{}", relay.port, relay.token);
+        let addr = format!("127.0.0.1:{}/{}", relay.port, relay.token());
         cs.push(Collab::join(connect(&addr, None).unwrap(), addr, "C".into(), false).unwrap());
         settle(&mut cs, |cs| cs[2].0.peers.contains_key(&a));
         assert!(cs[2].0.peers[&a].spotlight, "presence replayed to a joiner");
@@ -828,7 +876,8 @@ mod tests {
         let (relay, mut cs) = session(&["Host", "Guest"]);
         let (host, guest) = (cs[0].0.client, cs[1].0.client);
         settle(&mut cs, |cs| cs[0].0.peers.contains_key(&guest) && cs[1].0.peers.contains_key(&host));
-        relay.kick(guest);
+        let old = relay.token();
+        let token = relay.kick(guest);
         settle(&mut cs, |cs| matches!(cs[1].0.status, Status::Disconnected(_)) && cs[0].0.peers.is_empty());
         assert!(matches!(&cs[1].0.status, Status::Disconnected(why) if why.contains("removed")), "{:?}", cs[1].0.status);
         assert!(cs[0].0.peers.is_empty(), "the host sees them leave");
@@ -838,6 +887,36 @@ mod tests {
         c.tick(d, 100.0);
         assert!(matches!(cs[1].0.status, Status::Disconnected(_)));
         assert_eq!(relay.state.lock().unwrap().clients.len(), 1);
+        // The old address no longer gets anyone in; the new one does.
+        let host = format!("127.0.0.1:{}", relay.port);
+        assert!(connect(&format!("{host}/{old}"), None).is_err(), "kicked guest can't rejoin with the old address");
+        assert!(connect(&format!("{host}/{token}"), None).is_ok());
+    }
+
+    #[test]
+    fn hosts_collab_kick_updates_the_shared_address() {
+        let relay = serve(TcpListener::bind("127.0.0.1:0").unwrap(), Document::default(), session_token());
+        let addr = format!("127.0.0.1:{}/{}", relay.port, relay.token());
+        let (mut c, _) = Collab::join(connect(&addr, None).unwrap(), addr.clone(), "Host".into(), true).unwrap();
+        c.relay = Some(relay);
+        c.kick(99);
+        let token = c.relay.as_ref().unwrap().token();
+        assert!(c.address.ends_with(&format!("/{token}")) && c.address != addr, "{}", c.address);
+    }
+
+    #[test]
+    fn a_hostile_welcome_is_repaired() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = format!("127.0.0.1:{}/x", listener.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            let mut ws = tungstenite::accept(listener.accept().unwrap().0).unwrap();
+            let mut bad = Document::default();
+            bad.pages[0].children.push(999);
+            ws.send(Message::text(crate::doc::to_json(&ToClient::Welcome { client: 1, doc: Box::new(bad) }))).unwrap();
+            let _ = ws.read();
+        });
+        let (_, doc) = Collab::join(connect(&addr, None).unwrap(), addr, "A".into(), false).unwrap();
+        assert!(doc.pages[0].children.is_empty(), "the missing layer is dropped instead of crashing the page");
     }
 
     #[test]

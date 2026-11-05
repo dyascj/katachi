@@ -149,20 +149,24 @@ pub fn parse_hex(s: &str) -> Option<Rgba> {
     Some(Rgba::rgb((v >> 16) as u8, (v >> 8) as u8, v as u8))
 }
 
-/// A text field showing `shown` that commits a parse of its text on Enter or focus loss.
-fn commit_field<T>(ui: &mut Ui, id: egui::Id, shown: String, width: f32, parse: impl Fn(&str) -> Option<T>) -> Option<T> {
-    let mut buf = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or(shown);
-    let resp = ui.add(egui::TextEdit::singleline(&mut buf).id(id).desired_width(width).font(FontId::monospace(11.0)));
-    let mut out = None;
-    if resp.lost_focus() {
-        out = parse(&buf);
-        ui.data_mut(|d| d.remove::<String>(id));
-    } else if resp.has_focus() {
-        ui.data_mut(|d| d.insert_temp(id, buf));
+/// A field that edits a copy of `shown` while focused (kept under `id`) and returns its text
+/// on Enter or blur. Escape reverts instead, as in Figma. `add` draws the field around the buffer.
+pub fn buffered_text(ui: &mut Ui, id: egui::Id, shown: impl FnOnce() -> String, add: impl FnOnce(&mut Ui, &mut String) -> egui::Response) -> (egui::Response, Option<String>) {
+    let mut buf = ui.data(|d| d.get_temp::<String>(id)).unwrap_or_else(shown);
+    let resp = add(ui, &mut buf);
+    let commit = resp.lost_focus() && !ui.input(|i| i.key_pressed(egui::Key::Escape));
+    if resp.has_focus() {
+        ui.data_mut(|d| d.insert_temp(id, buf.clone()));
     } else {
         ui.data_mut(|d| d.remove::<String>(id));
     }
-    out
+    (resp, commit.then_some(buf))
+}
+
+/// A monospace field showing `shown` that commits a parse of its text on Enter or blur.
+fn commit_field<T>(ui: &mut Ui, id: egui::Id, shown: String, width: f32, parse: impl Fn(&str) -> Option<T>) -> Option<T> {
+    let add = |ui: &mut Ui, buf: &mut String| ui.add(egui::TextEdit::singleline(buf).id(id).desired_width(width).font(FontId::monospace(11.0)));
+    buffered_text(ui, id, || shown, add).1.and_then(|t| parse(&t))
 }
 
 /// Hex text field that commits on Enter / focus loss, keeping alpha.
@@ -270,16 +274,17 @@ pub struct Swatches {
 }
 
 const SWATCHES: &str = "picker-swatches";
+const PICKER_SHOWN: &str = "picker-shown";
 
 impl App {
     /// Every solid color on the current page, and the solid color styles.
     pub fn swatches(&self) -> Swatches {
-        let mut page = vec![];
+        let (mut page, mut seen) = (vec![], std::collections::HashSet::new());
         for &r in &self.doc.pages[self.page].children {
             for id in std::iter::once(r).chain(self.doc.descendants(r)) {
                 let n = self.doc.node(id);
                 for p in n.fills.iter().chain(&n.strokes).filter(|p| p.visible && p.kind == PaintKind::Solid) {
-                    if !page.contains(&p.color) {
+                    if seen.insert(p.color) {
                         page.push(p.color);
                     }
                 }
@@ -297,9 +302,11 @@ impl App {
         Swatches { page, styles }
     }
 
-    /// Hand the swatches to any color picker drawn this frame (only while a popover is open).
+    /// Hand the swatches to the color picker while one is showing (it marks the frames it's
+    /// drawn in), not while any menu or dropdown is open: the scan walks the whole page.
     pub fn offer_swatches(&self, ctx: &egui::Context) {
-        if egui::Popup::is_any_open(ctx) {
+        let shown: Option<u64> = ctx.data(|d| d.get_temp(egui::Id::new(PICKER_SHOWN)));
+        if shown.is_some_and(|f| f + 1 >= ctx.cumulative_pass_nr()) {
             ctx.data_mut(|d| d.insert_temp(egui::Id::new(SWATCHES), std::sync::Arc::new(self.swatches())));
         }
     }
@@ -487,6 +494,8 @@ fn rgb_picker(ui: &mut Ui, color: &mut Rgba) -> bool {
         ui.data_mut(|d| d.insert_temp(id, (color.with_alpha(255), k)));
     }
     // Swatches: colors on this page, then color styles. A click applies one.
+    let pass = ui.ctx().cumulative_pass_nr();
+    ui.data_mut(|d| d.insert_temp(egui::Id::new(PICKER_SHOWN), pass));
     let sw: Option<std::sync::Arc<Swatches>> = ui.data(|d| d.get_temp(egui::Id::new(SWATCHES)));
     if let Some(sw) = sw {
         let page: Vec<(String, Rgba)> = sw.page.iter().take(40).map(|c| (format!("#{}", c.hex()), *c)).collect();
@@ -584,7 +593,7 @@ pub fn paint_row(ui: &mut Ui, id: egui::Id, paint: &mut Paint, title: &str) -> P
                 }
             }
             k => {
-                ui.add_sized([56.0, 20.0], egui::Label::new(format!("{k:?}")));
+                ui.add_sized([56.0, 20.0], egui::Label::new(k.label()));
             }
         }
         if alpha_field(ui, &mut paint.color) {
@@ -607,18 +616,18 @@ fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEve
     let mut ev = None;
     // Paint type and blend mode as dropdowns, as in Figma's header.
     ui.horizontal(|ui| {
-        crate::chrome::menu_button(ui, format!("{:?}", paint.kind), |ui| {
+        crate::chrome::menu_button(ui, paint.kind.label(), |ui| {
             for k in PaintKind::ALL {
-                if ui.selectable_label(paint.kind == k, format!("{k:?}")).clicked() && paint.kind != k {
+                if ui.selectable_label(paint.kind == k, k.label()).clicked() && paint.kind != k {
                     paint.convert(k);
                     ev = Some(PaintEvent::Changed);
                 }
             }
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            crate::chrome::menu_button(ui, format!("{:?}", paint.blend), |ui| {
+            crate::chrome::menu_button(ui, paint.blend.label(), |ui| {
                 for b in crate::doc::BlendMode::ALL {
-                    if ui.selectable_label(paint.blend == b, format!("{b:?}")).clicked() && paint.blend != b {
+                    if ui.selectable_label(paint.blend == b, b.label()).clicked() && paint.blend != b {
                         paint.blend = b;
                         ev = Some(PaintEvent::Changed);
                     }
@@ -652,8 +661,12 @@ fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEve
             let mut remove = None;
             let selected_id = id.with("stop");
             let mut sel: usize = ui.data(|d| d.get_temp(selected_id)).unwrap_or(0).min(paint.stops.len().saturating_sub(1));
-            for i in 0..paint.stops.len() {
-                ui.horizontal(|ui| {
+            // Each stop's row has a key that follows it through the re-sort below, so the
+            // selection and a drag in progress stay on their stop when it passes a neighbor.
+            let keys_id = id.with("stop-keys");
+            let mut keys: Vec<u64> = ui.data(|d| d.get_temp(keys_id)).filter(|k: &Vec<u64>| k.len() == paint.stops.len()).unwrap_or_else(|| (0..paint.stops.len() as u64).collect());
+            for (i, &key) in keys.iter().enumerate() {
+                ui.push_id(key, |ui| ui.horizontal(|ui| {
                     let (t, c) = &mut paint.stops[i];
                     let mut pct = (*t * 100.0).round();
                     if ui.radio(sel == i, "").clicked() {
@@ -663,7 +676,7 @@ fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEve
                         *t = pct / 100.0;
                         ev = Some(PaintEvent::Changed);
                     }
-                    if hex_field(ui, id.with(("stop-hex", i)), c, 56.0) {
+                    if hex_field(ui, id.with(("stop-hex", key)), c, 56.0) {
                         ev = Some(PaintEvent::Changed);
                     }
                     if alpha_field(ui, c) {
@@ -672,20 +685,31 @@ fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEve
                     if paint.stops.len() > 2 && icon_button(ui, Icon::Minus, false, 20.0, "Remove stop").clicked() {
                         remove = Some(i);
                     }
-                });
+                }));
             }
             if let Some(i) = remove {
                 paint.stops.remove(i);
+                keys.remove(i);
+                if sel > i {
+                    sel -= 1;
+                }
+                sel = sel.min(paint.stops.len() - 1);
                 ev = Some(PaintEvent::Changed);
             }
             if ui.button("Add stop").clicked() {
                 let t = 0.5;
                 let c = paint.sample(t);
                 paint.stops.push((t, c));
+                keys.push(keys.iter().max().map_or(0, |k| k + 1));
                 sel = paint.stops.len() - 1;
                 ev = Some(PaintEvent::Changed);
             }
-            paint.stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut order: Vec<usize> = (0..paint.stops.len()).collect();
+            order.sort_by(|&a, &b| paint.stops[a].0.total_cmp(&paint.stops[b].0));
+            sel = order.iter().position(|&i| i == sel).unwrap_or(0);
+            paint.stops = order.iter().map(|&i| paint.stops[i]).collect();
+            keys = order.iter().map(|&i| keys[i]).collect();
+            ui.data_mut(|d| d.insert_temp(keys_id, keys));
             if let Some((_, c)) = paint.stops.get_mut(sel)
                 && rgb_picker(ui, c) {
                     ev = Some(PaintEvent::Changed);
@@ -704,7 +728,7 @@ fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEve
             ui.horizontal(|ui| {
                 use crate::doc::ScaleMode;
                 for m in [ScaleMode::Fill, ScaleMode::Fit, ScaleMode::Crop, ScaleMode::Stretch, ScaleMode::Tile] {
-                    if ui.selectable_label(paint.scale_mode == m, format!("{m:?}")).clicked() && paint.scale_mode != m {
+                    if ui.selectable_label(paint.scale_mode == m, m.label()).clicked() && paint.scale_mode != m {
                         // Crop starts from what Fill shows.
                         if m == ScaleMode::Crop {
                             paint.tile_scale = 1.0;

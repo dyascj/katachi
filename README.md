@@ -11,10 +11,22 @@ It is a clean-room implementation. No Figma code, assets, or file internals are 
 
 **macOS**
 
+Download `Katachi-macos.dmg` from the [latest release](https://github.com/dyascj/katachi/releases/latest)
+and drag Katachi into Applications. The app is signed ad hoc, not notarized, so the first launch is
+blocked: open System Settings > Privacy & Security and click **Open Anyway**, or run
+`xattr -dr com.apple.quarantine /Applications/Katachi.app`. Or build it yourself:
+
 ```sh
 git clone https://github.com/dyascj/katachi && cd katachi
 scripts/macos-app.sh --install   # builds Katachi.app into /Applications
 ```
+
+**Windows** (10 and 11, x86_64)
+
+Download `Katachi-windows.zip` from the [latest release](https://github.com/dyascj/katachi/releases/latest),
+unzip it into a folder of your own (for example `%LOCALAPPDATA%\Programs\Katachi`), and run
+`katachi.exe`. SmartScreen may warn that the app is unrecognized: click **More info**, then
+**Run anyway**. Keep it in a folder you can write to so it can update itself.
 
 **Linux** (x86_64 and arm64, X11 and Wayland)
 
@@ -150,7 +162,7 @@ package instead. Set `KATACHI_NO_UPDATE=1` to turn the check off.
 - Comments pinned to frames, with replies, resolve, @mentions, filters, and unread markers
 
 **Handoff**
-- Dev Mode (Shift D) with CSS, Tailwind, SwiftUI, and Jetpack Compose code that uses your variable and style names, colors, type, and auto layout spacing on hover
+- Dev Mode (Shift D) with CSS, Tailwind, React (inline styles or Tailwind), SwiftUI, and Jetpack Compose code that uses your variable and style names, colors, type, and auto layout spacing on hover
 - Ready for dev status on frames, and annotations pinned to layers
 - Copy as PNG, SVG, CSS, or code
 
@@ -171,7 +183,7 @@ package instead. Set `KATACHI_NO_UPDATE=1` to turn the check off.
 
 **MCP server (for AI agents)**
 - The app serves MCP at `http://127.0.0.1:3855/mcp` while it's open, like Figma's Dev Mode MCP server, but agents can also edit: `claude mcp add --transport http katachi http://127.0.0.1:3855/mcp` (or Main menu > MCP server to copy the command). Stdio clients use `katachi mcp`
-- Tools: `get_metadata` (XML outline), `get_screenshot`, `get_code` (CSS, Tailwind, SwiftUI, Compose), `get_variable_defs`, `get_components`, `get_selection`, `find_nodes`, `execute_code` (Figma plugin-API JavaScript, one undo step per call), `list_pages`, `set_page`, `select`, `import_svg`, `place_image`, `export` (PNG, JPG, WebP, SVG, PDF at 2x, 512w, ...), `get_comments`, `reply_to_comment`, `save`, `open_file`, `undo`
+- Tools: `get_metadata` (XML outline), `get_screenshot`, `get_code` (CSS, Tailwind, React, SwiftUI, Compose), `get_variable_defs`, `get_components`, `get_selection`, `find_nodes`, `execute_code` (Figma plugin-API JavaScript, one undo step per call), `list_pages`, `set_page`, `select`, `import_svg`, `place_image`, `export` (PNG, JPG, WebP, SVG, PDF at 2x, 512w, ...), `get_comments`, `reply_to_comment`, `save`, `open_file`, `undo`
 - Only native clients can connect: requests from web pages (anything sending an Origin header) are refused
 
 **Plugins**

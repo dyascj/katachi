@@ -153,6 +153,8 @@ fn deleting_an_earlier_page_stays_on_the_current_one() {
         h.state_mut().doc.pages.push(p);
     }
     h.state_mut().page = 2;
+    // One comment per page; the deleted page's goes, the rest follow their pages.
+    h.state_mut().doc.comments = (0..4).map(|p| crate::doc::Comment { id: p as u64 + 1, page: p, at: pos2(0., 0.), anchor: None, messages: vec![], resolved: false }).collect();
     h.run_steps(2);
     h.get_by_label("Page 1").click_secondary();
     h.run_steps(2);
@@ -160,6 +162,29 @@ fn deleting_an_earlier_page_stays_on_the_current_one() {
     h.run_steps(2);
     let st = h.state();
     assert_eq!((st.doc.pages.len(), st.doc.pages[st.page].name.as_str()), (3, "Page 3"));
+    assert_eq!(st.doc.comments.iter().map(|c| (c.id, c.page)).collect::<Vec<_>>(), vec![(2, 0), (3, 1), (4, 2)]);
+}
+
+#[test]
+fn undoing_a_variable_delete_restores_its_bindings() {
+    use crate::doc::{Bindable, Rgba, VarValue};
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    let st = h.state_mut();
+    let coll = st.doc.add_collection("Tokens".into());
+    let var = st.doc.add_variable(coll, "brand".into(), VarValue::Color(Rgba::rgb(255, 0, 0)));
+    st.doc.node_mut(id).bindings = vec![(Bindable::Fill, var)];
+    st.show_variables = true;
+    h.run_steps(3);
+    h.get_by_label("Delete variable").click();
+    h.run_steps(2);
+    assert!(h.state().doc.variables.is_empty() && h.state().doc.node(id).bindings.is_empty());
+    h.state_mut().show_variables = false;
+    h.run_steps(1);
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    let st = h.state();
+    assert_eq!(st.doc.variables.len(), 1);
+    assert_eq!(st.doc.node(id).bindings, vec![(Bindable::Fill, var)], "the layer is bound again");
 }
 
 #[test]
@@ -1320,8 +1345,8 @@ fn autosave_and_recovery_roundtrip() {
     // Once the process that wrote it is gone, a new session can recover it as unsaved work.
     let p = mine.with_file_name(mine.file_name().unwrap().to_string_lossy().replacen(&own, "4000000000-", 1));
     std::fs::rename(&mine, &p).unwrap();
+    assert!(crate::files::orphaned_recoveries(std::path::Path::new("none")).contains(&p));
     let mut b = App::new(None);
-    assert!(b.recoverable.contains(&p));
     b.recover(&p);
     assert_eq!(b.doc.nodes.len(), 1);
     assert!(b.dirty);
@@ -4112,11 +4137,32 @@ fn comments_filter_mention_and_track_unread() {
     assert_eq!(t, "hi @Luna ");
     assert!(mentions("hi @Luna, look", "Luna") && !mentions("hi @Lunatic", "Luna"));
     h.state_mut().open_comment = Some(2);
+    h.run_steps(2);
     h.state_mut().comment_reply = "Thanks @Lu".into();
     h.run_steps(2);
     h.get_by_label("@Luna").click();
     h.run_steps(2);
     assert_eq!(h.state().comment_reply, "Thanks @Luna ");
+    // Enter sends the reply.
+    h.get_all_by_value("Thanks @Luna ").next().unwrap().focus();
+    h.run_steps(1);
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    assert_eq!(h.state().doc.comments[1].messages.last().unwrap().1, "Thanks @Luna");
+    // A draft stays with its thread.
+    h.state_mut().comment_reply = "Half".into();
+    h.state_mut().open_comment = Some(1);
+    h.run_steps(2);
+    assert_eq!(h.state().comment_reply, "", "another thread starts with an empty reply");
+    // Escape closes the thread, and so does leaving its page.
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    assert_eq!(h.state().open_comment, None);
+    h.state_mut().open_comment = Some(1);
+    h.run_steps(2);
+    h.state_mut().doc.comments[0].page = 1;
+    h.run_steps(2);
+    assert_eq!(h.state().open_comment, None, "a thread on another page closes");
 }
 
 #[test]
@@ -4231,6 +4277,9 @@ fn library_components_place_update_detach_and_relink() {
     h.run_steps(2);
     assert!(h.query_by_label("Missing").is_some() && h.query_by_label("Relink…").is_some());
     assert_eq!(h.state().doc.node(inst).fills[0].color, red);
+    // Relinking it to this file itself is refused.
+    h.state_mut().relink_library(0, dir.join("app.katachi"));
+    assert_eq!(h.state().doc.libraries[0].id, "kit-id", "a file can't be its own library");
     // Detaching a library instance leaves a plain frame.
     h.state_mut().show_libraries = false;
     h.state_mut().sel = vec![inst];
@@ -4404,4 +4453,228 @@ fn agent_shot() {
     h.run_steps(5);
     h.render().unwrap().save(out.join("agent.png")).unwrap();
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn text_editor_undo_stays_within_one_layer() {
+    let mut h = harness();
+    let mut a = Node::new(Kind::Text, r(0., 0., 100., 20.));
+    a.text = "Alpha".into();
+    let mut b = a.clone();
+    b.rect = r(0., 100., 100., 20.);
+    b.text = "Beta".into();
+    let a = h.state_mut().doc.insert(0, None, None, a);
+    let b = h.state_mut().doc.insert(0, None, None, b);
+    h.state_mut().editing_text = Some(a);
+    h.state_mut().focus_text = true;
+    h.run_steps(3);
+    h.state_mut().editing_text = None;
+    h.run_steps(2);
+    h.state_mut().editing_text = Some(b);
+    h.state_mut().focus_text = true;
+    h.run_steps(3);
+    // Cmd Z in B's editor has nothing of B's to undo, and must not bring back A's text.
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().doc.node(b).text, "Beta");
+}
+
+#[test]
+fn frames_in_sections_act_top_level() {
+    let mut h = harness();
+    let st = h.state_mut();
+    let sec = st.doc.insert(0, None, None, Node::new(Kind::Section, r(0., 0., 600., 400.)));
+    let a = st.doc.insert(0, Some(sec), None, Node::new(Kind::Frame, r(50., 50., 200., 150.)));
+    let b = st.doc.insert(0, Some(sec), None, Node::new(Kind::Frame, r(300., 50., 200., 150.)));
+    let btn = st.doc.insert(0, Some(a), None, Node::new(Kind::Rectangle, r(60., 60., 40., 20.)));
+    assert_eq!(crate::prototype::top_frame(&st.doc, btn), a, "noodles and Present start from the frame, not the section");
+    assert_eq!(crate::prototype::frames_on_page(&st.doc, 0), vec![a, b]);
+    assert_eq!(st.selectable(btn, false), btn, "frames in a section are click-through like top-level ones");
+    h.run_steps(2);
+    let labeled: Vec<NodeId> = h.state().frame_labels.iter().map(|l| l.0).collect();
+    assert!(labeled.contains(&a) && labeled.contains(&b), "{labeled:?}");
+    h.state_mut().sel = vec![btn];
+    h.state_mut().present(0.0);
+    h.run_steps(2);
+    let p = h.state().presenting.as_ref().unwrap();
+    assert_eq!(p.frame, a);
+    assert!(p.delays_fired, "nothing on a delay: Present stops checking every frame");
+}
+
+#[test]
+fn scale_tool_scales_contents_and_rotated_resize_pins_text() {
+    let mut h = harness();
+    // K on a frame: the child grows and moves with it, not just its stroke.
+    let f = draw(&mut h, Key::F, (0.0, 0.0), (100.0, 100.0));
+    let c = draw(&mut h, Key::R, (50.0, 50.0), (100.0, 100.0));
+    assert_eq!(h.state().doc.node(c).parent, Some(f));
+    h.state_mut().doc.node_mut(c).stroke_width = 2.0;
+    h.state_mut().sel = vec![f];
+    key(&mut h, Modifiers::NONE, Key::K);
+    let (p, q) = (s(&h, 100., 100.), s(&h, 200., 200.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    assert_eq!(rect(&h, f), r(0., 0., 200., 200.));
+    assert_eq!(rect(&h, c), r(100., 100., 100., 100.));
+    assert!((h.state().doc.node(c).stroke_width - 4.0).abs() < 0.01);
+    // Back to Move: widening rotated auto-width text makes it wrap, as unrotated text does.
+    key(&mut h, Modifiers::NONE, Key::V);
+    let mut t = Node::new(Kind::Text, r(400., 0., 10., 10.));
+    (t.text, t.font_size, t.text_sizing) = ("Hello".into(), 20.0, crate::doc::TextSizing::AutoWidth);
+    let t = h.state_mut().doc.insert(0, None, None, t);
+    h.run_steps(2);
+    let tr = rect(&h, t);
+    h.state_mut().doc.rotate(t, 90.0, tr.center());
+    h.state_mut().sel = vec![t];
+    h.run_steps(2);
+    // Turned 90°, its right edge (local max-x) faces up.
+    let (p, q) = (s(&h, tr.center().x, tr.center().y - tr.width() / 2.0), s(&h, tr.center().x, tr.center().y - tr.width() / 2.0 - 30.0));
+    drag(&mut h, p, q, Modifiers::NONE);
+    let n = h.state().doc.node(t);
+    assert_eq!(n.text_sizing, crate::doc::TextSizing::AutoHeight);
+    assert!((n.rect.width() - (tr.width() + 30.0)).abs() < 1.0, "{:?} from {tr:?}", n.rect);
+}
+
+#[test]
+fn multi_selection_edits_change_only_that_property() {
+    use crate::doc::{CompProp, Paint, PropValue, Rgba, StrokeAlign, StyleValue, TextAlign, TextStyle};
+    let mut h = harness();
+    // Typography: aligning two different texts keeps each one's font, size and style.
+    let mut a = Node::new(Kind::Text, r(0., 0., 200., 40.));
+    (a.text, a.font_size, a.font_weight) = ("Heading".into(), 32.0, 700);
+    let mut b = Node::new(Kind::Text, r(0., 60., 200., 20.));
+    (b.text, b.font_size, b.font_family) = ("Body".into(), 14.0, "Roboto".into());
+    let sid = h.state_mut().doc.add_style("H1".into(), StyleValue::Text(TextStyle::of(&a)));
+    a.text_style = Some(sid);
+    let a = h.state_mut().doc.insert(0, None, None, a);
+    let b = h.state_mut().doc.insert(0, None, None, b);
+    h.state_mut().sel = vec![a, b];
+    h.run_steps(3);
+    assert!(h.query_by_label("Mixed").is_some(), "differing fonts read as mixed");
+    h.get_by_label("Align center  ⌥⌘T").click();
+    h.run_steps(2);
+    let d = &h.state().doc;
+    assert_eq!([d.node(a).text_align, d.node(b).text_align], [TextAlign::Center; 2]);
+    assert_eq!([d.node(a).font_size, d.node(b).font_size], [32.0, 14.0]);
+    assert_eq!([d.node(a).font_weight, d.node(b).font_weight], [700, 400]);
+    assert_ne!(d.node(a).font_family, d.node(b).font_family);
+    assert_eq!(d.node(a).text_style, Some(sid), "alignment isn't part of a text style");
+
+    // Strokes: changing the alignment keeps each layer's own stroke paints.
+    let mut x = Node::new(Kind::Rectangle, r(300., 0., 40., 40.));
+    x.strokes = vec![Paint::solid(Rgba::rgb(255, 0, 0))];
+    let mut y = Node::new(Kind::Rectangle, r(360., 0., 40., 40.));
+    y.strokes = vec![Paint::solid(Rgba::rgb(0, 0, 255))];
+    let x = h.state_mut().doc.insert(0, None, None, x);
+    let y = h.state_mut().doc.insert(0, None, None, y);
+    h.state_mut().sel = vec![x, y];
+    h.run_steps(3);
+    assert!(h.query_by_label("Mixed strokes. Click + to replace them.").is_some());
+    h.get_by_value(h.state().doc.node(x).stroke_align.label()).click();
+    h.run_steps(2);
+    h.get_by_label("Outside").click();
+    h.run_steps(2);
+    let d = &h.state().doc;
+    assert_eq!([d.node(x).stroke_align, d.node(y).stroke_align], [StrokeAlign::Outside; 2]);
+    assert_eq!(d.node(x).strokes[0].color, Rgba::rgb(255, 0, 0));
+    assert_eq!(d.node(y).strokes[0].color, Rgba::rgb(0, 0, 255), "the other layer keeps its stroke");
+
+    // Component properties: editing one keeps each instance's other values.
+    let mut c = Node::new(Kind::Component, r(0., 200., 100., 40.));
+    c.comp_props = vec![
+        CompProp { name: "Label".into(), default: PropValue::Text("Save".into()), preferred: vec![] },
+        CompProp { name: "Icon".into(), default: PropValue::Bool(false), preferred: vec![] },
+    ];
+    let c = h.state_mut().doc.insert(0, None, None, c);
+    let i1 = h.state_mut().doc.instantiate(c, 0, None, None, pos2(0., 300.));
+    let i2 = h.state_mut().doc.instantiate(c, 0, None, None, pos2(200., 300.));
+    h.state_mut().doc.node_mut(i1).prop_values = vec![("Icon".into(), PropValue::Bool(true))];
+    h.state_mut().sel = vec![i1, i2];
+    h.run_steps(3);
+    h.get_all_by_value("Save").next().unwrap().focus();
+    h.run_steps(1);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.get_all_by_value("Save").next().unwrap().type_text("Go");
+    h.run_steps(2);
+    let get = |h: &Harness<App>, i: NodeId, k: &str| h.state().doc.node(i).prop_values.iter().find(|p| p.0 == k).map(|p| p.1.clone());
+    assert_eq!(get(&h, i1, "Label"), Some(PropValue::Text("Go".into())));
+    assert_eq!(get(&h, i2, "Label"), Some(PropValue::Text("Go".into())));
+    assert_eq!(get(&h, i1, "Icon"), Some(PropValue::Bool(true)));
+    assert_eq!(get(&h, i2, "Icon"), None, "the other instance keeps its own value");
+}
+
+#[test]
+fn add_stop_selects_the_new_stop() {
+    use crate::doc::{Paint, PaintKind, Rgba};
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    let mut g = Paint::solid(Rgba::rgb(255, 0, 0));
+    g.convert(PaintKind::Linear);
+    h.state_mut().doc.node_mut(id).fills = vec![g];
+    h.run_steps(2);
+    h.get_all_by_label("Color swatch").next().unwrap().click();
+    h.run_steps(3);
+    h.get_by_label("Add stop").click();
+    h.run_steps(3);
+    let p = &h.state().doc.node(id).fills[0];
+    assert_eq!(p.stops.len(), 3);
+    assert_eq!(p.stops[1].0, 0.5, "the new stop sorts into the middle");
+    assert_eq!(h.state().gradient_edit.unwrap().stop, 1, "and is the one selected");
+}
+
+#[test]
+fn escape_reverts_a_buffered_field() {
+    let mut h = harness();
+    h.run_steps(2);
+    let typed = |h: &mut Harness<App>, end: Key| {
+        h.get_all_by_value("1x").next().unwrap().focus();
+        h.run_steps(1);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+        h.get_all_by_value("1x").next().unwrap().type_text("3x");
+        h.run_steps(1);
+        h.key_press(end);
+        h.run_steps(2);
+    };
+    typed(&mut h, Key::Escape);
+    assert_eq!(h.state().export_default.scale, 1.0, "Escape leaves the field's value alone");
+    typed(&mut h, Key::Enter);
+    assert_eq!(h.state().export_default.scale, 3.0, "Enter commits it");
+}
+
+#[test]
+fn nested_instance_props_reach_instances_and_self_nesting_is_refused() {
+    let mut doc = crate::doc::Document::default();
+    crate::plugins::run(&mut doc, 0, &[], r##"
+        const icon = figma.createComponent(); icon.name = "Icon"; icon.resize(20, 20);
+        const g = figma.createText(); g.name = "Glyph"; g.characters = "A"; icon.appendChild(g);
+        icon.addComponentProperty("Glyph", "TEXT", "A");
+        g.componentPropertyReferences = { characters: "Glyph" };
+        const b = figma.createComponent(); b.name = "Button"; b.resize(100, 40); b.y = 100;
+        b.appendChild(icon.createInstance());
+        b.createInstance().x = 300;
+    "##).unwrap();
+    doc.reflow();
+    let comp = |doc: &crate::doc::Document, name: &str| doc.nodes.values().find(|n| n.name == name && n.kind == Kind::Component).unwrap().id;
+    let (icon, button) = (comp(&doc, "Icon"), comp(&doc, "Button"));
+    let main_nested = doc.descendants(button).into_iter().find(|&d| doc.node(d).kind == Kind::Instance).unwrap();
+    let outer = doc.nodes.values().find(|n| n.kind == Kind::Instance && n.component == Some(button)).unwrap().id;
+    let glyph = |doc: &crate::doc::Document| doc.descendants(outer).into_iter().find(|&d| doc.node(d).kind == Kind::Text).map(|t| doc.node(t).text.clone());
+    assert_eq!(glyph(&doc).as_deref(), Some("A"));
+    // A4: the main component's nested instance property reaches the existing instance.
+    doc.node_mut(main_nested).prop_values = vec![("Glyph".into(), crate::doc::PropValue::Text("B".into()))];
+    doc.reflow();
+    assert_eq!(glyph(&doc).as_deref(), Some("B"));
+    let copy = doc.descendants(outer).into_iter().find(|&d| doc.node(d).kind == Kind::Instance).unwrap();
+    assert_eq!(doc.node(copy).prop_values, doc.node(main_nested).prop_values, "the copy holds the new value too");
+    // A1: an instance dropped into its own main (or into a component it uses) is refused,
+    // and one already there doesn't grow.
+    assert!(!doc.reparent(outer, 0, Some(button), None));
+    assert!(doc.nests_in_own_main(button, Some(icon)), "Button uses Icon, so Icon can't hold a Button");
+    let count = doc.nodes.len();
+    doc.node_mut(outer).parent = Some(button);
+    doc.node_mut(button).children.push(outer);
+    doc.pages[0].children.retain(|&c| c != outer);
+    for _ in 0..3 {
+        doc.node_mut(button).opacity -= 0.1;
+        doc.reflow();
+    }
+    assert_eq!(doc.nodes.len(), count, "no copies nest inside it");
 }

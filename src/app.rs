@@ -102,6 +102,30 @@ impl Drag {
 /// One file to export: the layers to render, the base file name, and the preset.
 pub type ExportJob = (Vec<NodeId>, String, crate::doc::ExportSetting);
 
+/// Linux save dialogs return the name as typed: add ".katachi" so Open and the file manager can
+/// find the file. The dialog only confirmed replacing the name without it, so ask before
+/// replacing one with it. None = don't save.
+fn with_katachi_extension(p: PathBuf) -> Option<PathBuf> {
+    if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("katachi")) {
+        return Some(p);
+    }
+    let mut name = p.into_os_string();
+    name.push(".katachi");
+    let p = PathBuf::from(name);
+    if p.exists() {
+        let replace = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("Replace file?")
+            .set_description(format!("{} already exists. Do you want to replace it?", p.display()))
+            .set_buttons(rfd::MessageButtons::OkCancel)
+            .show();
+        if replace != rfd::MessageDialogResult::Ok {
+            return None;
+        }
+    }
+    Some(p)
+}
+
 /// "Name" + suffix + "@2x" for scaled rasters, with the format's extension.
 pub fn export_file_name(name: &str, p: &crate::doc::ExportSetting) -> String {
     let scaled = p.format.raster() && p.size == crate::doc::ExportSize::Scale && p.scale != 1.0;
@@ -176,6 +200,8 @@ pub enum Want {
     Home,
     /// Quitting was cancelled: tabs already answered "Don't save" must ask again next time.
     KeepOpen,
+    /// Open a crashed session's autosave in a new tab.
+    Recover(PathBuf),
 }
 
 /// A plugin with a UI, running until it closes.
@@ -193,6 +219,9 @@ pub struct PluginRun {
 }
 
 const CLIP_TAG: &str = "katachi/nodes:";
+
+/// Shown when a paste or drop would put an instance inside its own main component.
+pub const NESTED_MAIN: &str = "Can't place an instance inside its own main component";
 
 /// One undo step: the document, and the selection and page it was edited with, so undo and
 /// redo bring back what was selected and go to the page where the change happened (as in Figma).
@@ -508,7 +537,6 @@ impl App {
             review_updates: false,
             focused: false,
         };
-        app.recoverable = crate::files::orphaned_recoveries(&app.recovery);
         if let Some(p) = path {
             app.open_path(p);
         }
@@ -574,7 +602,6 @@ impl App {
         }
     }
 
-    #[cfg(test)]
     pub fn recovery_path(&self) -> &std::path::Path {
         &self.recovery
     }
@@ -840,8 +867,9 @@ impl App {
         chain.push(hit);
         for (i, &cur) in chain.iter().enumerate() {
             let n = self.doc.node(cur);
-            // Top-level frames are click-through; instances act like groups.
-            let top_frame = matches!(n.kind, Kind::Frame | Kind::Component | Kind::ComponentSet | Kind::Section) && n.parent.is_none();
+            // Top-level frames (sections don't count as a level) are click-through; instances act like groups.
+            let top_level = chain[..i].iter().all(|a| self.doc.node(*a).kind == Kind::Section);
+            let top_frame = matches!(n.kind, Kind::Frame | Kind::Component | Kind::ComponentSet | Kind::Section) && top_level;
             let entered = self.sel.iter().any(|&s| s != cur && self.doc.is_ancestor(cur, s));
             if i + 1 == chain.len() || !(top_frame || entered) {
                 return cur;
@@ -1376,10 +1404,16 @@ impl App {
             let mut out = vec![];
             for root in frag.iter().filter(|n| !n.parent.is_some_and(|p| in_frag.contains(&p))) {
                 let live = self.doc.nodes.get(&root.id).is_some_and(|n| n.kind == Kind::Component);
+                let sub: Vec<Node> = frag.iter().filter(|n| n.id == root.id || self.frag_descends(&frag, n.id, root.id)).cloned().collect();
+                // Figma refuses an instance inside its own main component.
+                let mains: Vec<NodeId> = if root.kind == Kind::Component && live { vec![root.id] } else { sub.iter().filter(|n| n.kind == Kind::Instance).filter_map(|n| n.component).collect() };
+                if mains.iter().any(|&c| self.doc.nests_in_own_main(c, parent)) {
+                    self.toast(NESTED_MAIN.into());
+                    continue;
+                }
                 if root.kind == Kind::Component && live {
                     out.push(self.doc.instantiate(root.id, self.page, parent, at, root.rect.min));
                 } else {
-                    let sub: Vec<Node> = frag.iter().filter(|n| n.id == root.id || self.frag_descends(&frag, n.id, root.id)).cloned().collect();
                     out.extend(self.doc.paste(&sub, self.page, parent, at));
                 }
                 at = at.map(|i| i + 1);
@@ -1768,7 +1802,7 @@ impl App {
                 true
             }
             Err(e) => {
-                self.toast(format!("Couldn't open file: {e}"));
+                self.toast(format!("Couldn't open {}: {e}", p.file_name().unwrap_or(p.as_os_str()).to_string_lossy()));
                 false
             }
         }
@@ -1798,7 +1832,10 @@ impl App {
         let path = match (&self.path, save_as) {
             (Some(p), false) => p.clone(),
             _ => match rfd::FileDialog::new().add_filter("Katachi", &["katachi"]).set_file_name(format!("{}.katachi", self.display_name())).save_file() {
-                Some(p) => p,
+                Some(p) => match with_katachi_extension(p) {
+                    Some(p) => p,
+                    None => return false,
+                },
                 None => return false,
             },
         };
@@ -1904,19 +1941,22 @@ impl App {
         self.reset_to(App::new(None));
     }
 
-    /// Open an autosave from a crashed session as unsaved work.
+    /// Open an autosave from a crashed session as unsaved work, in this new, empty app (the
+    /// shell gives each one its own tab, so recovering never replaces a document).
     pub fn recover(&mut self, p: &std::path::Path) {
+        debug_assert!(self.path.is_none() && !self.dirty);
         let parsed = std::fs::read_to_string(p)
-            .ok()
-            .and_then(|s| crate::doc::parse_file(&s).ok());
-        if let Some(doc) = parsed {
-            self.reset_to(App::new(None));
-            self.doc = doc;
-            self.dirty = true;
-            // Re-home the autosave before deleting the old one, so a second crash loses nothing.
-            let _ = crate::files::write_atomic(&self.recovery, self.document_json().as_bytes());
-            let _ = std::fs::remove_file(p);
-            self.recoverable.retain(|q| q != p);
+            .map_err(|e| e.to_string())
+            .and_then(|s| crate::doc::parse_file(&s));
+        match parsed {
+            Ok(doc) => {
+                self.doc = doc;
+                self.dirty = true;
+                // Re-home the autosave before deleting the old one, so a second crash loses nothing.
+                let _ = crate::files::write_atomic(&self.recovery, self.document_json().as_bytes());
+                let _ = std::fs::remove_file(p);
+            }
+            Err(e) => self.toast(format!("Couldn't recover autosave: {e}")),
         }
     }
 
@@ -2417,8 +2457,11 @@ impl App {
                 });
             }
         });
-        if let (Some(id), Some(r)) = (kick, self.collab.as_ref().and_then(|c| c.relay.as_ref())) {
-            r.kick(id);
+        if let Some(id) = kick
+            && let Some(c) = self.collab.as_mut()
+        {
+            c.kick(id);
+            self.toast("Removed. The session address changed: share the new one with anyone who should stay.".into());
         }
         if let Some(id) = follow {
             self.toggle_follow(id);
@@ -2454,8 +2497,9 @@ impl App {
             Ok(l) => {
                 let port = l.local_addr().map_or(self.collab_port, |a| a.port());
                 let relay = crate::collab::serve(l, self.doc.clone(), crate::collab::session_token());
-                let shared = format!("{}:{port}/{}", crate::collab::local_ip(), relay.token);
-                self.join_session(ctx, &format!("127.0.0.1:{port}/{}", relay.token), true);
+                let token = relay.token();
+                let shared = format!("{}:{port}/{token}", crate::collab::local_ip());
+                self.join_session(ctx, &format!("127.0.0.1:{port}/{token}"), true);
                 if let Some(c) = self.collab.as_mut() {
                     c.address = shared;
                     c.relay = Some(relay);
@@ -2527,7 +2571,10 @@ impl App {
             dismiss = true;
         }
         match action {
-            Some((p, true)) => self.recover(&p),
+            Some((p, true)) => {
+                self.recoverable.retain(|q| *q != p);
+                self.want = Some(Want::Recover(p));
+            }
             Some((p, false)) => {
                 let _ = std::fs::remove_file(&p);
                 self.recoverable.retain(|q| *q != p);
@@ -3266,5 +3313,19 @@ impl App {
             self.allow_close = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_as_adds_the_katachi_extension() {
+        let dir = std::env::temp_dir().join(format!("katachi-ext-{}", std::process::id()));
+        let named = |n: &str| with_katachi_extension(dir.join(n)).unwrap();
+        assert_eq!(named("Landing page"), dir.join("Landing page.katachi"));
+        assert_eq!(named("Landing v1.2"), dir.join("Landing v1.2.katachi"), "a dot in the name isn't an extension");
+        assert_eq!(named("Kit.KATACHI"), dir.join("Kit.KATACHI"));
     }
 }

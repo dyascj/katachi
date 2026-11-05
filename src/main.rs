@@ -1,3 +1,6 @@
+// Release builds on Windows are GUI programs, so double-clicking one opens no console window.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod agent;
 mod agent_ui;
 mod app;
@@ -47,14 +50,17 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     if args.get(1).is_some_and(|a| a == "--version" || a == "-V") {
+        attach_console();
         println!("katachi {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     if args.get(1).is_some_and(|a| a == "serve") {
+        attach_console();
         serve_headless(&args[2..]);
         return Ok(());
     }
-    let path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+    // Every file named (a file manager opening several at once passes them all).
+    let paths = std::env::args_os().skip(1).map(std::path::PathBuf::from).collect();
     macos_open::install();
     let transparent = !cfg!(target_os = "linux") || appearance::load().glass;
     appearance::TRANSPARENT_WINDOW.store(transparent, std::sync::atomic::Ordering::Relaxed);
@@ -86,9 +92,24 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             setup_style(&cc.egui_ctx);
-            Ok(Box::new(shell::Shell::new(path)))
+            macos_open::set_context(&cc.egui_ctx);
+            Ok(Box::new(shell::Shell::new(paths)))
         }),
     )
+}
+
+/// Windows release builds have no console of their own, so `katachi --version` and `katachi serve`
+/// print to the terminal they were typed in. A no-op without one (piped output keeps its pipes).
+fn attach_console() {
+    #[cfg(windows)]
+    {
+        unsafe extern "system" {
+            fn AttachConsole(process: u32) -> i32;
+        }
+        const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+        // SAFETY: takes a plain process id and only changes which console this process uses.
+        unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    }
 }
 
 fn setup_style(ctx: &egui::Context) {
@@ -146,7 +167,7 @@ fn serve_headless(args: &[String]) {
     };
     let listener = std::net::TcpListener::bind(("0.0.0.0", port)).expect("port in use");
     let relay = collab::serve(listener, doc, collab::session_token());
-    println!("Katachi session on {}:{port}/{}", collab::local_ip(), relay.token);
+    println!("Katachi session on {}:{port}/{}", collab::local_ip(), relay.token());
     println!("Share the whole address, code included: anyone without it is turned away.");
     let mut last = String::new();
     loop {

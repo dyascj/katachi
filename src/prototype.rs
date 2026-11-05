@@ -291,9 +291,11 @@ fn draw_device_front(painter: &Painter, device: Device, screen: Rect, s: f32) {
     }
 }
 
-/// Top-level frame containing `id` (or `id` itself).
+/// Top-level frame containing `id` (or `id` itself). Sections only organize: a frame in one
+/// counts as top-level, as in Figma.
 pub fn top_frame(doc: &Document, id: NodeId) -> NodeId {
-    *doc.ancestors(id).last().unwrap_or(&id)
+    let chain: Vec<NodeId> = std::iter::once(id).chain(doc.ancestors(id)).collect();
+    chain.into_iter().rev().find(|&a| doc.node(a).kind != Kind::Section).unwrap_or(id)
 }
 
 /// Name path of a layer relative to its top frame, for smart-animate matching.
@@ -437,9 +439,9 @@ impl App {
             .sel
             .first()
             .map(|&s| top_frame(&self.doc, s))
-            .filter(|f| self.doc.node(*f).kind.is_frame())
+            .filter(|f| self.doc.node(*f).kind.is_frame() && self.doc.node(*f).kind != Kind::Section)
             .or_else(|| page.flows.first().copied().filter(|f| self.doc.nodes.contains_key(f)))
-            .or_else(|| page.children.iter().copied().find(|c| self.doc.node(*c).kind.is_frame()));
+            .or_else(|| frames_on_page(&self.doc, self.page).first().copied());
         let Some(frame) = start else {
             self.toast("Add a frame to present".into());
             return;
@@ -645,7 +647,7 @@ impl App {
                     return;
                 }
                 Key::ArrowRight | Key::ArrowLeft => {
-                    let frames: Vec<NodeId> = self.doc.pages[self.page].children.iter().copied().filter(|c| self.doc.node(*c).kind.is_frame()).collect();
+                    let frames = frames_on_page(&self.doc, self.page);
                     if let Some(i) = frames.iter().position(|f| *f == frame) {
                         let j = if k == Key::ArrowRight { (i + 1).min(frames.len() - 1) } else { i.saturating_sub(1) };
                         self.go(frames[j], Default::default(), false, now);
@@ -817,18 +819,30 @@ impl App {
             }
         }
         // After-delay triggers fire once per visit.
-        let (shown_at, fired) = self.presenting.as_ref().map_or((now, true), |p| (p.shown_at, p.delays_fired));
+        // The frame shown now: a click this frame may have just navigated.
+        let (frame, shown_at, fired) = self.presenting.as_ref().map_or((frame, now, true), |p| (p.frame, p.shown_at, p.delays_fired));
         if !fired && doc.nodes.contains_key(&frame) {
-            let delayed = std::iter::once(frame)
+            // The soonest one; wake up just for it, not every frame.
+            let soonest = std::iter::once(frame)
                 .chain(doc.descendants(frame))
-                .find_map(|id| doc.node(id).reactions.iter().find(|r| matches!(r.trigger, Trigger::AfterDelay(ms) if (now - shown_at) * 1000.0 >= ms as f64)).map(|r| (id, r.clone())));
-            if let Some((id, r)) = delayed {
-                if let Some(p) = self.presenting.as_mut() {
-                    p.delays_fired = true;
+                .flat_map(|id| doc.node(id).reactions.iter().filter_map(move |r| if let Trigger::AfterDelay(ms) = r.trigger { Some((ms, id, r)) } else { None }))
+                .min_by_key(|(ms, ..)| *ms)
+                .map(|(ms, id, r)| (ms as f64 / 1000.0 - (now - shown_at), id, r.clone()));
+            match soonest {
+                Some((wait, _, _)) if wait > 0.0 => ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait)),
+                Some((_, id, r)) => {
+                    if let Some(p) = self.presenting.as_mut() {
+                        p.delays_fired = true;
+                    }
+                    self.perform(&doc, id, &r, &ctx, now);
+                    ctx.request_repaint();
                 }
-                self.perform(&doc, id, &r, &ctx, now);
+                None => {
+                    if let Some(p) = self.presenting.as_mut() {
+                        p.delays_fired = true;
+                    }
+                }
             }
-            ctx.request_repaint();
         }
         // Flash hotspots after a missed click, like Figma.
         if self.presenting.as_ref().is_some_and(|p| p.hint_until > now) && doc.nodes.contains_key(&top) {
@@ -869,9 +883,20 @@ fn overlay_at(doc: &Document, p: &Presentation, trigger: NodeId, o: NodeId, s: &
     free * k
 }
 
-/// Destinations a reaction can point at: top-level frames on the page.
+/// Destinations a reaction can point at: top-level frames on the page, including those in
+/// sections, in layer order.
 pub fn frames_on_page(doc: &Document, page: usize) -> Vec<NodeId> {
-    doc.pages[page].children.iter().copied().filter(|c| doc.node(*c).kind.is_frame() && doc.node(*c).kind != Kind::Section).collect()
+    let mut out = vec![];
+    let mut stack: Vec<NodeId> = doc.pages[page].children.iter().rev().copied().collect();
+    while let Some(c) = stack.pop() {
+        let n = doc.node(c);
+        if n.kind == Kind::Section {
+            stack.extend(n.children.iter().rev());
+        } else if n.kind.is_frame() {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// The variants a Change to on `id` can pick: the other variants of the set it's in.

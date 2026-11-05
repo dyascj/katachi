@@ -7,6 +7,9 @@ use resvg::usvg;
 
 fn options() -> usvg::Options<'static> {
     let mut opt = usvg::Options::default();
+    // SVGs come from other people (pastes, downloads, plugins): load embedded data: images only,
+    // never local files or network shares named in an <image href>.
+    opt.image_href_resolver.resolve_string = Box::new(|_, _| None);
     for f in crate::export::FONTS {
         opt.fontdb_mut().load_font_data(f.to_vec());
     }
@@ -230,8 +233,17 @@ pub fn outline(doc: &Document, ids: &[NodeId]) -> Option<Node> {
         p.p += origin;
     }
     let mut n = Node::vector_paths(subs);
-    if let Some(s) = style {
-        // Gradient handles were relative to the first path; keep paints but re-anchor solids only.
+    if let Some(mut s) = style {
+        // Paints come from the first path, its gradient handles relative to that path's box:
+        // move them into the merged box so the gradient stays where it was.
+        let (first, all) = (s.rect.translate(origin), n.rect);
+        let map = |p: Pos2| ((first.min + p.to_vec2() * first.size() - all.min) / all.size().max(Vec2::splat(1e-6))).to_pos2();
+        for p in s.fills.iter_mut().chain(s.strokes.iter_mut()).filter(|p| p.kind.is_gradient()) {
+            if p.kind != PaintKind::Linear {
+                p.width_to = Some(map(p.width_point()));
+            }
+            (p.from, p.to) = (map(p.from), map(p.to));
+        }
         n.fills = s.fills;
         n.strokes = s.strokes;
         n.stroke_width = s.stroke_width;
@@ -243,6 +255,22 @@ pub fn outline(doc: &Document, ids: &[NodeId]) -> Option<Node> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flatten_keeps_gradients_where_they_were() {
+        let mut d = Document::default();
+        let mut a = Node::new(Kind::Rectangle, Rect::from_min_size(pos2(0., 0.), vec2(100., 100.)));
+        let mut g = Paint::solid(Rgba::BLACK);
+        (g.kind, g.stops, g.from, g.to) = (PaintKind::Linear, vec![(0.0, Rgba::BLACK), (1.0, Rgba::WHITE)], pos2(0., 0.5), pos2(1., 0.5));
+        a.fills = vec![g];
+        let a = d.insert(0, None, None, a);
+        let b = d.insert(0, None, None, Node::new(Kind::Rectangle, Rect::from_min_size(pos2(300., 0.), vec2(100., 100.))));
+        let n = outline(&d, &[a, b]).unwrap();
+        assert_eq!(n.rect, Rect::from_min_size(pos2(0., 0.), vec2(400., 100.)));
+        // The gradient still spans only the first rectangle: a quarter of the merged box.
+        let f = &n.fills[0];
+        assert!((f.from - pos2(0., 0.5)).length() < 0.01 && (f.to - pos2(0.25, 0.5)).length() < 0.01, "{:?} {:?}", f.from, f.to);
+    }
 
     #[test]
     fn imports_paths_groups_gradients_and_holes() {
@@ -276,6 +304,22 @@ mod tests {
         let dot = d.node(kids[2]);
         assert_eq!(dot.fills[0].color, Rgba([0, 255, 0, 128]));
         assert_eq!(dot.paths[0].points.len(), 4, "circle = 4 cubic anchors");
+    }
+
+    #[test]
+    fn image_hrefs_load_data_urls_but_not_local_files() {
+        use base64::Engine;
+        let png = resvg::tiny_skia::Pixmap::new(2, 2).unwrap().encode_png().unwrap();
+        let path = std::env::temp_dir().join(format!("katachi-svg-href-{}.png", std::process::id()));
+        std::fs::write(&path, &png).unwrap();
+        let data = base64::engine::general_purpose::STANDARD.encode(&png);
+        let svg = format!(
+            r#"<svg width="10" height="10" xmlns="http://www.w3.org/2000/svg"><image href="{}" width="2" height="2"/><image href="data:image/png;base64,{data}" width="2" height="2"/></svg>"#,
+            path.display()
+        );
+        let (_, images) = import(&mut Document::default(), svg.as_bytes(), "x.svg", 0, None, Pos2::ZERO).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(images.len(), 1, "only the data: image loads");
     }
 
     #[test]

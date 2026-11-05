@@ -1,0 +1,4 @@
+# Link the C runtime statically on Windows, so katachi.exe starts on a clean install without
+# the Visual C++ redistributable (VCRUNTIME140.dll).
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

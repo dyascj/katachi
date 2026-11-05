@@ -32,7 +32,29 @@ pub fn hidden(name: &str) -> bool {
 }
 
 /// A library component's content hash: its whole subtree (a component set with its variants).
+/// Where it sits on the canvas and editor-only state (expanded, locked, Dev Mode marks,
+/// export presets) aren't changes worth an update.
 pub fn component_hash(lib: &Document, root: NodeId) -> u64 {
+    let origin = lib.nodes[&root].rect.min.to_vec2();
+    let nodes: Vec<Node> = std::iter::once(root)
+        .chain(lib.descendants(root))
+        .map(|id| Node {
+            rect: lib.nodes[&id].rect.translate(-origin),
+            expanded: false,
+            locked: false,
+            ready: false,
+            annotations: vec![],
+            exports: vec![],
+            synced: None,
+            ..(*lib.nodes[&id]).clone()
+        })
+        .collect();
+    hash_of(&nodes)
+}
+
+/// The hash copies made before `component_hash` ignored position still carry; it counts as
+/// unchanged so those files don't all offer updates at once.
+fn legacy_component_hash(lib: &Document, root: NodeId) -> u64 {
     let nodes: Vec<&Node> = std::iter::once(root).chain(lib.descendants(root)).map(|id| &*lib.nodes[&id]).collect();
     hash_of(&nodes)
 }
@@ -89,6 +111,7 @@ pub fn changes(doc: &Document, lib_id: &str, lib: &Document) -> Vec<Change> {
         if let Some(r) = mine(&n.remote)
             && let Some(c) = lib.nodes.get(&r.key)
             && component_hash(lib, r.key) != r.hash
+            && legacy_component_hash(lib, r.key) != r.hash
         {
             out.push(change(Asset::Component, r.key, &c.name));
         }
@@ -387,12 +410,25 @@ pub fn relative(dir: &Path, to: &Path) -> String {
     up.chain(down).collect::<Vec<_>>().join("/")
 }
 
-/// A stored library path, resolved against this file's folder.
+/// A stored library path, resolved against this file's folder. ".." steps are folded in and
+/// separators made native, so it matches the same file opened directly (one tab per file).
 pub fn resolve(dir: Option<&Path>, path: &str) -> PathBuf {
-    match dir {
+    use std::path::Component;
+    let joined = match dir {
         Some(d) if Path::new(path).is_relative() && !Path::new(path).has_root() => d.join(path),
         _ => PathBuf::from(path),
+    };
+    let mut out = PathBuf::new();
+    for c in joined.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir if matches!(out.components().next_back(), Some(Component::Normal(_))) => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
     }
+    out
 }
 
 /// Read a .katachi file.
@@ -421,10 +457,13 @@ pub fn load(dir: Option<&Path>, r: &LibraryRef, cached: Option<&Loaded>) -> Load
     let path = resolve(dir, &r.path);
     let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
     let now = modified(&path);
-    if let Some(c) = cached.filter(|c| c.path == path && c.modified == now) {
+    // A missing library is looked for again each time, in case it came back or was opened.
+    if let Some(c) = cached.filter(|c| c.doc.is_some() && c.path == path && c.modified == now) {
         return c.clone();
     }
-    if let Some(doc) = read(&path) {
+    // Another file saved over the library's path isn't the library (files from before ids
+    // can't be told apart, so they're taken as they are).
+    if let Some(doc) = read(&path).filter(|d| r.id.is_empty() || d.id.is_empty() || d.id == r.id) {
         return Loaded { path, doc: Some(Arc::new(doc)), modified: now };
     }
     // ponytail: parses every candidate; fine for a missing library, an index if it gets slow.
@@ -527,6 +566,12 @@ impl App {
     pub fn relink_library(&mut self, i: usize, path: PathBuf) {
         let Some(lib) = read(&path) else { return self.toast("Couldn't open that file as a library".into()) };
         let (old, new) = (self.doc.libraries[i].id.clone(), id_of(&lib, &path));
+        if self.path.as_ref() == Some(&path) || new == self.doc.id {
+            return self.toast("A file can't be its own library".into());
+        }
+        if self.doc.libraries.iter().any(|l| l.id == new && l.id != old) {
+            return self.toast("That library is already in this file".into());
+        }
         self.checkpoint();
         if new != old {
             let retarget = |r: &mut Option<Remote>| {
@@ -795,6 +840,39 @@ mod tests {
     }
 
     #[test]
+    fn moving_or_expanding_a_component_is_not_an_update() {
+        let (mut lib, button, _, _) = library();
+        let before = component_hash(&lib, button);
+        for id in std::iter::once(button).chain(lib.descendants(button)) {
+            let n = lib.node_mut(id);
+            n.rect = n.rect.translate(vec2(300., 40.));
+            (n.expanded, n.locked) = (true, true);
+        }
+        assert_eq!(component_hash(&lib, button), before);
+        lib.node_mut(button).opacity = 0.5;
+        assert_ne!(component_hash(&lib, button), before, "a real change still counts");
+    }
+
+    #[test]
+    fn a_missing_library_is_found_when_it_returns_and_an_impostor_is_not() {
+        let dir = std::env::temp_dir().join(format!("katachi-lib-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = LibraryRef { id: "lib1".into(), name: "kit".into(), path: "kit.katachi".into(), enabled: true };
+        let path = dir.join("kit.katachi");
+        let _ = std::fs::remove_file(&path);
+        let missing = load(Some(&dir), &r, None);
+        assert!(missing.doc.is_none());
+        // A different file saved at the library's path isn't accepted.
+        let other = Document { id: "other".into(), ..Default::default() };
+        std::fs::write(&path, crate::doc::file_json(&other)).unwrap();
+        assert!(load(Some(&dir), &r, Some(&missing)).doc.is_none());
+        // The library itself coming back is found, even with the miss cached.
+        std::fs::write(&path, crate::doc::file_json(&library().0)).unwrap();
+        assert!(load(Some(&dir), &r, Some(&missing)).doc.is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn import_update_and_localize() {
         let (mut lib, button, blue, _) = library();
         assert_eq!(components(&lib).iter().map(|c| c.2.as_str()).collect::<Vec<_>>(), vec!["Button"], "hidden components aren't offered");
@@ -848,7 +926,9 @@ mod tests {
         let p = |s: &str| PathBuf::from(s);
         assert_eq!(relative(&p("/work/app"), &p("/work/app/ui.katachi")), "ui.katachi");
         assert_eq!(relative(&p("/work/app"), &p("/work/kit/ui.katachi")), "../kit/ui.katachi");
-        assert_eq!(resolve(Some(&p("/work/app")), "../kit/ui.katachi"), p("/work/app/../kit/ui.katachi"));
+        // ".." is folded in, so it matches the file opened directly (A3).
+        assert_eq!(resolve(Some(&p("/work/app")), "../kit/ui.katachi"), p("/work/kit/ui.katachi"));
+        assert_eq!(resolve(Some(&p("/work/app")), "./ui.katachi"), p("/work/app/ui.katachi"));
         assert_eq!(resolve(Some(&p("/work/app")), "/abs/ui.katachi"), p("/abs/ui.katachi"));
     }
 }

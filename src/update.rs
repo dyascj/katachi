@@ -41,7 +41,7 @@ pub struct Updater {
 impl Updater {
     /// Check now and every six hours, unless this is a development build.
     pub fn start() -> Self {
-        let off = cfg!(debug_assertions) || cfg!(test) || std::env::var_os("KATACHI_NO_UPDATE").is_some() || !crate::settings::load().check_updates || managed().is_some();
+        let off = cfg!(debug_assertions) || cfg!(test) || std::env::var_os("KATACHI_NO_UPDATE").is_some() || managed().is_some();
         let u = Updater { state: Arc::new(Mutex::new(State::Idle)), seen: State::Idle, wake: Arc::default() };
         // Windows can't delete a running exe, so the last update's old copy goes now.
         if cfg!(windows) && let Ok(exe) = std::env::current_exe() {
@@ -49,17 +49,24 @@ impl Updater {
         }
         if !off {
             let (state, wake) = (u.state.clone(), u.wake.clone());
-            std::thread::spawn(move || loop {
-                if let Ok(Some(found)) = check(env!("CARGO_PKG_VERSION")) {
-                    let mut s = state.lock().unwrap();
-                    if matches!(*s, State::Idle | State::Available { .. } | State::Failed(_)) {
-                        *s = found;
+            // The preference is read every minute, so switching it in Settings works without a restart.
+            std::thread::spawn(move || {
+                let mut last: Option<std::time::Instant> = None;
+                loop {
+                    if crate::settings::load().check_updates && last.is_none_or(|t| t.elapsed().as_secs() >= 6 * 3600) {
+                        last = Some(std::time::Instant::now());
+                        if let Ok(Some(found)) = check(env!("CARGO_PKG_VERSION")) {
+                            let mut s = state.lock().unwrap();
+                            if matches!(*s, State::Idle | State::Available { .. } | State::Failed(_)) {
+                                *s = found;
+                            }
+                            if let Some(ctx) = wake.lock().unwrap().as_ref() {
+                                ctx.request_repaint();
+                            }
+                        }
                     }
-                    if let Some(ctx) = wake.lock().unwrap().as_ref() {
-                        ctx.request_repaint();
-                    }
+                    std::thread::sleep(std::time::Duration::from_secs(60));
                 }
-                std::thread::sleep(std::time::Duration::from_secs(6 * 3600));
             });
         }
         u
@@ -149,27 +156,28 @@ impl Updater {
 }
 
 /// Why this copy can't update itself, when something else installs updates: a package manager
-/// (installed under /usr), an AppImage or Flatpak (read-only), or a folder this user can't write.
+/// (installed under /usr), an AppImage or Flatpak (read-only), a folder this user can't write,
+/// or a macOS build that isn't Katachi.app (cargo install, target/release).
 pub fn managed() -> Option<&'static str> {
     static M: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
     *M.get_or_init(managed_now)
 }
 
 fn managed_now() -> Option<&'static str> {
-    if cfg!(target_os = "macos") || cfg!(windows) {
-        return None;
-    }
-    if std::env::var_os("APPIMAGE").is_some() {
+    if cfg!(target_os = "linux") && std::env::var_os("APPIMAGE").is_some() {
         return Some("This AppImage is updated by downloading the new one.");
     }
-    if std::env::var_os("FLATPAK_ID").is_some() || std::env::var_os("SNAP").is_some() {
+    if cfg!(target_os = "linux") && (std::env::var_os("FLATPAK_ID").is_some() || std::env::var_os("SNAP").is_some()) {
         return Some("Updates come from your software store.");
     }
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
+    let Ok(target) = install_target() else {
+        return Some("This build isn't Katachi.app, so it can't update itself. Download new versions from the releases page.");
+    };
+    let dir = target.parent()?;
+    // The swap renames the install inside this folder, so it has to be writable.
     let probe = dir.join(".katachi-write-test");
-    if exe.starts_with("/usr") || std::fs::write(&probe, b"").is_err() {
-        return Some("Updates come from your package manager.");
+    if target.starts_with("/usr") || std::fs::write(&probe, b"").is_err() {
+        return Some(if cfg!(target_os = "linux") { "Updates come from your package manager." } else { "Katachi's folder isn't writable by you, so it can't update itself. Download new versions from the releases page." });
     }
     let _ = std::fs::remove_file(probe);
     None
@@ -199,11 +207,29 @@ pub fn newer(tag: &str, current: &str) -> bool {
     !a.is_empty() && a > b
 }
 
+/// A system command-line tool, run without a console window. On Windows it comes from System32 by
+/// full path: a bare name is looked up in the app's own folder first (often Downloads), so a
+/// stray curl.exe there would run.
+#[cfg(windows)]
+fn tool(name: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    let windir = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+    let mut c = std::process::Command::new(windir.join("System32").join(format!("{name}.exe")));
+    // CREATE_NO_WINDOW: no console flashing up.
+    c.creation_flags(0x0800_0000);
+    c
+}
+
+#[cfg(not(windows))]
+fn tool(name: &str) -> std::process::Command {
+    std::process::Command::new(name)
+}
+
 fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
-    let out = match std::process::Command::new("curl").args(["-fsSL", "--retry", "2", "-H", "User-Agent: Katachi"]).args(args).output() {
+    let out = match tool("curl").args(["-fsSL", "--retry", "2", "-H", "User-Agent: Katachi"]).args(args).output() {
         // Some Linux installs ship wget but not curl.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && !cfg!(windows) => {
-            std::process::Command::new("wget").args(["-qO-", "--tries=3", "--header=User-Agent: Katachi"]).args(args).output().map_err(|_| "neither curl nor wget is installed".to_string())?
+            tool("wget").args(["-qO-", "--tries=3", "--header=User-Agent: Katachi"]).args(args).output().map_err(|_| "neither curl nor wget is installed".to_string())?
         }
         r => r.map_err(|e| format!("curl: {e}"))?,
     };
@@ -242,9 +268,17 @@ fn install(url: &str, sig_url: &str, version: &str) -> Result<(), String> {
     let stage = parent.join(".katachi-update");
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage).map_err(|e| format!("{}: {e}", stage.display()))?;
+    let swapped = swap_in(&data, &target, parent, &stage);
+    // The download is tens of MB, so it never stays behind, whatever happened.
+    let _ = std::fs::remove_dir_all(&stage);
+    swapped
+}
+
+/// Unpack the verified download into `stage` and swap it in for `target`.
+fn swap_in(data: &[u8], target: &Path, parent: &Path, stage: &Path) -> Result<(), String> {
     let archive = stage.join(ASSET);
-    std::fs::write(&archive, &data).map_err(|e| e.to_string())?;
-    let status = std::process::Command::new("tar").arg(if ASSET.ends_with(".zip") { "-xf" } else { "-xzf" }).arg(&archive).arg("-C").arg(&stage).status().map_err(|e| e.to_string())?;
+    std::fs::write(&archive, data).map_err(|e| e.to_string())?;
+    let status = tool("tar").arg(if ASSET.ends_with(".zip") { "-xf" } else { "-xzf" }).arg(&archive).arg("-C").arg(stage).status().map_err(|e| e.to_string())?;
     if !status.success() {
         return Err("couldn't unpack the download".into());
     }
@@ -262,20 +296,18 @@ fn install(url: &str, sig_url: &str, version: &str) -> Result<(), String> {
     if !cfg!(target_os = "macos") {
         let ran = std::process::Command::new(&fresh).arg("--version").output();
         if !ran.as_ref().is_ok_and(|o| o.status.success() && o.stdout.starts_with(b"katachi ")) {
-            let _ = std::fs::remove_dir_all(&stage);
             return Err("the new version doesn't run on this system".into());
         }
     }
     // Move the running copy aside (allowed even while it runs), put the new one in its place.
     let old = parent.join(if cfg!(target_os = "macos") { ".Katachi-old.app" } else if cfg!(windows) { "katachi.old.exe" } else { ".katachi-old" });
     let _ = remove(&old);
-    std::fs::rename(&target, &old).map_err(|e| format!("{}: {e}", target.display()))?;
-    if let Err(e) = std::fs::rename(&fresh, &target) {
-        let _ = std::fs::rename(&old, &target);
+    std::fs::rename(target, &old).map_err(|e| format!("{}: {e}", target.display()))?;
+    if let Err(e) = std::fs::rename(&fresh, target) {
+        let _ = std::fs::rename(&old, target);
         return Err(e.to_string());
     }
     let _ = remove(&old);
-    let _ = std::fs::remove_dir_all(&stage);
     Ok(())
 }
 
@@ -303,7 +335,7 @@ fn restart() {
     let pid = std::process::id();
     let t = target.display().to_string().replace('\'', "'\\''");
     let spawned = if cfg!(windows) {
-        std::process::Command::new("cmd").args(["/C", &format!("timeout /T 2 /NOBREAK >NUL & start \"\" \"{}\"", target.display())]).spawn()
+        tool("cmd").args(["/C", &format!("timeout /T 2 /NOBREAK >NUL & start \"\" \"{}\"", target.display())]).spawn()
     } else {
         let launch = if cfg!(target_os = "macos") { format!("open '{t}'") } else { format!("'{t}' >/dev/null 2>&1 &") };
         std::process::Command::new("sh").args(["-c", &format!("while kill -0 {pid} 2>/dev/null; do sleep 0.2; done; {launch}")]).spawn()
@@ -327,6 +359,14 @@ mod tests {
         let data = curl(&[&url]).unwrap();
         assert!(verified(&data, &curl_text(&sig).unwrap(), &signed_comment(&version)), "{version}: {ASSET} doesn't match its signature");
         eprintln!("Katachi {version}: {ASSET} ({} MB) verified", data.len() >> 20);
+    }
+
+    /// A test binary sits in target/, like a cargo install or target/release build: on macOS it
+    /// isn't Katachi.app, so it must not offer an "Update now" that can only fail.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_build_outside_the_app_bundle_does_not_offer_updates() {
+        assert!(managed_now().is_some());
     }
 
     #[test]

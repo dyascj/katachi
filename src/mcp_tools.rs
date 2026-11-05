@@ -154,6 +154,8 @@ impl App {
                     Some("swiftui") => crate::codegen::Lang::SwiftUi,
                     Some("compose") => crate::codegen::Lang::Compose,
                     Some("tailwind") => crate::codegen::Lang::Tailwind,
+                    Some("react") => crate::codegen::Lang::React,
+                    Some("react-tailwind") => crate::codegen::Lang::ReactTailwind,
                     _ => crate::codegen::Lang::Css,
                 };
                 let mut out = String::new();
