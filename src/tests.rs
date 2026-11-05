@@ -4391,6 +4391,7 @@ echo '{{"type":"result","subtype":"success","is_error":false}}'
 }
 
 /// Type a message into the Agent panel and wait until the agent has answered `replies` times.
+#[cfg(unix)]
 fn agent_say(h: &mut Harness<App>, text: &str, reply: &str, replies: usize) {
     h.event(Event::Text(text.into()));
     key(h, Modifiers::NONE, Key::Enter);

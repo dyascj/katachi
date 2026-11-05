@@ -2109,8 +2109,8 @@ impl App {
         }
     }
 
-    /// Tests: an MCP server on a free port, for the Agent panel.
-    #[cfg(test)]
+    /// Tests: an MCP server on a free port, for the Agent panel (its tests are Unix only).
+    #[cfg(all(test, unix))]
     pub fn listen_for_agents(&mut self, ctx: &egui::Context) {
         self.mcp = crate::mcp::start(ctx.clone(), 0);
     }
