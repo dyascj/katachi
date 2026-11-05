@@ -163,7 +163,7 @@ fn serve_headless(args: &[String]) {
     };
     let listener = std::net::TcpListener::bind(("0.0.0.0", port)).expect("port in use");
     let relay = collab::serve(listener, doc, collab::session_token());
-    println!("Katachi session on {}:{port}/{}", collab::local_ip(), relay.token);
+    println!("Katachi session on {}:{port}/{}", collab::local_ip(), relay.token());
     println!("Share the whole address, code included: anyone without it is turned away.");
     let mut last = String::new();
     loop {

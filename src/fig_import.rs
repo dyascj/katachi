@@ -10,6 +10,19 @@ pub struct FigFile {
     pub images: HashMap<String, Vec<u8>>,
 }
 
+/// The most any one part of a `.fig` may inflate to. Real files are far smaller; this
+/// turns a decompression bomb into an error instead of an out-of-memory abort.
+const MAX_INFLATED: usize = 1 << 30;
+
+fn read_capped(r: impl std::io::Read, cap: usize) -> Result<Vec<u8>, String> {
+    let mut out = vec![];
+    std::io::Read::read_to_end(&mut r.take(cap as u64 + 1), &mut out).map_err(|e| e.to_string())?;
+    if out.len() > cap {
+        return Err("file is too large".into());
+    }
+    Ok(out)
+}
+
 fn fig_kiwi(data: &[u8]) -> Result<Value, String> {
     if !data.starts_with(b"fig-kiwi") && !data.starts_with(b"fig-jam.") {
         return Err("not a Figma file".into());
@@ -24,12 +37,9 @@ fn fig_kiwi(data: &[u8]) -> Result<Value, String> {
     }
     let inflate = |c: &[u8]| -> Result<Vec<u8>, String> {
         if c.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
-            let mut out = vec![];
-            let mut dec = ruzstd::decoding::StreamingDecoder::new(c).map_err(|e| e.to_string())?;
-            std::io::Read::read_to_end(&mut dec, &mut out).map_err(|e| e.to_string())?;
-            Ok(out)
+            read_capped(ruzstd::decoding::StreamingDecoder::new(c).map_err(|e| e.to_string())?, MAX_INFLATED)
         } else {
-            miniz_oxide::inflate::decompress_to_vec(c).map_err(|e| format!("{e:?}"))
+            miniz_oxide::inflate::decompress_to_vec_with_limit(c, MAX_INFLATED).map_err(|e| format!("{e:?}"))
         }
     };
     let schema = Schema::decode(&inflate(chunks.first().ok_or("missing schema")?)?)?;
@@ -41,18 +51,23 @@ pub fn read(data: &[u8]) -> Result<FigFile, String> {
         return Ok(FigFile { message: fig_kiwi(data)?, images: HashMap::new() });
     }
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(data)).map_err(|e| e.to_string())?;
-    let mut canvas = vec![];
-    let mut images = HashMap::new();
-    for i in 0..zip.len() {
-        let mut f = zip.by_index(i).map_err(|e| e.to_string())?;
-        let name = f.name().map(|n| n.to_string()).unwrap_or_default();
-        let mut buf = vec![];
-        std::io::Read::read_to_end(&mut f, &mut buf).map_err(|e| e.to_string())?;
-        if name == "canvas.fig" {
-            canvas = buf;
-        } else if let Some(hash) = name.strip_prefix("images/").filter(|h| !h.is_empty()) {
-            images.insert(hash.to_string(), buf);
+    // Only the entries Katachi uses are inflated, all sharing one size budget.
+    let mut left = MAX_INFLATED;
+    let mut entry = |zip: &mut zip::ZipArchive<_>, name: &str| -> Result<Vec<u8>, String> {
+        let f = zip.by_name(name).map_err(|e| e.to_string())?;
+        if f.size() > left as u64 {
+            return Err("file is too large".into());
         }
+        let buf = read_capped(f, left)?;
+        left -= buf.len();
+        Ok(buf)
+    };
+    let canvas = entry(&mut zip, "canvas.fig")?;
+    let names: Vec<String> = zip.file_names().filter_map(Result::ok).filter(|n| n.len() > 7 && n.starts_with("images/")).map(|n| n.into_owned()).collect();
+    let mut images = HashMap::new();
+    for name in names {
+        let buf = entry(&mut zip, &name)?;
+        images.insert(name["images/".len()..].to_string(), buf);
     }
     Ok(FigFile { message: fig_kiwi(&canvas)?, images })
 }
@@ -135,7 +150,7 @@ fn paints(list: &[Value]) -> Vec<Paint> {
             "IMAGE" => {
                 let mut i = Paint::solid(Rgba::WHITE.with_alpha((opacity * 255.0) as u8));
                 i.kind = PaintKind::Image;
-                i.image = p.get("image").and_then(|im| im.get("hash")).map(|h| hex(&h.bytes())).unwrap_or_default();
+                i.image = p.get("image").and_then(|im| im.get("hash")).map(|h| hex(h.bytes())).unwrap_or_default();
                 i.scale_mode = match p.s("imageScaleMode") {
                     Some("FIT") => ScaleMode::Fit,
                     Some("TILE") => ScaleMode::Tile,
@@ -258,9 +273,10 @@ fn guid(v: Option<&Value>) -> Option<Guid> {
 }
 
 /// Build a Katachi document from a decoded `.fig`.
-pub fn to_document(fig: &FigFile) -> Result<Document, String> {
-    let changes = fig.message.arr("nodeChanges");
-    let blobs: Vec<Vec<u8>> = fig.message.arr("blobs").iter().map(|b| b.get("bytes").map(|x| x.bytes()).unwrap_or_default()).collect();
+pub fn to_document(fig: FigFile) -> Result<Document, String> {
+    let FigFile { message, images } = fig;
+    let changes = message.arr("nodeChanges");
+    let blobs: Vec<&[u8]> = message.arr("blobs").iter().map(|b| b.get("bytes").map_or(&[][..], |x| x.bytes())).collect();
     let by_guid: HashMap<Guid, &Value> = changes.iter().filter_map(|n| Some((guid(n.get("guid"))?, n))).collect();
     // Children of each node, in Figma's fractional-index order.
     let mut kids: HashMap<Guid, Vec<(String, Guid)>> = HashMap::new();
@@ -275,8 +291,8 @@ pub fn to_document(fig: &FigFile) -> Result<Document, String> {
     }
     let doc_root = changes.iter().find(|n| n.s("type") == Some("DOCUMENT")).and_then(|n| guid(n.get("guid"))).ok_or("no document node")?;
     let mut doc = Document { pages: vec![], ..Default::default() };
-    for (k, v) in &fig.images {
-        doc.images.insert(k.clone(), std::sync::Arc::new(v.clone()));
+    for (k, v) in images {
+        doc.images.insert(k, std::sync::Arc::new(v));
     }
     let mut ids: HashMap<Guid, NodeId> = HashMap::new();
     let mut instances: Vec<(NodeId, Guid)> = vec![];
@@ -291,7 +307,7 @@ pub fn to_document(fig: &FigFile) -> Result<Document, String> {
         doc.pages.push(Page { name, children: vec![], background: bg, flows: vec![], view: None, guides: vec![], prototype: Default::default() });
         let page = doc.pages.len() - 1;
         for (_, child) in kids.get(&page_guid).cloned().unwrap_or_default() {
-            import_node(&mut doc, &by_guid, &kids, &blobs, child, page, None, Affine::ID, &mut ids, &mut instances);
+            import_node(&mut doc, &by_guid, &kids, &blobs, child, page, None, Affine::ID, &mut ids, &mut instances, 0);
         }
     }
     if doc.pages.is_empty() {
@@ -607,14 +623,20 @@ fn import_node(
     doc: &mut Document,
     by_guid: &HashMap<Guid, &Value>,
     kids: &HashMap<Guid, Vec<(String, Guid)>>,
-    blobs: &[Vec<u8>],
+    blobs: &[&[u8]],
     g: Guid,
     page: usize,
     parent: Option<NodeId>,
     parent_world: Affine,
     ids: &mut HashMap<Guid, NodeId>,
     instances: &mut Vec<(NodeId, Guid)>,
+    depth: u32,
 ) {
+    // A guid listed under two parents (or under its own descendant) is imported once,
+    // and absurdly deep trees stop before they overflow the stack.
+    if ids.contains_key(&g) || depth > 512 {
+        return;
+    }
     let v = by_guid[&g];
     let ty = v.s("type").unwrap_or("");
     let world = parent_world.then(Affine::of(v.get("transform")));
@@ -750,7 +772,7 @@ fn import_node(
             strokes_included: v.b("bordersTakeSpace") == Some(true),
             cross_gap: v.f("stackCounterSpacing").filter(|g| g.is_finite()).or(v.f("stackSpacing")).unwrap_or(0.0),
             reverse_z: v.b("stackReverseZIndex") == Some(true),
-            grid: [v.f("gridColumnCount").unwrap_or(0.0) as u32, v.f("gridRowCount").unwrap_or(0.0) as u32],
+            grid: ["gridColumnCount", "gridRowCount"].map(|k| v.f(k).unwrap_or(0.0).clamp(0.0, crate::doc::MAX_GRID as f32) as u32),
             tracks: [None; 2],
         };
         if n.layout.mode == LayoutMode::Grid {
@@ -758,7 +780,7 @@ fn import_node(
             n.layout.cross_gap = v.f("gridRowGap").unwrap_or(n.layout.cross_gap);
         }
     }
-    n.grid_span = [v.f("gridColumnSpan").unwrap_or(1.0).max(1.0) as u32, v.f("gridRowSpan").unwrap_or(1.0).max(1.0) as u32];
+    n.grid_span = ["gridColumnSpan", "gridRowSpan"].map(|k| v.f(k).unwrap_or(1.0).clamp(1.0, crate::doc::MAX_GRID as f32) as u32);
     // Unset bounds are stored as 0 (min) and infinity (max).
     let bound = |k: &str, axis: &str| v.get(k).and_then(|s| s.get("value")).and_then(|s| s.f(axis)).filter(|x| x.is_finite() && *x > 0.0);
     n.min_size = [bound("minSize", "x"), bound("minSize", "y")];
@@ -788,7 +810,7 @@ fn import_node(
     // Vector-like layers already baked their children (boolean operands) into geometry.
     if !vectorish {
         for (_, c) in kids.get(&g).cloned().unwrap_or_default() {
-            import_node(doc, by_guid, kids, blobs, c, page, Some(id), world, ids, instances);
+            import_node(doc, by_guid, kids, blobs, c, page, Some(id), world, ids, instances, depth + 1);
         }
     }
 }
@@ -968,7 +990,7 @@ fn effects(v: &Value) -> Vec<Shadow> {
 
 /// Read a `.fig` file into a Katachi document.
 pub fn import(data: &[u8]) -> Result<Document, String> {
-    to_document(&read(data)?)
+    to_document(read(data)?)
 }
 
 #[cfg(test)]
@@ -1008,7 +1030,7 @@ mod tests {
               ] },
               "componentPropAssignments": [{ "defID": g(90), "value": { "boolValue": false } }] },
         ] });
-        let doc = to_document(&FigFile { message: kv(msg), images: HashMap::new() }).unwrap();
+        let doc = to_document(FigFile { message: kv(msg), images: HashMap::new() }).unwrap();
         let inst = doc.nodes.values().find(|n| n.kind == Kind::Instance).unwrap();
         assert_eq!(inst.opacity, 0.5, "path naming the main component targets the instance");
         let kids: Vec<&Node> = inst.children.iter().map(|c| doc.node(*c)).collect();
@@ -1038,7 +1060,7 @@ mod tests {
               "fillPaints": [{ "type": "SOLID", "color": { "r": 0.0, "g": 0.0, "b": 0.0, "a": 1.0 }, "opacity": 1.0, "visible": true,
                 "colorVar": { "dataType": "ALIAS", "value": { "alias": { "guid": g(20) } } } }] },
         ] });
-        let mut doc = to_document(&FigFile { message: kv(msg), images: HashMap::new() }).unwrap();
+        let mut doc = to_document(FigFile { message: kv(msg), images: HashMap::new() }).unwrap();
         assert_eq!(doc.collections[0].modes, vec!["Light", "Dark"]);
         let rect = doc.nodes.values().find(|n| n.kind == Kind::Rectangle).unwrap().id;
         assert_eq!(doc.node(rect).fills[0].color, Rgba::rgb(0, 0, 0), "dark mode value");
@@ -1046,6 +1068,29 @@ mod tests {
         doc.node_mut(frame).modes.clear();
         doc.reflow();
         assert_eq!(doc.node(rect).fills[0].color, Rgba::rgb(255, 0, 0), "switching back to the default mode");
+    }
+
+    #[test]
+    fn duplicate_guids_import_once() {
+        use serde_json::json;
+        let g = |l: u64| json!({ "sessionID": 1, "localID": l });
+        let at = |l: u64, pos: &str| json!({ "guid": g(l), "position": pos });
+        let xf = json!({ "m00": 1.0, "m01": 0.0, "m02": 0.0, "m10": 0.0, "m11": 1.0, "m12": 0.0 });
+        let frame = |me: u64, parent: u64| json!({ "guid": g(me), "type": "FRAME", "parentIndex": at(parent, "a"), "size": { "x": 10, "y": 10 }, "transform": xf });
+        // Frame 2 is listed under the page and again under its own child 3.
+        let msg = json!({ "nodeChanges": [
+            { "guid": g(0), "type": "DOCUMENT" },
+            { "guid": g(1), "type": "CANVAS", "name": "Page", "parentIndex": at(0, "a") },
+            frame(2, 1), frame(3, 2), frame(2, 3),
+        ] });
+        let doc = to_document(FigFile { message: kv(msg), images: HashMap::new() }).unwrap();
+        assert_eq!(doc.nodes.len(), 2);
+    }
+
+    #[test]
+    fn inflating_past_the_cap_fails() {
+        assert_eq!(read_capped(&[0u8; 10][..], 10).unwrap().len(), 10);
+        assert!(read_capped(&[0u8; 11][..], 10).is_err());
     }
 
     #[test]
@@ -1060,7 +1105,7 @@ mod tests {
             { "guid": g(2), "type": "FRAME", "name": "List", "parentIndex": at(1, "a"), "size": { "x": 100, "y": 100 }, "transform": xf, "scrollDirection": "VERTICAL" },
             { "guid": g(3), "type": "RECTANGLE", "name": "Header", "parentIndex": at(2, "a"), "size": { "x": 10, "y": 10 }, "transform": xf, "scrollBehavior": "STICKY_SCROLLS" },
         ] });
-        let doc = to_document(&FigFile { message: kv(msg), images: HashMap::new() }).unwrap();
+        let doc = to_document(FigFile { message: kv(msg), images: HashMap::new() }).unwrap();
         let frame = doc.nodes.values().find(|n| n.kind == Kind::Frame).unwrap();
         assert_eq!(frame.overflow, crate::doc::Overflow::Vertical);
         assert_eq!(doc.node(frame.children[0]).scroll_pos, crate::doc::ScrollPos::Sticky);

@@ -2331,7 +2331,8 @@ impl Node {
     pub fn star_points(&self) -> Vec<Pos2> {
         let r = self.rect;
         let (c, rx, ry) = (r.center(), r.width() / 2.0, r.height() / 2.0);
-        let n = self.point_count.max(3) as usize;
+        // Files and peers can carry any count; a huge one would allocate gigabytes.
+        let n = self.point_count.clamp(3, 1000) as usize;
         let star = self.kind == Kind::Star;
         let steps = if star { n * 2 } else { n };
         (0..steps)
@@ -2415,6 +2416,9 @@ pub struct Guide {
 }
 
 pub const PAGE_BG: Rgba = Rgba::rgb(0xF5, 0xF5, 0xF5);
+
+/// Upper bound on grid layout column/row counts and spans.
+pub const MAX_GRID: u32 = 1000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Document {
@@ -3860,14 +3864,15 @@ impl Document {
     /// sparse auto-placement); rows are added when the children outnumber the cells.
     fn layout_grid(&mut self, f: NodeId, n: &Node, kids: &[NodeId], [pt, pr, pb, pl]: [f32; 4], out: &dyn Fn(&Node) -> f32) {
         let l = n.layout;
-        let cols = l.grid[0].max(1) as usize;
+        // Counts and spans arrive unchecked from files, plugins, and peers; the cell map is rows x cols.
+        let cols = l.grid[0].clamp(1, MAX_GRID) as usize;
         let gaps = [l.gap, l.cross_gap];
         let mut taken: Vec<Vec<bool>> = vec![];
         let mut placed: Vec<(NodeId, [usize; 2], [usize; 2])> = vec![];
         let mut cursor = 0;
         for &c in kids {
             let span = self.nodes[&c].grid_span;
-            let (cs, rs) = ((span[0].max(1) as usize).min(cols), span[1].max(1) as usize);
+            let (cs, rs) = ((span[0].max(1) as usize).min(cols), span[1].clamp(1, MAX_GRID) as usize);
             let mut i = cursor;
             loop {
                 let (r, col) = (i / cols, i % cols);
@@ -3885,7 +3890,7 @@ impl Document {
                 i += 1;
             }
         }
-        let counts = [cols, (l.grid[1] as usize).max(taken.len()).max(1)];
+        let counts = [cols, (l.grid[1].min(MAX_GRID) as usize).max(taken.len()).max(1)];
         let pad = [pl + pr, pt + pb];
         let fills = |k: &Node, axis: usize| k.sizing[axis] == Sizing::Fill && (k.kind != Kind::Text || k.text_sizing != TextSizing::AutoWidth);
         let lsize = |k: &Node| k.aabb().size() + Vec2::splat(2.0 * out(k));
@@ -4548,6 +4553,20 @@ mod tests {
         d.node_mut(f).layout.tracks = [Some(40.), None];
         d.reflow();
         assert_eq!(d.node(e).rect.min.x, 60.0);
+    }
+
+    #[test]
+    fn huge_grid_and_star_counts_are_clamped() {
+        let mut d = Document::default();
+        let mut f = Node::new(Kind::Frame, r(0., 0., 100., 100.));
+        f.layout = AutoLayout { mode: LayoutMode::Grid, grid: [u32::MAX, u32::MAX], ..Default::default() };
+        let f = d.insert(0, None, None, f);
+        let k = d.insert(0, Some(f), None, Node::new(Kind::Rectangle, r(0., 0., 10., 10.)));
+        d.node_mut(k).grid_span = [u32::MAX, u32::MAX];
+        d.reflow();
+        let mut star = Node::new(Kind::Star, r(0., 0., 10., 10.));
+        star.point_count = u32::MAX;
+        assert_eq!(star.star_points().len(), 2000);
     }
 
     #[test]
