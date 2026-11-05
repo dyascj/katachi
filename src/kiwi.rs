@@ -12,6 +12,8 @@ pub enum Value {
     Float(f32),
     Str(String),
     Enum(String),
+    /// A byte array (blob), kept packed: blobs are large and common.
+    Bytes(Vec<u8>),
     Array(Vec<Value>),
     Object(BTreeMap<String, Value>),
 }
@@ -58,10 +60,10 @@ impl Value {
             _ => &[],
         }
     }
-    pub fn bytes(&self) -> Vec<u8> {
+    pub fn bytes(&self) -> &[u8] {
         match self {
-            Value::Array(v) => v.iter().filter_map(|b| if let Value::Byte(x) = b { Some(*x) } else { None }).collect(),
-            _ => vec![],
+            Value::Bytes(v) => v,
+            _ => &[],
         }
     }
 }
@@ -96,7 +98,13 @@ pub struct Schema {
 struct Reader<'a> {
     data: &'a [u8],
     at: usize,
+    /// Current definition nesting, so a self-containing struct or a deeply nested file
+    /// fails cleanly instead of overflowing the stack.
+    depth: u32,
 }
+
+/// Far deeper than any real `.fig` (node trees are flat, linked by parent index).
+const MAX_DEPTH: u32 = 256;
 
 impl Reader<'_> {
     fn byte(&mut self) -> Result<u8, String> {
@@ -159,7 +167,7 @@ impl Reader<'_> {
 impl Schema {
     /// Decode a binary Kiwi schema.
     pub fn decode(data: &[u8]) -> Result<Schema, String> {
-        let mut r = Reader { data, at: 0 };
+        let mut r = Reader { data, at: 0, depth: 0 };
         let count = r.var_uint()?;
         let mut defs = vec![];
         for _ in 0..count {
@@ -187,11 +195,21 @@ impl Schema {
     /// Decode a message of the named root type.
     pub fn decode_message(&self, root: &str, data: &[u8]) -> Result<Value, String> {
         let idx = self.defs.iter().position(|d| d.name == root).ok_or(format!("no type {root}"))?;
-        let mut r = Reader { data, at: 0 };
+        let mut r = Reader { data, at: 0, depth: 0 };
         self.read_def(&mut r, idx)
     }
 
     fn read_def(&self, r: &mut Reader, idx: usize) -> Result<Value, String> {
+        if r.depth >= MAX_DEPTH {
+            return Err("nesting too deep".into());
+        }
+        r.depth += 1;
+        let v = self.read_def_body(r, idx);
+        r.depth -= 1;
+        v
+    }
+
+    fn read_def_body(&self, r: &mut Reader, idx: usize) -> Result<Value, String> {
         let def = &self.defs[idx];
         match def.kind {
             DefKind::Enum => {
@@ -222,15 +240,23 @@ impl Schema {
     fn read_field(&self, r: &mut Reader, f: &Field) -> Result<Value, String> {
         if f.array {
             let n = r.var_uint()? as usize;
-            // Byte arrays (blobs) are common and large; read them directly.
+            // Every element takes at least a byte, so a count past the end is a lie.
+            if n > r.data.len() - r.at {
+                return Err("unexpected end of data".into());
+            }
             if f.ty == -2 {
-                let bytes = r.data.get(r.at..r.at + n).ok_or("unexpected end of data")?;
+                let bytes = r.data[r.at..r.at + n].to_vec();
                 r.at += n;
-                return Ok(Value::Array(bytes.iter().map(|b| Value::Byte(*b)).collect()));
+                return Ok(Value::Bytes(bytes));
             }
             let mut v = Vec::with_capacity(n.min(1 << 16));
             for _ in 0..n {
+                let start = r.at;
                 v.push(self.read_one(r, f.ty)?);
+                // An empty struct reads no bytes; arrays of them only exist to blow up memory.
+                if r.at == start {
+                    return Err("empty array element".into());
+                }
             }
             Ok(Value::Array(v))
         } else {
@@ -339,5 +365,45 @@ mod tests {
         assert_eq!(v.arr("pts")[0].f("x"), Some(1.5));
         assert_eq!(v.arr("pts")[0].f("y"), Some(0.0), "NaN reads as 0");
         assert_eq!(v.get("n"), Some(&Value::Int(-7)));
+    }
+
+    /// Schema with `struct E {}`, `struct S { S s; }`, and `message M { M m = 1; S s = 2; E[] e = 3; byte[] b = 4; }`.
+    fn hostile_schema() -> Schema {
+        let mut s = vec![];
+        vu(&mut s, 3);
+        st(&mut s, "E");
+        s.push(1);
+        vu(&mut s, 0);
+        st(&mut s, "S");
+        s.push(1);
+        vu(&mut s, 1);
+        st(&mut s, "s");
+        vi(&mut s, 1);
+        s.push(0);
+        vu(&mut s, 1);
+        st(&mut s, "M");
+        s.push(2);
+        vu(&mut s, 4);
+        for (n, t, arr, v) in [("m", 2, 0u8, 1), ("s", 1, 0, 2), ("e", 0, 1, 3), ("b", -2, 1, 4)] {
+            st(&mut s, n);
+            vi(&mut s, t);
+            s.push(arr);
+            vu(&mut s, v);
+        }
+        Schema::decode(&s).unwrap()
+    }
+
+    #[test]
+    fn hostile_messages_fail_cleanly() {
+        let schema = hostile_schema();
+        let err = |m: &[u8]| schema.decode_message("M", m).unwrap_err();
+        assert_eq!(err(&[2]), "nesting too deep", "self-containing struct");
+        assert_eq!(err(&vec![1; 100_000]), "nesting too deep", "deeply nested messages");
+        let mut huge = vec![3];
+        vu(&mut huge, 4_000_000_000);
+        assert_eq!(err(&huge), "unexpected end of data", "count larger than the data");
+        assert_eq!(err(&[3, 3, 0, 0, 0]), "empty array element");
+        let v = schema.decode_message("M", &[4, 2, 7, 9, 0]).unwrap();
+        assert_eq!(v.get("b").unwrap().bytes(), &[7, 9]);
     }
 }
