@@ -274,16 +274,17 @@ pub struct Swatches {
 }
 
 const SWATCHES: &str = "picker-swatches";
+const PICKER_SHOWN: &str = "picker-shown";
 
 impl App {
     /// Every solid color on the current page, and the solid color styles.
     pub fn swatches(&self) -> Swatches {
-        let mut page = vec![];
+        let (mut page, mut seen) = (vec![], std::collections::HashSet::new());
         for &r in &self.doc.pages[self.page].children {
             for id in std::iter::once(r).chain(self.doc.descendants(r)) {
                 let n = self.doc.node(id);
                 for p in n.fills.iter().chain(&n.strokes).filter(|p| p.visible && p.kind == PaintKind::Solid) {
-                    if !page.contains(&p.color) {
+                    if seen.insert(p.color) {
                         page.push(p.color);
                     }
                 }
@@ -301,9 +302,11 @@ impl App {
         Swatches { page, styles }
     }
 
-    /// Hand the swatches to any color picker drawn this frame (only while a popover is open).
+    /// Hand the swatches to the color picker while one is showing (it marks the frames it's
+    /// drawn in), not while any menu or dropdown is open: the scan walks the whole page.
     pub fn offer_swatches(&self, ctx: &egui::Context) {
-        if egui::Popup::is_any_open(ctx) {
+        let shown: Option<u64> = ctx.data(|d| d.get_temp(egui::Id::new(PICKER_SHOWN)));
+        if shown.is_some_and(|f| f + 1 >= ctx.cumulative_pass_nr()) {
             ctx.data_mut(|d| d.insert_temp(egui::Id::new(SWATCHES), std::sync::Arc::new(self.swatches())));
         }
     }
@@ -491,6 +494,8 @@ fn rgb_picker(ui: &mut Ui, color: &mut Rgba) -> bool {
         ui.data_mut(|d| d.insert_temp(id, (color.with_alpha(255), k)));
     }
     // Swatches: colors on this page, then color styles. A click applies one.
+    let pass = ui.ctx().cumulative_pass_nr();
+    ui.data_mut(|d| d.insert_temp(egui::Id::new(PICKER_SHOWN), pass));
     let sw: Option<std::sync::Arc<Swatches>> = ui.data(|d| d.get_temp(egui::Id::new(SWATCHES)));
     if let Some(sw) = sw {
         let page: Vec<(String, Rgba)> = sw.page.iter().take(40).map(|c| (format!("#{}", c.hex()), *c)).collect();

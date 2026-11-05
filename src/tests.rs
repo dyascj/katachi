@@ -4112,11 +4112,32 @@ fn comments_filter_mention_and_track_unread() {
     assert_eq!(t, "hi @Luna ");
     assert!(mentions("hi @Luna, look", "Luna") && !mentions("hi @Lunatic", "Luna"));
     h.state_mut().open_comment = Some(2);
+    h.run_steps(2);
     h.state_mut().comment_reply = "Thanks @Lu".into();
     h.run_steps(2);
     h.get_by_label("@Luna").click();
     h.run_steps(2);
     assert_eq!(h.state().comment_reply, "Thanks @Luna ");
+    // Enter sends the reply.
+    h.get_all_by_value("Thanks @Luna ").next().unwrap().focus();
+    h.run_steps(1);
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    assert_eq!(h.state().doc.comments[1].messages.last().unwrap().1, "Thanks @Luna");
+    // A draft stays with its thread.
+    h.state_mut().comment_reply = "Half".into();
+    h.state_mut().open_comment = Some(1);
+    h.run_steps(2);
+    assert_eq!(h.state().comment_reply, "", "another thread starts with an empty reply");
+    // Escape closes the thread, and so does leaving its page.
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    assert_eq!(h.state().open_comment, None);
+    h.state_mut().open_comment = Some(1);
+    h.run_steps(2);
+    h.state_mut().doc.comments[0].page = 1;
+    h.run_steps(2);
+    assert_eq!(h.state().open_comment, None, "a thread on another page closes");
 }
 
 #[test]

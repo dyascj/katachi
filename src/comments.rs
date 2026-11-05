@@ -263,7 +263,9 @@ impl App {
             }
         }
         let Some(id) = self.open_comment else { return };
-        let Some(c) = self.doc.comments.iter().find(|c| c.id == id).cloned() else {
+        // A thread closes with its pin: on another page, with comments hidden, or on Escape.
+        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let Some(c) = self.doc.comments.iter().find(|c| c.id == id && c.page == self.page).cloned().filter(|_| self.comments_visible() && !escape) else {
             self.open_comment = None;
             return;
         };
@@ -275,6 +277,12 @@ impl App {
         let mut edited: Option<(usize, String)> = None;
         let mut stop_editing = false;
         let mut reply = std::mem::take(&mut self.comment_reply);
+        // A half-written reply belongs to its thread; opening another starts empty.
+        let reply_for = egui::Id::new("comment-reply-for");
+        if ctx.data(|d| d.get_temp::<u64>(reply_for)).is_some_and(|f| f != id) {
+            reply.clear();
+        }
+        ctx.data_mut(|d| d.insert_temp(reply_for, id));
         egui::Area::new(egui::Id::new(("comment-thread", id))).fixed_pos(p).order(egui::Order::Foreground).show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.set_width(260.0);
@@ -346,8 +354,9 @@ impl App {
                 ui.separator();
                 let field = egui::Id::new(("comment-reply-text", id));
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut reply).id(field).hint_text("Reply, @ to mention").desired_width(190.0));
-                    if ui.add_enabled(!reply.trim().is_empty(), egui::Button::new("Send")).clicked() {
+                    let r = ui.add(egui::TextEdit::singleline(&mut reply).id(field).hint_text("Reply, @ to mention").desired_width(190.0));
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if (ui.add_enabled(!reply.trim().is_empty(), egui::Button::new("Send")).clicked() || enter) && !reply.trim().is_empty() {
                         action = Some("reply");
                     }
                 });
