@@ -149,20 +149,24 @@ pub fn parse_hex(s: &str) -> Option<Rgba> {
     Some(Rgba::rgb((v >> 16) as u8, (v >> 8) as u8, v as u8))
 }
 
-/// A text field showing `shown` that commits a parse of its text on Enter or focus loss.
-fn commit_field<T>(ui: &mut Ui, id: egui::Id, shown: String, width: f32, parse: impl Fn(&str) -> Option<T>) -> Option<T> {
-    let mut buf = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or(shown);
-    let resp = ui.add(egui::TextEdit::singleline(&mut buf).id(id).desired_width(width).font(FontId::monospace(11.0)));
-    let mut out = None;
-    if resp.lost_focus() {
-        out = parse(&buf);
-        ui.data_mut(|d| d.remove::<String>(id));
-    } else if resp.has_focus() {
-        ui.data_mut(|d| d.insert_temp(id, buf));
+/// A field that edits a copy of `shown` while focused (kept under `id`) and returns its text
+/// on Enter or blur. Escape reverts instead, as in Figma. `add` draws the field around the buffer.
+pub fn buffered_text(ui: &mut Ui, id: egui::Id, shown: impl FnOnce() -> String, add: impl FnOnce(&mut Ui, &mut String) -> egui::Response) -> (egui::Response, Option<String>) {
+    let mut buf = ui.data(|d| d.get_temp::<String>(id)).unwrap_or_else(shown);
+    let resp = add(ui, &mut buf);
+    let commit = resp.lost_focus() && !ui.input(|i| i.key_pressed(egui::Key::Escape));
+    if resp.has_focus() {
+        ui.data_mut(|d| d.insert_temp(id, buf.clone()));
     } else {
         ui.data_mut(|d| d.remove::<String>(id));
     }
-    out
+    (resp, commit.then_some(buf))
+}
+
+/// A monospace field showing `shown` that commits a parse of its text on Enter or blur.
+fn commit_field<T>(ui: &mut Ui, id: egui::Id, shown: String, width: f32, parse: impl Fn(&str) -> Option<T>) -> Option<T> {
+    let add = |ui: &mut Ui, buf: &mut String| ui.add(egui::TextEdit::singleline(buf).id(id).desired_width(width).font(FontId::monospace(11.0)));
+    buffered_text(ui, id, || shown, add).1.and_then(|t| parse(&t))
 }
 
 /// Hex text field that commits on Enter / focus loss, keeping alpha.
@@ -652,8 +656,12 @@ fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEve
             let mut remove = None;
             let selected_id = id.with("stop");
             let mut sel: usize = ui.data(|d| d.get_temp(selected_id)).unwrap_or(0).min(paint.stops.len().saturating_sub(1));
+            // Each stop's row has a key that follows it through the re-sort below, so the
+            // selection and a drag in progress stay on their stop when it passes a neighbor.
+            let keys_id = id.with("stop-keys");
+            let mut keys: Vec<u64> = ui.data(|d| d.get_temp(keys_id)).filter(|k: &Vec<u64>| k.len() == paint.stops.len()).unwrap_or_else(|| (0..paint.stops.len() as u64).collect());
             for i in 0..paint.stops.len() {
-                ui.horizontal(|ui| {
+                ui.push_id(keys[i], |ui| ui.horizontal(|ui| {
                     let (t, c) = &mut paint.stops[i];
                     let mut pct = (*t * 100.0).round();
                     if ui.radio(sel == i, "").clicked() {
@@ -663,7 +671,7 @@ fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEve
                         *t = pct / 100.0;
                         ev = Some(PaintEvent::Changed);
                     }
-                    if hex_field(ui, id.with(("stop-hex", i)), c, 56.0) {
+                    if hex_field(ui, id.with(("stop-hex", keys[i])), c, 56.0) {
                         ev = Some(PaintEvent::Changed);
                     }
                     if alpha_field(ui, c) {
@@ -672,20 +680,31 @@ fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEve
                     if paint.stops.len() > 2 && icon_button(ui, Icon::Minus, false, 20.0, "Remove stop").clicked() {
                         remove = Some(i);
                     }
-                });
+                }));
             }
             if let Some(i) = remove {
                 paint.stops.remove(i);
+                keys.remove(i);
+                if sel > i {
+                    sel -= 1;
+                }
+                sel = sel.min(paint.stops.len() - 1);
                 ev = Some(PaintEvent::Changed);
             }
             if ui.button("Add stop").clicked() {
                 let t = 0.5;
                 let c = paint.sample(t);
                 paint.stops.push((t, c));
+                keys.push(keys.iter().max().map_or(0, |k| k + 1));
                 sel = paint.stops.len() - 1;
                 ev = Some(PaintEvent::Changed);
             }
-            paint.stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut order: Vec<usize> = (0..paint.stops.len()).collect();
+            order.sort_by(|&a, &b| paint.stops[a].0.total_cmp(&paint.stops[b].0));
+            sel = order.iter().position(|&i| i == sel).unwrap_or(0);
+            paint.stops = order.iter().map(|&i| paint.stops[i]).collect();
+            keys = order.iter().map(|&i| keys[i]).collect();
+            ui.data_mut(|d| d.insert_temp(keys_id, keys));
             if let Some((_, c)) = paint.stops.get_mut(sel)
                 && rgb_picker(ui, c) {
                     ev = Some(PaintEvent::Changed);

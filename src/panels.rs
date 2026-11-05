@@ -512,15 +512,9 @@ fn export_row(ui: &mut Ui, id: egui::Id, p: &mut crate::doc::ExportSetting, remo
     ui.horizontal(|ui| {
         if p.format.raster() {
             let tid = id.with("size");
-            let mut text = ui.data(|d| d.get_temp::<String>(tid)).unwrap_or_else(|| p.size_label());
-            let r = ui.add(egui::TextEdit::singleline(&mut text).id(tid).desired_width(40.0)).on_hover_text("Scale (2x), width (512w) or height (512h)");
-            if r.has_focus() {
-                ui.data_mut(|d| d.insert_temp(tid, text));
-            } else {
-                if r.lost_focus() {
-                    p.set_size(&text);
-                }
-                ui.data_mut(|d| d.remove::<String>(tid));
+            let add = |ui: &mut Ui, buf: &mut String| ui.add(egui::TextEdit::singleline(buf).id(tid).desired_width(40.0)).on_hover_text("Scale (2x), width (512w) or height (512h)");
+            if let Some(text) = crate::paint_ui::buffered_text(ui, tid, || p.size_label(), add).1 {
+                p.set_size(&text);
             }
             let m = icon_button(ui, Icon::Chevron(true), false, 16.0, "Export size");
             egui::Popup::menu(&m).id(id.with("sizes")).style(crate::chrome::menu_style).show(|ui| {
@@ -596,12 +590,12 @@ fn align_grid(ui: &mut Ui, l: &mut AutoLayout) {
     }
 }
 
-fn section_title(ui: &mut Ui, title: &str) -> bool {
+fn section_title(ui: &mut Ui, title: &str, tip: &str) -> bool {
     let mut add = false;
     ui.horizontal(|ui| {
         ui.label(RichText::new(title).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            add = icon_button(ui, Icon::Plus, false, 22.0, "").clicked();
+            add = icon_button(ui, Icon::Plus, false, 22.0, tip).clicked();
         });
     });
     add
@@ -610,18 +604,11 @@ fn section_title(ui: &mut Ui, title: &str) -> bool {
 /// A name field that commits on Enter or blur, for renames that move rows around (a folder or
 /// group renamed per keystroke would lose its field mid-word). Returns the new text once.
 pub fn commit_field(ui: &mut Ui, id: egui::Id, current: &str, width: f32, framed: bool) -> Option<String> {
-    let mut buf: String = ui.data(|d| d.get_temp(id)).unwrap_or_else(|| current.to_string());
-    let mut field = egui::TextEdit::singleline(&mut buf).id(id).desired_width(width);
-    if !framed {
-        field = field.frame(egui::Frame::NONE);
-    }
-    let r = ui.add(field);
-    if r.has_focus() {
-        ui.data_mut(|d| d.insert_temp(id, buf.clone()));
-    } else {
-        ui.data_mut(|d| d.remove::<String>(id));
-    }
-    (r.lost_focus() && buf != current).then_some(buf)
+    let add = |ui: &mut Ui, buf: &mut String| {
+        let field = egui::TextEdit::singleline(buf).id(id).desired_width(width);
+        ui.add(if framed { field } else { field.frame(egui::Frame::NONE) })
+    };
+    crate::paint_ui::buffered_text(ui, id, || current.to_string(), add).1.filter(|b| b != current)
 }
 
 /// One layout guide's settings (type, count or size, gutter, margin, color).
@@ -1554,78 +1541,82 @@ impl App {
         let drag_key = ui.id().with("page-drag");
         let mut dragging: Option<usize> = ui.data(|d| d.get_temp(drag_key));
         let mut rects = vec![];
-        for i in 0..self.doc.pages.len() {
-            let page_name = self.doc.pages[i].name.clone();
-            let divider = is_divider(&page_name);
-            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), if divider { 13.0 } else { 26.0 }), Sense::click_and_drag());
-            rects.push(rect);
-            if resp.drag_started() {
-                dragging = Some(i);
-            }
-            resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, i == self.page, &page_name));
-            crate::chrome::context_menu(&resp, |ui| {
-                if ui.button("Rename").clicked() {
-                    self.renaming_page = Some((i, page_name.clone()));
-                    ui.close();
+        // A long page list scrolls, leaving room for the layers below (Figma).
+        let max = (ui.available_height() * 0.3).max(130.0);
+        egui::ScrollArea::vertical().id_salt("pages").max_height(max).auto_shrink([false, true]).show(ui, |ui| {
+            for i in 0..self.doc.pages.len() {
+                let page_name = self.doc.pages[i].name.clone();
+                let divider = is_divider(&page_name);
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), if divider { 13.0 } else { 26.0 }), Sense::click_and_drag());
+                rects.push(rect);
+                if resp.drag_started() {
+                    dragging = Some(i);
                 }
-                if !divider && ui.button("Duplicate page").clicked() {
-                    duplicate = Some(i);
-                    ui.close();
-                }
-                if ui.button("Add divider").clicked() {
-                    divider_at = Some(i + 1);
-                    ui.close();
-                }
-                if ui.add_enabled(self.doc.pages.len() > 1, egui::Button::new(if divider { "Delete divider" } else { "Delete page" })).clicked() {
-                    delete = Some(i);
-                    ui.close();
-                }
-            });
-            if divider && !matches!(&self.renaming_page, Some((pi, _)) if *pi == i) {
-                // Figma's page dividers: a line in the list, never opened.
-                let x = rect.x_range().shrink(10.0);
-                ui.painter().hline(x, rect.center().y, Stroke::new(1.0, theme::border(ui.ctx())));
-                if resp.double_clicked() {
-                    self.renaming_page = Some((i, page_name));
-                }
-                continue;
-            }
-            if i == self.page {
-                ui.painter().rect_filled(rect, 4.0, theme::subtle(ui.ctx()));
-            } else if resp.hovered() {
-                ui.painter().rect_filled(rect, 4.0, theme::subtle(ui.ctx()).gamma_multiply(0.6));
-            }
-            if let Some((pi, buf)) = &mut self.renaming_page
-                && *pi == i {
-                    let r = ui.put(rect.shrink2(vec2(6.0, 3.0)), egui::TextEdit::singleline(buf));
-                    let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                    if !r.has_focus() && !r.lost_focus() && !cancel {
-                        r.request_focus();
+                resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, i == self.page, &page_name));
+                crate::chrome::context_menu(&resp, |ui| {
+                    if ui.button("Rename").clicked() {
+                        self.renaming_page = Some((i, page_name.clone()));
+                        ui.close();
                     }
-                    if r.lost_focus() || cancel {
-                        let name = if cancel { String::new() } else { buf.trim().to_string() };
-                        self.renaming_page = None;
-                        if !name.is_empty() && name != self.doc.pages[i].name {
-                            self.checkpoint();
-                            self.doc.pages[i].name = name;
-                        }
+                    if !divider && ui.button("Duplicate page").clicked() {
+                        duplicate = Some(i);
+                        ui.close();
+                    }
+                    if ui.button("Add divider").clicked() {
+                        divider_at = Some(i + 1);
+                        ui.close();
+                    }
+                    if ui.add_enabled(self.doc.pages.len() > 1, egui::Button::new(if divider { "Delete divider" } else { "Delete page" })).clicked() {
+                        delete = Some(i);
+                        ui.close();
+                    }
+                });
+                if divider && !matches!(&self.renaming_page, Some((pi, _)) if *pi == i) {
+                    // Figma's page dividers: a line in the list, never opened.
+                    let x = rect.x_range().shrink(10.0);
+                    ui.painter().hline(x, rect.center().y, Stroke::new(1.0, theme::border(ui.ctx())));
+                    if resp.double_clicked() {
+                        self.renaming_page = Some((i, page_name));
                     }
                     continue;
                 }
-            ui.painter().text(
-                rect.left_center() + vec2(10.0, 0.0),
-                egui::Align2::LEFT_CENTER,
-                &self.doc.pages[i].name,
-                FontId::proportional(12.0),
-                ui.visuals().text_color(),
-            );
-            if resp.clicked() {
-                self.select_page(i);
+                if i == self.page {
+                    ui.painter().rect_filled(rect, 4.0, theme::subtle(ui.ctx()));
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(rect, 4.0, theme::subtle(ui.ctx()).gamma_multiply(0.6));
+                }
+                if let Some((pi, buf)) = &mut self.renaming_page
+                    && *pi == i {
+                        let r = ui.put(rect.shrink2(vec2(6.0, 3.0)), egui::TextEdit::singleline(buf));
+                        let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                        if !r.has_focus() && !r.lost_focus() && !cancel {
+                            r.request_focus();
+                        }
+                        if r.lost_focus() || cancel {
+                            let name = if cancel { String::new() } else { buf.trim().to_string() };
+                            self.renaming_page = None;
+                            if !name.is_empty() && name != self.doc.pages[i].name {
+                                self.checkpoint();
+                                self.doc.pages[i].name = name;
+                            }
+                        }
+                        continue;
+                    }
+                ui.painter().text(
+                    rect.left_center() + vec2(10.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    &self.doc.pages[i].name,
+                    FontId::proportional(12.0),
+                    ui.visuals().text_color(),
+                );
+                if resp.clicked() {
+                    self.select_page(i);
+                }
+                if resp.double_clicked() {
+                    self.renaming_page = Some((i, self.doc.pages[i].name.clone()));
+                }
             }
-            if resp.double_clicked() {
-                self.renaming_page = Some((i, self.doc.pages[i].name.clone()));
-            }
-        }
+        });
         if let Some(from) = dragging {
             let (ptr, released) = ui.input(|i| (i.pointer.hover_pos(), i.pointer.any_released()));
             let span = rects.first().map_or(Rect::NOTHING, |f| f.union(*rects.last().unwrap())).expand2(vec2(0.0, 8.0));
@@ -1663,10 +1654,9 @@ impl App {
                 self.doc.remove(id);
             }
             self.doc.pages.remove(i);
-            // Pages after the deleted one move up; stay on the one being viewed.
-            if i < self.page {
-                self.page -= 1;
-            }
+            // Pages after the deleted one move up, with their comments; stay on the one being viewed.
+            self.doc.comments.retain(|c| c.page != i);
+            self.renumber_pages(|p| if p > i { p - 1 } else { p });
             self.page = self.page.min(self.doc.pages.len() - 1);
             self.sel.clear();
             self.view_ready = false;
@@ -1927,6 +1917,9 @@ impl App {
             [id] => {
                 self.left_tab_assets = false;
                 self.renaming = Some((id, self.doc.node(id).name.clone()));
+                // The field lives in the layer's row: show it, even if scrolled away or filtered out.
+                self.layer_search = None;
+                self.prev_sel.clear();
             }
             _ => self.batch_rename = Some(BatchRename { to: String::new(), start: 1, find: String::new(), with: String::new(), focus: true }),
         }
@@ -2195,10 +2188,10 @@ impl App {
                 Some((f, l)) => (Some(f.trim().to_string()), l.trim().to_string()),
                 None => (None, st.name.clone()),
             };
-            let mut name = leaf;
-            let r = ui.add(egui::TextEdit::singleline(&mut name).frame(egui::Frame::NONE).desired_width(130.0));
-            if r.changed() {
-                self.begin_edit();
+            // Committed once, keyed by id: the list is sorted by name, so a per-keystroke rename
+            // would move the style out from under the field.
+            if let Some(name) = commit_field(ui, egui::Id::new(("style-name", st.id)), &leaf, 130.0, false) {
+                self.checkpoint();
                 if let Some(x) = self.doc.styles.iter_mut().find(|x| x.id == st.id) {
                     x.name = match &folder {
                         Some(f) => format!("{f} / {name}"),
@@ -2216,6 +2209,33 @@ impl App {
         });
     }
 
+    /// A paint style's paints, topmost first, with add and remove. Shared by Local styles and
+    /// the linked-style popover. Returns whether anything changed.
+    fn edit_paint_style(&mut self, ui: &mut Ui, id: egui::Id, ps: &mut Vec<Paint>) -> bool {
+        let mut changed = false;
+        let mut remove = None;
+        for i in (0..ps.len()).rev() {
+            match paint_row(ui, id.with(i), &mut ps[i], "Fill") {
+                PaintEvent::None => {}
+                PaintEvent::Changed => changed = true,
+                PaintEvent::Remove => remove = Some(i),
+                PaintEvent::Image(bytes) => {
+                    ps[i].image = self.add_image(bytes);
+                    changed = true;
+                }
+            }
+        }
+        if let Some(i) = remove {
+            ps.remove(i);
+            changed = true;
+        }
+        if ui.button("Add fill").clicked() {
+            ps.push(Paint::solid(SHAPE_GRAY));
+            changed = true;
+        }
+        changed
+    }
+
     /// Figma's style editor: the full name (slashes make folders) and the style's value. Every
     /// layer using the style follows.
     fn style_editor(&mut self, ui: &mut Ui, st: &crate::doc::Style) {
@@ -2227,9 +2247,7 @@ impl App {
         let id = ui.id().with(("style-edit", st.id));
         match &mut value {
             StyleValue::Paint(ps) => {
-                for (i, p) in ps.iter_mut().enumerate().rev() {
-                    paint_row(ui, id.with(i), p, "Fill");
-                }
+                self.edit_paint_style(ui, id, ps);
             }
             StyleValue::Text(t) => text_style_editor(ui, id, t),
             StyleValue::Effect(es) => {
@@ -2334,9 +2352,9 @@ impl App {
                 ui.end_row();
                 ui.label("Background");
                 ui.horizontal(|ui| {
-                    let mut c = [ps.background.0[0], ps.background.0[1], ps.background.0[2]];
-                    if egui::color_picker::color_edit_button_srgb(ui, &mut c).changed() {
-                        ps.background = Rgba::rgb(c[0], c[1], c[2]);
+                    // The presentation background is opaque.
+                    if crate::paint_ui::color_swatch(ui, ui.id().with("proto-bg-swatch"), &mut ps.background) {
+                        ps.background = ps.background.with_alpha(255);
                     }
                     hex_field(ui, ui.id().with("proto-bg"), &mut ps.background, 56.0);
                 });
@@ -2380,7 +2398,7 @@ impl App {
         }
         let mut reactions = self.doc.node(id).reactions.clone();
         let mut changed = false;
-        if section_title(ui, "Interactions") {
+        if section_title(ui, "Interactions", "Add interaction") {
             // A new link points at the next frame to the right (then below), not whatever is first in the layer list.
             let here = self.doc.node(top).rect.min;
             let to = frames
@@ -2559,10 +2577,7 @@ impl App {
                                 match val {
                                     VarValue::Color(c) => {
                                         ui.horizontal(|ui| {
-                                            let mut rgb = [c.0[0], c.0[1], c.0[2]];
-                                            if egui::color_picker::color_edit_button_srgb(ui, &mut rgb).changed() {
-                                                *c = Rgba([rgb[0], rgb[1], rgb[2], c.0[3]]);
-                                            }
+                                            crate::paint_ui::color_swatch(ui, pid.with("var-swatch"), c);
                                             hex_field(ui, pid.with("var-hex"), c, 56.0);
                                         });
                                     }
@@ -2621,10 +2636,7 @@ impl App {
                                     o.background = on.then_some(Rgba([0, 0, 0, 64]));
                                 }
                                 if let Some(bg) = &mut o.background {
-                                    let mut c = bg.to32();
-                                    if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::OnlyBlend).changed() {
-                                        *bg = Rgba(c.to_srgba_unmultiplied());
-                                    }
+                                    crate::paint_ui::color_swatch(ui, ui.id().with("overlay-bg"), bg);
                                 }
                             });
                             ui.end_row();
@@ -3710,7 +3722,8 @@ impl App {
         let mut sizing = n.sizing;
         let (mut mins, mut maxs) = (n.min_size, n.max_size);
         let mut sized = false;
-        let mut sizing_changed = false;
+        // Menu picks are one step each; dragging or typing a min/max value is one step per gesture.
+        let (mut sizing_changed, mut bounds_changed) = (false, false);
         ui.horizontal(|ui| {
             let menus = roots.len() == 1 && (can_hug || parent_al);
             // Two fields and two 18-point menu buttons, with the gaps between them, fill the row exactly.
@@ -3736,13 +3749,17 @@ impl App {
                 let [xw, xh] = &mut maxs;
                 for (b, label) in [(mw, "Min W"), (xw, "Max W"), (mh, "Min H"), (xh, "Max H")] {
                     if let Some(v) = b {
-                        sizing_changed |= num_field(ui, v, label, 0.0, half(ui) - 4.0);
+                        bounds_changed |= num_field(ui, v, label, 0.0, half(ui) - 4.0);
                     }
                 }
             });
         }
-        if sizing_changed {
-            self.checkpoint();
+        if sizing_changed || bounds_changed {
+            if sizing_changed {
+                self.checkpoint();
+            } else {
+                self.begin_edit();
+            }
             let n = self.doc.node_mut(first);
             n.sizing = sizing;
             // Filling text wraps at its width, like Figma.
@@ -4189,14 +4206,9 @@ impl App {
                 LineHeight::Px(v) => num(v),
                 LineHeight::Percent(p) => format!("{}%", num(p)),
             };
-            let mut buf: String = ui.data(|d| d.get_temp(lh_id)).unwrap_or(shown);
-            let r = ui.add_sized([half(ui), 22.0], egui::TextEdit::singleline(&mut buf).id(lh_id).hint_text("Line height"));
-            if r.has_focus() {
-                ui.data_mut(|d| d.insert_temp(lh_id, buf.clone()));
-            } else {
-                ui.data_mut(|d| d.remove::<String>(lh_id));
-            }
-            if r.lost_focus() {
+            let add = |ui: &mut Ui, buf: &mut String| ui.add_sized([half(ui), 22.0], egui::TextEdit::singleline(buf).id(lh_id).hint_text("Line height"));
+            let (r, typed) = crate::paint_ui::buffered_text(ui, lh_id, || shown, add);
+            if let Some(buf) = typed {
                 let v = buf.trim();
                 // "inf", "NaN" and negatives parse as floats but aren't line heights.
                 let ok = |x: &f32| x.is_finite() && *x >= 0.0;
@@ -4470,13 +4482,7 @@ impl App {
                     if style.remote.is_some() {
                         ui.label(RichText::new("From a library: edit it in its file.").color(theme::muted(ui.ctx())));
                     } else if let StyleValue::Paint(mut ps) = style.value.clone() {
-                        let mut edited = false;
-                        for (i, p) in ps.iter_mut().enumerate().rev() {
-                            if !matches!(paint_row(ui, ui.id().with(("style-paint", style.id, i)), p, "Fill"), PaintEvent::None) {
-                                edited = true;
-                            }
-                        }
-                        if edited {
+                        if self.edit_paint_style(ui, ui.id().with(("style-paint", style.id)), &mut ps) {
                             self.begin_edit();
                             if let Some(st) = self.doc.styles.iter_mut().find(|s| s.id == style.id) {
                                 st.value = StyleValue::Paint(ps);
@@ -4618,15 +4624,9 @@ impl App {
                     let mut style = (n.dash.clone(), n.cap, n.join);
                     let dash_id = ui.id().with(("dash", n.id));
                     let shown = style.0.iter().map(|d| num(*d)).collect::<Vec<_>>().join(", ");
-                    let mut buf: String = ui.data(|d| d.get_temp(dash_id)).unwrap_or(shown);
                     ui.label("Dashes");
-                    let r = ui.add(egui::TextEdit::singleline(&mut buf).id(dash_id).hint_text("e.g. 4, 2"));
-                    if r.has_focus() {
-                        ui.data_mut(|d| d.insert_temp(dash_id, buf.clone()));
-                    } else {
-                        ui.data_mut(|d| d.remove::<String>(dash_id));
-                    }
-                    if r.lost_focus() {
+                    let add = |ui: &mut Ui, buf: &mut String| ui.add(egui::TextEdit::singleline(buf).id(dash_id).hint_text("e.g. 4, 2"));
+                    if let Some(buf) = crate::paint_ui::buffered_text(ui, dash_id, || shown, add).1 {
                         style.0 = buf.split([',', ' ']).filter_map(|t| t.trim().parse::<f32>().ok()).filter(|v| v.is_finite() && *v >= 0.0).collect();
                     }
                     ui.horizontal(|ui| {
@@ -4736,7 +4736,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Layout guide").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                add = icon_button(ui, Icon::Plus, false, 22.0, "").clicked();
+                add = icon_button(ui, Icon::Plus, false, 22.0, "Add layout guide").clicked();
                 pick = self.style_picker(ui, ui.id().with("grid-styles"), |v| matches!(v, StyleValue::Grid(_)));
             });
         });

@@ -4383,3 +4383,41 @@ fn multi_selection_edits_change_only_that_property() {
     assert_eq!(get(&h, i1, "Icon"), Some(PropValue::Bool(true)));
     assert_eq!(get(&h, i2, "Icon"), None, "the other instance keeps its own value");
 }
+
+#[test]
+fn add_stop_selects_the_new_stop() {
+    use crate::doc::{Paint, PaintKind, Rgba};
+    let mut h = harness();
+    let id = draw(&mut h, Key::R, (0.0, 0.0), (100.0, 100.0));
+    let mut g = Paint::solid(Rgba::rgb(255, 0, 0));
+    g.convert(PaintKind::Linear);
+    h.state_mut().doc.node_mut(id).fills = vec![g];
+    h.run_steps(2);
+    h.get_all_by_label("Color swatch").next().unwrap().click();
+    h.run_steps(3);
+    h.get_by_label("Add stop").click();
+    h.run_steps(3);
+    let p = &h.state().doc.node(id).fills[0];
+    assert_eq!(p.stops.len(), 3);
+    assert_eq!(p.stops[1].0, 0.5, "the new stop sorts into the middle");
+    assert_eq!(h.state().gradient_edit.unwrap().stop, 1, "and is the one selected");
+}
+
+#[test]
+fn escape_reverts_a_buffered_field() {
+    let mut h = harness();
+    h.run_steps(2);
+    let typed = |h: &mut Harness<App>, end: Key| {
+        h.get_all_by_value("1x").next().unwrap().focus();
+        h.run_steps(1);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+        h.get_all_by_value("1x").next().unwrap().type_text("3x");
+        h.run_steps(1);
+        h.key_press(end);
+        h.run_steps(2);
+    };
+    typed(&mut h, Key::Escape);
+    assert_eq!(h.state().export_default.scale, 1.0, "Escape leaves the field's value alone");
+    typed(&mut h, Key::Enter);
+    assert_eq!(h.state().export_default.scale, 3.0, "Enter commits it");
+}
