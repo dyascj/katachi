@@ -1,4 +1,4 @@
-//! Dev Mode code: CSS, SwiftUI, and Jetpack Compose for a selected layer.
+//! Dev Mode code: CSS, Tailwind, SwiftUI, Jetpack Compose, and React for a selected layer.
 
 use crate::canvas::num;
 use crate::doc::{
@@ -13,10 +13,12 @@ pub enum Lang {
     Tailwind,
     SwiftUi,
     Compose,
+    React,
+    ReactTailwind,
 }
 
 impl Lang {
-    pub const ALL: [Lang; 4] = [Lang::Css, Lang::Tailwind, Lang::SwiftUi, Lang::Compose];
+    pub const ALL: [Lang; 6] = [Lang::Css, Lang::Tailwind, Lang::SwiftUi, Lang::Compose, Lang::React, Lang::ReactTailwind];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -24,6 +26,8 @@ impl Lang {
             Lang::Tailwind => "Tailwind",
             Lang::SwiftUi => "SwiftUI",
             Lang::Compose => "Compose",
+            Lang::React => "React",
+            Lang::ReactTailwind => "React (Tailwind)",
         }
     }
 }
@@ -50,9 +54,15 @@ pub fn code_name(name: &str, platform: usize) -> String {
     let words: Vec<String> = name.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(|w| w.to_lowercase()).collect();
     match platform {
         0 => format!("var(--{})", words.join("-")),
-        1 => words.iter().enumerate().map(|(i, w)| if i == 0 { w.clone() } else { w[..1].to_uppercase() + &w[1..] }).collect(),
+        1 => words.iter().enumerate().map(|(i, w)| if i == 0 { w.clone() } else { capitalize(w) }).collect(),
         _ => words.join("_"),
     }
+}
+
+/// `w` with its first letter uppercased, by char rather than byte so "émeraude" or "主要" can't panic.
+fn capitalize(w: &str) -> String {
+    let mut c = w.chars();
+    c.next().map_or(String::new(), |f| f.to_uppercase().chain(c).collect())
 }
 
 fn css_color(c: Rgba) -> String {
@@ -119,13 +129,16 @@ pub fn css(doc: &Document, id: NodeId) -> String {
         }
     }
     let (w, h) = (n.rect.width(), n.rect.height());
+    // Fill grows along the parent's main axis and stretches across it.
+    let main = usize::from(parent.is_some_and(|p| p.layout.mode == LayoutMode::Vertical));
+    let fill = |axis: usize| if axis == main { ("flex", "1 0 0") } else { ("align-self", "stretch") };
     match n.sizing[0] {
-        Sizing::Fill if in_flow => decl!("flex", "1 0 0".into()),
+        Sizing::Fill if in_flow => decl!(fill(0).0, fill(0).1.into()),
         Sizing::Hug => decl!("width", "fit-content".into()),
         _ => decl!("width", var(Bindable::Width, format!("{}px", num(w)))),
     }
     match n.sizing[1] {
-        Sizing::Fill if in_flow => decl!("align-self", "stretch".into()),
+        Sizing::Fill if in_flow => decl!(fill(1).0, fill(1).1.into()),
         Sizing::Hug => decl!("height", "fit-content".into()),
         _ => decl!("height", var(Bindable::Height, format!("{}px", num(h)))),
     }
@@ -352,6 +365,17 @@ fn tw(prefix: &str, v: &str) -> String {
 /// Tailwind classes for one layer, on the element Dev Mode would write for it.
 pub fn tailwind(doc: &Document, id: NodeId) -> String {
     let n = doc.node(id);
+    let class = tailwind_classes(doc, id).join(" ");
+    if n.kind == Kind::Text {
+        format!("<p class=\"{class}\">{}</p>", crate::export::esc(&n.text).replace('\n', "<br>"))
+    } else {
+        format!("<div class=\"{class}\"></div>")
+    }
+}
+
+/// The classes `tailwind` puts on a layer's element.
+fn tailwind_classes(doc: &Document, id: NodeId) -> Vec<String> {
+    let n = doc.node(id);
     let mut c: Vec<String> = vec![];
     let var = |p: Bindable, raw: String| bound(doc, n, p, 0, raw);
     // A bound property uses the variable; plain lengths use the spacing scale.
@@ -364,13 +388,15 @@ pub fn tailwind(doc: &Document, id: NodeId) -> String {
         c.push(tw_len("left", n.rect.min.x - origin.x));
         c.push(tw_len("top", n.rect.min.y - origin.y));
     }
+    let main = usize::from(parent.is_some_and(|p| p.layout.mode == LayoutMode::Vertical));
+    let fill = |axis: usize| if axis == main { "flex-1" } else { "self-stretch" }.to_string();
     match n.sizing[0] {
-        Sizing::Fill if in_flow => c.push("flex-1".into()),
+        Sizing::Fill if in_flow => c.push(fill(0)),
         Sizing::Hug => c.push("w-fit".into()),
         _ => c.push(len("w", Bindable::Width, n.rect.width())),
     }
     match n.sizing[1] {
-        Sizing::Fill if in_flow => c.push("self-stretch".into()),
+        Sizing::Fill if in_flow => c.push(fill(1)),
         Sizing::Hug => c.push("h-fit".into()),
         _ => c.push(len("h", Bindable::Height, n.rect.height())),
     }
@@ -422,8 +448,7 @@ pub fn tailwind(doc: &Document, id: NodeId) -> String {
             }
         }
     }
-    let text = n.kind == Kind::Text;
-    if text {
+    if n.kind == Kind::Text {
         if let Some(col) = n.first_fill() {
             c.push(tw("text", &var(Bindable::Fill, css_color(col))));
         }
@@ -462,10 +487,8 @@ pub fn tailwind(doc: &Document, id: NodeId) -> String {
             c.push(if n.max_lines > 1 { format!("line-clamp-{}", n.max_lines) } else { "truncate".into() });
         }
     } else if let [one] = n.fills.iter().filter(|f| f.visible).collect::<Vec<_>>()[..] {
-        c.push(match one.kind {
-            PaintKind::Solid => tw("bg", &var(Bindable::Fill, css_color(one.color))),
-            _ => tw("background", &css_paint(one)),
-        });
+        // Tailwind's `bg-[...]` takes colors and images (gradients) alike; there is no `background-`.
+        c.push(tw("bg", &if one.kind == PaintKind::Solid { var(Bindable::Fill, css_color(one.color)) } else { css_paint(one) }));
     }
     if n.kind == Kind::Ellipse {
         c.push("rounded-full".into());
@@ -508,12 +531,7 @@ pub fn tailwind(doc: &Document, id: NodeId) -> String {
     if n.clip && n.kind.is_frame() {
         c.push("overflow-hidden".into());
     }
-    let class = c.join(" ");
-    if text {
-        format!("<p class=\"{class}\">{}</p>", n.text)
-    } else {
-        format!("<div class=\"{class}\"></div>")
-    }
+    c
 }
 
 fn swift_color(c: Rgba) -> String {
@@ -579,8 +597,9 @@ pub fn compose(doc: &Document, id: NodeId) -> String {
     let fill_color = |c: Rgba| bound(doc, n, Bindable::Fill, 2, compose_color(c));
     if n.kind == Kind::Text {
         let mut t = format!(
-            "Text(\n    text = {:?},\n    fontSize = {}.sp,\n    fontWeight = FontWeight.W{},\n    fontFamily = FontFamily({:?})",
-            n.text,
+            "Text(\n    text = {},\n    fontSize = {}.sp,\n    fontWeight = FontWeight.W{},\n    fontFamily = FontFamily({:?})",
+            // Kotlin reads `$` in a string as a template.
+            format!("{:?}", n.text).replace('$', "\\$"),
             num(n.font_size),
             (n.font_weight / 100 * 100).clamp(100, 900),
             n.font_family
@@ -625,12 +644,130 @@ pub fn compose(doc: &Document, id: NodeId) -> String {
     }
 }
 
+/// A React function component named after the layer, its visible children nested as elements.
+/// Styles are `css` as a style object, or with `tailwind` set, `tailwind`'s classes.
+pub fn react(doc: &Document, id: NodeId, tailwind: bool) -> String {
+    let mut out = format!("export function {}() {{\n  return (\n", component_name(&doc.node(id).name));
+    jsx(doc, id, tailwind, true, 2, &mut out);
+    out + "  );\n}"
+}
+
+/// One layer's element and its children's, indented `depth` levels.
+fn jsx(doc: &Document, id: NodeId, tailwind: bool, root: bool, depth: usize, out: &mut String) {
+    let n = doc.node(id);
+    let ind = "  ".repeat(depth);
+    let text = n.kind == Kind::Text;
+    // A boolean's children are its operands, not elements; slices draw nothing.
+    let kids: Vec<NodeId> = if matches!(n.kind, Kind::Text | Kind::Boolean) {
+        vec![]
+    } else {
+        n.children.iter().copied().filter(|&c| doc.node(c).visible && doc.node(c).kind != Kind::Slice).collect()
+    };
+    let image = !text && kids.is_empty() && matches!(n.fills.iter().filter(|f| f.visible).collect::<Vec<_>>()[..], [f] if f.kind == PaintKind::Image);
+    // The root drops its canvas position. Absolutely placed children need a positioned parent,
+    // which an absolutely placed layer already is.
+    // ponytail: offsets are from the nearest frame (as in `css`), so children of a placed group land off by the group's offset.
+    let placed = !root && (n.absolute || n.parent.is_some_and(|p| doc.node(p).layout.mode == LayoutMode::None));
+    let relative = !placed && kids.iter().any(|&c| n.layout.mode == LayoutMode::None || doc.node(c).absolute);
+    let mut attrs = vec![];
+    if image {
+        attrs.push("src=\"image.png\"".to_string());
+        attrs.push(format!("alt=\"{}\"", crate::export::esc(&n.name)));
+    }
+    if tailwind {
+        let mut c = tailwind_classes(doc, id);
+        c.retain(|c| !(root && (c == "absolute" || c.starts_with("left-") || c.starts_with("top-")) || image && c.starts_with("bg-")));
+        if relative {
+            c.push("relative".into());
+        }
+        if image {
+            c.push("object-cover".into());
+        }
+        attrs.push(format!("className=\"{}\"", c.join(" ")));
+    } else {
+        let css = css(doc, id);
+        // `css` writes one declaration or comment per line, after a comment naming the layer.
+        let mut entries: Vec<String> = css
+            .lines()
+            .skip(1)
+            .filter_map(|l| match l.strip_suffix(';').and_then(|l| l.split_once(": ")) {
+                Some((k, _)) if root && matches!(k, "position" | "left" | "top") || image && k == "background" => None,
+                Some((k, v)) => Some(style_entry(k, v) + ","),
+                None => Some(l.to_string()),
+            })
+            .collect();
+        if relative {
+            entries.push("position: \"relative\",".into());
+        }
+        if image {
+            entries.push("objectFit: \"cover\",".into());
+        }
+        let body: String = entries.iter().map(|e| format!("{ind}    {e}\n")).collect();
+        attrs.push(format!("style={{{{\n{body}{ind}  }}}}"));
+    }
+    let tag = if text { "p" } else if image { "img" } else { "div" };
+    let leaf = !text && kids.is_empty();
+    if tailwind {
+        let _ = writeln!(out, "{ind}<{tag} {}{}", attrs.join(" "), if leaf { " />" } else { ">" });
+    } else {
+        let _ = writeln!(out, "{ind}<{tag}");
+        for a in &attrs {
+            let _ = writeln!(out, "{ind}  {a}");
+        }
+        let _ = writeln!(out, "{ind}{}", if leaf { "/>" } else { ">" });
+    }
+    if leaf {
+        return;
+    }
+    if text {
+        let _ = writeln!(out, "{ind}  {}", jsx_text(&n.text));
+    }
+    for &c in &kids {
+        jsx(doc, c, tailwind, false, depth + 1, out);
+    }
+    let _ = writeln!(out, "{ind}</{tag}>");
+}
+
+/// One CSS declaration as a style entry: a camelCase key (`-webkit-box-orient` is `WebkitBoxOrient`),
+/// px lengths and bare numbers as numbers (React adds the px), everything else, variables
+/// included, as a string.
+fn style_entry(k: &str, v: &str) -> String {
+    let mut key = String::new();
+    let mut up = false;
+    for ch in k.chars() {
+        match ch {
+            '-' => up = true,
+            _ if up => {
+                key.extend(ch.to_uppercase());
+                up = false;
+            }
+            _ => key.push(ch),
+        }
+    }
+    // React reads a unitless line height as a multiple of the font size, so it keeps its px.
+    let number = v.strip_suffix("px").filter(|_| key != "lineHeight").unwrap_or(v);
+    if number.parse::<f32>().is_ok_and(f32::is_finite) { format!("{key}: {number}") } else { format!("{key}: {:?}", v.replace('"', "'")) }
+}
+
+/// Text as JSX children: entities for what JSX would parse as markup or code, `<br />` for line breaks.
+fn jsx_text(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('{', "&#123;").replace('}', "&#125;").replace('\n', "<br />")
+}
+
+/// A layer name as a component name: its words in PascalCase, prefixed if that wouldn't start with a letter.
+fn component_name(name: &str) -> String {
+    let s: String = name.split(|c: char| !c.is_alphanumeric()).map(capitalize).collect();
+    if s.starts_with(char::is_alphabetic) { s } else { format!("Component{s}") }
+}
+
 pub fn generate(doc: &Document, id: NodeId, lang: Lang) -> String {
     match lang {
         Lang::Css => css(doc, id),
         Lang::Tailwind => tailwind(doc, id),
         Lang::SwiftUi => swiftui(doc, id),
         Lang::Compose => compose(doc, id),
+        Lang::React => react(doc, id, false),
+        Lang::ReactTailwind => react(doc, id, true),
     }
 }
 
@@ -724,5 +861,116 @@ mod tests {
         for want in ["flex ", "flex-row", "items-center", "gap-[var(--gap-md,_12px)]", "p-4", "w-[300px]", "h-[100px]", "rounded-lg", "bg-[var(--color-primary,_#FF0000)]"] {
             assert!(tw.contains(want) || (want == "rounded-lg" && tw.contains("rounded-[8px]")), "missing {want}: {tw}");
         }
+    }
+
+    /// A vertical card with a heading, a filled bar, and an avatar image.
+    fn card() -> (Document, NodeId) {
+        use crate::doc::{Bindable, Paint, VarValue};
+        let mut d = Document::default();
+        let c = d.add_collection("Theme".into());
+        let primary = d.add_variable(c, "color/Primary".into(), VarValue::Color(Rgba::rgb(255, 0, 0)));
+        let mut f = Node::new(Kind::Frame, Rect::from_min_size(pos2(40., 60.), vec2(200., 120.)));
+        f.name = "Profile card".into();
+        f.layout = AutoLayout { mode: LayoutMode::Vertical, gap: 8., padding: [16.; 4], ..Default::default() };
+        let f = d.insert(0, None, None, f);
+        let mut t = Node::new(Kind::Text, Rect::from_min_size(pos2(56., 76.), vec2(100., 20.)));
+        t.text = "Hi {name} <3".into();
+        t.line_height = LineHeight::Px(20.);
+        d.insert(0, Some(f), None, t);
+        let mut r = Node::new(Kind::Rectangle, Rect::from_min_size(pos2(56., 104.), vec2(168., 4.)));
+        r.sizing = [Sizing::Fill, Sizing::Fixed];
+        r.bindings = vec![(Bindable::Fill, primary)];
+        d.insert(1, Some(f), None, r);
+        let mut img = Node::new(Kind::Rectangle, Rect::from_min_size(pos2(56., 116.), vec2(32., 32.)));
+        img.name = "Avatar".into();
+        let mut p = Paint::solid(Rgba::rgb(0, 0, 0));
+        p.convert(PaintKind::Image);
+        img.fills = vec![p];
+        d.insert(2, Some(f), None, img);
+        (d, f)
+    }
+
+    #[test]
+    fn react_nests_children_in_a_component() {
+        let (d, f) = card();
+        let jsx = generate(&d, f, Lang::React);
+        for want in [
+            "export function ProfileCard() {\n  return (\n    <div\n      style={{\n",
+            "display: \"flex\",",
+            "flexDirection: \"column\",",
+            "gap: 8,",
+            "padding: 16,",
+            "width: 200,",
+            "lineHeight: \"20px\",",
+            "fontFamily: \"'Inter'\",",
+            "      <p\n",
+            "        Hi &#123;name&#125; &lt;3\n      </p>",
+            "alignSelf: \"stretch\",",
+            "background: \"var(--color-primary, ",
+            "      <img\n        src=\"image.png\"\n        alt=\"Avatar\"\n",
+            "objectFit: \"cover\",",
+            "      />\n    </div>\n  );\n}",
+        ] {
+            assert!(jsx.contains(want), "missing {want:?}:\n{jsx}");
+        }
+        assert!(!jsx.contains("position") && !jsx.contains("url("), "the root drops its canvas position; the image is an <img>:\n{jsx}");
+        let tw = generate(&d, f, Lang::ReactTailwind);
+        for want in ["    <div className=\"w-[200px] h-[120px] flex flex-col", "      <p className=\"", "        Hi &#123;name&#125; &lt;3\n", "<img src=\"image.png\" alt=\"Avatar\" className=\"", "object-cover\" />"] {
+            assert!(tw.contains(want), "missing {want:?}:\n{tw}");
+        }
+        assert!(!tw.contains("absolute") && !tw.contains("bg-[url"), "{tw}");
+    }
+
+    #[test]
+    fn react_positions_free_children_and_names_components() {
+        let mut d = Document::default();
+        let f = d.insert(0, None, None, Node::new(Kind::Frame, Rect::from_min_size(pos2(100., 100.), vec2(50., 50.))));
+        d.insert(0, Some(f), None, Node::new(Kind::Rectangle, Rect::from_min_size(pos2(110., 120.), vec2(10., 10.))));
+        let jsx = react(&d, f, false);
+        assert!(jsx.contains("position: \"relative\",") && jsx.contains("position: \"absolute\",\n          left: 10,\n          top: 20,"), "{jsx}");
+        assert_eq!(style_entry("-webkit-line-clamp", "2"), "WebkitLineClamp: 2");
+        assert_eq!(component_name("1 big-button"), "Component1BigButton");
+        assert_eq!(component_name("émeraude carte"), "ÉmeraudeCarte");
+        assert_eq!(jsx_text("a {b} <c>\nd"), "a &#123;b&#125; &lt;c&gt;<br />d");
+    }
+
+    #[test]
+    fn non_ascii_variable_words_dont_panic() {
+        assert_eq!(code_name("color/émeraude vert", 1), "colorÉmeraudeVert");
+        assert_eq!(code_name("色/主要", 1), "色主要");
+    }
+
+    #[test]
+    fn fill_follows_the_parent_direction() {
+        for (mode, grow, stretch) in [(LayoutMode::Horizontal, 0, 1), (LayoutMode::Vertical, 1, 0)] {
+            let mut d = Document::default();
+            let mut f = Node::new(Kind::Frame, Rect::from_min_size(pos2(0., 0.), vec2(100., 100.)));
+            f.layout = AutoLayout { mode, ..Default::default() };
+            let f = d.insert(0, None, None, f);
+            let mut kid = Node::new(Kind::Rectangle, Rect::from_min_size(pos2(0., 0.), vec2(10., 10.)));
+            kid.sizing[grow] = Sizing::Fill;
+            let kid = d.insert(0, Some(f), None, kid);
+            let (c, t) = (css(&d, kid), tailwind(&d, kid));
+            assert!(c.contains("flex: 1 0 0;") && !c.contains("align-self") && t.contains("flex-1") && !t.contains("self-stretch"), "{mode:?} grow:\n{c}\n{t}");
+            d.node_mut(kid).sizing = [Sizing::Fixed; 2];
+            d.node_mut(kid).sizing[stretch] = Sizing::Fill;
+            let (c, t) = (css(&d, kid), tailwind(&d, kid));
+            assert!(c.contains("align-self: stretch;") && !c.contains("flex:") && t.contains("self-stretch") && !t.contains("flex-1"), "{mode:?} stretch:\n{c}\n{t}");
+        }
+    }
+
+    #[test]
+    fn tailwind_gradients_and_escaped_strings() {
+        let mut d = Document::default();
+        let mut n = Node::new(Kind::Rectangle, Rect::from_min_size(pos2(0., 0.), vec2(10., 10.)));
+        n.fills[0].convert(PaintKind::Linear);
+        let n = d.insert(0, None, None, n);
+        let tw = tailwind(&d, n);
+        assert!(tw.contains(" bg-[linear-gradient(") && !tw.contains("background-"), "{tw}");
+        let mut t = Node::new(Kind::Text, Rect::from_min_size(pos2(0., 0.), vec2(10., 10.)));
+        t.text = "Total $amount < 5 & up\nnow".into();
+        let t = d.insert(0, None, None, t);
+        assert!(compose(&d, t).contains(r#"text = "Total \$amount < 5 & up\nnow","#), "{}", compose(&d, t));
+        assert!(tailwind(&d, t).ends_with(">Total $amount &lt; 5 &amp; up<br>now</p>"), "{}", tailwind(&d, t));
     }
 }
