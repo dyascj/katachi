@@ -757,22 +757,51 @@ impl Svg<'_> {
     }
 }
 
-/// Export bounds: layers plus their drop shadows, like Figma.
+/// Export bounds: layers plus their strokes, arrowheads, and drop shadows, like Figma.
 pub fn export_bounds(doc: &Document, ids: &[NodeId]) -> Rect {
-    let r = ids.iter().fold(Rect::NOTHING, |r, id| {
-        let n = doc.node(*id);
-        let mut b = n.aabb();
-        for s in n.shadows.iter().filter(|s| s.visible) {
-            match s.kind {
-                EffectKind::DropShadow => b = b.union(n.aabb().translate(s.offset).expand(s.blur + s.spread)),
-                EffectKind::LayerBlur => b = b.union(n.aabb().expand(s.max_blur())),
-                EffectKind::Texture => b = b.union(n.aabb().expand(s.blur)),
-                _ => {}
-            }
-        }
-        r.union(b)
-    });
+    let r = ids.iter().fold(Rect::NOTHING, |r, id| r.union(ink_bounds(doc, *id)));
     if r.is_finite() { r } else { Rect::ZERO }
+}
+
+/// A layer's box grown by what draws past it. Groups have no stroke of their own but hold
+/// layers that may (a group of lines is zero pixels tall).
+fn ink_bounds(doc: &Document, id: NodeId) -> Rect {
+    let n = doc.node(id);
+    let mut b = n.aabb().expand(stroke_reach(n));
+    if n.kind == Kind::Group {
+        for c in &n.children {
+            b = b.union(ink_bounds(doc, *c));
+        }
+    }
+    let base = b;
+    for s in n.shadows.iter().filter(|s| s.visible) {
+        match s.kind {
+            EffectKind::DropShadow => b = b.union(base.translate(s.offset).expand(s.blur + s.spread)),
+            EffectKind::LayerBlur => b = b.union(base.expand(s.max_blur())),
+            EffectKind::Texture => b = b.union(base.expand(s.blur)),
+            _ => {}
+        }
+    }
+    b
+}
+
+/// How far a layer's stroke and line-end markers reach past its box.
+fn stroke_reach(n: &Node) -> f32 {
+    if !n.strokes.iter().any(|s| s.visible) {
+        return 0.0;
+    }
+    let w = n.stroke_sides.map_or(n.stroke_width, |s| s.into_iter().fold(0.0, f32::max));
+    let line = match (n.kind, n.stroke_align) {
+        (_, StrokeAlign::Outside) => w,
+        (Kind::Vector, _) | (_, StrokeAlign::Center) => w / 2.0,
+        (_, StrokeAlign::Inside) => 0.0,
+    };
+    let marker = if n.kind == Kind::Vector && (n.start_marker != crate::doc::Marker::None || n.end_marker != crate::doc::Marker::None) {
+        (n.stroke_width * 3.0).max(6.0)
+    } else {
+        0.0
+    };
+    line.max(marker)
 }
 
 pub fn to_svg(doc: &Document, ids: &[NodeId]) -> String {
@@ -855,6 +884,8 @@ pub fn backdrop_parts(doc: &Document, id: NodeId, export: bool) -> Option<(Strin
 /// glass and masked to its shape (premultiplied RGBA).
 pub fn backdrop_pixels(n: &Node, (content, mask, region): &(String, String, Rect), scale: f32) -> Option<(Vec<u8>, [usize; 2])> {
     let s = n.shadows.iter().find(|s| s.visible && s.kind.is_backdrop())?;
+    // The scale `rasterize` will actually use, so blur radii match the pixels.
+    let scale = fit_scale(region.size(), scale);
     let (mut px, size) = rasterize(content, scale)?;
     let (m, msize) = rasterize(mask, scale)?;
     if msize != size {
@@ -930,14 +961,36 @@ fn noise_table(density: f32) -> String {
     (0..STEPS).map(|i| if (i as f32 + 0.5) / STEPS as f32 >= cut { "1" } else { "0" }).collect::<Vec<_>>().join(" ")
 }
 
-/// Rasterize SVG text at `scale` (premultiplied RGBA pixels and size).
+/// usvg options with Inter, plus the installed fonts when `system`. Built once: copying the
+/// fonts into a fresh database on every render is slow.
+fn usvg_options(system: bool) -> &'static resvg::usvg::Options<'static> {
+    static PLAIN: std::sync::OnceLock<resvg::usvg::Options<'static>> = std::sync::OnceLock::new();
+    static SYSTEM: std::sync::OnceLock<resvg::usvg::Options<'static>> = std::sync::OnceLock::new();
+    (if system { &SYSTEM } else { &PLAIN }).get_or_init(|| {
+        let mut opt = resvg::usvg::Options::default();
+        if system {
+            opt.fontdb = std::sync::Arc::new(crate::text::system_fonts().clone());
+        }
+        for f in FONTS {
+            opt.fontdb_mut().load_font_data(f.to_vec());
+        }
+        opt
+    })
+}
+
+/// `scale`, lowered as needed so content `size` big fits the canvas's 4096 px texture limit.
+fn fit_scale(size: Vec2, scale: f32) -> f32 {
+    scale.min(4096.0 / size.x.max(1.0)).min(4096.0 / size.y.max(1.0))
+}
+
+/// Rasterize SVG text at `scale`, or less if that would pass 4096 px a side (premultiplied RGBA
+/// pixels and size). The pixels always cover the whole SVG.
 pub fn rasterize(svg: &str, scale: f32) -> Option<(Vec<u8>, [usize; 2])> {
-    let mut opt = resvg::usvg::Options::default();
-    for f in FONTS {
-        opt.fontdb_mut().load_font_data(f.to_vec());
-    }
-    let tree = resvg::usvg::Tree::from_str(svg, &opt).ok()?;
+    // Installed fonts only when text names a family other than Inter, or an italic.
+    let system = svg.split(r#"font-family=""#).skip(1).any(|f| !f.starts_with("Inter,")) || svg.contains(r#"font-style="italic""#);
+    let tree = resvg::usvg::Tree::from_str(svg, usvg_options(system)).ok()?;
     let size = tree.size();
+    let scale = fit_scale(Vec2::new(size.width(), size.height()), scale);
     let (w, h) = ((size.width() * scale).ceil() as u32, (size.height() * scale).ceil() as u32);
     let mut pix = resvg::tiny_skia::Pixmap::new(w.clamp(1, 4096), h.clamp(1, 4096))?;
     resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pix.as_mut());
@@ -1025,14 +1078,7 @@ fn needs_system_fonts(doc: &Document) -> bool {
 }
 
 pub fn svg_to_png(doc: &Document, svg: &str, scale: f32) -> Result<Vec<u8>, String> {
-    let mut opt = resvg::usvg::Options::default();
-    if needs_system_fonts(doc) {
-        opt.fontdb = std::sync::Arc::new(crate::text::system_fonts().clone());
-    }
-    for f in FONTS {
-        opt.fontdb_mut().load_font_data(f.to_vec());
-    }
-    let tree = resvg::usvg::Tree::from_str(svg, &opt).map_err(|e| e.to_string())?;
+    let tree = resvg::usvg::Tree::from_str(svg, usvg_options(needs_system_fonts(doc))).map_err(|e| e.to_string())?;
     let size = tree.size();
     let (w, h) = ((size.width() * scale).ceil() as u32, (size.height() * scale).ceil() as u32);
     let mut pix = resvg::tiny_skia::Pixmap::new(w.max(1), h.max(1)).ok_or("export too large")?;
@@ -1077,6 +1123,42 @@ mod tests {
         assert_eq!(safe_name("a:b*c?d\"e<f>g|h"), "abcdefgh");
         let names = unique_names(vec!["Icon.png".into(), "icon.png".into(), "Icon.png".into(), "Icon@2x.png".into()]);
         assert_eq!(names, ["Icon.png", "icon 2.png", "Icon 3.png", "Icon@2x.png"]);
+    }
+
+    #[test]
+    fn export_bounds_reach_strokes_and_arrowheads() {
+        use crate::doc::{Marker, Paint, StrokeAlign};
+        let mut d = Document::default();
+        let pts = [PathPoint { p: pos2(0., 0.), ..Default::default() }, PathPoint { p: pos2(100., 0.), ..Default::default() }];
+        let mut line = Node::vector(&pts, false);
+        (line.strokes, line.stroke_width) = (vec![Paint::solid(Rgba::rgb(0, 0, 0))], 4.0);
+        let l = d.insert(0, None, None, line.clone());
+        assert_eq!(export_bounds(&d, &[l]), Rect::from_min_max(pos2(-2., -2.), pos2(102., 2.)), "a line exports whole, not cut in half");
+        // In a group too, whose own box is as flat as the line.
+        let g = d.insert(0, None, None, Node::new(Kind::Group, Rect::ZERO));
+        d.reparent(l, 0, Some(g), None);
+        d.reflow();
+        assert_eq!(export_bounds(&d, &[g]).height(), 4.0);
+        line.end_marker = Marker::Arrow;
+        let a = d.insert(0, None, None, line);
+        assert_eq!(export_bounds(&d, &[a]).height(), 24.0, "arrowheads are 3x the stroke");
+        let mut b = Node::new(Kind::Rectangle, Rect::from_min_size(pos2(0., 0.), vec2(10., 10.)));
+        (b.strokes, b.stroke_width, b.stroke_align) = (vec![Paint::solid(Rgba::rgb(0, 0, 0))], 3.0, StrokeAlign::Outside);
+        let b = d.insert(0, None, None, b);
+        assert_eq!(export_bounds(&d, &[b]), Rect::from_min_max(pos2(-3., -3.), pos2(13., 13.)));
+        d.node_mut(b).stroke_align = StrokeAlign::Inside;
+        assert_eq!(export_bounds(&d, &[b]), Rect::from_min_max(pos2(0., 0.), pos2(10., 10.)));
+    }
+
+    #[test]
+    fn rasterize_covers_the_whole_svg_past_the_size_limit() {
+        // 2000 wide at 4x is 8000 px: rendered smaller, not cropped to its left half.
+        let svg = r##"<svg width="2000" height="10" viewBox="0 0 2000 10" xmlns="http://www.w3.org/2000/svg"><rect x="1000" width="1000" height="10" fill="#f00"/></svg>"##;
+        let (px, [w, h]) = rasterize(svg, 4.0).unwrap();
+        assert_eq!(w, 4096);
+        assert_eq!(h, 21);
+        assert_eq!(px[(w - 1) * 4 + 3], 255, "the right edge is drawn");
+        assert_eq!(px[3], 0, "the left edge is empty");
     }
 
     #[test]
