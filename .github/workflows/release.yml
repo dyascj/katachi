@@ -7,7 +7,19 @@ permissions:
   contents: write
 
 jobs:
+  # One job creates the release, as a draft, so the build jobs don't race to create it and nobody
+  # sees it until sign publishes it with every asset, signature, and its notes.
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --draft --verify-tag --title "Katachi ${GITHUB_REF_NAME#v}" --notes ""
+
   macos:
+    needs: draft
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -29,26 +41,27 @@ jobs:
           hdiutil create -volname Katachi -srcfolder "$RUNNER_TEMP/stage/Katachi.app" -size "${size}m" -ov -format UDZO Katachi-macos.dmg
           # What the in-app updater downloads.
           tar -czf Katachi-macos.app.tar.gz -C "$RUNNER_TEMP/stage" Katachi.app
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            Katachi-macos.dmg
-            Katachi-macos.app.tar.gz
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" Katachi-macos.dmg Katachi-macos.app.tar.gz -R "$GITHUB_REPOSITORY" --clobber
 
   windows:
+    needs: draft
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
       - run: Compress-Archive -Path target/release/katachi.exe -DestinationPath Katachi-windows.zip
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: Katachi-windows.zip
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: gh release upload "$GITHUB_REF_NAME" Katachi-windows.zip -R "$GITHUB_REPOSITORY" --clobber
 
   # Built on AlmaLinux 8 (glibc 2.28) so one binary runs on RHEL 8+, Debian 11+, Ubuntu 20.04+,
   # Fedora, Arch, and the rest. Everything graphical is loaded at runtime, so nothing else links.
   linux:
+    needs: draft
     strategy:
       matrix:
         include:
@@ -89,9 +102,9 @@ jobs:
         run: |
           sudo apt-get install -y -q rpm
           scripts/linux-package.sh target/release/katachi ${{ matrix.arch }} dist
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/* -R "$GITHUB_REPOSITORY" --clobber
 
   # Sign every asset so the in-app updater can check downloads against the key built into Katachi.
   sign:
@@ -113,8 +126,8 @@ jobs:
           done
           rm key
           gh release upload "$GITHUB_REF_NAME" dist/*.minisig -R "$GITHUB_REPOSITORY" --clobber
-      # Hand-written notes live in release-notes/<tag>.md. Signing comes first, so updates still
-      # work if this fails, but a release without notes fails loudly here.
+      # Hand-written notes live in release-notes/<tag>.md. A release without notes fails loudly
+      # here and stays a draft.
       - name: Publish release notes
         env:
           GH_TOKEN: ${{ github.token }}
@@ -122,3 +135,8 @@ jobs:
           notes="release-notes/$GITHUB_REF_NAME.md"
           if [ ! -f "$notes" ]; then echo "::error::Write $notes before tagging"; exit 1; fi
           gh release edit "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --title "Katachi ${GITHUB_REF_NAME#v}" --notes-file "$notes"
+      # Public only now, with every asset signed and the notes in place.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --draft=false --latest

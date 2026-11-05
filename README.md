@@ -11,10 +11,22 @@ It is a clean-room implementation. No Figma code, assets, or file internals are 
 
 **macOS**
 
+Download `Katachi-macos.dmg` from the [latest release](https://github.com/dyascj/katachi/releases/latest)
+and drag Katachi into Applications. The app is signed ad hoc, not notarized, so the first launch is
+blocked: open System Settings > Privacy & Security and click **Open Anyway**, or run
+`xattr -dr com.apple.quarantine /Applications/Katachi.app`. Or build it yourself:
+
 ```sh
 git clone https://github.com/dyascj/katachi && cd katachi
 scripts/macos-app.sh --install   # builds Katachi.app into /Applications
 ```
+
+**Windows** (10 and 11, x86_64)
+
+Download `Katachi-windows.zip` from the [latest release](https://github.com/dyascj/katachi/releases/latest),
+unzip it into a folder of your own (for example `%LOCALAPPDATA%\Programs\Katachi`), and run
+`katachi.exe`. SmartScreen may warn that the app is unrecognized: click **More info**, then
+**Run anyway**. Keep it in a folder you can write to so it can update itself.
 
 **Linux** (x86_64 and arm64, X11 and Wayland)
 
