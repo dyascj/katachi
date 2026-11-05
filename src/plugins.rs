@@ -244,11 +244,23 @@ pub fn install(manifest: &std::path::Path) -> Result<Installed, String> {
 pub fn load(p: &Installed) -> Result<(String, Option<String>, String), String> {
     let m: Value = serde_json::from_str(&std::fs::read_to_string(&p.manifest).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     let main = m["main"].as_str().ok_or("manifest has no main")?;
-    let code = std::fs::read_to_string(p.manifest.with_file_name(main)).map_err(|e| e.to_string())?;
+    let code = plugin_file(&p.manifest, main)?;
     // `ui` is a file, or (for multiple UIs) a map of names to files; the first one is `__html__`.
     let ui = m["ui"].as_str().or_else(|| m["ui"].as_object().and_then(|o| o.values().next()).and_then(|v| v.as_str()));
-    let html = ui.and_then(|f| std::fs::read_to_string(p.manifest.with_file_name(f)).ok());
+    let html = ui.and_then(|f| plugin_file(&p.manifest, f).ok());
     Ok((code, html, m["id"].as_str().unwrap_or(&p.name).to_string()))
+}
+
+/// Read a file named in a manifest. It must resolve inside the manifest's folder, so a
+/// downloaded plugin can't name `~/.ssh/id_ed25519` (or `../..`) as its UI and read it.
+fn plugin_file(manifest: &std::path::Path, name: &str) -> Result<String, String> {
+    let manifest = manifest.canonicalize().map_err(|e| e.to_string())?;
+    let dir = manifest.parent().ok_or("bad manifest path")?;
+    let path = dir.join(name).canonicalize().map_err(|e| format!("{name}: {e}"))?;
+    if !path.starts_with(dir) {
+        return Err(format!("{name} is outside the plugin's folder"));
+    }
+    std::fs::read_to_string(path).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -256,6 +268,27 @@ mod tests {
     use super::*;
     use crate::doc::{Kind, Node, Rgba};
     use egui::{Rect, pos2, vec2};
+
+    #[test]
+    fn manifest_files_stay_in_the_plugin_folder() {
+        let root = std::env::temp_dir().join(format!("katachi-plugin-paths-{}", std::process::id()));
+        let dir = root.join("plugin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(root.join("secret.txt"), "secret").unwrap();
+        std::fs::write(dir.join("code.js"), "figma.closePlugin()").unwrap();
+        let manifest = dir.join("manifest.json");
+        let p = Installed { name: "P".into(), manifest: manifest.clone() };
+        let with = |main: &str, ui: &str| {
+            std::fs::write(&manifest, serde_json::json!({ "name": "P", "main": main, "ui": ui }).to_string()).unwrap();
+            load(&p)
+        };
+        let secret = root.join("secret.txt").to_string_lossy().into_owned();
+        assert_eq!(with("code.js", "../secret.txt").unwrap().1, None, "parent folder");
+        assert_eq!(with("code.js", &secret).unwrap().1, None, "absolute path");
+        assert!(with(&secret, "code.js").is_err(), "main outside the folder");
+        assert_eq!(with("code.js", "code.js").unwrap().1.as_deref(), Some("figma.closePlugin()"));
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn plugin_api_edits_creates_and_removes() {

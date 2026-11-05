@@ -323,13 +323,14 @@ impl Shell {
             resp.on_hover_text("Home");
             x = home.max.x;
             p.vline(x, r.y_range(), Stroke::new(1.0, line));
-            // File tabs share what's left, between 110 and 220 points each.
+            // File tabs share what's left, between 60 and 220 points each. Tabs that still don't
+            // fit drop off the end (Ctrl+Tab reaches them), never under the window buttons or "+".
             let end = if own_frame() { r.max.x - BUTTONS_W } else { r.max.x };
             let room = (end - x - 44.0).max(0.0);
-            let w = if self.tabs.is_empty() { 0.0 } else { (room / self.tabs.len() as f32).clamp(110.0, 220.0) };
+            let w = if self.tabs.is_empty() { 0.0 } else { (room / self.tabs.len() as f32).clamp(60.0, 220.0) };
             for (i, t) in self.tabs.iter().enumerate() {
                 let tr = Rect::from_min_size(pos2(x, r.min.y), vec2(w, r.height()));
-                if tr.min.x > r.max.x {
+                if tr.max.x > end - 36.0 {
                     break;
                 }
                 let on = self.active == Some(i);
@@ -904,6 +905,13 @@ impl eframe::App for Shell {
 fn reveal(p: &Path) {
     if cfg!(target_os = "macos") {
         let _ = std::process::Command::new("open").arg("-R").arg(p).spawn();
+    } else if cfg!(windows) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // Explorer parses its own command line; this is the form it documents (paths can't hold quotes).
+            let _ = std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", p.display())).spawn();
+        }
     } else {
         // Linux file managers that implement FileManager1 open the folder with the file selected.
         let path: String = p.to_string_lossy().bytes().map(|b| if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
@@ -1032,6 +1040,24 @@ mod tests {
         assert!(s.home.notice.is_none());
         std::fs::remove_file(&rel).unwrap();
         let _ = std::fs::remove_file(&bad);
+    }
+
+    #[test]
+    fn many_tabs_keep_the_new_tab_button_on_screen() {
+        crate::tests::isolate_data();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_eframe(|cc| {
+            crate::setup_style(&cc.egui_ctx);
+            let mut s = Shell::new(vec![]);
+            s.update = crate::update::Updater::off();
+            for _ in 0..30 {
+                s.new_tab();
+            }
+            s
+        });
+        h.run_steps(2);
+        use egui_kittest::kittest::Queryable;
+        let plus = h.get_by_label("New design file").rect();
+        assert!(plus.max.x < 1440.0, "the + button stays inside the window: {plus:?}");
     }
 
     #[test]

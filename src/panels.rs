@@ -2810,7 +2810,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Code").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                egui::ComboBox::from_id_salt("code-lang").selected_text(self.code_lang.label()).width(90.0).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("code-lang").selected_text(self.code_lang.label()).width(120.0).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
                     for lang in Lang::ALL {
                         ui.selectable_value(&mut self.code_lang, lang, lang.label());
                     }

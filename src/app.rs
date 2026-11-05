@@ -2412,8 +2412,11 @@ impl App {
                 });
             }
         });
-        if let (Some(id), Some(r)) = (kick, self.collab.as_ref().and_then(|c| c.relay.as_ref())) {
-            r.kick(id);
+        if let Some(id) = kick
+            && let Some(c) = self.collab.as_mut()
+        {
+            c.kick(id);
+            self.toast("Removed. The session address changed: share the new one with anyone who should stay.".into());
         }
         if let Some(id) = follow {
             self.toggle_follow(id);
@@ -2449,8 +2452,9 @@ impl App {
             Ok(l) => {
                 let port = l.local_addr().map_or(self.collab_port, |a| a.port());
                 let relay = crate::collab::serve(l, self.doc.clone(), crate::collab::session_token());
-                let shared = format!("{}:{port}/{}", crate::collab::local_ip(), relay.token);
-                self.join_session(ctx, &format!("127.0.0.1:{port}/{}", relay.token), true);
+                let token = relay.token();
+                let shared = format!("{}:{port}/{token}", crate::collab::local_ip());
+                self.join_session(ctx, &format!("127.0.0.1:{port}/{token}"), true);
                 if let Some(c) = self.collab.as_mut() {
                     c.address = shared;
                     c.relay = Some(relay);
