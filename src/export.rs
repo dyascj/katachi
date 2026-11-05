@@ -17,7 +17,7 @@ fn color_parts(c: Rgba) -> (String, f32) {
     (format!("#{}", c.hex()), c.a() as f32 / 255.0)
 }
 
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
