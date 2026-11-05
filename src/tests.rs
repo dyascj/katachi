@@ -4252,6 +4252,9 @@ fn library_components_place_update_detach_and_relink() {
     h.run_steps(2);
     assert!(h.query_by_label("Missing").is_some() && h.query_by_label("Relink…").is_some());
     assert_eq!(h.state().doc.node(inst).fills[0].color, red);
+    // Relinking it to this file itself is refused.
+    h.state_mut().relink_library(0, dir.join("app.katachi"));
+    assert_eq!(h.state().doc.libraries[0].id, "kit-id", "a file can't be its own library");
     // Detaching a library instance leaves a plain frame.
     h.state_mut().show_libraries = false;
     h.state_mut().sel = vec![inst];
