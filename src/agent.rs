@@ -254,11 +254,13 @@ fn command(agent: &Installed, req: &Request, scratch: &Path) -> std::io::Result<
         }
         Harness::Gemini => {
             // Gemini reads MCP servers only from settings files; a system settings file of our own
-            // adds Katachi without touching the person's settings.
+            // adds Katachi without touching the person's settings. Headless Gemini refuses to
+            // work in a folder that isn't trusted, so it works in Katachi's own folder, which
+            // holds nothing but these files.
             let settings = scratch.join("gemini-settings.json");
-            let cfg = json!({ "mcpServers": { SERVER: { "httpUrl": url, "trust": true } } });
+            let cfg = json!({ "mcpServers": { SERVER: { "httpUrl": url, "trust": true } }, "security": { "folderTrust": { "enabled": false } } });
             std::fs::write(&settings, cfg.to_string())?;
-            cmd.env("GEMINI_CLI_SYSTEM_SETTINGS_PATH", &settings);
+            cmd.env("GEMINI_CLI_SYSTEM_SETTINGS_PATH", &settings).current_dir(scratch);
             cmd.args(["-o", "stream-json"]);
             if let Some(s) = req.session {
                 cmd.args(["--resume", s]);
@@ -365,7 +367,8 @@ impl Run {
         let scratch = crate::files::data_dir().join("agent");
         std::fs::create_dir_all(&scratch)?;
         let (mut cmd, stdin) = command(agent, req, &scratch)?;
-        if agent.harness != Harness::Cursor {
+        // Agents that need a folder of Katachi's own (Gemini, Cursor) have one already.
+        if cmd.get_current_dir().is_none() {
             cmd.current_dir(req.cwd);
         }
         cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -385,7 +388,8 @@ impl Run {
         if let Some(err) = child.stderr.take() {
             let tail = tail.clone();
             std::thread::spawn(move || {
-                for line in BufReader::new(err).lines().map_while(Result::ok) {
+                // A crash's stack frames say nothing a designer can act on; the message above them does.
+                for line in BufReader::new(err).lines().map_while(Result::ok).filter(|l| !l.trim_start().starts_with("at ")) {
                     let mut t = tail.lock().unwrap();
                     if t.len() == 8 {
                         t.pop_front();

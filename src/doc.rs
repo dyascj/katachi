@@ -3840,7 +3840,11 @@ impl Document {
         } else {
             vec![0.0; kids.len()]
         };
-        if n.sizing[ca] == Sizing::Hug {
+        // Hugging what every child fills has no answer (it used to collapse to nothing): as in
+        // Figma, the frame switches to a fixed size on that axis.
+        if n.sizing[ca] == Sizing::Hug && !kids.is_empty() && kids.iter().all(|c| fills(&self.nodes[c], ca)) {
+            self.node_mut(f).sizing[ca] = Sizing::Fixed;
+        } else if n.sizing[ca] == Sizing::Hug {
             let c = kids.iter().zip(&bases).map(|(c, o)| (&self.nodes[c], o)).filter(|(k, _)| !fills(k, ca)).map(|(k, o)| o + cross(lsize(k))).fold(0.0, f32::max);
             size = along(main(size), q0 + q1 + c);
         }

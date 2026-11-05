@@ -4679,3 +4679,37 @@ fn nested_instance_props_reach_instances_and_self_nesting_is_refused() {
     }
     assert_eq!(doc.nodes.len(), count, "no copies nest inside it");
 }
+
+/// QA: a hugging row whose cards all fill its height used to collapse to nothing, and undo
+/// didn't bring the cards back.
+#[test]
+fn row_whose_children_all_fill_its_height_keeps_its_size_and_undoes() {
+    use crate::doc::{AutoLayout, LayoutMode, Sizing};
+    let mut h = harness();
+    let st = h.state_mut();
+    let mut row = Node::new(Kind::Frame, r(0., 0., 10., 10.));
+    row.layout = AutoLayout { mode: LayoutMode::Horizontal, gap: 10., ..Default::default() };
+    row.sizing = [Sizing::Hug, Sizing::Hug];
+    let row = st.doc.insert(0, None, None, row);
+    let cards: Vec<NodeId> = [120., 160., 140.].iter().map(|&ht| st.doc.insert(0, Some(row), None, Node::new(Kind::Frame, r(0., 0., 100., ht)))).collect();
+    st.doc.reflow();
+    assert_eq!(st.doc.node(row).rect.height(), 160.0);
+    for &c in &cards {
+        h.state_mut().sel = vec![c];
+        h.run_steps(2);
+        let st = h.state_mut();
+        st.checkpoint();
+        st.doc.node_mut(c).sizing[1] = Sizing::Fill;
+        st.doc.reflow();
+        h.run_steps(3);
+    }
+    let st = h.state();
+    assert!(st.doc.node(row).rect.height() > 100.0, "the row keeps its height: {}", st.doc.node(row).rect.height());
+    assert!(cards.iter().all(|&c| st.doc.node(c).rect.height() == st.doc.node(row).rect.height()), "every card fills it");
+    assert_eq!(st.doc.node(row).sizing[1], Sizing::Fixed, "as in Figma, a frame can't hug what all its children fill");
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    let st = h.state();
+    assert_eq!(st.doc.node(cards[2]).sizing[1], Sizing::Fixed, "undo takes back the last change");
+    assert_eq!(st.doc.node(cards[2]).rect.height(), 140.0);
+    assert_eq!(st.doc.node(row).sizing[1], Sizing::Hug);
+}
