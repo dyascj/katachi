@@ -45,9 +45,12 @@ pub struct Shell {
 }
 
 impl Shell {
-    pub fn new(path: Option<PathBuf>) -> Self {
-        let mut s = Shell { tabs: vec![], active: None, idle: App::new(None), held: None, last_active: None, home: Home::default(), title: String::new(), update: crate::update::Updater::start() };
-        if let Some(p) = path {
+    pub fn new(paths: Vec<PathBuf>) -> Self {
+        let mut idle = App::new(None);
+        // Looked for once per launch: on Windows the check runs a process per autosave.
+        idle.recoverable = crate::files::orphaned_recoveries(idle.recovery_path());
+        let mut s = Shell { tabs: vec![], active: None, idle, held: None, last_active: None, home: Home::default(), title: String::new(), update: crate::update::Updater::start() };
+        for p in paths {
             s.open(p);
         }
         s
@@ -55,16 +58,35 @@ impl Shell {
 
     /// Open a file in a tab (or switch to the tab that already has it).
     pub fn open(&mut self, p: PathBuf) {
+        // Absolute, so recents and version history don't depend on the folder Katachi started in.
+        let p = std::path::absolute(&p).unwrap_or(p);
         if let Some(i) = self.tabs.iter().position(|t| t.path.as_deref() == Some(p.as_path())) {
             return self.activate(Some(i));
         }
         let mut app = App::new(None);
-        app.recoverable.clear();
         app.open_path(p);
         // A file that failed to open leaves an empty, unnamed document behind: don't keep it.
         if app.path.is_none() && !app.dirty {
             if let Some((msg, _)) = app.toast.take() {
-                self.home.notice = Some(msg);
+                self.report(msg);
+            }
+            return;
+        }
+        // Several files at once: an earlier one's error comes along instead of waiting on Home.
+        if let Some(msg) = self.home.notice.take() {
+            app.toast(msg);
+        }
+        self.tabs.push(app);
+        self.activate(Some(self.tabs.len() - 1));
+    }
+
+    /// Open a crashed session's autosave as unsaved work in a tab of its own.
+    fn recover(&mut self, p: PathBuf) {
+        let mut app = App::new(None);
+        app.recover(&p);
+        if !app.dirty {
+            if let Some((msg, _)) = app.toast.take() {
+                self.report(msg);
             }
             return;
         }
@@ -72,14 +94,22 @@ impl Shell {
         self.activate(Some(self.tabs.len() - 1));
     }
 
+    /// An error from opening a file: on the tab on screen, or on Home.
+    fn report(&mut self, msg: String) {
+        match self.active {
+            Some(i) => self.tabs[i].toast(msg),
+            None => self.home.notice = Some(msg),
+        }
+    }
+
     pub fn new_tab(&mut self) {
-        let mut app = App::new(None);
-        app.recoverable.clear();
-        self.tabs.push(app);
+        self.tabs.push(App::new(None));
         self.activate(Some(self.tabs.len() - 1));
     }
 
     fn activate(&mut self, i: Option<usize>) {
+        // An open error on Home is stale once anything else happens.
+        self.home.notice = None;
         if i.is_none() {
             self.home.refresh = true;
         }
@@ -152,9 +182,10 @@ impl Shell {
         if close && let Some(i) = self.active {
             self.request_close(i);
         }
-        // Ctrl Q quits on Windows and Linux (macOS gets Cmd Q from its app menu). Quitting asks
-        // about unsaved work first, as closing the window does.
-        if !cfg!(target_os = "macos") && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Q)) {
+        // Ctrl Q quits on Windows and Linux; macOS gets Cmd Q (and Dock > Quit, logging out) from
+        // AppKit, which `macos_open` turns into a request. Quitting asks about unsaved work
+        // first, as closing the window does.
+        if crate::macos_open::quit_requested() || !cfg!(target_os = "macos") && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Q)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         // Ctrl+Tab cycles Home and the tabs.
@@ -186,16 +217,33 @@ impl Shell {
         }
     }
 
-    /// What the tab on screen asked for this frame.
+    /// What the tab on screen (or, on Home, the session's holder: crash recovery) asked for
+    /// this frame.
     fn wants(&mut self) {
-        let Some(i) = self.active else { return };
-        match self.tabs[i].want.take() {
+        let want = match self.active {
+            Some(i) => self.tabs[i].want.take(),
+            None => self.holder().want.take(),
+        };
+        match want {
             Some(Want::NewTab) => self.new_tab(),
             Some(Want::Open(p)) => self.open(p),
             Some(Want::OpenDialog) => self.open_dialog(),
-            Some(Want::CloseTab) => self.close(i),
+            Some(Want::CloseTab) => {
+                if let Some(i) = self.active {
+                    self.close(i);
+                }
+            }
             Some(Want::Home) => self.activate(None),
-            Some(Want::KeepOpen) => self.tabs.iter_mut().for_each(|t| t.allow_close = false),
+            Some(Want::KeepOpen) => {
+                // Other tabs may have been asked too: those questions go with the cancelled quit.
+                for t in &mut self.tabs {
+                    t.allow_close = false;
+                    if t.confirm == Some(crate::app::After::Close) {
+                        t.confirm = None;
+                    }
+                }
+            }
+            Some(Want::Recover(p)) => self.recover(p),
             None => {}
         }
     }
@@ -205,7 +253,9 @@ impl Shell {
         if !ctx.input(|i| i.viewport().close_requested()) {
             return;
         }
-        if let Some(i) = self.tabs.iter().position(|t| t.dirty && !t.allow_close) {
+        // The tab on screen first: it has already asked (`App::close_guard`).
+        let waiting = |t: &App| t.dirty && !t.allow_close;
+        if let Some(i) = self.active.filter(|&i| waiting(&self.tabs[i])).or_else(|| self.tabs.iter().position(waiting)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.activate(Some(i));
             self.tabs[i].confirm = Some(crate::app::After::Close);
@@ -273,13 +323,14 @@ impl Shell {
             resp.on_hover_text("Home");
             x = home.max.x;
             p.vline(x, r.y_range(), Stroke::new(1.0, line));
-            // File tabs share what's left, between 110 and 220 points each.
+            // File tabs share what's left, between 60 and 220 points each. Tabs that still don't
+            // fit drop off the end (Ctrl+Tab reaches them), never under the window buttons or "+".
             let end = if own_frame() { r.max.x - BUTTONS_W } else { r.max.x };
             let room = (end - x - 44.0).max(0.0);
-            let w = if self.tabs.is_empty() { 0.0 } else { (room / self.tabs.len() as f32).clamp(110.0, 220.0) };
+            let w = if self.tabs.is_empty() { 0.0 } else { (room / self.tabs.len() as f32).clamp(60.0, 220.0) };
             for (i, t) in self.tabs.iter().enumerate() {
                 let tr = Rect::from_min_size(pos2(x, r.min.y), vec2(w, r.height()));
-                if tr.min.x > r.max.x {
+                if tr.max.x > end - 36.0 {
                     break;
                 }
                 let on = self.active == Some(i);
@@ -813,9 +864,7 @@ impl eframe::App for Shell {
         }
         // Anything that landed in `idle` (recovered work, a file an agent opened) becomes a tab.
         if self.held.is_none() && (self.idle.path.is_some() || self.idle.dirty) {
-            let mut fresh = App::new(None);
-            fresh.recoverable.clear();
-            let app = std::mem::replace(&mut self.idle, fresh);
+            let app = std::mem::replace(&mut self.idle, App::new(None));
             self.tabs.push(app);
             let i = self.tabs.len() - 1;
             self.held = Some(i);
@@ -828,6 +877,7 @@ impl eframe::App for Shell {
         }
         self.wants();
         self.close_guard(&ctx);
+        crate::macos_open::UNSAVED.store(self.tabs.iter().any(|t| t.dirty && !t.allow_close), Ordering::Relaxed);
         // Tabs in the background have unsaved work too.
         let now = ctx.input(|i| i.time);
         for t in &mut self.tabs {
@@ -842,9 +892,10 @@ impl eframe::App for Shell {
         }
     }
 
-    /// The window closed: every tab's unsaved work was saved or let go, so drop the autosaves.
+    /// The window closed: drop the autosaves of work that was saved or let go. Anything else
+    /// (a quit that skipped the "Save changes?" questions) keeps its autosave for next launch.
     fn on_exit(&mut self) {
-        for t in &self.tabs {
+        for t in self.tabs.iter().filter(|t| !t.dirty || t.allow_close) {
             t.clear_recovery();
         }
     }
@@ -854,6 +905,13 @@ impl eframe::App for Shell {
 fn reveal(p: &Path) {
     if cfg!(target_os = "macos") {
         let _ = std::process::Command::new("open").arg("-R").arg(p).spawn();
+    } else if cfg!(windows) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // Explorer parses its own command line; this is the form it documents (paths can't hold quotes).
+            let _ = std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", p.display())).spawn();
+        }
     } else {
         // Linux file managers that implement FileManager1 open the folder with the file selected.
         let path: String = p.to_string_lossy().bytes().map(|b| if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
@@ -892,7 +950,7 @@ mod tests {
         // Each frame is 31 s, past the autosave interval.
         let mut h = egui_kittest::Harness::builder().with_step_dt(31.0).build_eframe(move |cc| {
             crate::setup_style(&cc.egui_ctx);
-            let mut s = Shell::new(None);
+            let mut s = Shell::new(vec![]);
             s.update = crate::update::Updater::off();
             s.new_tab();
             s.tabs[0].doc.pages[0].name = page.clone();
@@ -909,10 +967,97 @@ mod tests {
         // Quitting: tab 0 said "Don't save", then tab 1 cancelled. Both must ask again next time.
         let s = h.state_mut();
         s.tabs[0].allow_close = true;
+        s.tabs[0].confirm = Some(crate::app::After::Close);
         s.tabs[1].want = Some(Want::KeepOpen);
         s.wants();
         assert!(s.tabs.iter().all(|t| !t.allow_close));
+        assert_eq!(s.tabs[0].confirm, None, "no stale \"Save changes?\" left to restart the quit");
+        // Quitting anyway (macOS Cmd Q used to skip the questions) keeps unsaved work's autosave.
+        let (dirty, clean) = (s.tabs[0].recovery_path().to_path_buf(), s.tabs[1].recovery_path().to_path_buf());
+        for p in [&dirty, &clean] {
+            crate::files::write_atomic(p, b"{}").unwrap();
+        }
+        eframe::App::on_exit(s);
+        assert!(dirty.exists() && !clean.exists());
         s.tabs[0].clear_recovery();
+    }
+
+    #[test]
+    fn each_recovered_autosave_gets_its_own_tab() {
+        crate::tests::isolate_data();
+        // Autosaves left by a session that crashed (its process id is long gone).
+        let dir = crate::files::recovery_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut left = vec![];
+        for i in 0..2 {
+            let mut app = App::new(None);
+            app.doc.pages[0].name = format!("Recovered {i}");
+            let p = dir.join(format!("4000000001-{}-{i}.katachi", std::process::id()));
+            crate::files::write_atomic(&p, crate::doc::file_json(&app.doc).as_bytes()).unwrap();
+            left.push(p);
+        }
+        let mut s = Shell::new(vec![]);
+        s.update = crate::update::Updater::off();
+        assert!(left.iter().all(|p| s.idle.recoverable.contains(p)), "found once, at launch");
+        // Recover on Home, then again over the first recovered tab.
+        s.idle.want = Some(Want::Recover(left[0].clone()));
+        s.wants();
+        s.hold();
+        s.holder().want = Some(Want::Recover(left[1].clone()));
+        s.wants();
+        let names: Vec<&str> = s.tabs.iter().map(|t| t.doc.pages[0].name.as_str()).collect();
+        assert_eq!(names, ["Recovered 0", "Recovered 1"]);
+        assert!(s.tabs.iter().all(|t| t.dirty && t.recovery_path().exists()), "each re-homed as unsaved work");
+        for t in &s.tabs {
+            t.clear_recovery();
+        }
+    }
+
+    #[test]
+    fn opening_files_from_args_relative_paths_and_bad_files() {
+        crate::tests::isolate_data();
+        let rel = PathBuf::from(format!("katachi-rel-{}.katachi", std::process::id()));
+        let bad = std::env::temp_dir().join(format!("katachi-bad-{}.katachi", std::process::id()));
+        assert!(App::new(None).save_to(rel.clone()));
+        std::fs::write(&bad, "not a design").unwrap();
+        // Bad file first: its error comes along to the tab the good one opens in.
+        let mut s = Shell::new(vec![bad.clone(), rel.clone(), rel.clone()]);
+        s.update = crate::update::Updater::off();
+        assert_eq!(s.tabs.len(), 1);
+        let abs = std::env::current_dir().unwrap().join(&rel);
+        assert_eq!(s.tabs[0].path.as_deref(), Some(abs.as_path()), "stored absolute");
+        assert!(s.tabs[0].toast.as_ref().is_some_and(|(m, _)| m.contains("Couldn't open katachi-bad")));
+        assert!(s.home.notice.is_none());
+        // From inside a tab, the error shows on the tab.
+        s.tabs[0].toast = None;
+        s.open(bad.clone());
+        assert!(s.tabs[0].toast.is_some() && s.home.notice.is_none());
+        // On Home it shows there, until something else happens.
+        s.activate(None);
+        s.open(bad.clone());
+        assert!(s.home.notice.is_some());
+        s.open(abs.clone());
+        assert!(s.home.notice.is_none());
+        std::fs::remove_file(&rel).unwrap();
+        let _ = std::fs::remove_file(&bad);
+    }
+
+    #[test]
+    fn many_tabs_keep_the_new_tab_button_on_screen() {
+        crate::tests::isolate_data();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_eframe(|cc| {
+            crate::setup_style(&cc.egui_ctx);
+            let mut s = Shell::new(vec![]);
+            s.update = crate::update::Updater::off();
+            for _ in 0..30 {
+                s.new_tab();
+            }
+            s
+        });
+        h.run_steps(2);
+        use egui_kittest::kittest::Queryable;
+        let plus = h.get_by_label("New design file").rect();
+        assert!(plus.max.x < 1440.0, "the + button stays inside the window: {plus:?}");
     }
 
     #[test]
@@ -926,7 +1071,7 @@ mod tests {
             app.doc.pages[0].name = name(p);
             assert!(app.save_to(p.clone()));
         }
-        let mut s = Shell::new(None);
+        let mut s = Shell::new(vec![]);
         s.update = crate::update::Updater::off();
         assert!(s.active.is_none(), "starts on Home");
         s.open(a.clone());
@@ -975,7 +1120,7 @@ mod look {
         }
         let mut h = Harness::builder().with_size(egui::vec2(1440.0, 900.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| {
             crate::setup_style(&cc.egui_ctx);
-            let mut s = Shell::new(None);
+            let mut s = Shell::new(vec![]);
             s.update = crate::update::Updater::off();
             *s.update.state.lock().unwrap() = crate::update::State::Available { version: "0.2.0".into(), url: String::new(), sig: String::new() };
             s

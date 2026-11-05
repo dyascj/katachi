@@ -17,7 +17,7 @@ fn color_parts(c: Rgba) -> (String, f32) {
     (format!("#{}", c.hex()), c.a() as f32 / 255.0)
 }
 
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
@@ -1081,6 +1081,10 @@ pub fn svg_to_png(doc: &Document, svg: &str, scale: f32) -> Result<Vec<u8>, Stri
     let tree = resvg::usvg::Tree::from_str(svg, usvg_options(needs_system_fonts(doc))).map_err(|e| e.to_string())?;
     let size = tree.size();
     let (w, h) = ((size.width() * scale).ceil() as u32, (size.height() * scale).ceil() as u32);
+    // A failed allocation aborts the process, so refuse anything over 16384 x 16384 (1 GiB) first.
+    if w as u64 * h as u64 > 16384 * 16384 {
+        return Err(format!("export too large: {w} x {h} pixels (the limit is 16384 x 16384)"));
+    }
     let mut pix = resvg::tiny_skia::Pixmap::new(w.max(1), h.max(1)).ok_or("export too large")?;
     resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pix.as_mut());
     pix.encode_png().map_err(|e| e.to_string())
@@ -1159,6 +1163,18 @@ mod tests {
         assert_eq!(h, 21);
         assert_eq!(px[(w - 1) * 4 + 3], 255, "the right edge is drawn");
         assert_eq!(px[3], 0, "the left edge is empty");
+    }
+
+    #[test]
+    fn huge_exports_fail_instead_of_aborting() {
+        let mut d = Document::default();
+        let f = d.insert(0, None, None, Node::new(Kind::Frame, Rect::from_min_size(pos2(0., 0.), vec2(10., 10.))));
+        let mut set = crate::doc::ExportSetting::default();
+        assert!(set.set_size("100000w"));
+        let scale = set.scale_for(vec2(10., 10.));
+        assert_eq!(scale, 1638.4, "width presets are capped");
+        let err = svg_to_png(&d, &to_svg(&d, &[f]), 10000.0).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
     }
 
     #[test]

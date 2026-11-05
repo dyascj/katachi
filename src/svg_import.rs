@@ -7,6 +7,9 @@ use resvg::usvg;
 
 fn options() -> usvg::Options<'static> {
     let mut opt = usvg::Options::default();
+    // SVGs come from other people (pastes, downloads, plugins): load embedded data: images only,
+    // never local files or network shares named in an <image href>.
+    opt.image_href_resolver.resolve_string = Box::new(|_, _| None);
     for f in crate::export::FONTS {
         opt.fontdb_mut().load_font_data(f.to_vec());
     }
@@ -301,6 +304,22 @@ mod tests {
         let dot = d.node(kids[2]);
         assert_eq!(dot.fills[0].color, Rgba([0, 255, 0, 128]));
         assert_eq!(dot.paths[0].points.len(), 4, "circle = 4 cubic anchors");
+    }
+
+    #[test]
+    fn image_hrefs_load_data_urls_but_not_local_files() {
+        use base64::Engine;
+        let png = resvg::tiny_skia::Pixmap::new(2, 2).unwrap().encode_png().unwrap();
+        let path = std::env::temp_dir().join(format!("katachi-svg-href-{}.png", std::process::id()));
+        std::fs::write(&path, &png).unwrap();
+        let data = base64::engine::general_purpose::STANDARD.encode(&png);
+        let svg = format!(
+            r#"<svg width="10" height="10" xmlns="http://www.w3.org/2000/svg"><image href="{}" width="2" height="2"/><image href="data:image/png;base64,{data}" width="2" height="2"/></svg>"#,
+            path.display()
+        );
+        let (_, images) = import(&mut Document::default(), svg.as_bytes(), "x.svg", 0, None, Pos2::ZERO).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(images.len(), 1, "only the data: image loads");
     }
 
     #[test]

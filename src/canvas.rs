@@ -1092,7 +1092,9 @@ impl App {
                             let index = target
                                 .filter(|t| self.doc.node(*t).layout.mode != LayoutMode::None)
                                 .map(|t| self.al_index(t, id, w));
-                            self.doc.reparent(id, self.page, target, index);
+                            if !self.doc.reparent(id, self.page, target, index) {
+                                self.toast(crate::app::NESTED_MAIN.into());
+                            }
                         }
                     }
                 }
