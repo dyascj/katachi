@@ -826,8 +826,9 @@ impl App {
         chain.push(hit);
         for (i, &cur) in chain.iter().enumerate() {
             let n = self.doc.node(cur);
-            // Top-level frames are click-through; instances act like groups.
-            let top_frame = matches!(n.kind, Kind::Frame | Kind::Component | Kind::ComponentSet | Kind::Section) && n.parent.is_none();
+            // Top-level frames (sections don't count as a level) are click-through; instances act like groups.
+            let top_level = chain[..i].iter().all(|a| self.doc.node(*a).kind == Kind::Section);
+            let top_frame = matches!(n.kind, Kind::Frame | Kind::Component | Kind::ComponentSet | Kind::Section) && top_level;
             let entered = self.sel.iter().any(|&s| s != cur && self.doc.is_ancestor(cur, s));
             if i + 1 == chain.len() || !(top_frame || entered) {
                 return cur;

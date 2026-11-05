@@ -4315,3 +4315,81 @@ fn plugins_and_agents_import_library_components_by_key() {
     let bad = app.mcp_tool(&ctx, "execute_code", &serde_json::json!({ "code": "await figma.importComponentByKeyAsync('nope:1')" }));
     assert_eq!(bad["isError"], true);
 }
+
+#[test]
+fn text_editor_undo_stays_within_one_layer() {
+    let mut h = harness();
+    let mut a = Node::new(Kind::Text, r(0., 0., 100., 20.));
+    a.text = "Alpha".into();
+    let mut b = a.clone();
+    b.rect = r(0., 100., 100., 20.);
+    b.text = "Beta".into();
+    let a = h.state_mut().doc.insert(0, None, None, a);
+    let b = h.state_mut().doc.insert(0, None, None, b);
+    h.state_mut().editing_text = Some(a);
+    h.state_mut().focus_text = true;
+    h.run_steps(3);
+    h.state_mut().editing_text = None;
+    h.run_steps(2);
+    h.state_mut().editing_text = Some(b);
+    h.state_mut().focus_text = true;
+    h.run_steps(3);
+    // Cmd Z in B's editor has nothing of B's to undo, and must not bring back A's text.
+    key(&mut h, Modifiers::COMMAND, Key::Z);
+    assert_eq!(h.state().doc.node(b).text, "Beta");
+}
+
+#[test]
+fn frames_in_sections_act_top_level() {
+    let mut h = harness();
+    let st = h.state_mut();
+    let sec = st.doc.insert(0, None, None, Node::new(Kind::Section, r(0., 0., 600., 400.)));
+    let a = st.doc.insert(0, Some(sec), None, Node::new(Kind::Frame, r(50., 50., 200., 150.)));
+    let b = st.doc.insert(0, Some(sec), None, Node::new(Kind::Frame, r(300., 50., 200., 150.)));
+    let btn = st.doc.insert(0, Some(a), None, Node::new(Kind::Rectangle, r(60., 60., 40., 20.)));
+    assert_eq!(crate::prototype::top_frame(&st.doc, btn), a, "noodles and Present start from the frame, not the section");
+    assert_eq!(crate::prototype::frames_on_page(&st.doc, 0), vec![a, b]);
+    assert_eq!(st.selectable(btn, false), btn, "frames in a section are click-through like top-level ones");
+    h.run_steps(2);
+    let labeled: Vec<NodeId> = h.state().frame_labels.iter().map(|l| l.0).collect();
+    assert!(labeled.contains(&a) && labeled.contains(&b), "{labeled:?}");
+    h.state_mut().sel = vec![btn];
+    h.state_mut().present(0.0);
+    h.run_steps(2);
+    let p = h.state().presenting.as_ref().unwrap();
+    assert_eq!(p.frame, a);
+    assert!(p.delays_fired, "nothing on a delay: Present stops checking every frame");
+}
+
+#[test]
+fn scale_tool_scales_contents_and_rotated_resize_pins_text() {
+    let mut h = harness();
+    // K on a frame: the child grows and moves with it, not just its stroke.
+    let f = draw(&mut h, Key::F, (0.0, 0.0), (100.0, 100.0));
+    let c = draw(&mut h, Key::R, (50.0, 50.0), (100.0, 100.0));
+    assert_eq!(h.state().doc.node(c).parent, Some(f));
+    h.state_mut().doc.node_mut(c).stroke_width = 2.0;
+    h.state_mut().sel = vec![f];
+    key(&mut h, Modifiers::NONE, Key::K);
+    let (p, q) = (s(&h, 100., 100.), s(&h, 200., 200.));
+    drag(&mut h, p, q, Modifiers::NONE);
+    assert_eq!(rect(&h, f), r(0., 0., 200., 200.));
+    assert_eq!(rect(&h, c), r(100., 100., 100., 100.));
+    assert!((h.state().doc.node(c).stroke_width - 4.0).abs() < 0.01);
+    // Back to Move: widening rotated auto-width text makes it wrap, as unrotated text does.
+    key(&mut h, Modifiers::NONE, Key::V);
+    let mut t = Node::new(Kind::Text, r(400., 0., 10., 10.));
+    (t.text, t.font_size, t.text_sizing) = ("Hello".into(), 20.0, crate::doc::TextSizing::AutoWidth);
+    let t = h.state_mut().doc.insert(0, None, None, t);
+    h.run_steps(2);
+    let tr = rect(&h, t);
+    h.state_mut().doc.rotate(t, 90.0, tr.center());
+    h.state_mut().sel = vec![t];
+    h.run_steps(2);
+    // Turned 90°, its right edge (local max-x) faces up.
+    let (p, q) = (s(&h, tr.center().x, tr.center().y - tr.width() / 2.0), s(&h, tr.center().x, tr.center().y - tr.width() / 2.0 - 30.0));
+    drag(&mut h, p, q, Modifiers::NONE);
+    let n = h.state().doc.node(t);
+    assert_eq!(n.text_sizing, crate::doc::TextSizing::AutoHeight);
+    assert!((n.rect.width() - (tr.width() + 30.0)).abs() < 1.0, "{:?} from {tr:?}", n.rect);
+}
