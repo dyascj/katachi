@@ -4315,3 +4315,93 @@ fn plugins_and_agents_import_library_components_by_key() {
     let bad = app.mcp_tool(&ctx, "execute_code", &serde_json::json!({ "code": "await figma.importComponentByKeyAsync('nope:1')" }));
     assert_eq!(bad["isError"], true);
 }
+
+/// A shell script that stands in for Claude Code: it records its arguments and prompt, then
+/// streams a tool call and a reply.
+#[cfg(unix)]
+fn fake_claude(dir: &std::path::Path, reply: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    let exe = dir.join("claude");
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$@" >> "{d}/args"
+echo --- >> "{d}/args"
+cat >> "{d}/prompts"
+echo '{{"type":"system","subtype":"init","session_id":"fake-1"}}'
+echo '{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"mcp__katachi__get_screenshot","input":{{}}}}]}}}}'
+echo '{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"mcp__katachi__execute_code","input":{{}}}}]}}}}'
+echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{reply}"}}]}}}}'
+echo '{{"type":"result","subtype":"success","is_error":false}}'
+"#,
+        d = dir.display()
+    );
+    std::fs::write(&exe, script).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::agent::set_found(crate::agent::Found { agents: vec![crate::agent::Installed { harness: crate::agent::Harness::Claude, exe }], path: std::env::var_os("PATH").unwrap_or_default() });
+}
+
+/// Type a message into the Agent panel and wait until the agent has answered `replies` times.
+fn agent_say(h: &mut Harness<App>, text: &str, reply: &str, replies: usize) {
+    h.event(Event::Text(text.into()));
+    key(h, Modifiers::NONE, Key::Enter);
+    for _ in 0..300 {
+        h.step();
+        if h.query_all_by_label(reply).count() == replies && h.query_by_label("Stop").is_none() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("the agent's reply never showed");
+}
+
+/// The Agent panel starts the installed agent with the prompt, shows what it did, and
+/// continues the same session on the next message.
+#[cfg(unix)]
+#[test]
+fn agent_panel_runs_an_agent_and_continues_its_session() {
+    let dir = std::env::temp_dir().join(format!("katachi-agent-test-{}", std::process::id()));
+    fake_claude(&dir, "Made it blue");
+    let mut h = harness();
+    let ctx = h.ctx.clone();
+    h.state_mut().listen_for_agents(&ctx);
+    key(&mut h, Modifiers::COMMAND, Key::L);
+    assert!(h.state().agent.open);
+    agent_say(&mut h, "make the card blue", "Made it blue", 1);
+    assert!(h.query_by_label("·  Edited the design").is_some(), "tool calls show as steps");
+    agent_say(&mut h, "now red", "Made it blue", 2);
+    let args = std::fs::read_to_string(dir.join("args")).unwrap();
+    let turns: Vec<&str> = args.split("---\n").filter(|t| !t.is_empty()).collect();
+    assert_eq!(turns.len(), 2);
+    let port = h.state().mcp_port().unwrap();
+    let tab = h.state().tab_id;
+    assert!(turns[0].contains(&format!("http://127.0.0.1:{port}/mcp/{tab}")), "the agent reaches this tab: {}", turns[0]);
+    assert!(!turns[0].contains("--resume") && turns[1].contains("--resume\nfake-1"), "the second turn continues the session");
+    let prompts = std::fs::read_to_string(dir.join("prompts")).unwrap();
+    assert!(prompts.contains("You're working inside Katachi") && prompts.contains("make the card blue") && prompts.contains("now red"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// target/shots/agent.png: the Agent panel mid-conversation, for the README.
+#[cfg(unix)]
+#[test]
+#[ignore]
+fn agent_shot() {
+    let dir = std::env::temp_dir().join(format!("katachi-agent-shot-{}", std::process::id()));
+    let reply = "I added a Pricing section under the hero: three plan cards in a horizontal auto layout with 24 px gaps, using your Primary color for the recommended plan.";
+    fake_claude(&dir, reply);
+    let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/shots");
+    std::fs::create_dir_all(&out).unwrap();
+    let mut h = Harness::builder().with_size(vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).with_theme(egui::Theme::Light).wgpu().build_eframe(|cc| {
+        crate::setup_style(&cc.egui_ctx);
+        App::new(Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/demo.katachi")))
+    });
+    h.run_steps(3);
+    let ctx = h.ctx.clone();
+    h.state_mut().listen_for_agents(&ctx);
+    key(&mut h, Modifiers::COMMAND, Key::L);
+    agent_say(&mut h, "Add a pricing section with three plans under the hero", reply, 1);
+    h.run_steps(5);
+    h.render().unwrap().save(out.join("agent.png")).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}

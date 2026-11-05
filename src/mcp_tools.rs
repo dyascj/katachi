@@ -6,7 +6,7 @@ use crate::mcp::{fail, image, text};
 use serde_json::{Value, json};
 use std::fmt::Write;
 
-fn kind_tag(k: Kind) -> &'static str {
+pub fn kind_tag(k: Kind) -> &'static str {
     match k {
         Kind::Frame => "frame",
         Kind::Group => "group",

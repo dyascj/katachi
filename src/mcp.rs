@@ -17,14 +17,20 @@ pub fn port() -> u16 {
 
 /// A tool call waiting for the UI thread.
 pub struct Call {
+    /// The tab it's for, when the agent was started from one (`/mcp/<tab>`); otherwise the
+    /// tab on screen.
+    pub tab: Option<u64>,
     pub name: String,
     pub args: Value,
     pub reply: Sender<Value>,
 }
 
-/// Start listening; tool calls arrive on the returned channel (the UI thread polls it).
-pub fn start(ctx: egui::Context) -> Option<Receiver<Call>> {
-    let listener = TcpListener::bind(("127.0.0.1", port())).ok()?;
+/// Start listening; tool calls arrive on the returned channel (the UI thread polls it). When
+/// another Katachi already has the port, this one listens on a free port instead, so its own
+/// Agent panel still reaches its own documents.
+pub fn start(ctx: egui::Context, port: u16) -> Option<(u16, Receiver<Call>)> {
+    let listener = TcpListener::bind(("127.0.0.1", port)).or_else(|_| TcpListener::bind(("127.0.0.1", 0))).ok()?;
+    let port = listener.local_addr().ok()?.port();
     let (tx, rx) = channel();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
@@ -34,7 +40,7 @@ pub fn start(ctx: egui::Context) -> Option<Receiver<Call>> {
             });
         }
     });
-    Some(rx)
+    Some((port, rx))
 }
 
 fn serve(mut stream: TcpStream, tx: &Sender<Call>, ctx: &egui::Context) -> std::io::Result<()> {
@@ -74,21 +80,26 @@ fn serve(mut stream: TcpStream, tx: &Sender<Call>, ctx: &egui::Context) -> std::
         }
         let mut body = vec![0; len];
         reader.read_exact(&mut body)?;
-        let (status, out) = match (method.as_str(), path.split('?').next().unwrap_or("")) {
+        // `/mcp`, or `/mcp/<tab>` for an agent working on one tab.
+        let route = path.split('?').next().unwrap_or("").strip_prefix("/mcp").and_then(|rest| match rest {
+            "" => Some(None),
+            r => r.strip_prefix('/').and_then(|t| t.parse::<u64>().ok()).map(Some),
+        });
+        let (status, out) = match (method.as_str(), route) {
             _ if foreign => ("403 Forbidden", String::new()),
-            ("POST", "/mcp") => match serde_json::from_slice::<Value>(&body) {
+            ("POST", Some(tab)) => match serde_json::from_slice::<Value>(&body) {
                 Ok(Value::Array(batch)) => {
-                    let replies: Vec<Value> = batch.iter().filter_map(|m| handle(m, tx, ctx)).collect();
+                    let replies: Vec<Value> = batch.iter().filter_map(|m| handle(m, tab, tx, ctx)).collect();
                     if replies.is_empty() { ("202 Accepted", String::new()) } else { ("200 OK", Value::Array(replies).to_string()) }
                 }
-                Ok(m) => match handle(&m, tx, ctx) {
+                Ok(m) => match handle(&m, tab, tx, ctx) {
                     Some(r) => ("200 OK", r.to_string()),
                     None => ("202 Accepted", String::new()),
                 },
                 Err(e) => ("400 Bad Request", error(Value::Null, -32700, &e.to_string()).to_string()),
             },
-            ("GET", "/mcp") => ("405 Method Not Allowed", String::new()),
-            ("DELETE", "/mcp") => ("200 OK", String::new()),
+            ("GET", Some(_)) => ("405 Method Not Allowed", String::new()),
+            ("DELETE", Some(_)) => ("200 OK", String::new()),
             _ => ("404 Not Found", String::new()),
         };
         let ctype = if out.is_empty() { "" } else { "Content-Type: application/json\r\n" };
@@ -110,7 +121,7 @@ fn error(id: Value, code: i64, msg: &str) -> Value {
 }
 
 /// One JSON-RPC message; notifications get no reply.
-fn handle(m: &Value, tx: &Sender<Call>, ctx: &egui::Context) -> Option<Value> {
+fn handle(m: &Value, tab: Option<u64>, tx: &Sender<Call>, ctx: &egui::Context) -> Option<Value> {
     let id = m.get("id")?.clone();
     let ok = |result: Value| json!({ "jsonrpc": "2.0", "id": id.clone(), "result": result });
     Some(match m["method"].as_str().unwrap_or("") {
@@ -126,7 +137,7 @@ fn handle(m: &Value, tx: &Sender<Call>, ctx: &egui::Context) -> Option<Value> {
             let (reply, wait) = channel();
             let name = m["params"]["name"].as_str().unwrap_or("").to_string();
             let args = m["params"]["arguments"].clone();
-            if tx.send(Call { name, args, reply }).is_err() {
+            if tx.send(Call { tab, name, args, reply }).is_err() {
                 return Some(error(id, -32603, "Katachi is closing"));
             }
             // macOS App Nap would let a backgrounded window sleep through the call.
@@ -301,13 +312,13 @@ mod tests {
                 let _ = c.reply.send(text(format!("{} {}", c.name, c.args["code"].as_str().unwrap_or(""))));
             }
         });
-        let init = handle(&json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-03-26" } }), &tx, &ctx).unwrap();
+        let init = handle(&json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-03-26" } }), None, &tx, &ctx).unwrap();
         assert_eq!(init["result"]["protocolVersion"], "2025-03-26", "echoes the client's version");
-        assert!(handle(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }), &tx, &ctx).is_none(), "notifications get no reply");
-        let list = handle(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }), &tx, &ctx).unwrap();
+        assert!(handle(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }), None, &tx, &ctx).is_none(), "notifications get no reply");
+        let list = handle(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }), None, &tx, &ctx).unwrap();
         assert!(list["result"]["tools"].as_array().unwrap().iter().any(|t| t["name"] == "execute_code"));
-        let call = handle(&json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "execute_code", "arguments": { "code": "return 1" } } }), &tx, &ctx).unwrap();
+        let call = handle(&json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "execute_code", "arguments": { "code": "return 1" } } }), None, &tx, &ctx).unwrap();
         assert_eq!(call["result"]["content"][0]["text"], "execute_code return 1");
-        assert_eq!(handle(&json!({ "jsonrpc": "2.0", "id": 4, "method": "nope" }), &tx, &ctx).unwrap()["error"]["code"], -32601);
+        assert_eq!(handle(&json!({ "jsonrpc": "2.0", "id": 4, "method": "nope" }), None, &tx, &ctx).unwrap()["error"]["code"], -32601);
     }
 }

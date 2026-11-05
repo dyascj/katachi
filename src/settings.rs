@@ -26,11 +26,13 @@ pub struct Prefs {
     pub snap_to_pixels: bool,
     /// Pencil: how far (screen points) a stroke may stray from the raw pointer path when simplified.
     pub pencil_smoothing: f32,
+    /// The Agent panel's agent, as last picked.
+    pub agent: Option<crate::agent::Harness>,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { name: String::new(), snap_to_objects: true, highlight_on_hover: true, keep_tool_selected: false, show_dimensions: true, nudge: 1.0, big_nudge: 10.0, check_updates: true, system_title_bar: false, pixel_grid: true, snap_to_pixels: true, pencil_smoothing: 1.5 }
+        Prefs { name: String::new(), snap_to_objects: true, highlight_on_hover: true, keep_tool_selected: false, show_dimensions: true, nudge: 1.0, big_nudge: 10.0, check_updates: true, system_title_bar: false, pixel_grid: true, snap_to_pixels: true, pencil_smoothing: 1.5, agent: None }
     }
 }
 
@@ -310,9 +312,17 @@ impl App {
     fn agents_tab(&mut self, ui: &mut Ui) {
         let port = crate::mcp::port();
         section(ui, "MCP server");
-        let listening = self.mcp_listening();
-        row(ui, "Status", if listening { "Agents can read and edit the file on screen" } else { "Another Katachi window is using the port" }, |ui| {
-            let (c, t) = if listening { (Color32::from_rgb(0x14, 0xAE, 0x5C), format!("Listening on 127.0.0.1:{port}")) } else { (Color32::from_rgb(0xE0, 0x4E, 0x3A), "Not running".into()) };
+        let listening = self.mcp_port();
+        let about = match listening {
+            Some(p) if p == port => "Agents can read and edit the file on screen",
+            Some(_) => "Another Katachi has the usual port; this one's Agent panel uses its own",
+            None => "Katachi couldn't open a local port",
+        };
+        row(ui, "Status", about, |ui| {
+            let (c, t) = match listening {
+                Some(p) => (Color32::from_rgb(0x14, 0xAE, 0x5C), format!("Listening on 127.0.0.1:{p}")),
+                None => (Color32::from_rgb(0xE0, 0x4E, 0x3A), "Not running".into()),
+            };
             ui.label(RichText::new(t).color(c));
         });
         section(ui, "Connect an agent");

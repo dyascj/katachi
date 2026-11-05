@@ -135,6 +135,25 @@ impl Shell {
         }
     }
 
+    /// Agents keep working on tabs that aren't on screen: hand them their tool calls, and read
+    /// what every tab's agent did.
+    fn agents_frame(&mut self, ctx: &egui::Context) {
+        for c in std::mem::take(&mut self.holder().mcp_elsewhere) {
+            let reply = match self.tabs.iter_mut().find(|t| Some(t.tab_id) == c.tab) {
+                Some(t) => t.mcp_tool(ctx, &c.name, &c.args),
+                None => crate::mcp::fail("The file this agent was working on has been closed."),
+            };
+            let _ = c.reply.send(reply);
+        }
+        // The tab on screen reads its own.
+        let now = ctx.input(|i| i.time);
+        for (i, t) in self.tabs.iter_mut().enumerate() {
+            if Some(i) != self.active {
+                t.agent_poll(now);
+            }
+        }
+    }
+
     fn holder(&mut self) -> &mut App {
         match self.held {
             Some(i) => &mut self.tabs[i],
@@ -811,6 +830,7 @@ impl eframe::App for Shell {
                 }
             }
         }
+        self.agents_frame(&ctx);
         // Anything that landed in `idle` (recovered work, a file an agent opened) becomes a tab.
         if self.held.is_none() && (self.idle.path.is_some() || self.idle.dirty) {
             let mut fresh = App::new(None);

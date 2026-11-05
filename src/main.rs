@@ -1,3 +1,5 @@
+mod agent;
+mod agent_ui;
 mod app;
 mod appearance;
 mod boolean;
