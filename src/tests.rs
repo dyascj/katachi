@@ -4442,3 +4442,43 @@ fn escape_reverts_a_buffered_field() {
     typed(&mut h, Key::Enter);
     assert_eq!(h.state().export_default.scale, 3.0, "Enter commits it");
 }
+
+#[test]
+fn nested_instance_props_reach_instances_and_self_nesting_is_refused() {
+    let mut doc = crate::doc::Document::default();
+    crate::plugins::run(&mut doc, 0, &[], r##"
+        const icon = figma.createComponent(); icon.name = "Icon"; icon.resize(20, 20);
+        const g = figma.createText(); g.name = "Glyph"; g.characters = "A"; icon.appendChild(g);
+        icon.addComponentProperty("Glyph", "TEXT", "A");
+        g.componentPropertyReferences = { characters: "Glyph" };
+        const b = figma.createComponent(); b.name = "Button"; b.resize(100, 40); b.y = 100;
+        b.appendChild(icon.createInstance());
+        b.createInstance().x = 300;
+    "##).unwrap();
+    doc.reflow();
+    let comp = |doc: &crate::doc::Document, name: &str| doc.nodes.values().find(|n| n.name == name && n.kind == Kind::Component).unwrap().id;
+    let (icon, button) = (comp(&doc, "Icon"), comp(&doc, "Button"));
+    let main_nested = doc.descendants(button).into_iter().find(|&d| doc.node(d).kind == Kind::Instance).unwrap();
+    let outer = doc.nodes.values().find(|n| n.kind == Kind::Instance && n.component == Some(button)).unwrap().id;
+    let glyph = |doc: &crate::doc::Document| doc.descendants(outer).into_iter().find(|&d| doc.node(d).kind == Kind::Text).map(|t| doc.node(t).text.clone());
+    assert_eq!(glyph(&doc).as_deref(), Some("A"));
+    // A4: the main component's nested instance property reaches the existing instance.
+    doc.node_mut(main_nested).prop_values = vec![("Glyph".into(), crate::doc::PropValue::Text("B".into()))];
+    doc.reflow();
+    assert_eq!(glyph(&doc).as_deref(), Some("B"));
+    let copy = doc.descendants(outer).into_iter().find(|&d| doc.node(d).kind == Kind::Instance).unwrap();
+    assert_eq!(doc.node(copy).prop_values, doc.node(main_nested).prop_values, "the copy holds the new value too");
+    // A1: an instance dropped into its own main (or into a component it uses) is refused,
+    // and one already there doesn't grow.
+    assert!(!doc.reparent(outer, 0, Some(button), None));
+    assert!(doc.nests_in_own_main(button, Some(icon)), "Button uses Icon, so Icon can't hold a Button");
+    let count = doc.nodes.len();
+    doc.node_mut(outer).parent = Some(button);
+    doc.node_mut(button).children.push(outer);
+    doc.pages[0].children.retain(|&c| c != outer);
+    for _ in 0..3 {
+        doc.node_mut(button).opacity -= 0.1;
+        doc.reflow();
+    }
+    assert_eq!(doc.nodes.len(), count, "no copies nest inside it");
+}

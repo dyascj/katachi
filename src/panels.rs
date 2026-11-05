@@ -1898,7 +1898,10 @@ impl App {
                         // The list is drawn top-first, so "above" means a higher z index.
                         None => list.iter().position(|c| *c == id).map_or(0, |i| if zone == 0 { i + 1 } else { i }),
                     };
-                    self.doc.reparent(m, self.page, parent, Some(at));
+                    if !self.doc.reparent(m, self.page, parent, Some(at)) {
+                        self.toast(crate::app::NESTED_MAIN.into());
+                        continue;
+                    }
                     below = Some(m);
                 }
                 self.doc.reflow();
