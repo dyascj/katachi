@@ -318,7 +318,7 @@ impl App {
                         });
                     }
                     Item::Agent(t) => {
-                        ui.add(egui::Label::new(t.as_str()).selectable(true));
+                        ui.add(egui::Label::new(markdown(t, ui.style())).selectable(true));
                     }
                     Item::Step(s) => {
                         ui.label(RichText::new(format!("·  {s}")).small().color(faint));
@@ -392,6 +392,57 @@ impl App {
     }
 }
 
+/// The bits of Markdown agents reply in: headings, bullets, **bold**, `code`, and code blocks.
+fn markdown(text: &str, style: &egui::Style) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let body = egui::TextStyle::Body.resolve(style);
+    let mono = egui::TextStyle::Monospace.resolve(style);
+    let (ink, strong) = (style.visuals.text_color(), style.visuals.strong_text_color());
+    let plain = TextFormat { font_id: body.clone(), color: ink, ..Default::default() };
+    let bold = TextFormat { color: strong, font_id: egui::FontId::new(body.size, egui::FontFamily::Name("Inter SemiBold".into())), ..Default::default() };
+    let code = TextFormat { font_id: mono, color: ink, background: style.visuals.code_bg_color, ..Default::default() };
+    let mut job = LayoutJob::default();
+    let mut fenced = false;
+    for (i, line) in text.lines().enumerate() {
+        if i > 0 {
+            job.append("\n", 0.0, plain.clone());
+        }
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            job.append(line, 0.0, code.clone());
+            continue;
+        }
+        let trimmed = line.trim_start();
+        let (line, base) = match trimmed.trim_start_matches('#') {
+            rest if rest.len() < trimmed.len() && rest.starts_with(' ') => (rest.trim_start().to_string(), &bold),
+            _ => match trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+                Some(rest) => (format!("{}•  {rest}", &line[..line.len() - trimmed.len()]), &plain),
+                None => (line.to_string(), &plain),
+            },
+        };
+        // Alternate between the base style and bold or code at each marker.
+        let mut rest = line.as_str();
+        while !rest.is_empty() {
+            let next = [("**", &bold), ("`", &code)].into_iter().filter_map(|(m, f)| rest.find(m).map(|at| (at, m, f))).min_by_key(|x| x.0);
+            match next.and_then(|(at, m, f)| rest[at + m.len()..].find(m).map(|len| (at, m, f, len))) {
+                Some((at, m, f, len)) => {
+                    job.append(&rest[..at], 0.0, base.clone());
+                    job.append(&rest[at + m.len()..at + m.len() + len], 0.0, f.clone());
+                    rest = &rest[at + 2 * m.len() + len..];
+                }
+                None => {
+                    job.append(rest, 0.0, base.clone());
+                    rest = "";
+                }
+            }
+        }
+    }
+    job
+}
+
 /// What to tell the agent at the start of a conversation.
 const PREAMBLE: &str = "You're working inside Katachi, a design tool like Figma, through its MCP server `katachi`. \
 The person is looking at the file named below and wants you to work on the design itself. Look before you change things: \
@@ -412,6 +463,14 @@ fn friendly_error(harness: Option<Harness>, msg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_replies_lose_their_markers() {
+        let style = egui::Style::default();
+        let job = markdown("## Done\nI added **three** cards:\n- Free\n* `Pro` plan\n```\nlet x = 1;\n```", &style);
+        assert_eq!(job.text, "Done\nI added three cards:\n•  Free\n•  Pro plan\n\nlet x = 1;\n");
+        assert_eq!(markdown("a ** b", &style).text, "a ** b", "an unpaired marker stays as typed");
+    }
 
     #[test]
     fn sign_in_failures_say_what_to_do() {

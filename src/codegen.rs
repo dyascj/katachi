@@ -664,6 +664,9 @@ fn jsx(doc: &Document, id: NodeId, tailwind: bool, root: bool, depth: usize, out
         n.children.iter().copied().filter(|&c| doc.node(c).visible && doc.node(c).kind != Kind::Slice).collect()
     };
     let image = !text && kids.is_empty() && matches!(n.fills.iter().filter(|f| f.visible).collect::<Vec<_>>()[..], [f] if f.kind == PaintKind::Image);
+    // Paths can't be boxes: they're inline SVG, keeping only the styles that place them.
+    let vector = matches!(n.kind, Kind::Vector | Kind::Boolean | Kind::Star | Kind::Polygon);
+    let places = |k: &str| matches!(k, "position" | "left" | "top" | "flex" | "align-self");
     // The root drops its canvas position. Absolutely placed children need a positioned parent,
     // which an absolutely placed layer already is.
     // ponytail: offsets are from the nearest frame (as in `css`), so children of a placed group land off by the group's offset.
@@ -677,6 +680,9 @@ fn jsx(doc: &Document, id: NodeId, tailwind: bool, root: bool, depth: usize, out
     if tailwind {
         let mut c = tailwind_classes(doc, id);
         c.retain(|c| !(root && (c == "absolute" || c.starts_with("left-") || c.starts_with("top-")) || image && c.starts_with("bg-")));
+        if vector {
+            c.retain(|c| c == "absolute" || ["left-", "top-", "flex-", "self-"].iter().any(|p| c.starts_with(p)));
+        }
         if relative {
             c.push("relative".into());
         }
@@ -691,8 +697,9 @@ fn jsx(doc: &Document, id: NodeId, tailwind: bool, root: bool, depth: usize, out
             .lines()
             .skip(1)
             .filter_map(|l| match l.strip_suffix(';').and_then(|l| l.split_once(": ")) {
-                Some((k, _)) if root && matches!(k, "position" | "left" | "top") || image && k == "background" => None,
+                Some((k, _)) if root && matches!(k, "position" | "left" | "top") || image && k == "background" || vector && !places(k) => None,
                 Some((k, v)) => Some(style_entry(k, v) + ","),
+                None if vector => None,
                 None => Some(l.to_string()),
             })
             .collect();
@@ -704,6 +711,15 @@ fn jsx(doc: &Document, id: NodeId, tailwind: bool, root: bool, depth: usize, out
         }
         let body: String = entries.iter().map(|e| format!("{ind}    {e}\n")).collect();
         attrs.push(format!("style={{{{\n{body}{ind}  }}}}"));
+    }
+    if vector {
+        // ponytail: the SVG's box includes the stroke, so a placed path sits off by half its stroke width.
+        let svg = svg_jsx(&crate::export::to_svg(doc, &[id]));
+        let attrs: Vec<String> = attrs.into_iter().filter(|a| a != "className=\"\"" && !a.starts_with("style={{\n") || a.contains(':')).collect();
+        let attrs = if tailwind { attrs.join(" ") } else { attrs.join(" ").replace('\n', " ").split_whitespace().collect::<Vec<_>>().join(" ") };
+        let svg = if attrs.is_empty() { svg } else { svg.replacen("<svg", &format!("<svg {attrs}"), 1) };
+        let _ = writeln!(out, "{ind}{svg}");
+        return;
     }
     let tag = if text { "p" } else if image { "img" } else { "div" };
     let leaf = !text && kids.is_empty();
@@ -747,6 +763,35 @@ fn style_entry(k: &str, v: &str) -> String {
     // React reads a unitless line height as a multiple of the font size, so it keeps its px.
     let number = v.strip_suffix("px").filter(|_| key != "lineHeight").unwrap_or(v);
     if number.parse::<f32>().is_ok_and(f32::is_finite) { format!("{key}: {number}") } else { format!("{key}: {:?}", v.replace('"', "'")) }
+}
+
+/// SVG markup as JSX: attributes in camelCase (`stroke-width` is `strokeWidth`), `class` as
+/// `className`, and inline styles as style objects.
+fn svg_jsx(svg: &str) -> String {
+    let mut out = String::with_capacity(svg.len());
+    let mut rest = svg;
+    // Attribute names are the only unquoted `name=` runs inside tags.
+    while let Some(eq) = rest.find("=\"") {
+        let name_start = rest[..eq].rfind([' ', '<', '\n']).map_or(0, |i| i + 1);
+        let close = rest[eq + 2..].find('"').map_or(rest.len(), |i| eq + 2 + i);
+        let (name, value) = (&rest[name_start..eq], &rest[eq + 2..close]);
+        out.push_str(&rest[..name_start]);
+        if name == "style" {
+            let entries: Vec<String> = value.split(';').filter_map(|d| d.split_once(':')).map(|(k, v)| style_entry(k.trim(), v.trim())).collect();
+            out.push_str(&format!("style={{{{ {} }}}}", entries.join(", ")));
+        } else {
+            let jsx_name = match name {
+                "class" => "className".to_string(),
+                "xlink:href" => "xlinkHref".to_string(),
+                "xml:space" => "xmlSpace".to_string(),
+                "xmlns:xlink" => "xmlnsXlink".to_string(),
+                n => style_entry(n, "0").trim_end_matches(": 0").to_string(),
+            };
+            out.push_str(&format!("{jsx_name}=\"{value}\""));
+        }
+        rest = &rest[(close + 1).min(rest.len())..];
+    }
+    out + rest
 }
 
 /// Text as JSX children: entities for what JSX would parse as markup or code, `<br />` for line breaks.
@@ -932,6 +977,20 @@ mod tests {
         assert_eq!(component_name("1 big-button"), "Component1BigButton");
         assert_eq!(component_name("émeraude carte"), "ÉmeraudeCarte");
         assert_eq!(jsx_text("a {b} <c>\nd"), "a &#123;b&#125; &lt;c&gt;<br />d");
+    }
+
+    #[test]
+    fn react_keeps_vectors_as_svg() {
+        let d = crate::doc::parse_file(include_str!("../examples/demo.katachi")).unwrap();
+        let landing = d.nodes.values().find(|n| n.name == "Landing").unwrap().id;
+        for tailwind in [false, true] {
+            let jsx = react(&d, landing, tailwind);
+            let line = jsx.lines().find(|l| l.contains("<svg")).unwrap_or_else(|| panic!("the squiggle is an <svg>:\n{jsx}"));
+            assert!(line.contains("<path d=\"M") && line.contains("strokeWidth=\"3\"") && !line.contains("stroke-width"), "{line}");
+            assert!(line.contains("absolute") || line.contains("position: \"absolute\""), "it stays where it was placed: {line}");
+            assert!(!line.contains("border"), "{line}");
+        }
+        assert_eq!(svg_jsx(r##"<g class="a" style="mix-blend-mode: multiply; opacity: 0.5"><use xlink:href="#p"/></g>"##), r##"<g className="a" style={{ mixBlendMode: "multiply", opacity: 0.5 }}><use xlinkHref="#p"/></g>"##);
     }
 
     #[test]
