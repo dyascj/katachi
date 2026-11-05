@@ -112,6 +112,9 @@ impl App {
         }
         let mut open = true;
         let before = (self.doc.collections.clone(), self.doc.variables.clone());
+        // Deleted after the frame's other edits, as its own undo step, so undo restores the
+        // layers' bindings along with the variable.
+        let mut delete = None;
         crate::chrome::window(ctx, "Local variables", &mut open, 760.0, |ui| {
             // Library collections are edited in their libraries.
             let Some(first) = self.doc.collections.iter().find(|c| c.remote.is_none()).map(|c| c.id) else {
@@ -173,7 +176,6 @@ impl App {
                         }
                     }
                     ui.end_row();
-                    let mut delete = None;
                     for group in &groups {
                         let rows: Vec<usize> = mine.iter().copied().filter(|&vi| group_of(&self.doc.variables[vi].name).0 == group.as_deref()).collect();
                         if let Some(g) = group {
@@ -206,14 +208,6 @@ impl App {
                             ui.end_row();
                         }
                     }
-                    if let Some(id) = delete {
-                        self.doc.variables.retain(|v| v.id != id);
-                        for n in self.doc.nodes.values_mut() {
-                            if n.bindings.iter().any(|(_, v)| *v == id) {
-                                std::sync::Arc::make_mut(n).bindings.retain(|(_, v)| *v != id);
-                            }
-                        }
-                    }
                 });
             });
             ui.data_mut(|d| d.insert_temp(collapsed_id, collapsed));
@@ -235,14 +229,23 @@ impl App {
             });
             });
         });
-        if (self.doc.collections.clone(), self.doc.variables.clone()) != before {
+        if self.doc.collections != before.0 || self.doc.variables != before.1 {
             // Record the edit for undo, then re-resolve bound layers.
-            let (c, v) = (self.doc.collections.clone(), self.doc.variables.clone());
-            self.doc.collections = before.0;
-            self.doc.variables = before.1;
+            let c = std::mem::replace(&mut self.doc.collections, before.0);
+            let v = std::mem::replace(&mut self.doc.variables, before.1);
             self.begin_edit();
             self.doc.collections = c;
             self.doc.variables = v;
+            self.doc.reflow();
+        }
+        if let Some(id) = delete {
+            self.checkpoint();
+            self.doc.variables.retain(|v| v.id != id);
+            for n in self.doc.nodes.values_mut() {
+                if n.bindings.iter().any(|(_, v)| *v == id) {
+                    std::sync::Arc::make_mut(n).bindings.retain(|(_, v)| *v != id);
+                }
+            }
             self.doc.reflow();
         }
         self.show_variables = open;
@@ -271,8 +274,8 @@ impl App {
             ui.label(RichText::new(&t[..1]).color(crate::appearance::faint(ui.ctx())).monospace()).on_hover_text(t);
             let (group, leaf) = group_of(&self.doc.variables[vi].name);
             let group = group.map(String::from);
-            let mut leaf = leaf.to_string();
-            if ui.add(egui::TextEdit::singleline(&mut leaf).desired_width(if grouped { 132.0 } else { 150.0 })).changed() {
+            // Committed once, keyed by id: a "/" typed mid-word would move the row under the field.
+            if let Some(leaf) = crate::panels::commit_field(ui, egui::Id::new(("var-name", vid)), leaf, if grouped { 132.0 } else { 150.0 }, true) {
                 self.doc.variables[vi].name = match group {
                     Some(g) => format!("{g}/{leaf}"),
                     None => leaf,

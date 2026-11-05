@@ -1086,6 +1086,11 @@ impl BlendMode {
     pub fn from_figma(name: Option<&str>) -> Self {
         BlendMode::ALL.into_iter().find(|b| Some(b.css().replace('-', "_").to_uppercase().as_str()) == name).unwrap_or_default()
     }
+    /// Figma's menu name: "Color dodge", "Soft light".
+    pub fn label(self) -> String {
+        let css = self.css().replace('-', " ");
+        css[..1].to_uppercase() + &css[1..]
+    }
     /// CSS / SVG `mix-blend-mode` keyword.
     pub fn css(self) -> &'static str {
         match self {
@@ -1285,6 +1290,16 @@ pub enum Cap {
     Square,
 }
 
+impl Cap {
+    pub fn label(self) -> &'static str {
+        match self {
+            Cap::None => "Flat",
+            Cap::Round => "Round",
+            Cap::Square => "Square",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Join {
     #[default]
@@ -1293,11 +1308,31 @@ pub enum Join {
     Bevel,
 }
 
+impl Join {
+    pub fn label(self) -> &'static str {
+        match self {
+            Join::Miter => "Miter",
+            Join::Round => "Round",
+            Join::Bevel => "Bevel",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StrokeAlign {
     Inside,
     Center,
     Outside,
+}
+
+impl StrokeAlign {
+    pub fn label(self) -> &'static str {
+        match self {
+            StrokeAlign::Inside => "Inside",
+            StrokeAlign::Center => "Center",
+            StrokeAlign::Outside => "Outside",
+        }
+    }
 }
 
 /// A vector anchor. `p` is relative to the node's `rect.min`; handles are offsets from `p`.
@@ -1364,6 +1399,16 @@ impl PaintKind {
     pub fn is_gradient(self) -> bool {
         !matches!(self, PaintKind::Solid | PaintKind::Image)
     }
+    pub fn label(self) -> &'static str {
+        match self {
+            PaintKind::Solid => "Solid",
+            PaintKind::Linear => "Linear",
+            PaintKind::Radial => "Radial",
+            PaintKind::Image => "Image",
+            PaintKind::Angular => "Angular",
+            PaintKind::Diamond => "Diamond",
+        }
+    }
 }
 
 /// Figma's GRADIENT_* paint type names.
@@ -1394,6 +1439,18 @@ pub enum ScaleMode {
     /// Figma's Crop: like Fill, zoomed by `tile_scale` (1 = cover) and shifted by `from`
     /// (-1..1 of the room to move on each axis, 0 = centered).
     Crop,
+}
+
+impl ScaleMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            ScaleMode::Fill => "Fill",
+            ScaleMode::Fit => "Fit",
+            ScaleMode::Stretch => "Stretch",
+            ScaleMode::Tile => "Tile",
+            ScaleMode::Crop => "Crop",
+        }
+    }
 }
 
 /// An embedded image's pixel size (read from its header).
@@ -2826,15 +2883,49 @@ impl Document {
     }
 
     /// Move `id` under `parent` at `index` (index is computed after detaching).
-    pub fn reparent(&mut self, id: NodeId, page: usize, parent: Option<NodeId>, index: Option<usize>) {
+    /// Move `id` under `parent`. Returns false (and leaves it) when that would put a layer in
+    /// itself, or an instance inside its own main component.
+    pub fn reparent(&mut self, id: NodeId, page: usize, parent: Option<NodeId>, index: Option<usize>) -> bool {
         if parent == Some(id) || parent.is_some_and(|p| self.is_ancestor(id, p)) {
-            return;
+            return false;
+        }
+        let inside_main = |doc: &Document, n: NodeId| doc.nodes[&n].kind == Kind::Instance && doc.nodes[&n].component.is_some_and(|c| doc.nests_in_own_main(c, parent));
+        if parent != self.nodes[&id].parent && std::iter::once(id).chain(self.descendants(id)).any(|n| inside_main(self, n)) {
+            return false;
         }
         self.detach(id);
         self.node_mut(id).parent = parent;
         let list = self.children_of_mut(page, parent);
         let i = index.unwrap_or(list.len()).min(list.len());
         list.insert(i, id);
+        true
+    }
+
+    /// Whether an instance of `comp` under `parent` would contain itself: `parent` is inside a
+    /// component that `comp` uses, directly or through instances of other components.
+    pub fn nests_in_own_main(&self, comp: NodeId, parent: Option<NodeId>) -> bool {
+        let Some(p) = parent.filter(|p| self.nodes.contains_key(p)) else { return false };
+        let mains: Vec<NodeId> = std::iter::once(p).chain(self.ancestors(p)).filter(|a| self.nodes[a].kind == Kind::Component).collect();
+        if mains.is_empty() {
+            return false;
+        }
+        // Walk `comp` and the mains of the instances inside it.
+        let (mut seen, mut stack) = (std::collections::HashSet::new(), vec![comp]);
+        while let Some(c) = stack.pop() {
+            if mains.contains(&c) {
+                return true;
+            }
+            if !self.nodes.contains_key(&c) || !seen.insert(c) {
+                continue;
+            }
+            for d in self.descendants(c) {
+                let n = &self.nodes[&d];
+                if n.kind == Kind::Instance && let Some(m) = n.component {
+                    stack.push(m);
+                }
+            }
+        }
+        false
     }
 
     pub fn translate(&mut self, id: NodeId, d: Vec2) {
@@ -3313,7 +3404,9 @@ impl Document {
     /// Bring an instance in line with its main component, keeping overrides.
     pub fn sync_instance(&mut self, inst: NodeId) {
         let Some(comp) = self.nodes[&inst].component.filter(|c| self.nodes.contains_key(c)) else { return };
-        if comp == inst || self.is_ancestor(inst, comp) {
+        // Copying a component into an instance inside it (or inside a component it uses) would
+        // nest another copy on every pass.
+        if comp == inst || self.is_ancestor(inst, comp) || self.nests_in_own_main(comp, self.nodes[&inst].parent) {
             return;
         }
         // An instance nested inside another instance is a copy its outer instance keeps in step;
@@ -4305,7 +4398,7 @@ fn merge_from(e: &mut Node, src: &Node) {
         name, visible, opacity, fills, strokes, stroke_width, stroke_sides, stroke_align, radius, corner_radii, dash, cap, join, clip, shadows, layout, sizing, min_size, max_size, constraints, absolute,
         paths, even_odd, text, font_size, font_weight, font_family, italic, text_sizing, text_align, text_valign, line_height, letter_spacing,
         decoration, text_case, paragraph_spacing, paragraph_indent, vertical_trim, truncate, max_lines, rotation, component, start_marker, end_marker, point_count, inner_ratio, reactions, overflow, scroll_pos, fill_style,
-        stroke_style, text_style, effect_style, grid_style, prop_bind, is_mask, blend, bindings, modes, spans, lists, exposed, grid_span, grids, arc, bool_op
+        stroke_style, text_style, effect_style, grid_style, prop_bind, prop_values, is_mask, blend, bindings, modes, spans, lists, exposed, grid_span, grids, arc, bool_op
     );
     e.synced = Some(Box::new(Node { children: vec![], synced: None, remote: None, ..src.clone() }));
 }

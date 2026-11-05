@@ -220,6 +220,9 @@ pub struct PluginRun {
 
 const CLIP_TAG: &str = "katachi/nodes:";
 
+/// Shown when a paste or drop would put an instance inside its own main component.
+pub const NESTED_MAIN: &str = "Can't place an instance inside its own main component";
+
 /// One undo step: the document, and the selection and page it was edited with, so undo and
 /// redo bring back what was selected and go to the page where the change happened (as in Figma).
 struct Snapshot {
@@ -1386,10 +1389,16 @@ impl App {
             let mut out = vec![];
             for root in frag.iter().filter(|n| !n.parent.is_some_and(|p| in_frag.contains(&p))) {
                 let live = self.doc.nodes.get(&root.id).is_some_and(|n| n.kind == Kind::Component);
+                let sub: Vec<Node> = frag.iter().filter(|n| n.id == root.id || self.frag_descends(&frag, n.id, root.id)).cloned().collect();
+                // Figma refuses an instance inside its own main component.
+                let mains: Vec<NodeId> = if root.kind == Kind::Component && live { vec![root.id] } else { sub.iter().filter(|n| n.kind == Kind::Instance).filter_map(|n| n.component).collect() };
+                if mains.iter().any(|&c| self.doc.nests_in_own_main(c, parent)) {
+                    self.toast(NESTED_MAIN.into());
+                    continue;
+                }
                 if root.kind == Kind::Component && live {
                     out.push(self.doc.instantiate(root.id, self.page, parent, at, root.rect.min));
                 } else {
-                    let sub: Vec<Node> = frag.iter().filter(|n| n.id == root.id || self.frag_descends(&frag, n.id, root.id)).cloned().collect();
                     out.extend(self.doc.paste(&sub, self.page, parent, at));
                 }
                 at = at.map(|i| i + 1);
