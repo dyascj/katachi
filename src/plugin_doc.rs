@@ -1257,7 +1257,7 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
     }
     for (k, i) in [("gridColumnSpan", 0), ("gridRowSpan", 1)] {
         if changed(k) {
-            n.grid_span[i] = num(k).unwrap_or(1.0).max(1.0) as u32;
+            n.grid_span[i] = num(k).unwrap_or(1.0).clamp(1.0, crate::doc::MAX_GRID as f32) as u32;
         }
     }
     for (k, i, max) in [("minWidth", 0, false), ("minHeight", 1, false), ("maxWidth", 0, true), ("maxHeight", 1, true)] {
@@ -1285,7 +1285,7 @@ fn apply_props(doc: &mut Document, id: NodeId, v: &Value, base: &Value, moved: b
         }
         for (k, i) in [("gridColumnCount", 0), ("gridRowCount", 1)] {
             if changed(k) {
-                l.grid[i] = num(k).unwrap_or(0.0).max(0.0) as u32;
+                l.grid[i] = num(k).unwrap_or(0.0).clamp(0.0, crate::doc::MAX_GRID as f32) as u32;
             }
         }
         if changed("gridColumnGap") {
