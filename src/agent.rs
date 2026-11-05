@@ -222,7 +222,7 @@ const SERVER: &str = "katachi";
 /// Prompts go through stdin where the agent supports it: no length limits, and no quoting
 /// rules for Windows' `.cmd` shims.
 fn command(agent: &Installed, req: &Request, scratch: &Path) -> std::io::Result<(Command, Option<String>)> {
-    let mut cmd = Command::new(&agent.exe);
+    let mut cmd = agent_command(&agent.exe, req.path);
     let url = req.mcp_url;
     let stdin = match agent.harness {
         Harness::Claude => {
@@ -304,6 +304,50 @@ fn command(agent: &Installed, req: &Request, scratch: &Path) -> std::io::Result<
     Ok((cmd, stdin))
 }
 
+/// A command for an agent: on its PATH, without a console window, and not refused for nesting.
+fn agent_command(exe: &Path, path: &OsStr) -> Command {
+    let mut cmd = Command::new(exe);
+    // Started from inside a Claude Code session, Claude would refuse to nest.
+    cmd.env("PATH", path).env_remove("CLAUDECODE");
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+    cmd
+}
+
+/// The agent's own commands to remove and add Katachi as an MCP server, for using it outside
+/// Katachi. OpenCode and Cursor have no such command.
+fn server_commands(h: Harness, url: &str) -> Option<[Vec<&str>; 2]> {
+    Some(match h {
+        Harness::Claude => [vec!["mcp", "remove", "--scope", "user", SERVER], vec!["mcp", "add", "--scope", "user", "--transport", "http", SERVER, url]],
+        Harness::Codex => [vec!["mcp", "remove", SERVER], vec!["mcp", "add", SERVER, "--url", url]],
+        Harness::Gemini => [vec!["mcp", "remove", "--scope", "user", SERVER], vec!["mcp", "add", "--scope", "user", "--transport", "http", "--trust", SERVER, url]],
+        Harness::OpenCode | Harness::Cursor => return None,
+    })
+}
+
+pub fn can_connect(h: Harness) -> bool {
+    server_commands(h, "").is_some()
+}
+
+/// Add Katachi to the agent's own MCP servers (replacing an older entry), off the UI thread.
+/// The outcome lands in egui's temporary data under `id`.
+pub fn connect(agent: &Installed, path: &OsStr, url: &str, ctx: &egui::Context, id: egui::Id) {
+    let Some([remove, add]) = server_commands(agent.harness, url) else { return };
+    let (remove, add): (Vec<String>, Vec<String>) = (remove.into_iter().map(String::from).collect(), add.into_iter().map(String::from).collect());
+    let (exe, path, ctx) = (agent.exe.clone(), path.to_os_string(), ctx.clone());
+    ctx.data_mut(|d| d.insert_temp(id, "Adding...".to_string()));
+    std::thread::spawn(move || {
+        let _ = agent_command(&exe, &path).args(&remove).stdin(Stdio::null()).output();
+        let msg = match agent_command(&exe, &path).args(&add).stdin(Stdio::null()).output() {
+            Ok(o) if o.status.success() => "Added".to_string(),
+            Ok(o) => String::from_utf8_lossy(&o.stderr).lines().chain(String::from_utf8_lossy(&o.stdout).lines()).find(|l| !l.trim().is_empty()).unwrap_or("Failed").to_string(),
+            Err(e) => e.to_string(),
+        };
+        ctx.data_mut(|d| d.insert_temp(id, msg));
+        ctx.request_repaint();
+    });
+}
+
 fn toml_string(s: &str) -> String {
     Value::String(s.into()).to_string()
 }
@@ -324,18 +368,12 @@ impl Run {
         if agent.harness != Harness::Cursor {
             cmd.current_dir(req.cwd);
         }
-        cmd.env("PATH", req.path)
-            // Started from inside a Claude Code session, Claude would refuse to nest.
-            .env_remove("CLAUDECODE")
-            .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // Its own process group, so Stop ends the agent and everything it started.
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-        // No console window flashing up for each turn.
-        #[cfg(windows)]
-        std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
         let mut child = cmd.spawn()?;
         if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
             std::thread::spawn(move || {

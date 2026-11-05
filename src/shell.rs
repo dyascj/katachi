@@ -324,6 +324,12 @@ impl Shell {
                     let (a, b) = (xr.center() - vec2(4.0, 4.0), xr.center() + vec2(4.0, 4.0));
                     p.line_segment([a, b], Stroke::new(1.3, c));
                     p.line_segment([pos2(a.x, b.y), pos2(b.x, a.y)], Stroke::new(1.3, c));
+                } else if t.agent_busy() {
+                    // An agent is working in this tab: a turning arc.
+                    let spin = ctx.input(|i| i.time) as f32 * 6.0;
+                    let arc: Vec<_> = (0..=12).map(|k| xr.center() + egui::Vec2::angled(spin + k as f32 * 0.4) * 5.0).collect();
+                    p.add(egui::Shape::line(arc, Stroke::new(1.5, muted)));
+                    ctx.request_repaint();
                 } else if t.dirty {
                     p.circle_filled(xr.center(), 3.5, muted);
                 }

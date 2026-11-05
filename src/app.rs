@@ -1749,7 +1749,8 @@ impl App {
 
     // ---------- files ----------
 
-    pub fn open_path(&mut self, p: PathBuf) {
+    /// Open a file into this app; false (after a toast) if it couldn't be read.
+    pub fn open_path(&mut self, p: PathBuf) -> bool {
         if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("fig")) {
             return self.import_fig(&p);
         }
@@ -1764,13 +1765,17 @@ impl App {
                 crate::files::add_recent(&p);
                 self.path = Some(p);
                 self.refresh_libraries();
+                true
             }
-            Err(e) => self.toast(format!("Couldn't open file: {e}")),
+            Err(e) => {
+                self.toast(format!("Couldn't open file: {e}"));
+                false
+            }
         }
     }
 
     /// Open a Figma `.fig` as a new, unsaved document (the original is never written to).
-    pub fn import_fig(&mut self, p: &std::path::Path) {
+    pub fn import_fig(&mut self, p: &std::path::Path) -> bool {
         let result = std::fs::read(p).map_err(|e| e.to_string()).and_then(|b| crate::fig_import::import(&b));
         match result {
             Ok(doc) => {
@@ -1780,8 +1785,12 @@ impl App {
                 let name = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 self.draft_name = Some(name.clone());
                 self.toast(format!("Imported {name}: {} layers. Save to keep it as a .katachi file.", self.doc.nodes.len()));
+                true
             }
-            Err(e) => self.toast(format!("Couldn't import: {e}")),
+            Err(e) => {
+                self.toast(format!("Couldn't import: {e}"));
+                false
+            }
         }
     }
 
@@ -1871,25 +1880,14 @@ impl App {
 
     /// Render each job and write it to its path; a toast says how it went.
     fn write_exports(&mut self, jobs: &[ExportJob], targets: &[PathBuf]) {
-        let mut done = 0;
-        for ((ids, _, p), path) in jobs.iter().zip(targets) {
-            // A slice exports whatever lies inside it.
-            let (svg, size) = match ids.as_slice() {
-                [one] if self.doc.node(*one).kind == Kind::Slice => {
-                    let n = self.doc.node(*one);
-                    (crate::export::region_svg(&self.doc, self.page, n.aabb(), n.id), n.aabb().size())
-                }
-                _ => (crate::export::to_svg(&self.doc, ids), crate::export::export_bounds(&self.doc, ids).size()),
-            };
-            match crate::export::encode_preset(&self.doc, &svg, p, size).and_then(|d| std::fs::write(path, d).map_err(|e| e.to_string())) {
-                Ok(()) => done += 1,
-                Err(e) => return self.toast(format!("Export failed: {e}")),
-            }
-        }
-        self.toast(match targets {
-            [one] if done == 1 => format!("Exported {}", one.file_name().unwrap_or_default().to_string_lossy()),
-            _ => format!("Exported {done} files"),
-        });
+        let msg = match self.render_exports(jobs, targets) {
+            Err(e) => format!("Export failed: {e}"),
+            Ok(()) => match targets {
+                [one] => format!("Exported {}", one.file_name().unwrap_or_default().to_string_lossy()),
+                _ => format!("Exported {} files", targets.len()),
+            },
+        };
+        self.toast(msg);
     }
 
     /// New and Open make tabs.
@@ -2078,8 +2076,16 @@ impl App {
             self.mcp_tried = true;
             self.mcp = crate::mcp::start(ctx.clone(), crate::mcp::port());
         }
+        // A drag rebuilds the document from its starting copy each frame, which would throw an
+        // agent's edit away: calls wait until it ends.
+        if self.drag.is_some() {
+            return;
+        }
         let calls: Vec<crate::mcp::Call> = self.mcp.as_ref().map(|(_, rx)| rx.try_iter().collect()).unwrap_or_default();
         for c in calls {
+            if std::time::Instant::now() > c.deadline {
+                continue;
+            }
             if c.tab.is_some_and(|t| t != self.tab_id) {
                 self.mcp_elsewhere.push(c);
                 continue;
@@ -3136,6 +3142,9 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         if self.presenting.is_some() {
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.presentation_ui(ui));
+            // Agents keep working while you present.
+            self.mcp_frame(&ctx);
+            self.agent_poll(ctx.input(|i| i.time));
             return;
         }
         self.eyedropper(&ctx);

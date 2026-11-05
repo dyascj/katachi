@@ -325,11 +325,42 @@ impl App {
             };
             ui.label(RichText::new(t).color(c));
         });
-        section(ui, "Connect an agent");
-        row(ui, "Claude Code", "Adds Katachi as an HTTP MCP server", |ui| {
-            if ui.button("Copy command").clicked() {
-                ui.ctx().copy_text(format!("claude mcp add --transport http katachi http://127.0.0.1:{port}/mcp"));
-                self.toast("Copied. Run it in a terminal.".into());
+        section(ui, "Agents on this computer");
+        ui.label(RichText::new("The Agent panel (⌘L) runs these with your own sign-in. Add Katachi to one to use it from a terminal too.").small().color(crate::appearance::muted(ui.ctx())));
+        ui.add_space(4.0);
+        let found = crate::agent::found(ui.ctx());
+        let url = format!("http://127.0.0.1:{port}/mcp");
+        for h in crate::agent::Harness::ALL {
+            let installed = found.as_ref().and_then(|f| f.agents.iter().find(|a| a.harness == h).map(|a| (a.clone(), f.path.clone())));
+            let hint = match &installed {
+                Some((a, _)) => a.exe.display().to_string(),
+                None if found.is_none() => "Looking...".into(),
+                None => format!("Not installed (no `{}` found)", h.program()),
+            };
+            row(ui, h.label(), &hint, |ui| {
+                let Some((agent, path)) = &installed else { return };
+                if !crate::agent::can_connect(h) {
+                    return;
+                }
+                let id = egui::Id::new(("agent-connect", h.program()));
+                if ui.button("Add Katachi").on_hover_text(format!("Runs `{} mcp add` so the agent can use Katachi outside the app", h.program())).clicked() {
+                    crate::agent::connect(agent, path, &url, ui.ctx(), id);
+                }
+                if let Some(status) = ui.ctx().data(|d| d.get_temp::<String>(id)) {
+                    ui.add(egui::Label::new(RichText::new(status).small()).truncate());
+                }
+            });
+        }
+        ui.add_enabled_ui(!crate::agent::scanning(), |ui| {
+            if ui.button("Look again").clicked() {
+                crate::agent::rescan(ui.ctx());
+            }
+        });
+        section(ui, "Connect another agent");
+        row(ui, "Any HTTP MCP client", &url, |ui| {
+            if ui.button("Copy address").clicked() {
+                ui.ctx().copy_text(url.clone());
+                self.toast("Copied the MCP address".into());
             }
         });
         row(ui, "Claude Desktop, Cursor and others", "A stdio config that runs `katachi mcp`", |ui| {

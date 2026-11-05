@@ -5,7 +5,10 @@
 use crate::agent::{self, Event, Harness, Installed, Run};
 use crate::app::App;
 use crate::appearance as theme;
-use egui::{Align, Color32, Key, Layout, Modifiers, RichText, ScrollArea, Ui, vec2};
+use crate::doc::{Node, NodeId};
+use egui::{Align, Color32, Key, Layout, Modifiers, Painter, RichText, ScrollArea, Stroke, Ui, vec2};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 #[derive(Default)]
 pub struct Chat {
@@ -21,6 +24,8 @@ pub struct Chat {
     /// The undo history's length when the last turn ended, if it changed the file.
     undo_to: Option<usize>,
     focus: bool,
+    /// Layers an agent just changed, and when: they glow on the canvas for a moment.
+    marks: Vec<(NodeId, f64)>,
 }
 
 enum Item {
@@ -31,6 +36,9 @@ enum Item {
 }
 
 const INPUT: &str = "agent-input";
+/// How long an agent's change glows.
+const MARK_SECS: f64 = 2.5;
+const AGENT_INK: Color32 = Color32::from_rgb(0xF5, 0x9E, 0x0B);
 const SUGGESTIONS: [&str; 4] = [
     "Design a sign-in screen for a mobile app",
     "Tidy the selection with auto layout",
@@ -39,6 +47,43 @@ const SUGGESTIONS: [&str; 4] = [
 ];
 
 impl App {
+    pub fn agent_busy(&self) -> bool {
+        self.agent.run.is_some()
+    }
+
+    /// Note what an MCP call changed: the outermost changed layers, not each of their children.
+    /// Nodes are copy-on-write, so an unchanged layer is the same allocation as before.
+    pub fn mark_agent_changes(&mut self, before: &HashMap<NodeId, Arc<Node>>, now: f64) {
+        let changed: HashSet<NodeId> = self.doc.nodes.iter().filter(|(id, n)| before.get(id).is_none_or(|b| !Arc::ptr_eq(b, n))).map(|(id, _)| *id).collect();
+        let marks = &mut self.agent.marks;
+        marks.retain(|(id, at)| now - at < MARK_SECS && !changed.contains(id));
+        marks.extend(changed.iter().filter(|id| !self.doc.node(**id).parent.is_some_and(|p| changed.contains(&p))).map(|&id| (id, now)));
+    }
+
+    #[cfg(test)]
+    pub fn agent_marked(&self) -> Vec<NodeId> {
+        self.agent.marks.iter().map(|m| m.0).collect()
+    }
+
+    /// The glow on layers an agent just changed, fading out.
+    pub fn draw_agent_marks(&self, painter: &Painter) {
+        let now = painter.ctx().input(|i| i.time);
+        let mut fading = false;
+        for &(id, at) in &self.agent.marks {
+            let t = ((now - at) / MARK_SECS) as f32;
+            let Some(n) = self.doc.nodes.get(&id).filter(|_| t < 1.0) else { continue };
+            if self.doc.page_of(id) != self.page {
+                continue;
+            }
+            let pts = n.corners().map(|p| self.view.to_screen(p));
+            painter.add(egui::Shape::closed_line(pts.to_vec(), Stroke::new(2.0, AGENT_INK.gamma_multiply(1.0 - t))));
+            fading = true;
+        }
+        if fading {
+            painter.ctx().request_repaint();
+        }
+    }
+
     pub fn toggle_agent(&mut self) {
         self.agent.open = !self.agent.open;
         self.agent.focus = self.agent.open;
