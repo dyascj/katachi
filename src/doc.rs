@@ -1546,7 +1546,7 @@ impl ImageAdjust {
             return;
         }
         let gain = 2f32.powf(self.exposure);
-        for p in px.chunks_exact_mut(4) {
+        for p in px.as_chunks_mut::<4>().0 {
             let mut c = [p[0], p[1], p[2]].map(|v| v as f32 / 255.0);
             for v in &mut c {
                 *v = (*v * gain - 0.5) * (1.0 + self.contrast) + 0.5;
@@ -4086,7 +4086,7 @@ impl Document {
             .filter(|n| matches!(n.kind, Kind::Group | Kind::Boolean))
             .map(|n| (self.ancestors(n.id).len(), n.id))
             .collect();
-        groups.sort_by(|a, b| b.0.cmp(&a.0)); // deepest first
+        groups.sort_by_key(|g| std::cmp::Reverse(g.0)); // deepest first
         for (_, g) in groups {
             let kids = self.nodes[&g].children.clone();
             if kids.is_empty() {

@@ -1154,13 +1154,12 @@ mod tests {
         eprintln!("nodes: {} images: {} blobs: {}", changes.len(), fig.images.len(), fig.message.arr("blobs").len());
         eprintln!("types: {k:?}");
         let want = std::env::var("KATACHI_FIG_TYPE").unwrap_or("RECTANGLE".into());
-        if let Some(n) = changes.iter().find(|n| n.s("type") == Some(&want)) {
-            if let Value::Object(m) = n {
+        if let Some(n) = changes.iter().find(|n| n.s("type") == Some(&want))
+            && let Value::Object(m) = n {
                 for (key, v) in m {
                     let s = format!("{v:?}");
                     eprintln!("  {key}: {}", &s[..s.len().min(220)]);
                 }
             }
-        }
     }
 }

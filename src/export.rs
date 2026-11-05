@@ -906,7 +906,7 @@ pub fn backdrop_pixels(n: &Node, (content, mask, region): &(String, String, Rect
     } else {
         crate::render::blur_rgba(&mut px, w, h, s.blur / 2.0 * scale);
     }
-    for (p, a) in px.chunks_exact_mut(4).zip(m.chunks_exact(4).map(|c| c[3] as u32)) {
+    for (p, a) in px.as_chunks_mut::<4>().0.iter_mut().zip(m.as_chunks::<4>().0.iter().map(|c| c[3] as u32)) {
         for c in p.iter_mut() {
             *c = (*c as u32 * a / 255) as u8;
         }
@@ -920,7 +920,7 @@ impl Svg<'_> {
         let Some(parts) = backdrop_parts(self.doc, id, true) else { return };
         // ponytail: baked at 2x; scale with the export if large exports look soft
         let Some((mut px, [w, h])) = backdrop_pixels(self.doc.node(id), &parts, 2.0) else { return };
-        for p in px.chunks_exact_mut(4).filter(|p| p[3] > 0) {
+        for p in px.as_chunks_mut::<4>().0.iter_mut().filter(|p| p[3] > 0) {
             let a = p[3] as u32;
             for c in &mut p[..3] {
                 *c = (*c as u32 * 255 / a).min(255) as u8;

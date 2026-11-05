@@ -372,6 +372,8 @@ pub fn serve(listener: TcpListener, doc: Document, token: String) -> Relay {
             std::thread::spawn(move || {
                 // A connection that never finishes the handshake mustn't hold a thread forever.
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                // tungstenite's callback type fixes the size of this error.
+                #[allow(clippy::result_large_err)]
                 let check = |req: &tungstenite::handshake::server::Request, resp| {
                     if req.uri().path().trim_start_matches('/') == *token.lock().unwrap() {
                         Ok(resp)

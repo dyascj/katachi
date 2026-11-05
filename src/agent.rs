@@ -77,8 +77,8 @@ pub fn found_now() -> Option<Arc<Found>> {
     FOUND.get_or_init(|| Mutex::new(None)).lock().unwrap().clone()
 }
 
-/// Tests: pretend these were found.
-#[cfg(test)]
+/// Tests (with a shell-script agent, so Unix only): pretend these were found.
+#[cfg(all(test, unix))]
 pub fn set_found(found: Found) {
     *FOUND.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(Arc::new(found));
 }

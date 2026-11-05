@@ -89,7 +89,7 @@ pub struct AssetDrag(pub NodeId, pub Option<String>);
 /// content every 30 frames (staggered), so a big library costs little per frame.
 fn thumb(ctx: &egui::Context, cache: &mut std::collections::HashMap<(String, NodeId), (u64, egui::TextureHandle)>, doc: &crate::doc::Document, lib: &str, id: NodeId, budget: &mut usize) -> Option<egui::TextureHandle> {
     use std::hash::{Hash, Hasher};
-    let due = (ctx.cumulative_frame_nr() + id) % 30 == 0;
+    let due = (ctx.cumulative_frame_nr() + id).is_multiple_of(30);
     let k = (lib.to_string(), id);
     if let Some((_, tex)) = cache.get(&k)
         && (!due || *budget == 0)
@@ -719,6 +719,7 @@ fn text_style_editor(ui: &mut Ui, id: egui::Id, t: &mut crate::doc::TextStyle) {
 }
 
 /// Figma's frame presets: group, then (name, width, height).
+#[allow(clippy::type_complexity)]
 const FRAME_PRESETS: &[(&str, &[(&str, u32, u32)])] = &[
     ("Phone", &[("iPhone 16", 393, 852), ("iPhone 16 Pro", 402, 874), ("iPhone 16 Pro Max", 440, 956), ("iPhone 16 Plus", 430, 932), ("iPhone 14", 390, 844), ("iPhone SE", 320, 568), ("Android Compact", 412, 917), ("Android Medium", 700, 840)]),
     ("Tablet", &[("iPad mini 8.3", 744, 1133), ("iPad Pro 11\"", 834, 1194), ("iPad Pro 12.9\"", 1024, 1366), ("Surface Pro 8", 1440, 960)]),
@@ -923,7 +924,7 @@ impl App {
             })
             .collect();
         comps.sort_by(|a, b| (a.0, &a.2).cmp(&(b.0, &b.2)));
-        let libs: Vec<(String, String, std::sync::Arc<crate::doc::Document>, Vec<(usize, NodeId, String)>)> = self
+        let libs: Vec<_> = self
             .enabled_libs()
             .into_iter()
             .map(|(r, d)| {
@@ -2983,7 +2984,7 @@ impl App {
             ui.label(RichText::new(label).color(theme::muted(ui.ctx())).small());
             // Slash names make folders, as in Figma: "HUD / Title" sits in a HUD folder.
             let mut list = list;
-            list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            list.sort_by_key(|a| a.name.to_lowercase());
             let folder_of = |n: &str| n.rsplit_once('/').map(|(f, _)| f.trim().to_string());
             let mut folders: Vec<Option<String>> = vec![];
             for st in &list {
@@ -3520,7 +3521,7 @@ impl App {
                                 let label = if p.preferred.is_empty() { "Preferred".to_string() } else { format!("Preferred ({})", p.preferred.len()) };
                                 crate::chrome::menu_button(ui, label, |ui| {
                                     let mut comps: Vec<(NodeId, String)> = self.doc.nodes.values().filter(|n| n.kind == Kind::Component).map(|n| (n.id, n.name.clone())).collect();
-                                    comps.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+                                    comps.sort_by_key(|a| a.1.to_lowercase());
                                     for (cid, name) in comps {
                                         let mut on = p.preferred.contains(&cid);
                                         if ui.checkbox(&mut on, name).changed() {
