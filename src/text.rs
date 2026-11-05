@@ -88,6 +88,18 @@ pub fn styles_for(family: &str) -> Vec<(u16, bool)> {
     if s.is_empty() { vec![(400, false)] } else { s }
 }
 
+/// The style to keep when switching to `family`: the same one if it has it, else the nearest
+/// weight, upright if it has no italics.
+pub fn nearest_style(family: &str, weight: u16, italic: bool) -> (u16, bool) {
+    let ss = styles_for(family);
+    if ss.contains(&(weight, italic)) {
+        return (weight, italic);
+    }
+    let italic = italic && ss.iter().any(|s| s.1);
+    let near = ss.iter().filter(|s| s.1 == italic).min_by_key(|s| (s.0 as i32 - weight as i32).abs());
+    near.copied().unwrap_or((400, false))
+}
+
 /// Upright weights installed for `family`.
 pub fn weights_for(family: &str) -> Vec<u16> {
     let mut w: Vec<u16> = styles_for(family).into_iter().filter(|s| !s.1).map(|s| s.0).collect();

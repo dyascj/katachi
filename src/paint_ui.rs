@@ -584,7 +584,7 @@ pub fn paint_row(ui: &mut Ui, id: egui::Id, paint: &mut Paint, title: &str) -> P
                 }
             }
             k => {
-                ui.add_sized([56.0, 20.0], egui::Label::new(format!("{k:?}")));
+                ui.add_sized([56.0, 20.0], egui::Label::new(k.label()));
             }
         }
         if alpha_field(ui, &mut paint.color) {
@@ -607,18 +607,18 @@ fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEve
     let mut ev = None;
     // Paint type and blend mode as dropdowns, as in Figma's header.
     ui.horizontal(|ui| {
-        crate::chrome::menu_button(ui, format!("{:?}", paint.kind), |ui| {
+        crate::chrome::menu_button(ui, paint.kind.label(), |ui| {
             for k in PaintKind::ALL {
-                if ui.selectable_label(paint.kind == k, format!("{k:?}")).clicked() && paint.kind != k {
+                if ui.selectable_label(paint.kind == k, k.label()).clicked() && paint.kind != k {
                     paint.convert(k);
                     ev = Some(PaintEvent::Changed);
                 }
             }
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            crate::chrome::menu_button(ui, format!("{:?}", paint.blend), |ui| {
+            crate::chrome::menu_button(ui, paint.blend.label(), |ui| {
                 for b in crate::doc::BlendMode::ALL {
-                    if ui.selectable_label(paint.blend == b, format!("{b:?}")).clicked() && paint.blend != b {
+                    if ui.selectable_label(paint.blend == b, b.label()).clicked() && paint.blend != b {
                         paint.blend = b;
                         ev = Some(PaintEvent::Changed);
                     }
@@ -704,7 +704,7 @@ fn paint_editor(ui: &mut Ui, id: egui::Id, paint: &mut Paint) -> Option<PaintEve
             ui.horizontal(|ui| {
                 use crate::doc::ScaleMode;
                 for m in [ScaleMode::Fill, ScaleMode::Fit, ScaleMode::Crop, ScaleMode::Stretch, ScaleMode::Tile] {
-                    if ui.selectable_label(paint.scale_mode == m, format!("{m:?}")).clicked() && paint.scale_mode != m {
+                    if ui.selectable_label(paint.scale_mode == m, m.label()).clicked() && paint.scale_mode != m {
                         // Crop starts from what Fill shows.
                         if m == ScaleMode::Crop {
                             paint.tile_scale = 1.0;

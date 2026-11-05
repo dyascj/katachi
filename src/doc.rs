@@ -1085,6 +1085,11 @@ impl BlendMode {
     pub fn from_figma(name: Option<&str>) -> Self {
         BlendMode::ALL.into_iter().find(|b| Some(b.css().replace('-', "_").to_uppercase().as_str()) == name).unwrap_or_default()
     }
+    /// Figma's menu name: "Color dodge", "Soft light".
+    pub fn label(self) -> String {
+        let css = self.css().replace('-', " ");
+        css[..1].to_uppercase() + &css[1..]
+    }
     /// CSS / SVG `mix-blend-mode` keyword.
     pub fn css(self) -> &'static str {
         match self {
@@ -1283,6 +1288,16 @@ pub enum Cap {
     Square,
 }
 
+impl Cap {
+    pub fn label(self) -> &'static str {
+        match self {
+            Cap::None => "Flat",
+            Cap::Round => "Round",
+            Cap::Square => "Square",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Join {
     #[default]
@@ -1291,11 +1306,31 @@ pub enum Join {
     Bevel,
 }
 
+impl Join {
+    pub fn label(self) -> &'static str {
+        match self {
+            Join::Miter => "Miter",
+            Join::Round => "Round",
+            Join::Bevel => "Bevel",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StrokeAlign {
     Inside,
     Center,
     Outside,
+}
+
+impl StrokeAlign {
+    pub fn label(self) -> &'static str {
+        match self {
+            StrokeAlign::Inside => "Inside",
+            StrokeAlign::Center => "Center",
+            StrokeAlign::Outside => "Outside",
+        }
+    }
 }
 
 /// A vector anchor. `p` is relative to the node's `rect.min`; handles are offsets from `p`.
@@ -1362,6 +1397,16 @@ impl PaintKind {
     pub fn is_gradient(self) -> bool {
         !matches!(self, PaintKind::Solid | PaintKind::Image)
     }
+    pub fn label(self) -> &'static str {
+        match self {
+            PaintKind::Solid => "Solid",
+            PaintKind::Linear => "Linear",
+            PaintKind::Radial => "Radial",
+            PaintKind::Image => "Image",
+            PaintKind::Angular => "Angular",
+            PaintKind::Diamond => "Diamond",
+        }
+    }
 }
 
 /// Figma's GRADIENT_* paint type names.
@@ -1392,6 +1437,18 @@ pub enum ScaleMode {
     /// Figma's Crop: like Fill, zoomed by `tile_scale` (1 = cover) and shifted by `from`
     /// (-1..1 of the room to move on each axis, 0 = centered).
     Crop,
+}
+
+impl ScaleMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            ScaleMode::Fill => "Fill",
+            ScaleMode::Fit => "Fit",
+            ScaleMode::Stretch => "Stretch",
+            ScaleMode::Tile => "Tile",
+            ScaleMode::Crop => "Crop",
+        }
+    }
 }
 
 /// An embedded image's pixel size (read from its header).

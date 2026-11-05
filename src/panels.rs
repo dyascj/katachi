@@ -455,7 +455,8 @@ fn num_field(ui: &mut Ui, v: &mut f32, label: &str, min: f32, width: f32) -> boo
         "@rotate" => "°",
         _ => "",
     };
-    let mut tmp = if v.is_nan() { 0.0 } else { *v };
+    // A mixed field starts inside the range: DragValue reports clamping an out-of-range value as a change.
+    let mut tmp = if v.is_nan() { min.max(0.0) } else { *v };
     let mixed = v.is_nan();
     let resp = ui.add_sized(
         [width.max(30.0), 22.0],
@@ -3268,21 +3269,31 @@ impl App {
                 }
             }
         }
-        // Component property values.
+        // Component property values. Selected instances of the same component edit together;
+        // a value that differs between them shows as mixed, and an edit sets only that property.
         let props = self.doc.props_of(c);
-        let mut values = self.doc.node(i).prop_values.clone();
-        let mut changed = false;
+        let targets: Vec<NodeId> = pool.iter().copied().filter(|&s| s == i || self.doc.node(s).component == Some(c)).collect();
+        let value_of = |n: NodeId, p: &crate::doc::CompProp| self.doc.node(n).prop_values.iter().find(|(k, _)| *k == p.name).map(|(_, v)| v.clone()).unwrap_or(p.default.clone());
+        let mut edits = vec![];
         for p in &props {
-            let cur = values.iter().find(|(k, _)| *k == p.name).map(|(_, v)| v.clone()).unwrap_or(p.default.clone());
+            let mut cur = value_of(i, p);
+            let mixed = targets.iter().any(|&t| value_of(t, p) != cur);
+            if mixed {
+                match &mut cur {
+                    PropValue::Bool(b) => *b = false,
+                    PropValue::Text(t) => t.clear(),
+                    PropValue::Swap(_) => {}
+                }
+            }
             let mut next = cur.clone();
             ui.horizontal(|ui| {
                 ui.label(&p.name);
                 match &mut next {
                     PropValue::Bool(b) => {
-                        ui.checkbox(b, "");
+                        ui.add(egui::Checkbox::new(b, "").indeterminate(mixed));
                     }
                     PropValue::Text(t) => {
-                        ui.text_edit_singleline(t);
+                        ui.add(egui::TextEdit::singleline(t).hint_text(if mixed { "Mixed" } else { "" }));
                     }
                     PropValue::Swap(target) => {
                         // Preferred values, when the property has them, are what the picker offers (as in Figma).
@@ -3299,17 +3310,17 @@ impl App {
                 }
             });
             if next != cur {
-                values.retain(|(k, _)| *k != p.name);
-                values.push((p.name.clone(), next));
-                changed = true;
+                edits.push((p.name.clone(), next));
             }
         }
-        if changed {
+        if !edits.is_empty() {
             self.begin_edit();
-            // Selected instances of the same component take the same values.
-            let targets: Vec<NodeId> = pool.iter().copied().filter(|&s| s == i || self.doc.node(s).component == Some(c)).collect();
             for t in targets {
-                self.doc.node_mut(t).prop_values = values.clone();
+                let values = &mut self.doc.node_mut(t).prop_values;
+                for (name, v) in &edits {
+                    values.retain(|(k, _)| k != name);
+                    values.push((name.clone(), v.clone()));
+                }
             }
             self.doc.reflow();
         }
@@ -3971,9 +3982,9 @@ impl App {
             ui.label(RichText::new("Appearance").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let mut blend = n.blend;
-                egui::ComboBox::from_id_salt("blend").width(96.0).selected_text(format!("{blend:?}")).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("blend").width(96.0).selected_text(blend.label()).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
                     for b in crate::doc::BlendMode::ALL {
-                        ui.selectable_value(&mut blend, b, format!("{b:?}"));
+                        ui.selectable_value(&mut blend, b, b.label());
                     }
                 });
                 if blend != n.blend {
@@ -3984,9 +3995,12 @@ impl App {
                 }
             });
         });
-        let mut op = (n.opacity * 100.0).round();
-        let mut r = n.radius;
-        let has_radius = n.kind == Kind::Rectangle || n.kind.is_frame();
+        // Values that differ across the selection show "Mixed" (NaN).
+        let rounded = |t: &crate::doc::Node| t.kind == Kind::Rectangle || t.kind.is_frame();
+        let same = |f: &dyn Fn(&crate::doc::Node) -> bool| self.sel.iter().all(|&id| f(self.doc.node(id)));
+        let mut op = if same(&|o| o.opacity == n.opacity) { (n.opacity * 100.0).round() } else { f32::NAN };
+        let mut r = if same(&|o| !rounded(o) || o.radius == n.radius) { n.radius } else { f32::NAN };
+        let has_radius = rounded(n);
         let mut corners = n.corner_radii;
         ui.horizontal(|ui| {
             if num_field(ui, &mut op, "@opacity", 0.0, half(ui)) {
@@ -4016,18 +4030,24 @@ impl App {
             }
         });
         if let (true, Some(mut c)) = (has_radius, corners) {
-            let mut changed = false;
+            let mut changed = None;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 let w = (ui.max_rect().width() - 12.0) / 4.0 - 1.0;
-                for v in c.iter_mut() {
-                    changed |= num_field(ui, v, "", 0.0, w);
+                for (i, v) in c.iter_mut().enumerate() {
+                    if num_field(ui, v, "", 0.0, w) {
+                        changed = Some(i);
+                    }
                 }
             });
-            if changed {
+            // Only the corner that changed: each layer keeps its other corners.
+            if let Some(i) = changed {
                 self.begin_edit();
                 for &id in &self.sel {
-                    self.doc.node_mut(id).corner_radii = Some(c);
+                    let t = self.doc.node_mut(id);
+                    let mut own = t.corner_radii.unwrap_or([t.radius; 4]);
+                    own[i] = c[i];
+                    t.corner_radii = Some(own);
                 }
             }
         }
@@ -4077,12 +4097,40 @@ impl App {
                 });
             });
         }
+        // Values that differ across the selection show "Mixed" (an empty family, weight 0, NaN
+        // numbers), so an edit is seen against them and writes only the field that changed.
         let mut t = n.clone();
+        let same = |f: &dyn Fn(&crate::doc::Node) -> bool| self.sel.iter().all(|&id| f(self.doc.node(id)));
+        if !same(&|o| o.font_family == n.font_family) {
+            t.font_family.clear();
+        }
+        if !same(&|o| (o.font_weight, o.italic) == (n.font_weight, n.italic)) {
+            t.font_weight = 0;
+        }
+        if !same(&|o| o.line_height == n.line_height) {
+            t.line_height = LineHeight::Px(f32::NAN);
+        }
+        let ls_mixed = !same(&|o| o.letter_spacing == n.letter_spacing);
+        let mix = |v: &mut f32, f: fn(&crate::doc::Node) -> f32| {
+            if !same(&|o| f(o) == f(n)) {
+                *v = f32::NAN;
+            }
+        };
+        mix(&mut t.font_size, |o| o.font_size);
+        mix(&mut t.paragraph_spacing, |o| o.paragraph_spacing);
+        mix(&mut t.paragraph_indent, |o| o.paragraph_indent);
+        let base = t.clone();
         // Font family picker with search.
         let fam_id = ui.id().with("font-search");
         // A missing font reads struck through in italics, with a way to replace it (Figma).
         let missing = std::iter::once(&n.font_family).chain(n.spans.iter().filter_map(|sp| sp.style.font_family.as_ref())).any(|f| !crate::text::installed(f));
-        let label = if crate::text::installed(&t.font_family) { RichText::new(&t.font_family) } else { RichText::new(&t.font_family).italics().strikethrough() };
+        let label = if t.font_family.is_empty() {
+            RichText::new("Mixed")
+        } else if crate::text::installed(&t.font_family) {
+            RichText::new(&t.font_family)
+        } else {
+            RichText::new(&t.font_family).italics().strikethrough()
+        };
         let resp = ui.add_sized([ui.available_width(), 24.0], egui::Button::new(label));
         if missing {
             ui.horizontal(|ui| {
@@ -4112,12 +4160,9 @@ impl App {
                     let current = *f == t.font_family;
                     if ui.add(egui::Button::new(format!("{}{f}", if current { "✓  " } else { "     " })).frame(false)).clicked() {
                         t.font_family = f.clone();
-                        // Keep the style if the new family has it, else its nearest, upright if need be.
-                        let ss = styles_for(f);
-                        if !ss.contains(&(t.font_weight, t.italic)) {
-                            let italic = t.italic && ss.iter().any(|s| s.1);
-                            let near = ss.iter().filter(|s| s.1 == italic).min_by_key(|s| (s.0 as i32 - t.font_weight as i32).abs());
-                            (t.font_weight, t.italic) = near.copied().unwrap_or((400, false));
+                        // Mixed styles are matched per layer when the edit is written.
+                        if t.font_weight != 0 {
+                            (t.font_weight, t.italic) = crate::text::nearest_style(f, t.font_weight, t.italic);
                         }
                         ui.close();
                     }
@@ -4126,7 +4171,7 @@ impl App {
         });
         ui.horizontal(|ui| {
             // Font styles as Figma lists them: each weight, then its italic.
-            egui::ComboBox::from_id_salt("weight").width(half(ui) - 12.0).selected_text(style_name(t.font_weight, t.italic)).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("weight").width(half(ui) - 12.0).selected_text(if t.font_weight == 0 { "Mixed".into() } else { style_name(t.font_weight, t.italic) }).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
                 for (w, i) in styles_for(&t.font_family) {
                     if ui.selectable_label((t.font_weight, t.italic) == (w, i), style_name(w, i)).clicked() {
                         (t.font_weight, t.italic) = (w, i);
@@ -4139,6 +4184,7 @@ impl App {
         ui.horizontal(|ui| {
             let lh_id = ui.id().with(("lh", n.id));
             let shown = match t.line_height {
+                LineHeight::Px(v) if v.is_nan() => "Mixed".to_string(),
                 LineHeight::Auto => "Auto".to_string(),
                 LineHeight::Px(v) => num(v),
                 LineHeight::Percent(p) => format!("{}%", num(p)),
@@ -4166,7 +4212,7 @@ impl App {
             }
             r.on_hover_text("Line height: Auto, pixels, or percent");
             let mut ls = t.letter_spacing;
-            if ui.add_sized([half(ui), 22.0], DragValue::new(&mut ls).range(-100.0..=1000.0).speed(0.1).suffix("%").prefix("|A|  ").custom_formatter(|v, _| num(v as f32))).changed() {
+            if ui.add_sized([half(ui), 22.0], DragValue::new(&mut ls).range(-100.0..=1000.0).speed(0.1).suffix(if ls_mixed { "" } else { "%" }).prefix("|A|  ").custom_formatter(move |v, _| if ls_mixed { "Mixed".into() } else { num(v as f32) })).changed() {
                 t.letter_spacing = ls;
             }
         });
@@ -4266,30 +4312,33 @@ impl App {
                     .on_hover_text("Max lines (Auto fits the box)");
             }
         });
-        let changed = t.font_family != n.font_family
-            || t.font_weight != n.font_weight
-            || t.italic != n.italic
-            || t.font_size != n.font_size
-            || t.line_height != n.line_height
-            || t.letter_spacing != n.letter_spacing
-            || t.text_align != n.text_align
-            || t.text_valign != n.text_valign
-            || t.text_sizing != n.text_sizing
-            || t.decoration != n.decoration
-            || t.text_case != n.text_case
-            || t.truncate != n.truncate
-            || t.paragraph_spacing != n.paragraph_spacing
-            || t.paragraph_indent != n.paragraph_indent
-            || t.vertical_trim != n.vertical_trim
-            || t.max_lines != n.max_lines;
+        // A NaN that is still NaN is an untouched "Mixed" field, not an edit.
+        let ef = |a: f32, b: f32| a != b && !a.is_nan();
+        let lh_edited = t.line_height != base.line_height && !matches!(t.line_height, LineHeight::Px(v) if v.is_nan());
+        let style_changed = t.font_family != base.font_family
+            || (t.font_weight, t.italic) != (base.font_weight, base.italic)
+            || ef(t.font_size, base.font_size)
+            || lh_edited
+            || t.letter_spacing != base.letter_spacing
+            || t.decoration != base.decoration
+            || t.text_case != base.text_case;
+        let changed = style_changed
+            || t.text_align != base.text_align
+            || t.text_valign != base.text_valign
+            || t.text_sizing != base.text_sizing
+            || t.truncate != base.truncate
+            || ef(t.paragraph_spacing, base.paragraph_spacing)
+            || ef(t.paragraph_indent, base.paragraph_indent)
+            || t.vertical_trim != base.vertical_trim
+            || t.max_lines != base.max_lines;
         // With characters selected in the editor, changes style just that range (rich text).
         if changed && self.text_selection(ui.ctx()).is_some() {
             let patch = crate::doc::SpanStyle {
-                font_family: (t.font_family != n.font_family).then(|| t.font_family.clone()),
-                font_weight: (t.font_weight != n.font_weight).then_some(t.font_weight),
-                italic: (t.italic != n.italic).then_some(t.italic),
-                font_size: (t.font_size != n.font_size).then_some(t.font_size),
-                decoration: (t.decoration != n.decoration).then_some(t.decoration),
+                font_family: (t.font_family != base.font_family).then(|| t.font_family.clone()),
+                font_weight: (t.font_weight != base.font_weight).then_some(t.font_weight),
+                italic: (t.italic != base.italic).then_some(t.italic),
+                font_size: ef(t.font_size, base.font_size).then_some(t.font_size),
+                decoration: (t.decoration != base.decoration).then_some(t.decoration),
                 ..Default::default()
             };
             if !patch.is_empty() {
@@ -4301,24 +4350,38 @@ impl App {
             self.begin_edit();
             for &id in &self.sel.clone() {
                 let d = self.doc.node_mut(id);
-                // Changing a styled value by hand detaches the style, like Figma.
-                d.text_style = None;
-                d.font_family = t.font_family.clone();
-                d.font_weight = t.font_weight;
-                d.italic = t.italic;
-                d.font_size = t.font_size;
-                d.line_height = t.line_height;
-                d.letter_spacing = t.letter_spacing;
-                d.text_align = t.text_align;
-                d.text_valign = t.text_valign;
-                d.text_sizing = t.text_sizing;
-                d.decoration = t.decoration;
-                d.text_case = t.text_case;
-                d.truncate = t.truncate;
-                d.paragraph_spacing = t.paragraph_spacing.max(0.0);
-                d.paragraph_indent = t.paragraph_indent.max(0.0);
-                d.vertical_trim = t.vertical_trim;
-                d.max_lines = t.max_lines;
+                macro_rules! set {
+                    ($($f:ident),*) => {$(
+                        if t.$f != base.$f {
+                            d.$f = t.$f.clone();
+                        }
+                    )*};
+                }
+                set!(letter_spacing, text_align, text_valign, text_sizing, decoration, text_case, truncate, vertical_trim, max_lines);
+                if (t.font_weight, t.italic) != (base.font_weight, base.italic) {
+                    (d.font_weight, d.italic) = (t.font_weight, t.italic);
+                }
+                if t.font_family != base.font_family {
+                    d.font_family = t.font_family.clone();
+                    (d.font_weight, d.italic) = crate::text::nearest_style(&d.font_family, d.font_weight, d.italic);
+                }
+                if lh_edited {
+                    d.line_height = t.line_height;
+                }
+                if ef(t.font_size, base.font_size) {
+                    d.font_size = t.font_size;
+                }
+                if ef(t.paragraph_spacing, base.paragraph_spacing) {
+                    d.paragraph_spacing = t.paragraph_spacing.max(0.0);
+                }
+                if ef(t.paragraph_indent, base.paragraph_indent) {
+                    d.paragraph_indent = t.paragraph_indent.max(0.0);
+                }
+                // Changing a styled value by hand detaches the style, like Figma; alignment,
+                // resizing and truncation aren't part of a text style.
+                if style_changed {
+                    d.text_style = None;
+                }
             }
         }
     }
@@ -4332,13 +4395,18 @@ impl App {
         let mut changed = false;
         let link = if stroke { n.stroke_style } else { n.fill_style };
         let prop = if stroke { crate::doc::Bindable::Stroke } else { crate::doc::Bindable::Fill };
+        // Layers whose paints (or their style or variable) differ show "Mixed", as in Figma,
+        // rather than the first layer's list, which an edit would copy onto all of them.
+        let var = |t: &crate::doc::Node| t.bindings.iter().find(|(b, _)| *b == prop).map(|b| b.1);
+        let same = |t: &crate::doc::Node| var(t) == var(&n) && if stroke { (&t.strokes, t.stroke_style) == (&n.strokes, n.stroke_style) } else { (&t.fills, t.fill_style) == (&n.fills, n.fill_style) };
+        let mixed = self.sel.iter().map(|&id| self.doc.node(id)).any(|t| t.kind != Kind::Group && !same(t));
         let mut add = false;
         let mut pick = None;
         let mut var_pick = None;
         ui.horizontal(|ui| {
             ui.label(RichText::new(if stroke { "Stroke" } else { "Fill" }).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                add = icon_button(ui, Icon::Plus, false, 22.0, "").clicked();
+                add = icon_button(ui, Icon::Plus, false, 22.0, if stroke { "Add stroke" } else { "Add fill" }).clicked();
                 pick = self.style_picker(ui, ui.id().with(("paint-styles", stroke)), |v| matches!(v, StyleValue::Paint(_)));
                 // Figma's hexagon: apply a color variable to the paint.
                 if self.has_variables() {
@@ -4354,7 +4422,7 @@ impl App {
             return;
         }
         // A bound paint shows the variable's name in place of its value, with detach.
-        let bound = n.bindings.iter().find(|(b, _)| *b == prop).map(|(_, v)| *v);
+        let bound = n.bindings.iter().find(|(b, _)| *b == prop).map(|(_, v)| *v).filter(|_| !mixed);
         if let Some(var) = bound {
             let name = self.doc.variable(var).map_or("Missing variable".into(), |v| v.name.clone());
             ui.horizontal(|ui| {
@@ -4393,7 +4461,7 @@ impl App {
             _ => {}
         }
         // A linked style shows as one row; editing it edits the style for everyone.
-        if let Some(style) = link.and_then(|sid| self.doc.style(sid)).cloned() {
+        if let Some(style) = link.filter(|_| !mixed).and_then(|sid| self.doc.style(sid)).cloned() {
             ui.horizontal(|ui| {
                 style_preview(ui, &style.value);
                 let open = ui.add(egui::Button::new(&style.name).frame(false));
@@ -4432,6 +4500,10 @@ impl App {
                 (false, Kind::Frame) => Rgba::WHITE,
                 _ => SHAPE_GRAY,
             };
+            // Mixed paints are replaced by the new one.
+            if mixed {
+                paints.clear();
+            }
             paints.push(Paint::solid(c));
             changed = true;
             // A new stroke opens its editor right away, as in Figma.
@@ -4439,10 +4511,14 @@ impl App {
                 egui::Popup::open_id(ui.ctx(), ui.id().with((stroke, paints.len() - 1, first)).with("popup"));
             }
         }
+        if mixed && !add {
+            let what = if stroke { "strokes" } else { "fills" };
+            ui.label(RichText::new(format!("Mixed {what}. Click + to replace them.")).small().color(theme::muted(ui.ctx())));
+        }
         let mut remove = None;
         // Topmost paint first, as in Figma. Each row drags by its grip to reorder.
         let (mut rows, mut dragging, mut dropped) = (vec![], None, None);
-        for i in (0..paints.len()).rev().filter(|_| bound.is_none()) {
+        for i in (0..paints.len()).rev().filter(|_| bound.is_none() && (add || !mixed)) {
             let id = ui.id().with((stroke, i, first));
             let row = ui.horizontal(|ui| {
                 let grip = crate::paint_ui::grip(ui);
@@ -4488,16 +4564,22 @@ impl App {
             changed = true;
         }
         let (mut width, mut align) = (n.stroke_width, n.stroke_align);
-        let mut stroke_changed = false;
-        if stroke && !paints.is_empty() {
+        let (mut width_changed, mut align_changed) = (false, false);
+        let others = || self.sel.iter().map(|&id| self.doc.node(id)).filter(|t| t.kind != Kind::Group);
+        let width_mixed = others().any(|t| t.stroke_width != n.stroke_width);
+        let align_mixed = others().any(|t| t.stroke_align != n.stroke_align);
+        if stroke && (mixed || !paints.is_empty()) {
             ui.horizontal(|ui| {
-                stroke_changed |= ui
-                    .add(DragValue::new(&mut width).range(0.0..=1000.0).speed(0.1).prefix("Weight  ").custom_formatter(|v, _| num(v as f32)))
+                width_changed = ui
+                    .add(DragValue::new(&mut width).range(0.0..=1000.0).speed(0.1).prefix("Weight  ").custom_formatter(move |v, _| if width_mixed { "Mixed".into() } else { num(v as f32) }))
                     .changed();
                 if n.kind != Kind::Vector {
-                    egui::ComboBox::from_id_salt("stroke-align").width(70.0).selected_text(format!("{align:?}")).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
+                    let shown = if align_mixed { "Mixed" } else { align.label() };
+                    egui::ComboBox::from_id_salt("stroke-align").width(70.0).selected_text(shown).popup_style(crate::chrome::menu_style.into()).show_ui(ui, |ui| {
                         for a in [StrokeAlign::Inside, StrokeAlign::Center, StrokeAlign::Outside] {
-                            stroke_changed |= ui.selectable_value(&mut align, a, format!("{a:?}")).changed();
+                            if ui.selectable_label(!align_mixed && align == a, a.label()).clicked() {
+                                (align, align_changed) = (a, true);
+                            }
                         }
                     });
                 }
@@ -4521,7 +4603,12 @@ impl App {
                         self.begin_edit();
                         for &id in &self.sel.clone() {
                             let t = self.doc.node_mut(id);
-                            (t.start_marker, t.end_marker) = ends;
+                            if ends.0 != n.start_marker {
+                                t.start_marker = ends.0;
+                            }
+                            if ends.1 != n.end_marker {
+                                t.end_marker = ends.1;
+                            }
                         }
                     }
                 }
@@ -4545,20 +4632,28 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.label("Caps");
                         for c in [crate::doc::Cap::None, crate::doc::Cap::Round, crate::doc::Cap::Square] {
-                            ui.selectable_value(&mut style.1, c, format!("{c:?}"));
+                            ui.selectable_value(&mut style.1, c, c.label());
                         }
                     });
                     ui.horizontal(|ui| {
                         ui.label("Join");
                         for j in [crate::doc::Join::Miter, crate::doc::Join::Round, crate::doc::Join::Bevel] {
-                            ui.selectable_value(&mut style.2, j, format!("{j:?}"));
+                            ui.selectable_value(&mut style.2, j, j.label());
                         }
                     });
                     if style != (n.dash.clone(), n.cap, n.join) {
                         self.begin_edit();
                         for &id in &self.sel.clone() {
                             let t = self.doc.node_mut(id);
-                            (t.dash, t.cap, t.join) = style.clone();
+                            if style.0 != n.dash {
+                                t.dash = style.0.clone();
+                            }
+                            if style.1 != n.cap {
+                                t.cap = style.1;
+                            }
+                            if style.2 != n.join {
+                                t.join = style.2;
+                            }
                         }
                     }
                     if n.kind == Kind::Rectangle || n.kind.is_frame() {
@@ -4603,26 +4698,29 @@ impl App {
                 self.style_selection(ui.ctx(), crate::doc::SpanStyle { color: Some(c), ..Default::default() });
                 return;
             }
-        if changed || stroke_changed {
+        // Each control writes only its own field: a weight change keeps every layer's paints.
+        if changed || width_changed || align_changed {
             self.begin_edit();
             for &id in &self.sel.clone() {
                 let t = self.doc.node_mut(id);
                 if t.kind == Kind::Group {
                     continue;
                 }
-                if stroke {
-                    t.strokes = paints.clone();
-                    if stroke_changed {
-                        if width != t.stroke_width && t.stroke_sides.is_some() {
-                            t.stroke_sides = None;
-                        }
-                        t.stroke_width = width;
-                        if t.kind != Kind::Vector {
-                            t.stroke_align = align;
-                        }
+                if changed {
+                    if stroke { t.strokes = paints.clone() } else { t.fills = paints.clone() }
+                    if mixed {
+                        t.bindings.retain(|(b, _)| *b != prop);
+                        if stroke { t.stroke_style = None } else { t.fill_style = None }
                     }
-                } else {
-                    t.fills = paints.clone();
+                }
+                if width_changed {
+                    if width != t.stroke_width {
+                        t.stroke_sides = None;
+                    }
+                    t.stroke_width = width;
+                }
+                if align_changed && t.kind != Kind::Vector {
+                    t.stroke_align = align;
                 }
             }
         }
@@ -4717,12 +4815,17 @@ impl App {
         let mut shadows = self.doc.node(first).shadows.clone();
         let mut changed = false;
         let link = self.doc.node(first).effect_style;
+        // Different effects on the selected layers show "Mixed" (+ replaces them), like Export.
+        let mixed = self.sel.iter().any(|&id| (&self.doc.node(id).shadows, self.doc.node(id).effect_style) != (&shadows, link));
+        if mixed {
+            shadows.clear();
+        }
         let mut add = false;
         let mut pick = None;
         ui.horizontal(|ui| {
             ui.label(RichText::new("Effects").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                add = icon_button(ui, Icon::Plus, false, 22.0, "").clicked();
+                add = icon_button(ui, Icon::Plus, false, 22.0, "Add effect").clicked();
                 pick = self.style_picker(ui, ui.id().with("effect-styles"), |v| matches!(v, StyleValue::Effect(_)));
             });
         });
@@ -4744,7 +4847,7 @@ impl App {
             }
             _ => {}
         }
-        if let Some(style) = link.and_then(|sid| self.doc.style(sid)).cloned() {
+        if let Some(style) = link.filter(|_| !mixed).and_then(|sid| self.doc.style(sid)).cloned() {
             ui.horizontal(|ui| {
                 style_preview(ui, &style.value);
                 ui.label(&style.name);
@@ -4762,6 +4865,8 @@ impl App {
             changed = true;
             // A new effect opens its editor right away, as in Figma.
             egui::Popup::open_id(ui.ctx(), ui.id().with(("shadow", shadows.len() - 1, first)).with("popup"));
+        } else if mixed {
+            ui.label(RichText::new("Mixed effects. Click + to replace them.").small().color(theme::muted(ui.ctx())));
         }
         let mut remove = None;
         // Topmost first; each row drags by its grip to reorder, like paints.
@@ -4809,7 +4914,11 @@ impl App {
         if changed {
             self.begin_edit();
             for &id in &self.sel.clone() {
-                self.doc.node_mut(id).shadows = shadows.clone();
+                let t = self.doc.node_mut(id);
+                t.shadows = shadows.clone();
+                if mixed {
+                    t.effect_style = None;
+                }
             }
         }
     }

@@ -4315,3 +4315,71 @@ fn plugins_and_agents_import_library_components_by_key() {
     let bad = app.mcp_tool(&ctx, "execute_code", &serde_json::json!({ "code": "await figma.importComponentByKeyAsync('nope:1')" }));
     assert_eq!(bad["isError"], true);
 }
+
+#[test]
+fn multi_selection_edits_change_only_that_property() {
+    use crate::doc::{CompProp, Paint, PropValue, Rgba, StrokeAlign, StyleValue, TextAlign, TextStyle};
+    let mut h = harness();
+    // Typography: aligning two different texts keeps each one's font, size and style.
+    let mut a = Node::new(Kind::Text, r(0., 0., 200., 40.));
+    (a.text, a.font_size, a.font_weight) = ("Heading".into(), 32.0, 700);
+    let mut b = Node::new(Kind::Text, r(0., 60., 200., 20.));
+    (b.text, b.font_size, b.font_family) = ("Body".into(), 14.0, "Roboto".into());
+    let sid = h.state_mut().doc.add_style("H1".into(), StyleValue::Text(TextStyle::of(&a)));
+    a.text_style = Some(sid);
+    let a = h.state_mut().doc.insert(0, None, None, a);
+    let b = h.state_mut().doc.insert(0, None, None, b);
+    h.state_mut().sel = vec![a, b];
+    h.run_steps(3);
+    assert!(h.query_by_label("Mixed").is_some(), "differing fonts read as mixed");
+    h.get_by_label("Align center  ⌥⌘T").click();
+    h.run_steps(2);
+    let d = &h.state().doc;
+    assert_eq!([d.node(a).text_align, d.node(b).text_align], [TextAlign::Center; 2]);
+    assert_eq!([d.node(a).font_size, d.node(b).font_size], [32.0, 14.0]);
+    assert_eq!([d.node(a).font_weight, d.node(b).font_weight], [700, 400]);
+    assert_ne!(d.node(a).font_family, d.node(b).font_family);
+    assert_eq!(d.node(a).text_style, Some(sid), "alignment isn't part of a text style");
+
+    // Strokes: changing the alignment keeps each layer's own stroke paints.
+    let mut x = Node::new(Kind::Rectangle, r(300., 0., 40., 40.));
+    x.strokes = vec![Paint::solid(Rgba::rgb(255, 0, 0))];
+    let mut y = Node::new(Kind::Rectangle, r(360., 0., 40., 40.));
+    y.strokes = vec![Paint::solid(Rgba::rgb(0, 0, 255))];
+    let x = h.state_mut().doc.insert(0, None, None, x);
+    let y = h.state_mut().doc.insert(0, None, None, y);
+    h.state_mut().sel = vec![x, y];
+    h.run_steps(3);
+    assert!(h.query_by_label("Mixed strokes. Click + to replace them.").is_some());
+    h.get_by_value(h.state().doc.node(x).stroke_align.label()).click();
+    h.run_steps(2);
+    h.get_by_label("Outside").click();
+    h.run_steps(2);
+    let d = &h.state().doc;
+    assert_eq!([d.node(x).stroke_align, d.node(y).stroke_align], [StrokeAlign::Outside; 2]);
+    assert_eq!(d.node(x).strokes[0].color, Rgba::rgb(255, 0, 0));
+    assert_eq!(d.node(y).strokes[0].color, Rgba::rgb(0, 0, 255), "the other layer keeps its stroke");
+
+    // Component properties: editing one keeps each instance's other values.
+    let mut c = Node::new(Kind::Component, r(0., 200., 100., 40.));
+    c.comp_props = vec![
+        CompProp { name: "Label".into(), default: PropValue::Text("Save".into()), preferred: vec![] },
+        CompProp { name: "Icon".into(), default: PropValue::Bool(false), preferred: vec![] },
+    ];
+    let c = h.state_mut().doc.insert(0, None, None, c);
+    let i1 = h.state_mut().doc.instantiate(c, 0, None, None, pos2(0., 300.));
+    let i2 = h.state_mut().doc.instantiate(c, 0, None, None, pos2(200., 300.));
+    h.state_mut().doc.node_mut(i1).prop_values = vec![("Icon".into(), PropValue::Bool(true))];
+    h.state_mut().sel = vec![i1, i2];
+    h.run_steps(3);
+    h.get_all_by_value("Save").next().unwrap().focus();
+    h.run_steps(1);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.get_all_by_value("Save").next().unwrap().type_text("Go");
+    h.run_steps(2);
+    let get = |h: &Harness<App>, i: NodeId, k: &str| h.state().doc.node(i).prop_values.iter().find(|p| p.0 == k).map(|p| p.1.clone());
+    assert_eq!(get(&h, i1, "Label"), Some(PropValue::Text("Go".into())));
+    assert_eq!(get(&h, i2, "Label"), Some(PropValue::Text("Go".into())));
+    assert_eq!(get(&h, i1, "Icon"), Some(PropValue::Bool(true)));
+    assert_eq!(get(&h, i2, "Icon"), None, "the other instance keeps its own value");
+}
