@@ -13,7 +13,8 @@ pub fn data_dir() -> PathBuf {
     } else if cfg!(windows) {
         std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or(home).join("Katachi")
     } else {
-        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".local/share")).join("katachi")
+        // Set but empty counts as unset (XDG spec); an empty path would put data in the working folder.
+        std::env::var_os("XDG_DATA_HOME").filter(|d| !d.is_empty()).map(PathBuf::from).unwrap_or_else(|| home.join(".local/share")).join("katachi")
     }
 }
 
@@ -43,11 +44,26 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         }
         f.sync_all()
     })();
-    match written.and_then(|()| std::fs::rename(&tmp, &path)) {
+    match written.and_then(|()| rename(&tmp, &path)) {
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(e)
+        }
+    }
+}
+
+/// Windows refuses to replace a file that antivirus or a sync client (Defender, OneDrive,
+/// Dropbox) has open for a moment, so try again briefly before giving up.
+fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut tries = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied && tries < 10 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            r => return r,
         }
     }
 }
