@@ -4432,14 +4432,12 @@ fn agent_panel_runs_an_agent_and_continues_its_session() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// target/shots/agent.png: the Agent panel mid-conversation, for the README.
+/// target/shots/agent.png, for the README: a real Claude Code turn in the Agent panel. Needs
+/// Claude Code installed and signed in, and takes a minute or two.
 #[cfg(unix)]
 #[test]
 #[ignore]
 fn agent_shot() {
-    let dir = std::env::temp_dir().join(format!("katachi-agent-shot-{}", std::process::id()));
-    let reply = "I added a Pricing section under the hero: three plan cards in a horizontal auto layout with 24 px gaps, using your Primary color for the recommended plan.";
-    fake_claude(&dir, reply);
     let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/shots");
     std::fs::create_dir_all(&out).unwrap();
     let mut h = Harness::builder().with_size(vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).with_theme(egui::Theme::Light).wgpu().build_eframe(|cc| {
@@ -4448,12 +4446,24 @@ fn agent_shot() {
     });
     h.run_steps(3);
     let ctx = h.ctx.clone();
+    while crate::agent::found(&ctx).is_none() {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    h.state_mut().prefs.agent = Some(crate::agent::Harness::Claude);
     h.state_mut().listen_for_agents(&ctx);
     key(&mut h, Modifiers::COMMAND, Key::L);
-    agent_say(&mut h, "Add a pricing section with three plans under the hero", reply, 1);
-    h.run_steps(5);
+    h.event(Event::Text("Add a pricing section with three plan cards (Free, Pro, Team) to the right of the Landing frame, using auto layout. Make Pro stand out.".into()));
+    key(&mut h, Modifiers::NONE, Key::Enter);
+    let start = std::time::Instant::now();
+    while h.state().agent_busy() && start.elapsed().as_secs() < 300 {
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(!h.state().agent_busy(), "the agent didn't finish in five minutes");
+    // Zoom to fit everything, the agent's work included.
+    h.state_mut().zoom_to(&ctx, None, false);
+    h.run_steps(10);
     h.render().unwrap().save(out.join("agent.png")).unwrap();
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]

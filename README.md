@@ -181,6 +181,8 @@ package instead. Set `KATACHI_NO_UPDATE=1` to turn the check off.
 - It knows the file, the page, and your selection. Each reply's changes undo in one step (Undo these changes), and every tab keeps its own conversation; an agent keeps working on its file when you switch tabs
 - Settings > Agents lists the agents Katachi found and adds Katachi to Claude Code, Codex, or Gemini CLI with one click, for using it from a terminal too
 
+![Claude Code building a pricing section in the Agent panel](docs/agent.png)
+
 **MCP server (for AI agents)**
 - The app serves MCP at `http://127.0.0.1:3855/mcp` while it's open, like Figma's Dev Mode MCP server, but agents can also edit: `claude mcp add --transport http katachi http://127.0.0.1:3855/mcp` (or Main menu > MCP server to copy the command). Stdio clients use `katachi mcp`
 - Tools: `get_metadata` (XML outline), `get_screenshot`, `get_code` (CSS, Tailwind, React, SwiftUI, Compose), `get_variable_defs`, `get_components`, `get_selection`, `find_nodes`, `execute_code` (Figma plugin-API JavaScript, one undo step per call), `list_pages`, `set_page`, `select`, `import_svg`, `place_image`, `export` (PNG, JPG, WebP, SVG, PDF at 2x, 512w, ...), `get_comments`, `reply_to_comment`, `save`, `open_file`, `undo`

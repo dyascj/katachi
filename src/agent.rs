@@ -479,7 +479,8 @@ pub fn parse(harness: Harness, line: &str) -> Vec<Event> {
                 for block in v.pointer("/message/content").and_then(Value::as_array).into_iter().flatten() {
                     match block.get("type").and_then(Value::as_str) {
                         Some("text") => out.extend(s(block, "text").filter(|t| !t.trim().is_empty()).map(|text| Event::Text { text, delta: false })),
-                        Some("tool_use") => out.extend(s(block, "name").map(|n| Event::Tool(describe(&n)))),
+                        // ToolSearch only loads other tools' definitions; it isn't a step anyone took.
+                        Some("tool_use") => out.extend(s(block, "name").filter(|n| n != "ToolSearch").map(|n| Event::Tool(describe(&n)))),
                         _ => {}
                     }
                 }
