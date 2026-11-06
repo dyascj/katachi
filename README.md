@@ -2,10 +2,94 @@
 
 Katachi (形, "form") is a native design tool with Figma's workflow: the same canvas behavior, selection rules,
 tools, panels, and keyboard shortcuts. It is written in Rust, runs offline, and stores files on your disk.
+It runs the AI coding agents you already have (Claude Code, Codex, Gemini CLI, OpenCode, Cursor) right
+inside the app, so you can ask for a screen and watch it get built on the canvas.
 
 It is a clean-room implementation. No Figma code, assets, or file internals are used.
 
 ![Katachi](docs/screenshot.png)
+
+**Highlights**
+- **Design with AI agents, in the app.** The Agent panel (Cmd L) runs the agents installed on your computer against the open file, with your own sign-in. [More below](#design-with-ai-agents).
+- **Figma's workflow, natively.** The same tools, selection rules, panels, and shortcuts; auto layout with wrap and grid; components, variants, and properties; styles, variables, and modes; libraries; prototyping with smart animate and springs.
+- **Opens Figma files.** Drop a `.fig` on the canvas: pages, components, instances, variables, auto layout, and more come across.
+- **Handoff.** Dev Mode writes CSS, Tailwind, React, SwiftUI, and Jetpack Compose using your variable and style names.
+- **Real-time multiplayer and comments**, hosted from the app, with no account or cloud service.
+- **Open to automation.** An MCP server any agent can use, and Figma plugins and scripts.
+- **Yours, offline.** Plain `.katachi` files on your disk, crash recovery, version history, and signed auto-updates on macOS, Windows, and Linux.
+
+## Design with AI agents
+
+![Claude Code building a pricing section in the Agent panel](docs/agent.png)
+
+Press **Cmd L** (Ctrl L on Windows and Linux), or click the spark at the end of the toolbar, to open the
+Agent panel. Pick an agent, type what you want, and press Enter. The agent looks at your file, edits it
+through Katachi's own tools, and tells you what it did.
+
+**Agents it runs.** Whatever you already use. Katachi finds them on your computer, including ones
+installed with npm, Homebrew, or their own installers, and runs them with your own sign-in and model.
+Katachi has no account, no API key, and no server in between.
+
+| Agent | Install | Katachi runs |
+| --- | --- | --- |
+| Claude Code | [docs.anthropic.com/claude-code](https://docs.anthropic.com/en/docs/claude-code) | `claude -p --output-format stream-json` |
+| Codex | [developers.openai.com/codex/cli](https://developers.openai.com/codex/cli) | `codex exec --json` |
+| Gemini CLI | [github.com/google-gemini/gemini-cli](https://github.com/google-gemini/gemini-cli) | `gemini -o stream-json` |
+| OpenCode | [opencode.ai](https://opencode.ai) | `opencode run --format json` |
+| Cursor | [cursor.com/cli](https://cursor.com/cli) | `cursor-agent -p --output-format stream-json` |
+
+Sign in to an agent once in a terminal (run `claude`, `codex`, and so on), and it works in Katachi.
+
+**What to ask for**
+- "Design a sign-in screen for a mobile app"
+- "Add a pricing section with three plans next to the landing page, using auto layout"
+- "Tidy the selection with auto layout and consistent spacing"
+- "Make a dark version of the selected frame"
+- "Turn the selection into a component with hover and pressed variants"
+- "Rename these layers sensibly"
+- "Go through the open comments, fix what they ask, and reply to each"
+- "Export the selected frames as PNGs at 2x into my Downloads folder"
+
+**How it works with you**
+- **It knows where you are.** Every message tells the agent the file, the page, and what you have selected, so "make this a card" just works.
+- **You can watch.** Steps like "Looked at the canvas" and "Edited the design" stream in, and the layers it changes glow on the canvas for a moment. The reply shows its formatting: headings, lists, and code.
+- **Nothing is final.** Each change is one undo step, and **Undo these changes** under a reply takes back everything that reply did. **Stop** ends the agent at once, along with anything it started.
+- **Conversations continue.** Follow-ups pick up the agent's own session, so "now make the Pro card stand out" knows what you mean. **New chat** starts fresh.
+- **One conversation per tab.** Start an agent on one file and switch to another: it keeps working on the file it started on, and that tab shows a spinner until it's done.
+- **It stays in your design.** Agents are asked to work on the canvas, not on files on your disk, unless you ask for something like an export.
+
+**Settings > AI agents** lists the agents Katachi found and where. **Add Katachi** adds Katachi to Claude
+Code, Codex, or Gemini CLI as an MCP server (through their own `mcp add` commands), so you can drive the
+open file from a terminal or an editor too.
+
+**If something's off**
+- *"No agents found":* install one from the table above, then click **Look again**.
+- *"isn't signed in":* run the agent's command in a terminal once and sign in.
+- Katachi talks to agents through a local MCP server. If another copy of Katachi already uses its port, this one quietly uses a free port of its own; Settings > AI agents shows which.
+
+### Use Katachi from any agent (MCP)
+
+While Katachi is open, it serves MCP at `http://127.0.0.1:3855/mcp`, like Figma's Dev Mode MCP server,
+except agents can edit too. Add it to Claude Code with
+`claude mcp add --transport http katachi http://127.0.0.1:3855/mcp` (or click **Add Katachi** in
+Settings > AI agents). Clients that only speak stdio use `katachi mcp`.
+
+| Tool | What it does |
+| --- | --- |
+| `get_selection`, `get_metadata` | What's selected, and the page or a layer as an XML outline |
+| `get_screenshot` | A PNG of a layer, the selection, or the page |
+| `find_nodes` | Layers by name, text, or type (`*` wildcards) |
+| `get_code` | CSS, Tailwind, React, React with Tailwind, SwiftUI, or Jetpack Compose |
+| `get_variable_defs`, `get_components` | Variables, modes, styles, components, and library components |
+| `execute_code` | Figma plugin-API JavaScript against the file; one undo step per call |
+| `import_svg`, `place_image` | Add vector art or an image file |
+| `list_pages`, `set_page`, `select` | Move around the file |
+| `get_comments`, `reply_to_comment` | Read comment threads, reply, and resolve them |
+| `export` | PNG, JPG, WebP, SVG, or PDF at 2x, 512w, 512h, ... |
+| `save`, `open_file`, `undo` | File basics |
+
+Only programs on your computer can connect. Requests from web pages, including plugin windows served
+from your computer, are refused.
 
 ## Install
 
@@ -99,11 +183,13 @@ package instead. Set `KATACHI_NO_UPDATE=1` to turn the check off.
 - Smart guides that snap to edges, centers, and equal spacing, with pink gap markers
 - Smart selection: drag the pink handles between evenly spaced layers to respace them all, or drag a layer's center knob to swap places
 - Ruler guides: drag them out of the rulers, move them, drag them back to delete; layers snap to them
-- Alt-hover distance measurements, flip (Shift H/V), distribute and tidy up, alignment, N and Shift N to step through frames
+- Alt-hover distance measurements, flip (Shift H/V, including stars, arcs, corner radii, and gradients), distribute and tidy up, alignment, N and Shift N to step through frames
+- Frames inside sections act like top-level frames: name labels, click-through, and prototype targets
 - Right-click: Select layer (everything under the pointer), Move to page, Select matching layers, Select all with same fill, stroke, effect, font, or instance, Select inverse (Shift Cmd A)
 
 **Layers and pages**
 - Shift-click ranges, multi-layer drag to reorder and reparent, and the list scrolls to the selection
+- Edit several layers at once: changing one property changes only that property, and fields show Mixed where the layers differ
 - Batch rename (Cmd R with several layers): rename to `$&`, `$n`, `$N`, and match and replace, with a preview
 - Undo and redo bring back the selection and page of each step
 - Pages: drag to reorder, duplicate, and dividers (a page named `---`)
@@ -130,7 +216,7 @@ package instead. Set `KATACHI_NO_UPDATE=1` to turn the check off.
 - Multi-contour paths with even-odd or non-zero fill
 - Vector edit mode: move anchors and handles, marquee-select points, bend (Cmd-drag), cut (Y), join (Cmd J), continue a path with the pen, and edit polygons and stars
 - Ellipse arcs: start, sweep, and ratio for pies, donuts, and rings
-- Live boolean groups: union, subtract, intersect, exclude
+- Live boolean groups: union, subtract, intersect, exclude, with text as an operand (knockout text)
 - Flatten (Cmd E), outline stroke (Alt Cmd O), SVG import by paste, drag-and-drop, or File > Place
 
 **Paint and effects**
@@ -164,29 +250,20 @@ package instead. Set `KATACHI_NO_UPDATE=1` to turn the check off.
 **Handoff**
 - Dev Mode (Shift D) with CSS, Tailwind, React (inline styles or Tailwind), SwiftUI, and Jetpack Compose code that uses your variable and style names, colors, type, and auto layout spacing on hover
 - Ready for dev status on frames, and annotations pinned to layers
-- Copy as PNG, SVG, CSS, or code
+- Copy as PNG, SVG, CSS, or code; React output nests children as elements, keeps vectors as inline SVG, and uses your variables
 
 **Files**
 - Open Figma `.fig` files (Main menu > Open, or drop one on the canvas): pages, frames, sections, components, component sets, instances with overrides and component properties, variables and modes, vectors, text, images, effects, auto layout, and constraints
-- `.katachi` files (JSON), durable atomic saves, crash-recovery autosave for every tab, version history, open recent
+- `.katachi` files (JSON), durable atomic saves, crash-recovery autosave for every tab (each recovered file gets its own tab), version history, open recent
+- Quitting with unsaved work asks about each tab, on every platform
 - Export presets per layer to PNG, JPG, WebP, SVG, and PDF at any scale (2x, 2.5x) or size (512w, 512h), for several layers at once, and an Export dialog (Shift Cmd E) for everything on the page
 
 **Appearance**
 - Light, dark, or system theme (Main menu > Appearance). Pages left at the default canvas color follow the theme
 - Glass: translucent, tinted side panels and toolbars over a blurred desktop, with adjustable opacity, blur (macOS), and tint; the canvas stays solid. On Windows and Linux glass is translucency without the blur
 
-**Agents, in the app**
-- The Agent panel (Cmd L, or the spark in the toolbar) runs the coding agents already installed on your computer: Claude Code, Codex, Gemini CLI, OpenCode, or Cursor. They use your own sign-in and models; Katachi has no account or API key of its own
-- Ask for a screen, a component, a cleanup, or a dark version, and watch the agent build it on the canvas. Layers it changes glow for a moment, the tab shows a spinner while it works, and Stop ends it at once
-- It knows the file, the page, and your selection. Each reply's changes undo in one step (Undo these changes), and every tab keeps its own conversation; an agent keeps working on its file when you switch tabs
-- Settings > Agents lists the agents Katachi found and adds Katachi to Claude Code, Codex, or Gemini CLI with one click, for using it from a terminal too
-
-![Claude Code building a pricing section in the Agent panel](docs/agent.png)
-
-**MCP server (for AI agents)**
-- The app serves MCP at `http://127.0.0.1:3855/mcp` while it's open, like Figma's Dev Mode MCP server, but agents can also edit: `claude mcp add --transport http katachi http://127.0.0.1:3855/mcp` (or Main menu > MCP server to copy the command). Stdio clients use `katachi mcp`
-- Tools: `get_metadata` (XML outline), `get_screenshot`, `get_code` (CSS, Tailwind, React, SwiftUI, Compose), `get_variable_defs`, `get_components`, `get_selection`, `find_nodes`, `execute_code` (Figma plugin-API JavaScript, one undo step per call), `list_pages`, `set_page`, `select`, `import_svg`, `place_image`, `export` (PNG, JPG, WebP, SVG, PDF at 2x, 512w, ...), `get_comments`, `reply_to_comment`, `save`, `open_file`, `undo`
-- Only native clients can connect: requests from web pages (anything sending an Origin header) are refused
+**Agents and automation**
+- The Agent panel (Cmd L) and the MCP server: see [Design with AI agents](#design-with-ai-agents)
 
 **Plugins**
 - Run Figma plugins: Main menu > Plugins > Development > Import plugin from manifest. Plugins use the core of Figma's plugin API (`figma.currentPage`, selection, `findAll`, `create*`, fills, text, `notify`, `clientStorage`, `figma.on("selectionchange")`, async), and plugin UIs (`figma.showUI`) open in a panel with Figma's `postMessage` messaging (on Linux they open in your browser, connected the same way). Each change a plugin makes is one undo step
